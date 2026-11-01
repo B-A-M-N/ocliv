@@ -904,3 +904,16 @@ Drill (container removed afterwards, zero host footprint):
   `--check` passes. systemd activation still needs sudo on joker3
   (operator step below).
 - Disposition: FIXED (edge drift); VERIFIED (upgrade + E2E).
+
+## Round 35 — systemd relay live + cross-machine E2E (2026-11-01, joker3)
+- Operator installed the generated unit (`ocliv` user, 0600 env with
+  DOMAIN+RELAY_HOST+MCP_HOST+MCP_PORT, migrated lab DB, daemon-reload,
+  enable --now) → `systemctl is-active` = active.
+- Systemd instance verified from this PC: funnel edge 401; tunnel
+  attach ACTIVE/protected through the unit; tailnet edge unauth 401 →
+  redeem 200 → authorized 200 exact body → close → 503.
+- Migrated enrollment key works under the unit (identity preserved
+  across foreground→systemd cutover). No live tunnels were disrupted
+  (all leases were terminal before cutover).
+- Remaining: public DNS/ACME + ChatGPT perms (operator/infra).
+- Disposition: VERIFIED (systemd activation + full cycle).
