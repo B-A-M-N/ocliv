@@ -724,3 +724,14 @@ quirk only; public behavior is the oracle.
 - Focused tests `TestTunnel|TestClose|TestAttach|TestCleanup|TestRunner|
   TestSteady|TestShare` → ok.
 - Disposition: VERIFIED NON-ISSUE for this leg.
+
+## Round 24 — HTTP exchange + fencing re-audit (2026-11-01)
+- Re-read `relay_http.go` coordinator: three distinct deadlines (TTL
+  absolute, upload-idle policy, post-upload first-byte), socket deadline
+  armed only post-upload (Finding 2 holds), early-head upload watch with
+  bounded teardown, determined-outcome-before-cancellation ordering,
+  single writer lock, TTL re-checks per phase (R4).
+- Focused tests: held-end on late upload failure, stalled-upload
+  teardown, revoke fail-closed, stale-detach fencing, newer-deadline
+  expiry, stale-generation registration + disconnect → all PASS.
+- Disposition: VERIFIED NON-ISSUE for this leg.
