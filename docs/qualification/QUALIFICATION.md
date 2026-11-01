@@ -1084,3 +1084,19 @@ Drill (container removed afterwards, zero host footprint):
   account — recorded as BLOCKED-live, not simulated as done.
 - Disposition: FIXED (slice 5 scope). Diagnostics docs + full gates
   pending.
+
+## Round 46 — setup docs + full gates (2026-11-02)
+- New docs/SETUP.md: prerequisites, command sequence, what setup
+  automates vs leaves manual, failure/recovery table, simulated-vs-
+  live qualification matrix. AGENTS.md closeout: repo-map entry for
+  internal/setup, two setup troubleshooting rows.
+- Full gates on the setup tree: build, vet, gofmt clean;
+  internal/... PASS; integration 207s PASS; race
+  (relay/agent/config/cli/mcp/setup) PASS.
+- Live-verification status unchanged: detection/DNS-client/plan/
+  enroll-core/ask-guard/init-render tested; Caddy template syntax,
+  dynv6 wildcard resolution, on-demand issuance, Oracle launch, and
+  off-network HTTPS remain NOT VERIFIED (need operator infra).
+- Disposition: docs FIXED; live items remain BLOCKED on operator
+  prerequisites (VPS-or-direct-host with public IP, dynv6 zone,
+  OCI account, ChatGPT workspace).

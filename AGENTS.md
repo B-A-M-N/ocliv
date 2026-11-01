@@ -142,6 +142,8 @@ anything else is a failed oracle, not a pass.
 | `mcp doctor` exit `6` | Local `/mcp` failed initialize or tools/list | Probe the local server directly; fix it before blaming the tunnel |
 | `not enrolled` | No agent keys | `ocliv login` with a fresh one-time enrollment code |
 | `tailscale funnel` asks for approval | First-time Funnel needs tailnet admin consent | Approve in the admin console, or test over the tailnet instead |
+| `setup --auto` stops after DNS | CGNAT, missing token, or no viable path | Read the printed reason; fix that prerequisite (token, forward, provider) and re-run — nothing half-provisions |
+| setup persists nothing | DNS does not match egress yet | Wait for propagation and re-run; relay_url is written only after a verified match |
 
 ## Repo map
 
@@ -153,7 +155,10 @@ anything else is a failed oracle, not a pass.
   forwarding. `internal/cli/` — all UX: `cli.go` (dispatch/help),
   `cli_commands.go` (relay/tunnel), `cli_mcp*.go` (publish/serve/doctor).
 - `internal/mcp/` — bounded stdio adapter (loopback only, argv-only
-  children). `internal/{access,proxy,protocol,lease,store,limits,transport}/`
+  children). `internal/setup/` — `setup --auto` detection (read-only),
+  dynv6 sync, deployment render, bootstrap plan, Oracle adapter; live
+  executors need root, tests cover detection/client/plan/enroll-core.
+  `internal/{access,proxy,protocol,lease,store,limits,transport}/`
   — small policy/state primitives; keep them that way.
 - `tests/integration/` — harness + end-to-end (path routes, profiles,
   lifecycle, chaos). `packaging/caddy/` — wildcard + single-host edges;
