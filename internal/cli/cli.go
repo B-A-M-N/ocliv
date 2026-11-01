@@ -43,6 +43,8 @@ func Run(argv []string) int {
 		return cmdDoctor(argv[1:])
 	case "relay":
 		return cmdRelay(argv[1:])
+	case "setup":
+		return cmdSetup(argv[1:])
 	case "access":
 		return cmdAccess(argv[1:])
 	case "mcp":
@@ -72,6 +74,7 @@ Usage:
   ocliv mcp publish --local URL --auth upstream-oauth|fixture-anonymous [--name N] [--ttl D] ...
   ocliv mcp serve --local URL --auth upstream-oauth|fixture-anonymous ...
   ocliv mcp doctor [--lease ID] [--name LABEL]
+  ocliv setup --auto [--json] [--echo-v4 URL] [--echo-v6 URL] | setup --check ...
   ocliv version
 `)
 	return code

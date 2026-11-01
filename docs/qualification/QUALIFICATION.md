@@ -973,3 +973,17 @@ Drill (container removed afterwards, zero host footprint):
   issuance, off-network HTTPS tunnel test, ChatGPT registration
   (workspace permission), invalid-certificate rejection over real TLS,
   24h soak. No PUBLIC READY claim.
+
+## Round 39 — setup detection slice (2026-11-02)
+- New `internal/setup` package: interface scan + per-family echo
+  observation classifies direct-v6/direct-v4/NAT-needs-forward/CGNAT/
+  unknown; inbound always reported UNKNOWN (outbound echo is not
+  inbound evidence). No side effects.
+- New `ocliv setup --check/--auto/--json` (auto = detect + guided
+  next steps in this slice; provisioning follows). Token/credential
+  handling deferred to the dynv6 slice (env/file only, never argv).
+- Tests: 6 classification/echo tests + 2 CLI tests (echo verdict,
+  unknown-flag rejection). Focused suites PASS; live `setup --check`
+  on this host correctly reports nat-ipv4-needs-forward.
+- Disposition: FIXED (slice 1 scope). dynv6 update, bootstrap,
+  wildcard, Oracle adapter remain pending.
