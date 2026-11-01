@@ -178,6 +178,39 @@ production-ready only when an independent machine outside the relay's
 network reaches it over normal public DNS with default TLS
 verification — tailnet or loopback success never counts.
 
+### Temporary public proving via Tailscale Funnel (lab-only edge)
+
+Proves the relay path over the real public internet without a domain
+or open ports. Funnel is a throwaway edge, not a product dependency:
+it terminates public TLS itself, so SNI/Host consistency at the
+Funnel→Caddy hop stays NOT VERIFIED (proven once in
+[Gate 3](/home/bamn/ocliv/docs/qualification/GATE3-PUBLIC-FUNNEL.md);
+relay-side exact-Host checks still enforced and PASS).
+
+Rule: Funnel runs **on the relay host** — it publishes that machine's
+loopback listener. `tailscale up`/`login` only joins the tailnet;
+`tailscale funnel <port>` is a separate per-machine serve config.
+Connecting your account on machine A and running funnel there exposes
+machine A, never the relay on machine B. Moving the public test to a
+new relay host means running funnel there.
+
+On the relay host (needs the `tailscale` CLI installed and funnel
+allowed for the tailnet):
+
+```
+./caddy run --config packaging/caddy/Caddyfile.funnel --adapter caddyfile
+tailscale funnel 18081            # publishes THIS host's :18081
+tailscale funnel status           # note the exact *.ts.net hostname
+```
+
+Run the relay with `--relay-host/--mcp-host` set to that exact funnel
+hostname, then publish/verify from an independent public client with
+default TLS verification (no `-k`). Teardown with
+`tailscale funnel reset` — public exposure must not linger.
+
+`tailscale: command not found` means the CLI is not installed for that
+user/host — install Tailscale there; nothing in Ocliv substitutes for it.
+
 ## Private staging lab (tailnet, no VPS)
 
 Proves private multi-machine behavior only. Public DNS, ACME/DNS-01,
