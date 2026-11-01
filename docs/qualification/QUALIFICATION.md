@@ -399,3 +399,16 @@ Disposition: documented flows behave as documented; no drift found.
   INSERT..SELECT..WHERE EXISTS(lease ACTIVE) + ON CONFLICT DO NOTHING
   on `idx_mcp_publications_logical`; loser re-reads winner;
   `TestMCPRouteConcurrentCreate` green.
+
+## Re-audit on committed HEAD, round 2 (defect loop)
+
+- Operator-enrollment interference (P0-01): re-verified FIXED.
+  `cmdIssueEnroll` uses narrow `relay.IssueEnrollmentCode(db, ...)` and
+  never constructs a Server; `relay.New` (sole caller: `cmdRelayServe`)
+  keeps `reconcileBoot` for genuine startup. Grep confirms no other
+  `relay.New(` call sites.
+- Cross-process revoke convergence: VERIFIED. Server-path revoke
+  evicts live sessions post-commit (`TestRevokeAgentKeyTerminatesAuthority`,
+  `TestRevokeDeniesLiveDispatchAtBoundary`); CLI-driven revocation lands
+  in durable state and `supervise` revalidates lease status every 5s tick,
+  evicting terminal (REVOKED/CLOSED/EXPIRED) leases under live sessions.
