@@ -179,6 +179,10 @@ func terminalFixture(t *testing.T, dir, leaseStatus, pubAction string) (snapBefo
 		if _, err := db.SQL().Exec(`UPDATE leases SET token_generation=token_generation+1 WHERE id='lse-1'`); err != nil {
 			t.Fatal(err)
 		}
+	case "bump-generation":
+		if _, err := db.SQL().Exec(`UPDATE leases SET generation=generation+4 WHERE id='lse-1'`); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return snapBefore
 }
@@ -239,6 +243,26 @@ func TestRestoreRefusesTokenRotationRollback(t *testing.T) {
 	snapBefore := terminalFixture(t, dir, "ACTIVE", "bump-token-gen")
 	if err := RestoreState(dir, snapBefore, false, true); err == nil {
 		t.Fatal("token-rotation rollback restore accepted")
+	}
+}
+
+// TestRestoreRefusesFencingGenerationRollback: post-backup reconnects
+// (generation bumps) must not be undone by restore — the older snapshot
+// would let a superseded generation fence and regain live authority.
+func TestRestoreRefusesFencingGenerationRollback(t *testing.T) {
+	dir := t.TempDir()
+	snapBefore := terminalFixture(t, dir, "ACTIVE", "bump-generation")
+	if err := RestoreState(dir, snapBefore, false, true); err == nil {
+		t.Fatal("generation-rollback restore accepted")
+	}
+	db, err := store.Open(filepath.Join(dir, relayDBName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var g int64
+	if err := db.SQL().QueryRow(`SELECT generation FROM leases WHERE id='lse-1'`).Scan(&g); err != nil || g != 5 {
+		t.Fatalf("live fencing generation lost after refused restore: %d %v", g, err)
 	}
 }
 

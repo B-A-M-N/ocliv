@@ -86,6 +86,10 @@ type revocationSet struct {
 	// Rotation and revocation are the only bumpers, so any step
 	// back revalidates distrusted credentials and is refused.
 	leaseTokGen map[string]int64
+	// leaseGen maps every live lease to its fencing generation.
+	// Reconnects are the only bumpers, so a step back would let a
+	// superseded generation fence and regain live authority (P0-B).
+	leaseGen map[string]int64
 	// tokens/sessions are explicitly revoked capability rows.
 	tokens   map[string]bool
 	sessions map[string]bool
@@ -167,6 +171,27 @@ func readRevocations(q *sql.DB) (*revocationSet, error) {
 	if err := trows.Err(); err != nil {
 		return nil, apperr.E(apperr.CodeStoreFault, "reading token generations", err)
 	}
+	// Fencing generations for every lease (P0-B): only reconnects
+	// bump them, so any step back is refused like a rotation
+	// rollback.
+	s.leaseGen = map[string]int64{}
+	grows, err := q.Query(`SELECT id, generation FROM leases`)
+	if err != nil {
+		return nil, apperr.E(apperr.CodeStoreFault, "reading fencing generations", err)
+	}
+	for grows.Next() {
+		var id string
+		var g int64
+		if err := grows.Scan(&id, &g); err != nil {
+			grows.Close()
+			return nil, apperr.E(apperr.CodeStoreFault, "reading fencing generations", err)
+		}
+		s.leaseGen[id] = g
+	}
+	grows.Close()
+	if err := grows.Err(); err != nil {
+		return nil, apperr.E(apperr.CodeStoreFault, "reading fencing generations", err)
+	}
 	if s.tokens, err = collectStrings(q, `SELECT id FROM access_tokens WHERE revoked_at IS NOT NULL`); err != nil {
 		return nil, apperr.E(apperr.CodeStoreFault, "reading token revocations", err)
 	}
@@ -243,6 +268,16 @@ func rollbackDiff(live, backup *revocationSet) []string {
 	for id, g := range live.leaseTokGen {
 		if bg, ok := backup.leaseTokGen[id]; ok && bg < g {
 			missing = append(missing, "token-generation:"+id)
+		}
+	}
+	// Fencing generations never step back (P0-B): a lower backup
+	// generation would let a superseded generation fence and regain
+	// live authority. Rows absent from the backup are forward data
+	// loss (operator's explicit act), not resurrection — except
+	// live-terminal rows, caught above.
+	for id, g := range live.leaseGen {
+		if bg, ok := backup.leaseGen[id]; ok && bg < g {
+			missing = append(missing, "fencing-generation:"+id)
 		}
 	}
 	for id := range live.tokens {

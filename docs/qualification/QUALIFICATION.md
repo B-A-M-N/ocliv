@@ -531,3 +531,19 @@ quirk only; public behavior is the oracle.
   `TestControlAuthority|TestMCP|TestRoute|TestAdmit|TestPathRoute|TestVisitor|TestWildcard`
   → ok (3.9s).
 - Disposition: VERIFIED NON-ISSUE for this leg.
+
+## Round 11 — REAL DEFECT: fencing-generation restore rollback (2026-11-01)
+- Finding: `rollbackDiff` refused token_generation step-back but not fencing
+  `generation` step-back. `resumeLease` fences from the row's current
+  generation (`newGen = ls.Generation + 1`), so restoring a gen-3 snapshot
+  over live gen-5 lets a superseded gen-4 session fence and regain live
+  authority (transient, race with the legitimate agent). Severity P1.
+- Falsified: new `TestRestoreRefusesFencingGenerationRollback` failed
+  pre-fix ("generation-rollback restore accepted").
+- Fix: `revocationSet.leaseGen` (`SELECT id, generation`), populated in
+  `readRevocations`; `rollbackDiff` refuses backup < live for rows present
+  in both (absent rows remain operator-act data loss, symmetric with
+  token-generation; live-terminal rows already covered).
+- Verify: new test PASS; all 14 backup/restore tests PASS; full
+  `go test ./internal/relay/ -count=1` → ok (35.3s); `go vet` + `gofmt` clean.
+- Disposition: FIXED.
