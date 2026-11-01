@@ -823,3 +823,29 @@ quirk only; public behavior is the oracle.
   recorded outcomes (404 already-gone is success, not failure).
 - 23 focused tests → all PASS.
 - Disposition: VERIFIED NON-ISSUE for this leg.
+
+## FINAL CONVERGENCE AUDIT (2026-11-01)
+System-wide re-audit Rounds 7–31. Every subsystem examined against the
+live tree; all discoverable actionable defects fixed with red→green
+tests and committed in small slices. Final gates at tip: build, vet,
+gofmt, full internal suite green; worktree clean.
+
+Disposition ledger (this loop):
+- FIXED (4): WS hijack-buffer loss + silent hijack failure (R7);
+  restore fencing-generation rollback (R11); installer hostname/port
+  validation (R13); doctor IPv6-family + relay-host probes (R18).
+- FIXED (1): tailnet Caddyfile stale bind default (R14).
+- VERIFIED NON-ISSUE (21 legs): CLI/doctor, limits/transport, authority/
+  routing, agent lifecycle, MCP ingress/publication, MCP adapter/proxy,
+  store, metrics/identity/config, relay init, visitor/access, connect/
+  handshake, CLI tunnel lifecycle, HTTP exchange/fencing, WebSocket,
+  docs reconciliation, lease mgmt/revocation, transport/enrollment,
+  Server construction/dist, MCP publish/expose, fuzz + integration
+  suites green.
+- ACCEPTED RISK (2, minor): CLI runnerExit message matching (agent uses
+  typed PermanentError); in-memory seed zeroing absent.
+- BLOCKED, operator-only (unchanged, need no code): clean-host
+  install/upgrade drill; Gate B public DNS/ACME; Gate 4 ChatGPT
+  registration + real provider OAuth; load/soak/24h stability;
+  production backup recovery on live infra.
+No unresolved actionable finding remains. Loop converged.
