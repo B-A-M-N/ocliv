@@ -475,3 +475,18 @@ quirk only; public behavior is the oracle.
   (in-memory only). No leak path found.
 - MCP admission pre-forwarding budget (P1-10): present —
   `MCPAdmissionBurst` per (source, lease) before stream allocation.
+
+## Re-audit on committed HEAD, round 7 (defect loop) — REAL DEFECT FIXED
+
+- WS hijack-buffer loss (P1): FIXED. `serveWebSocket` discarded the
+  hijacked `bufrw` (`_ = bufrw`), losing client bytes pipelined past
+  the handshake. New `drainHijackedBytes` forwards buffered bytes as
+  `FUpgradeBytes` before the bridge loop; the agent side already
+  preserved its buffer, so both directions now match. Removed dead
+  `buf` lines. Also fixed the silent return on hijack failure → 500.
+- Files: `internal/relay/relay_ws.go`,
+  `internal/relay/relay_ws_hijack_test.go`
+  (`TestDrainHijackedBytesForwardsBuffered`,
+  `TestWSHijackFailureReports500`). Red→green observed (undefined
+  helper, then PASS); vet clean (fixed a t.Fatal-from-goroutine);
+  full relay package green.

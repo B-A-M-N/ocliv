@@ -5,6 +5,7 @@
 package relay
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha1"
 	"encoding/base64"
@@ -86,9 +87,20 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request, stream n
 	pubConn, bufrw, err := hj.Hijack()
 	if err != nil {
 		_ = sendAbort(stream, "internal", "hijack failed")
+		http.Error(w, "websocket not supported here", http.StatusInternalServerError)
 		return
 	}
 	defer pubConn.Close()
+	// Forward bytes the server buffered past the handshake (a client
+	// may pipeline frames immediately after its GET): the hijacked
+	// bufrw owns those bytes and reading the raw conn would lose
+	// them, corrupting the stream start.
+	if err := drainHijackedBytes(bufrw, func(p []byte) error {
+		return protocol.WriteFrame(stream, protocol.FUpgradeBytes, p)
+	}); err != nil {
+		_ = sendAbort(stream, "cancelled", "visitor went away")
+		return
+	}
 	// Complete the public 101 (E10): only now, after auth + local 101.
 	var hdr strings.Builder
 	hdr.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n")
@@ -104,7 +116,6 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request, stream n
 		_ = sendAbort(stream, "cancelled", "visitor went away")
 		return
 	}
-	_ = bufrw
 	metrics.Global.WSActive.Add(1)
 	defer metrics.Global.WSActive.Add(-1)
 	defer metrics.Global.WSClosed.Add(1)
@@ -148,8 +159,6 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request, stream n
 		}
 	}()
 	// Agent -> public: unframe UPGRADE_BYTES and write raw (E11 bidi).
-	buf := make([]byte, 0)
-	_ = buf
 	for {
 		if leaseExpired(t) {
 			return
@@ -173,6 +182,23 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request, stream n
 			return
 		}
 	}
+}
+
+// drainHijackedBytes forwards bytes the HTTP server buffered past the
+// upgrade handshake before Hijack returned. A client may pipeline
+// WebSocket frames immediately after its GET; the hijacked bufrw owns
+// those bytes and reading the raw conn would lose them. Empty buffers
+// are a no-op so the common case adds no extra frame.
+func drainHijackedBytes(bufrw *bufio.ReadWriter, forward func([]byte) error) error {
+	n := bufrw.Reader.Buffered()
+	if n == 0 {
+		return nil
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(bufrw.Reader, buf); err != nil {
+		return err
+	}
+	return forward(buf)
 }
 
 // wsAccept computes the RFC 6455 accept value.
