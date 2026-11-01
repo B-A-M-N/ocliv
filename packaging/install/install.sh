@@ -31,6 +31,39 @@ case "$DOMAIN" in
     exit 1
     ;;
 esac
+# Hostnames are written raw into relay.env and word-split into the launch
+# command, so reject anything outside the DNS label shape here instead of
+# failing late at service startup (a typo must never become an env-file
+# injection or a silently split flag).
+valid_host() {
+  # One trailing FQDN dot is tolerated (the relay trims it); everything
+  # else must be strict DNS label shape.
+  h="${1%.}"
+  case "$h" in
+    ""|-*|.*|*.|*-|*-.*|*.-*|*..*|*[!A-Za-z0-9.-]*)
+      return 1
+      ;;
+  esac
+  return 0
+}
+if ! valid_host "$DOMAIN"; then
+  echo "refusing malformed domain: $DOMAIN" >&2
+  exit 1
+fi
+for h in "$MCP_HOST" "$RELAY_HOST"; do
+  if [ -n "$h" ] && ! valid_host "$h"; then
+    echo "refusing malformed host: $h" >&2
+    exit 1
+  fi
+done
+if [ -n "$MCP_PORT" ]; then
+  case "$MCP_PORT" in
+    *[!0-9]*|"")
+      echo "refusing malformed edge port: $MCP_PORT" >&2
+      exit 1
+      ;;
+  esac
+fi
 
 cd "$SRC_DIR"
 NEW_BIN="$BIN.new.$$"

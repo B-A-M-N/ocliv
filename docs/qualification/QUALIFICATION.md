@@ -559,3 +559,23 @@ quirk only; public behavior is the oracle.
   writers; unsynchronized read is safe.
 - `go test ./internal/agent/ -count=1` → ok; `-race` → ok.
 - Disposition: VERIFIED NON-ISSUE for this leg.
+
+## Round 13 — installer hardening + packaging re-audit (2026-11-01)
+- Finding (P2, fail-early): `install.sh` wrote DOMAIN/MCP_HOST/RELAY_HOST
+  raw into root-owned `relay.env` with only a placeholder-domain check; a
+  typo'd value (spaces, `;`, newline) fails late at service startup instead
+  of at install. Operator is root so this is typo-safety, not a privilege
+  boundary — fail direction was already closed.
+- Fix: `valid_host()` in `install.sh` (strict DNS label shape, one
+  trailing FQDN dot tolerated to match relay `canonicalHost`); numeric
+  check for MCP_PORT. Verified matrix 15/15 via shell harness, including
+  a red pre-fix run that caught leading-hyphen acceptance (`-foo`, `--x`).
+- Durable tests: `packaging/install/install_validation_test.go`
+  (`TestInstallValidHostMatrix`, `TestInstallScriptSyntax`) — PASS.
+- Packaging re-audit: systemd unit + `ocliv-relay-launch.sh` add
+  `--mcp-host`/`--relay-host`/`--mcp-port` only when non-empty (P0-B
+  holds); unit keeps loopback-only, NoNewPrivileges, ProtectSystem=strict;
+  installer keeps build→preflight→preserve-prev→activate→verify order with
+  explicit clean-host NOT YET QUALIFIED honesty.
+- `go test ./packaging/install/ -count=1` → ok.
+- Disposition: FIXED (installer slice); VERIFIED NON-ISSUE (unit/launcher).
