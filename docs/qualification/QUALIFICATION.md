@@ -800,3 +800,12 @@ quirk only; public behavior is the oracle.
 - Operator revocation paths covered in Round 28.
 - Focused transport/enrollment/operator tests → ok.
 - Disposition: VERIFIED NON-ISSUE for this leg.
+
+## Round 30 — Server construction/dist/harness re-audit (2026-11-01)
+- `relay.New` is the single construction site: `reconcileBoot` errors
+  refuse startup (P1-05), mux wiring + authority gate (`authorizeHost`
+  before mux, CONNECT rejected first) in one place. No second
+  construction path; enrollment uses the store-only function (P0-01).
+- `live/ocliv-dist/SHA256SUMS` verifies OK (both runtime zips).
+- `tests/staging/` harness present (edge/forwarding/recovery + fixtures).
+- Disposition: VERIFIED NON-ISSUE for this leg.
