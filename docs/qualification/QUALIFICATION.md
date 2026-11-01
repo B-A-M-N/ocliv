@@ -443,3 +443,15 @@ Disposition: documented flows behave as documented; no drift found.
   OpenStream (P1-5); stale-generation streams are rejected before the
   request head is written, with a test barrier (`dispatchHold`)
   landing exactly in the check-to-write window.
+
+## Re-audit on committed HEAD, round 5 (defect loop)
+
+- Agent stale-generation + dial-target trust: VERIFIED enforced.
+  `handleStream` rejects lease/generation mismatch with FAbort before
+  any local dial; the dial destination is always the configured
+  loopback literal (`config.LoopbackTarget(port, ipv6)` built in
+  `prepareTunnel`, never stream-supplied) — D06/D07/F13 hold on the
+  agent side, matching the relay dispatch re-check.
+- serve-loop goroutine scope: VERIFIED fixed (P1-6). Cancellation
+  watcher uses `context.AfterFunc` bound to the session lifetime and
+  disarms on serve return; no per-reconnect waiter accumulation.
