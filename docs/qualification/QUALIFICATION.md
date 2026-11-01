@@ -873,3 +873,18 @@ Drill (container removed afterwards, zero host footprint):
   bad-code message) and states the code was not consumed.
 - Tests: `TestLoginDeniedMessageHonestStatus`,
   `TestLoginAuthorityRejectionSavesNothing` → PASS; full cli suite green.
+
+## Round 33 — bounded load soak (disposable loopback, 3 min)
+- Setup: relay + agent + fixture on loopback, public named tunnel,
+  20-way parallel GETs with small bodies, mid-soak tunnel kill and
+  named resume (fencing exercised under load).
+- Result: 7880/7880 HTTP 200 through the full forwarding path
+  (phase 1 + post-resume phase 2, zero 503/deny leakage), 0 errors in
+  the relay log, resumed tunnel ACTIVE.
+- Relay RSS 14.4MB → 21.4MB during load, flat across the 30s settle
+  (no leak signature; Go heap not yet collected is expected).
+- Scope: bounded 3-minute smoke, NOT 24h stability; loopback only
+  (TLS edge covered by the Round 32 drill). Soak script kept at
+  /tmp/soak/run.sh (transient, outside the repo).
+- Disposition: PASS (bounded); 24h soak remains BLOCKED (needs time +
+  production-like host).
