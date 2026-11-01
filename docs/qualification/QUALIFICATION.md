@@ -674,3 +674,14 @@ quirk only; public behavior is the oracle.
 - Config/leases: IPv6/TTL/UpstreamHost/ProbePath recorded per lease and
   honored by resume matching (P1-7) and now by doctor (Round 18).
 - Disposition: VERIFIED NON-ISSUE for this leg.
+
+## Round 20 — relay init generation re-audit (2026-11-01)
+- `parseRelayInit` validates domain/mcpHost via the same hostname
+  parsers as serve (fail-closed before generation), requires mcp-host
+  on the single-host edge, validates ACME email strictly (no controls,
+  whitespace, or shell metacharacters; hostname domain part).
+- `writeInitFile`: Lstat symlink refusal, identical-content idempotent
+  re-run, conflicting content fails closed, temp-file + rename writes.
+- `buildInitFiles` renders from embedded packaging templates (no drift);
+  `relay.env` values come only from validated inputs.
+- Disposition: VERIFIED NON-ISSUE for this leg.
