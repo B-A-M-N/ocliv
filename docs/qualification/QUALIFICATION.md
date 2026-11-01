@@ -685,3 +685,13 @@ quirk only; public behavior is the oracle.
 - `buildInitFiles` renders from embedded packaging templates (no drift);
   `relay.env` values come only from validated inputs.
 - Disposition: VERIFIED NON-ISSUE for this leg.
+
+## Round 21 — visitor/access re-audit (2026-11-01)
+- Re-read `relay_access.go`: P0-4 holds (independent non-secret row id,
+  bearer only in cookie, verifier-keyed lookup), atomic single-redeem
+  consumption, CSRF same-origin redeem, strict-CSP unlock page,
+  pre-auth rate limiting on unlock/redeem via trusted-edge client IP,
+  per-instance random HMAC key with documented restart invalidation.
+- Focused tests `TestUnlock|TestRedeem|TestCookie|TestShare|TestVisitor|
+  TestAccess|TestSession` → ok.
+- Disposition: VERIFIED NON-ISSUE for this leg.
