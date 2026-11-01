@@ -987,3 +987,17 @@ Drill (container removed afterwards, zero host footprint):
   on this host correctly reports nat-ipv4-needs-forward.
 - Disposition: FIXED (slice 1 scope). dynv6 update, bootstrap,
   wildcard, Oracle adapter remain pending.
+
+## Round 40 — setup dynv6 DNS slice (2026-11-02)
+- New `UpdateDynv6` client: zone restricted to *.dynv6.net (refused
+  pre-network otherwise), token required, server errors redact the
+  token, non-2xx fails.
+- `setup --auto --hostname ZONE` reads the HTTP token from DYNV6_TOKEN
+  or owner-only --token-file (never argv/logs/errors); --dry-run
+  previews with the token redacted and sends nothing; missing token
+  exits 4 with the exact account step.
+- Tests: 4 client tests + 3 CLI tests (dry-run silence, fixture
+  update, missing-token auth). Focused suites PASS. No live DNS
+  mutation performed in this slice.
+- Disposition: FIXED (slice 2 scope). Bootstrap/systemd/enrollment
+  (slice 3) pending.
