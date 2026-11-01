@@ -948,3 +948,16 @@ Drill (container removed afterwards, zero host footprint):
   against the extracted function (red before: function absent; green
   after). Full `packaging/install` package PASS (5/5).
 - Disposition: FIXED.
+
+## Round 38 — offline-route negative test (2026-11-02)
+- Gap: "disabled or offline routes" had Gate-3 manual evidence but no
+  repo regression test; unknown-host, replay, stale-generation, and
+  restart-recovery already covered (`staging_domain_test.go`,
+  `TestMgmtMutationReplayRejected`, `TestStaleDisconnect*`,
+  `TestRelayRestartRecovery`).
+- Test: `TestOfflineRouteDeniesWithoutForwarding` (lifecycle_test.go):
+  public lease serves 200 baseline, agent image stopped, visitor must
+  converge to 503 with zero additional local-app hits. PASS (0.25s).
+- Invalid-certificate rejection stays NOT VERIFIED locally (harness
+  is plain-HTTP loopback; needs the external TLS gate).
+- Disposition: FIXED (locally testable portion).

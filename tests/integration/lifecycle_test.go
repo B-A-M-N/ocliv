@@ -20,6 +20,44 @@ import (
 	"ocliv/internal/store"
 )
 
+// An offline publisher's route must deny without forwarding: after the
+// agent image stops, visitor traffic gets 503 and the local app sees
+// zero additional hits. A stale-but-registered route must never serve
+// from a dead session or silently forward into the void.
+func TestOfflineRouteDeniesWithoutForwarding(t *testing.T) {
+	app := startLocalApp(t)
+	defer app.srv.Close()
+	h := newHarness(t)
+	defer h.db.Close()
+	defer h.relaySrv.Close()
+	h.startAgentOpts(t, app.Port, config.Agent{Public: true})
+	resp := h.visitorReq(t, "GET", "/", nil, nil)
+	if body := readAll(t, resp.Body); resp.StatusCode != http.StatusOK || body != "hello" {
+		resp.Body.Close()
+		t.Fatalf("public baseline: status=%d body=%q", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+	before := app.Hits()
+	h.cancel() // stop the agent image; the session is gone
+	denied := false
+	deadline := time.Now().Add(20 * time.Second)
+	for !denied && time.Now().Before(deadline) {
+		resp := h.visitorReq(t, "GET", "/", nil, nil)
+		readAll(t, resp.Body)
+		resp.Body.Close()
+		denied = resp.StatusCode == http.StatusServiceUnavailable
+		if !denied {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	if !denied {
+		t.Fatal("offline route never denied with 503")
+	}
+	if got := app.Hits() - before; got != 0 {
+		t.Fatalf("offline route forwarded to local app %d times", got)
+	}
+}
+
 func leaseCount(t *testing.T, db *store.DB) int {
 	t.Helper()
 	var n int
