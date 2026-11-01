@@ -1043,3 +1043,27 @@ Drill (container removed afterwards, zero host footprint):
   live in-process relay. Focused suites green.
 - Disposition: FIXED (slice 3c scope). Wildcard/on-demand TLS (slice
   4) and provider adapter (slice 5) pending.
+
+## Round 44 — on-demand tunnel edge + relay ask endpoint (2026-11-02)
+- Decision: no DNS-01 plugin build required. The new `tunnel` edge
+  serves the apex over plain ACME and *.t.<domain> via ask-gated
+  on-demand issuance (per-hostname HTTP-01/TLS-ALPN-01), so
+  `ocliv 3000` works on free dynv6 names without wildcard certs.
+- New relay endpoint GET /v1/internal/ask?domain=: 200 only for the
+  local edge (loopback peer + loopback Host) asking about a tunnel
+  hostname under the configured namespace; all other callers fall
+  through to normal dispatch and get 404. Ask and routing share
+  splitTunnelHost so the two decisions cannot disagree.
+- Init: --edge tunnel (requires --mcp-host, rejects provider flags);
+  checkInitDir requires the ask stanza whenever on_demand is present
+  (an ask-less on-demand edge would dispense certs for any domain
+  pointed at the IP) and keeps the DNS-01 requirement for wildcard.
+  Template carries the same header contract as the other edges.
+- Setup renders the tunnel edge (single-host cannot serve tunnels).
+- Tests: 3 ask tests (approve/deny matrix, off-loopback, spoofed
+  Host), 2 init tests, all prior init/authority suites green.
+- NOT VERIFIED live: Caddy parsing the new template (no caddy binary
+  here — validate before use), dynv6 wildcard *.t resolution, first
+  on-demand issuance against a public IP.
+- Disposition: FIXED (slice 4 scope). Provider adapter (slice 5)
+  pending.

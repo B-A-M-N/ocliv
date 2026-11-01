@@ -1,0 +1,53 @@
+# Tunnel edge for ocliv self-hosting (no wildcard DNS record or DNS-01
+# plugin required). ONE public hostname ({$OCLIV_HOST}) serves agent
+# control, unlock pages, and path-based MCP routes with normal ACME;
+# *.t.{$OCLIV_DOMAIN} tunnel hostnames (`ocliv 3000`) get per-hostname
+# ACME certificates on first use via HTTP-01/TLS-ALPN-01 through this
+# same edge (on-demand issuance, no wildcard certificate).
+#
+# Abuse guard (do NOT remove): on-demand issuance asks the relay over
+# loopback whether the SNI is a real tunnel hostname under the relay's
+# namespace (see internal/relay/relay_ask.go). Without the ask stanza
+# this edge would issue certificates for ANY domain pointed at this
+# IP. The relay answers only for *.t.<namespace> from the local edge;
+# everything else is refused before issuance.
+#
+# DNS still required: the apex AND *.t.{$OCLIV_DOMAIN} (or each used
+# tunnel hostname, if the provider has no wildcard records) must
+# resolve here, and TCP 80/443 must reach this host, or ACME cannot
+# validate. Rate limits apply (~50 certificates/week/domain).
+#
+# Replace {$OCLIV_HOST}, {$OCLIV_DOMAIN} and {$OCLIV_ACME_EMAIL} at
+# deploy time. Validate with: caddy validate --config Caddyfile.tunnel
+# --adapter caddyfile
+{
+	auto_https disable_redirects
+	on_demand_tls {
+		ask http://127.0.0.1:8080/v1/internal/ask
+	}
+}
+
+{$OCLIV_HOST} {
+	tls {$OCLIV_ACME_EMAIL}
+
+	reverse_proxy 127.0.0.1:8080 {
+		# Overwrite, never append: the relay treats the rightmost entry
+		# as the client IP only from a loopback peer.
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+		# Strip anything the visitor smuggled in.
+		header_up -X-Forwarded-Host
+	}
+}
+
+*.t.{$OCLIV_DOMAIN} {
+	tls {
+		on_demand
+	}
+
+	reverse_proxy 127.0.0.1:8080 {
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+		header_up -X-Forwarded-Host
+	}
+}

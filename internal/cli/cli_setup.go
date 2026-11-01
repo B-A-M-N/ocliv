@@ -184,7 +184,7 @@ func runSetupRender(ctx context.Context, d setup.Detection, hostname, acmeEmail,
 	if outDir == "" {
 		outDir = filepath.Join(dir, "setup-"+strings.ToLower(hostname))
 	}
-	initArgv := []string{"--domain", hostname, "--mcp-host", hostname,
+	initArgv := []string{"--domain", hostname, "--edge", "tunnel", "--mcp-host", hostname,
 		"--acme-email", acmeEmail, "--out", outDir}
 	if code := cmdRelayInit(initArgv); code != apperr.ExitOK {
 		return code

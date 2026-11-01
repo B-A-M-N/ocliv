@@ -21,6 +21,17 @@ import (
 // else falls through to the legacy router, which fails closed (404
 // unknown, 400 malformed) without forwarding or touching localhost.
 func (s *Server) authorizeHost(w http.ResponseWriter, r *http.Request) bool {
+	// On-demand TLS ask: answered inline for the local edge only.
+	// Anything else falls through to the mux, where handleAsk denies
+	// indistinguishably from an unknown path.
+	if r.URL.Path == askPath {
+		if s.askAllowed(r) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+			return false
+		}
+		return true
+	}
 	host := canonicalHost(r.Host)
 	if isAgentPath(r.URL.Path) {
 		// Strict relay authority (MCP amendment P0, M11): no

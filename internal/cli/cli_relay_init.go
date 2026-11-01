@@ -50,7 +50,7 @@ func parseRelayInit(argv []string) (initConfig, int) {
 	c := initConfig{edge: "single-host"}
 	_, dataDir, _ := relayFlags(argv)
 	c.dataDir = dataDir
-	usage := "usage: ocliv relay init --domain DOMAIN [--mcp-host HOST] [--acme-email ADDR] [--edge single-host|wildcard] [--dns-provider NAME [--dns-env VAR]] [--allow-reserved-domain] [--data DIR] [--out DIR]\n       ocliv relay init --check --out DIR"
+	usage := "usage: ocliv relay init --domain DOMAIN [--mcp-host HOST] [--acme-email ADDR] [--edge single-host|wildcard|tunnel] [--dns-provider NAME [--dns-env VAR]] [--allow-reserved-domain] [--data DIR] [--out DIR]\n       ocliv relay init --check --out DIR"
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
 		switch {
@@ -112,8 +112,8 @@ func parseRelayInit(argv []string) (initConfig, int) {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return c, apperr.ExitCLIValidation
 	}
-	if c.edge != "single-host" && c.edge != "wildcard" {
-		fmt.Fprintln(os.Stderr, "error: --edge must be single-host or wildcard")
+	if c.edge != "single-host" && c.edge != "wildcard" && c.edge != "tunnel" {
+		fmt.Fprintln(os.Stderr, "error: --edge must be single-host, wildcard, or tunnel")
 		return c, apperr.ExitCLIValidation
 	}
 	if c.mcpHost != "" {
@@ -122,15 +122,16 @@ func parseRelayInit(argv []string) (initConfig, int) {
 			return c, apperr.ExitCLIValidation
 		}
 	}
-	if c.edge == "single-host" && c.mcpHost == "" {
-		fmt.Fprintln(os.Stderr, "error: --edge single-host requires --mcp-host HOST (the one public hostname)")
+	if (c.edge == "single-host" || c.edge == "tunnel") && c.mcpHost == "" {
+		fmt.Fprintln(os.Stderr, "error: --edge "+c.edge+" requires --mcp-host HOST (the one public apex hostname)")
 		return c, apperr.ExitCLIValidation
 	}
 	// A wildcard certificate can only be issued via DNS-01, so the
 	// wildcard edge must name its DNS plugin now — never ship a
 	// Caddyfile whose issuance path is still a commented placeholder.
-	// The single-host edge uses plain ACME and takes no provider flags.
-	if c.edge == "single-host" && (c.dnsProvider != "" || c.dnsEnv != "") {
+	// The single-host and tunnel edges use plain ACME/on-demand and
+	// take no provider flags.
+	if c.edge != "wildcard" && (c.dnsProvider != "" || c.dnsEnv != "") {
 		fmt.Fprintln(os.Stderr, "error: --dns-provider/--dns-env apply only to --edge wildcard")
 		return c, apperr.ExitCLIValidation
 	}
@@ -337,6 +338,8 @@ func buildInitFiles(cfg initConfig) map[string]string {
 	caddy := edgecaddy.SingleHost()
 	if cfg.edge == "wildcard" {
 		caddy = edgecaddy.Wildcard()
+	} else if cfg.edge == "tunnel" {
+		caddy = edgecaddy.TunnelOnDemand()
 	}
 	host := cfg.mcpHost
 	if host == "" {
@@ -353,6 +356,11 @@ func buildInitFiles(cfg initConfig) map[string]string {
 	if cfg.edge == "single-host" {
 		fmt.Fprintf(&dns, "%s      A     <relay IPv4>\n", host)
 		fmt.Fprintf(&dns, "%s      AAAA  <relay IPv6, if any>\n", host)
+	} else if cfg.edge == "tunnel" {
+		fmt.Fprintf(&dns, "%s      A     <relay IPv4>\n", host)
+		fmt.Fprintf(&dns, "%s      AAAA  <relay IPv6, if any>\n", host)
+		fmt.Fprintf(&dns, "*.t.%s        A     <relay IPv4>\n", cfg.domain)
+		fmt.Fprintf(&dns, "On-demand TLS: no DNS-01 plugin needed — each *.t.%s tunnel hostname gets its own ACME certificate on first use via HTTP-01/TLS-ALPN-01, gated by the relay ask endpoint. Every used tunnel hostname must resolve here: prefer a *.t.%s wildcard A record; without provider wildcard support, add one A record per tunnel hostname (verify each with dig). ACME rate limits apply (~50 certificates/week/domain).\n", cfg.domain, cfg.domain)
 	} else {
 		fmt.Fprintf(&dns, "relay.%s      A     <relay IPv4>\n", cfg.domain)
 		fmt.Fprintf(&dns, "*.t.%s        A     <relay IPv4>\n", cfg.domain)
@@ -435,7 +443,10 @@ func checkInitDir(outDir string) []string {
 	}
 	// A wildcard edge without an ACTIVE dns line cannot issue its
 	// certificate: the issuance path must never be a commented
-	// placeholder that passes generation but dies at runtime.
+	// placeholder that passes generation but dies at runtime. The
+	// tunnel edge instead issues per-hostname via on-demand, gated by
+	// the relay ask endpoint — its own structural requirement.
+	hasOnDemand := strings.Contains(string(caddy), "on_demand")
 	for _, line := range strings.Split(string(caddy), "\n") {
 		t := strings.TrimSpace(line)
 		if strings.HasPrefix(t, "dns ") && !strings.HasPrefix(t, "#") {
@@ -443,9 +454,13 @@ func checkInitDir(outDir string) []string {
 		}
 	}
 	// Only the wildcard edge needs DNS-01; the single-host edge uses
-	// plain ACME and carries no dns line by design.
-	if strings.Contains(string(caddy), "*.t.") {
+	// plain ACME and the tunnel edge uses ask-gated on-demand, so
+	// neither carries a dns line by design.
+	if strings.Contains(string(caddy), "*.t.") && !hasOnDemand {
 		fail("Caddyfile: wildcard edge has no active DNS-01 stanza (dns <provider> commented or missing)")
+	}
+	if hasOnDemand && !strings.Contains(string(caddy), "ask http://127.0.0.1:8080/v1/internal/ask") {
+		fail("Caddyfile: on-demand issuance without the relay ask guard would dispense certificates for any domain pointed here")
 	}
 dnsOK:
 	if strings.Contains(string(caddy), "<provider>") {

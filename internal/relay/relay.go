@@ -186,6 +186,7 @@ func New(o Options) (*Server, error) {
 	s.mux.HandleFunc("/v1/agent/lease/", s.handleAgentLease) // signed agent management
 	s.mux.HandleFunc("/v1/agent/mcp-routes", s.handleAgentPublications)
 	s.mux.HandleFunc("/v1/agent/mcp-routes/", s.handleAgentPublications)
+	s.mux.HandleFunc(askPath, s.handleAsk)
 	s.mux.HandleFunc(access.UnlockPath, s.handleUnlockPage)
 	s.mux.HandleFunc(access.RedeemPath, s.handleRedeem)
 	s.mux.HandleFunc("/", s.handlePublic)

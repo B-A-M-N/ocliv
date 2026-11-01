@@ -144,6 +144,48 @@ func TestRelayInitCheckRejectsBadDir(t *testing.T) {
 	}
 }
 
+// The tunnel edge serves the apex over plain ACME plus *.t.<domain>
+// tunnel hostnames via on-demand issuance gated by the relay ask
+// endpoint — no wildcard DNS record or DNS-01 plugin required.
+func TestRelayInitGeneratesTunnel(t *testing.T) {
+	out := t.TempDir()
+	argv := []string{"--domain", "hosting-test.net", "--edge", "tunnel",
+		"--mcp-host", "relay.hosting-test.net",
+		"--acme-email", "ops@hosting-test.net", "--out", out}
+	if code := cmdRelayInit(argv); code != apperr.ExitOK {
+		t.Fatalf("exit=%d", code)
+	}
+	caddy, err := os.ReadFile(filepath.Join(out, "Caddyfile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"relay.hosting-test.net", "*.t.hosting-test.net",
+		"on_demand", "ask http://127.0.0.1:8080/v1/internal/ask",
+	} {
+		if !strings.Contains(string(caddy), want) {
+			t.Fatalf("tunnel Caddyfile missing %q", want)
+		}
+	}
+	if strings.Contains(string(caddy), "dns ") {
+		t.Fatalf("tunnel edge must not carry a DNS-01 stanza")
+	}
+	if code := cmdRelayInit([]string{"--check", "--out", out}); code != apperr.ExitOK {
+		t.Fatalf("--check on tunnel dir: exit=%d", code)
+	}
+}
+
+func TestRelayInitTunnelRejectsProvider(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "deploy")
+	argv := []string{"--domain", "hosting-test.net", "--edge", "tunnel",
+		"--mcp-host", "relay.hosting-test.net",
+		"--acme-email", "ops@hosting-test.net",
+		"--dns-provider", "digitalocean", "--out", out}
+	if code := cmdRelayInit(argv); code != apperr.ExitCLIValidation {
+		t.Fatalf("provider on tunnel: exit=%d, want %d", code, apperr.ExitCLIValidation)
+	}
+}
+
 func TestRelayInitGeneratesWildcard(t *testing.T) {
 	out := t.TempDir()
 	argv := []string{"--domain", "hosting-test.net", "--edge", "wildcard",
