@@ -71,12 +71,12 @@ func (s *Server) handleChallenge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pub, tenant, status, err := s.lookupKey(req.KeyID)
-	if err != nil || status != "active" {
-		s.db.Audit("agent", tenant, "", "challenge", "denied", "unknown or revoked key")
+	if err != nil || !s.identityAdmitted(tenant, status) {
+		s.db.Audit("agent", tenant, "", "challenge", "denied", "unknown, revoked, or suspended key")
 		http.Error(w, "unknown agent key", http.StatusUnauthorized)
 		return
 	}
-	ch, err := identity.NewChallenge("https://"+s.relayHost, "ocliv/1")
+	ch, err := identity.NewChallenge("https://"+s.relayHost, protocol.Version)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -90,7 +90,7 @@ func (s *Server) handleChallenge(w http.ResponseWriter, r *http.Request) {
 	_ = pub
 	writeJSON(w, http.StatusOK, challengeResp{
 		Nonce: nonceB64, Origin: "https://" + s.relayHost,
-		Version: "ocliv/1", Expires: ch.ExpiresAt.UTC().Format(time.RFC3339Nano),
+		Version: protocol.Version, Expires: ch.ExpiresAt.UTC().Format(time.RFC3339Nano),
 	})
 }
 
@@ -105,6 +105,22 @@ func (s *Server) lookupKey(keyID string) (ed25519.PublicKey, string, string, err
 		return nil, "", "", apperr.E(apperr.CodeEnrollAuth, "unknown agent key", err)
 	}
 	return ed25519.PublicKey(pub), tenant, status, nil
+}
+
+// identityAdmitted is the single operator-identity gate (P0-A): the key
+// must be active and its tenant must not be suspended. Every agent
+// attach path (challenge, connect, management auth, allocate/resume)
+// enforces it; storage failures fail closed.
+func (s *Server) identityAdmitted(tenantID, keyStatus string) bool {
+	if keyStatus != "active" || tenantID == "" {
+		return false
+	}
+	var tst string
+	err := s.db.SQL().QueryRow(`SELECT status FROM tenants WHERE id=?`, tenantID).Scan(&tst)
+	if err != nil {
+		return false
+	}
+	return tst != "suspended"
 }
 
 // attachedMsg confirms session establishment before yamux starts.
@@ -189,14 +205,14 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pub, tenant, status, err := s.lookupKey(keyID)
-	if err != nil || status != "active" {
-		s.db.Audit("agent", tenant, "", "handshake", "denied", "unknown or revoked key")
-		http.Error(w, "unknown or revoked agent key", http.StatusUnauthorized)
+	if err != nil || !s.identityAdmitted(tenant, status) {
+		s.db.Audit("agent", tenant, "", "handshake", "denied", "unknown, revoked, or suspended key")
+		http.Error(w, "unknown, revoked, or suspended agent key", http.StatusUnauthorized)
 		return
 	}
 	origin := "https://" + s.relayHost
 	leaseIntentStr := string(intentRaw)
-	if err := identity.Verify(pub, nonce, shortKeyID(keyID), origin, "ocliv/1", ts, leaseIntentStr, sig); err != nil {
+	if err := identity.Verify(pub, nonce, shortKeyID(keyID), origin, protocol.Version, ts, leaseIntentStr, sig); err != nil {
 		s.db.Audit("agent", tenant, "", "handshake", "denied", "bad signature")
 		http.Error(w, "handshake signature invalid", http.StatusUnauthorized)
 		return

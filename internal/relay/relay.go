@@ -30,6 +30,11 @@ type Options struct {
 	// without wildcard DNS (P0-A). Empty disables path-route resolution
 	// entirely; wildcard tunnel-host routing is unaffected.
 	MCPExternalHost string
+	// MCPExternalPort is the public HTTPS port minted into route URLs.
+	// 0 means 443 (omitted from URLs). A non-443 edge (e.g. a lab Caddy
+	// on 8444) must set it or minted URLs point at a closed port while
+	// Host matching — which strips numeric ports — still works.
+	MCPExternalPort int
 	ServerKey       []byte // HMAC key for visitor sessions; random per relay
 	Logger          Logger
 }
@@ -115,7 +120,11 @@ type Server struct {
 	relayHost string
 	// mcpHost is the exact canonical external hostname for path-based
 	// MCP routes; empty means the feature is off (P0-A).
-	mcpHost  string
+	mcpHost string
+	// mcpPort is the normalized public HTTPS port (443 default), minted
+	// into route URLs when non-443. Host authority matching strips ports
+	// (canonicalHost), so this affects only advertised URLs, never admission.
+	mcpPort  int
 	visitors visitorAccess // HMAC key + verifier for visitor sessions
 	log      Logger
 
@@ -148,11 +157,16 @@ func New(o Options) (*Server, error) {
 		}
 		o.ServerKey = k
 	}
+	port := o.MCPExternalPort
+	if port == 0 {
+		port = 443
+	}
 	s := &Server{
 		db:           o.DB,
 		namespace:    strings.ToLower(o.Namespace),
 		relayHost:    strings.ToLower(o.RelayHost),
 		mcpHost:      strings.ToLower(o.MCPExternalHost),
+		mcpPort:      port,
 		visitors:     newVisitorAccess(o.ServerKey),
 		log:          o.Logger,
 		registry:     newSessionRegistry(),
@@ -170,6 +184,8 @@ func New(o Options) (*Server, error) {
 	s.mux.HandleFunc("/v1/agent/challenge", s.handleChallenge)
 	s.mux.HandleFunc("/v1/agent/connect", s.handleConnect)
 	s.mux.HandleFunc("/v1/agent/lease/", s.handleAgentLease) // signed agent management
+	s.mux.HandleFunc("/v1/agent/mcp-routes", s.handleAgentPublications)
+	s.mux.HandleFunc("/v1/agent/mcp-routes/", s.handleAgentPublications)
 	s.mux.HandleFunc(access.UnlockPath, s.handleUnlockPage)
 	s.mux.HandleFunc(access.RedeemPath, s.handleRedeem)
 	s.mux.HandleFunc("/", s.handlePublic)

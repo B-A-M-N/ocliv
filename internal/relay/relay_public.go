@@ -37,6 +37,26 @@ type routeTarget struct {
 	// (P0-B). Both are zero on the wildcard path.
 	MCPProfile   IngressProfile
 	ViaPathRoute bool
+	// MCPVerified reports that the path-route publication completed
+	// OAuth discovery verification and explicit activation (P0-A).
+	// Unverified publications deny the tool path but still serve the
+	// public discovery document. False on the wildcard path unless
+	// proven otherwise by leaseHasPendingPublication.
+	MCPVerified bool
+}
+
+// leaseHasPendingPublication reports whether the lease carries at
+// least one unrevoked, unverified publication. While pending, the
+// lease's wildcard tool path denies; activation (or deletion) clears
+// the condition. Metadata paths are unaffected.
+func (s *Server) leaseHasPendingPublication(leaseID string) bool {
+	var n int
+	if err := s.db.SQL().QueryRow(
+		`SELECT COUNT(*) FROM mcp_publications WHERE lease_id=? AND revoked_at IS NULL AND verified_at IS NULL`,
+		leaseID).Scan(&n); err != nil {
+		return true
+	}
+	return n > 0
 }
 
 // leaseExpired reports whether a routed lease has passed its TTL.
@@ -115,6 +135,26 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request, t *routeTar
 	if t.AccessMode == "public" {
 		s.serveProxied(w, r, t, sess, true, false)
 		return
+	}
+	// Pending verification (P0-A): a publication that has not completed
+	// OAuth discovery verification and activation denies the tool
+	// path on every ingress surface — path route and wildcard alike.
+	// The discovery document stays servable so the publisher's own
+	// verification probe can complete. On the wildcard path there is
+	// no publication row in the target, so pending state is re-proven
+	// from the lease binding; a lease with no publications at all
+	// (mcp serve, no publish) is unaffected. Denial is 404,
+	// indistinguishable from an unknown route.
+	if IsMCPMode(t.AccessMode) && r.URL.EscapedPath() == "/mcp" {
+		verified := t.MCPVerified
+		if !t.ViaPathRoute {
+			verified = !s.leaseHasPendingPublication(t.LeaseID)
+		}
+		if !verified {
+			s.db.Audit("visitor", "", t.LeaseID, "mcp_path", "denied", "publication unverified")
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
 	}
 	if IsMCPMode(t.AccessMode) && r.URL.EscapedPath() != "/mcp" &&
 		r.URL.EscapedPath() != mcpWellKnownUpstreamPath {

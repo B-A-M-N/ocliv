@@ -238,7 +238,8 @@ func TestRegisterStaleGenerationRejected(t *testing.T) {
 // readiness probe relies on: a new-lease intent without confirmed local
 // readiness is refused, never minted (P1-09).
 func TestUnconfirmedNewLeaseRefused(t *testing.T) {
-	s, _ := newLifecycleServer(t)
+	s, db := newLifecycleServer(t)
+	enrollTestKey(t, db.SQL(), "key-test", "tenant-test")
 	_, _, err := s.allocateOrResume("tenant-test", "key-test", LeaseIntent{
 		Port: 3000, Ready: false, Version: "1",
 	})

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,6 +36,19 @@ func postMCPRoute(t *testing.T, s *Server, priv ed25519.PrivateKey, keyID, lease
 	return w.Code, w.Body.String()
 }
 
+// postMCPDelete issues a signed route DELETE through the full handler
+// stack, returning the status and body.
+func postMCPDelete(t *testing.T, s *Server, priv ed25519.PrivateKey, keyID, leaseID, routeID string) (int, string) {
+	t.Helper()
+	path := "/v1/agent/lease/" + leaseID + "/mcp-route/" + routeID
+	r := signedMgmtRequest(t, priv, keyID, http.MethodDelete, path)
+	r.Host = "relay.example.test"
+	r.RequestURI = path
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	return w.Code, w.Body.String()
+}
+
 // A lease already revoked before creation fails closed with 409 and no
 // row: the pre-check denies without touching the mapping table.
 func TestCreateRouteAgainstRevokedLeaseFailsClosed(t *testing.T) {
@@ -49,7 +63,7 @@ func TestCreateRouteAgainstRevokedLeaseFailsClosed(t *testing.T) {
 		t.Fatalf("create on revoked lease: status=%d, want 409", code)
 	}
 	var n int
-	if err := db.SQL().QueryRow(`SELECT COUNT(*) FROM mcp_routes WHERE lease_id='lse-dead'`).Scan(&n); err != nil || n != 0 {
+	if err := db.SQL().QueryRow(`SELECT COUNT(*) FROM mcp_publications WHERE lease_id='lse-dead'`).Scan(&n); err != nil || n != 0 {
 		t.Fatalf("route row minted for revoked lease: n=%d err=%v", n, err)
 	}
 }
@@ -81,8 +95,75 @@ func TestCreateRouteRevokedMidFlightDenied(t *testing.T) {
 		t.Fatalf("mid-flight revoke: status=%d, want 409", code)
 	}
 	var n int
-	if err := db.SQL().QueryRow(`SELECT COUNT(*) FROM mcp_routes WHERE lease_id='lse-race'`).Scan(&n); err != nil || n != 0 {
+	if err := db.SQL().QueryRow(`SELECT COUNT(*) FROM mcp_publications WHERE lease_id='lse-race'`).Scan(&n); err != nil || n != 0 {
 		t.Fatalf("route row minted after mid-flight revoke: n=%d err=%v", n, err)
+	}
+}
+
+// A revoke of the REPLACEMENT lease landing between the ACTIVE
+// pre-check and the rebind UPDATE must not move the binding: the fenced
+// rebind denies the write and the handler reports 409, never 200 and
+// never a route bound to a dead lease. Without the EXISTS predicate
+// this test goes red (binding moves, 200 returned).
+func TestRebindRevokedMidFlightDenied(t *testing.T) {
+	s, db := newMCPServer(t)
+	priv := enrollTestKey(t, db.SQL(), "key-test", "tenant-test")
+	insertMCPLeaseRow(t, db, "lse-a", "fence.t.example.test", AccessModeMCPUpstreamOAuth, lease.StateActive, 1, nil)
+	r1 := publishRoute(t, s, priv, "key-test", "lse-a", "upstream-oauth")
+	insertMCPLeaseRow(t, db, "lse-b", "other.t.example.test", AccessModeMCPUpstreamOAuth, lease.StateActive, 1, nil)
+	relabel(t, db, "lse-b", "fence")
+	fired := make(chan struct{}, 1)
+	s.routeCreateHold = func() {
+		if err := s.revokeLease("lse-b"); err != nil {
+			t.Errorf("hook revoke: %v", err)
+		}
+		fired <- struct{}{}
+	}
+	defer func() { s.routeCreateHold = nil }()
+	code, _ := postMCPRoute(t, s, priv, "key-test", "lse-b", "upstream-oauth")
+	select {
+	case <-fired:
+	default:
+		t.Fatal("rebind barrier never fired")
+	}
+	if code != http.StatusConflict {
+		t.Fatalf("mid-flight revoke of replacement: status=%d, want 409", code)
+	}
+	var bound string
+	if err := db.SQL().QueryRow(`SELECT lease_id FROM mcp_publications WHERE route_id=?`, r1).Scan(&bound); err != nil || bound != "lse-a" {
+		t.Fatalf("binding moved to dead lease: bound=%q err=%v", bound, err)
+	}
+}
+
+// A close of the REPLACEMENT lease racing the rebind must also fail
+// closed with 409, leaving the original binding untouched (P0-C).
+func TestRebindClosedMidFlightDenied(t *testing.T) {
+	s, db := newMCPServer(t)
+	priv := enrollTestKey(t, db.SQL(), "key-test", "tenant-test")
+	insertMCPLeaseRow(t, db, "lse-a", "fence2.t.example.test", AccessModeMCPUpstreamOAuth, lease.StateActive, 1, nil)
+	r1 := publishRoute(t, s, priv, "key-test", "lse-a", "upstream-oauth")
+	insertMCPLeaseRow(t, db, "lse-b", "other2.t.example.test", AccessModeMCPUpstreamOAuth, lease.StateActive, 1, nil)
+	relabel(t, db, "lse-b", "fence2")
+	fired := make(chan struct{}, 1)
+	s.routeCreateHold = func() {
+		if err := s.closeLeaseDurable("lse-b"); err != nil {
+			t.Errorf("hook close: %v", err)
+		}
+		fired <- struct{}{}
+	}
+	defer func() { s.routeCreateHold = nil }()
+	code, _ := postMCPRoute(t, s, priv, "key-test", "lse-b", "upstream-oauth")
+	select {
+	case <-fired:
+	default:
+		t.Fatal("rebind barrier never fired")
+	}
+	if code != http.StatusConflict {
+		t.Fatalf("mid-flight close of replacement: status=%d, want 409", code)
+	}
+	var bound string
+	if err := db.SQL().QueryRow(`SELECT lease_id FROM mcp_publications WHERE route_id=?`, r1).Scan(&bound); err != nil || bound != "lse-a" {
+		t.Fatalf("binding moved to closed lease: bound=%q err=%v", bound, err)
 	}
 }
 
@@ -108,16 +189,23 @@ func newMCPServer(t *testing.T) (*Server, *store.DB) {
 
 // insertMCPLeaseRow creates a directly-bound lease row for route tests.
 // Unlike insertLeaseRow it sets an explicit hostname/access mode and TTL.
+// The label is the hostname's left label, mirroring named-lease
+// allocation: publications key on it, so distinct test leases stay in
+// distinct publications unless a test deliberately shares a name.
 func insertMCPLeaseRow(t *testing.T, db *store.DB, id, hostname, mode, status string, gen uint64, expiresAt *string) {
 	t.Helper()
 	var exp any
 	if expiresAt != nil {
 		exp = *expiresAt
 	}
+	label := hostname
+	if i := strings.Index(hostname, "."); i > 0 {
+		label = hostname[:i]
+	}
 	_, err := db.SQL().Exec(
 		`INSERT INTO leases(id, tenant_id, agent_key_id, hostname, label, port, access_mode, generation, status, expires_at, created_at)
 		 VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-		id, "tenant-test", "key-test", hostname, "mcplabel", 3000, mode, gen, status, exp,
+		id, "tenant-test", "key-test", hostname, label, 3000, mode, gen, status, exp,
 		time.Now().UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		t.Fatal(err)
@@ -255,6 +343,77 @@ func TestMCPRouteMetadataAdmitted(t *testing.T) {
 	r3.Host = "public.example.org"
 	if _, _, _, code := s.admitPathRoute(r3); code != http.StatusServiceUnavailable {
 		t.Fatalf("revoked metadata route: got %d, want 503", code)
+	}
+}
+
+// TestSharedHostMetadataDiscoveryFullHandler proves the complete
+// authority → admission → forwarding sequence for OAuth discovery on a
+// shared relay/MCP hostname (audit P0). Before the fix, authorizeHost
+// rejected /.well-known/oauth-protected-resource/r/<id>/mcp with 421
+// before admission; the tool path /r/<id>/mcp worked, so discovery was
+// the only broken half. A live route must forward (the fake agent
+// aborts, surfacing 502 — never 421); unknown/revoked/malformed routes
+// fail closed with path-route semantics; unrelated .well-known paths
+// keep the 421; agent control on the shared authority is untouched.
+func TestSharedHostMetadataDiscoveryFullHandler(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "ocliv.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	s, err := New(Options{
+		DB: db, Namespace: "t.example.test",
+		RelayHost: "public.example.org", MCPExternalHost: "public.example.org",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertMCPLeaseRow(t, db, "lse-mdh", "mdh.t.example.test", AccessModeMCPUpstreamOAuth, lease.StateActive, 1, nil)
+	h := newDispatchHarness(t)
+	insertRegistrySession(s, &Session{LeaseID: "lse-mdh", Generation: 1, Yamux: h.relayYS,
+		Budget: s.budgets.For("lse-mdh"), closed: make(chan struct{})})
+	if err := createMCPRoute(db, "public.example.org", "route-mdh", "lse-mdh", "upstream-oauth"); err != nil {
+		t.Fatal(err)
+	}
+	// Live discovery through the FULL handler: admitted and forwarded,
+	// never 421. The fake agent applies the generation contract and
+	// aborts, so the visitor sees a 5xx, never success, never 421.
+	w := serveRoute(s, http.MethodGet, "public.example.org", "/.well-known/oauth-protected-resource/r/route-mdh/mcp", nil)
+	select {
+	case head := <-h.gotHead:
+		if head.Generation != 1 || head.LeaseID != "lse-mdh" {
+			t.Fatalf("discovery forwarded wrong head: %+v", head)
+		}
+	case <-h.noHead:
+		t.Fatal("live discovery never reached the agent")
+	case <-time.After(12 * time.Second):
+		t.Fatal("live discovery stalled before the agent")
+	}
+	if w.Code == http.StatusMisdirectedRequest {
+		t.Fatal("shared-host discovery rejected at the authority gate (421)")
+	}
+	if w.Code/100 != 5 {
+		t.Fatalf("aborted discovery: status=%d, want 5xx", w.Code)
+	}
+	// Unknown route IDs fail closed with path-route semantics, not 421.
+	if w := serveRoute(s, http.MethodGet, "public.example.org", "/.well-known/oauth-protected-resource/r/no-such-route/mcp", nil); w.Code != http.StatusNotFound {
+		t.Fatalf("unknown metadata route: got %d, want 404", w.Code)
+	}
+	// Revoked leases deny discovery exactly like tool traffic.
+	insertMCPLeaseRow(t, db, "lse-mdhr", "mdhr.t.example.test", AccessModeMCPUpstreamOAuth, lease.StateRevoked, 1, nil)
+	if err := createMCPRoute(db, "public.example.org", "route-mdhr", "lse-mdhr", "upstream-oauth"); err != nil {
+		t.Fatal(err)
+	}
+	if w := serveRoute(s, http.MethodGet, "public.example.org", "/.well-known/oauth-protected-resource/r/route-mdhr/mcp", nil); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("revoked metadata route: got %d, want 503", w.Code)
+	}
+	// Unrelated .well-known paths keep the 421: the fix must not loosen
+	// the shared authority into a generic well-known router.
+	if w := serveRoute(s, http.MethodGet, "public.example.org", "/.well-known/oauth-protected-resource/other", nil); w.Code != http.StatusMisdirectedRequest {
+		t.Fatalf("unrelated well-known: got %d, want 421", w.Code)
+	}
+	if w := serveRoute(s, http.MethodGet, "public.example.org", "/.well-known/nodeinfo", nil); w.Code != http.StatusMisdirectedRequest {
+		t.Fatalf("foreign well-known: got %d, want 421", w.Code)
 	}
 }
 

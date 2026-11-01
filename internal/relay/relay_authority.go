@@ -36,13 +36,18 @@ func (s *Server) authorizeHost(w http.ResponseWriter, r *http.Request) bool {
 	if s.mcpHost != "" && host == s.mcpHost {
 		// Single-host ingress (P0-A): the configured external MCP
 		// hostname may share the control authority — one FQDN serves
-		// agent control and /r/<route-id>/mcp. Route-shaped MCP paths
-		// pass through to handlePublic, which admits them against the
-		// route binding, lease status, and generation, or fails closed
-		// (404/503) without reaching any other handler class. Every
-		// other path on the control authority keeps the 421 below, and
-		// agent paths keep the strict branch above.
+		// agent control, /r/<route-id>/mcp, AND the per-resource
+		// OAuth discovery shape
+		// /.well-known/oauth-protected-resource/r/<route-id>/mcp.
+		// Both route shapes pass through to handlePublic, which admits
+		// them against the route binding, lease status, and generation,
+		// or fails closed (404/503) without reaching any other handler
+		// class. Every other path on the control authority keeps the
+		// 421 below, and agent paths keep the strict branch above.
 		if _, ok := parseMCPRoutePath(r.URL.EscapedPath()); ok {
+			return true
+		}
+		if _, ok := parseMCPRouteMetadataPath(r.URL.EscapedPath()); ok {
 			return true
 		}
 	}
@@ -84,7 +89,10 @@ func isAgentPath(p string) bool {
 	case "/v1/agent/enroll", "/v1/agent/challenge", "/v1/agent/connect":
 		return true
 	}
-	return strings.HasPrefix(p, "/v1/agent/lease/")
+	if strings.HasPrefix(p, "/v1/agent/lease/") {
+		return true
+	}
+	return p == "/v1/agent/mcp-routes" || strings.HasPrefix(p, "/v1/agent/mcp-routes/")
 }
 
 // splitTunnelHost uses the lease package's exact-Host parser so the

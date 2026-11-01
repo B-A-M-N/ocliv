@@ -41,7 +41,7 @@ func (s *Server) agentLeaseAuth(r *http.Request, leaseID string) (tenantID, keyI
 		return "", "", false
 	}
 	pub, tenant, status, err := s.lookupKey(key)
-	if err != nil || status != "active" {
+	if err != nil || !s.identityAdmitted(tenant, status) {
 		return "", "", false
 	}
 	var owner, ownerTenant, st string
@@ -107,7 +107,7 @@ func (s *Server) handleAgentLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	leaseID, action := parts[0], parts[1]
-	tenant, _, ok := s.agentLeaseAuth(r, leaseID)
+	tenant, keyID, ok := s.agentLeaseAuth(r, leaseID)
 	if !ok {
 		s.db.Audit("agent", "", leaseID, "mgmt_"+action, "denied", "auth failed")
 		http.Error(w, "forbidden", http.StatusForbidden)
@@ -212,7 +212,7 @@ func (s *Server) handleAgentLease(w http.ResponseWriter, r *http.Request) {
 		s.serveMCPRouteList(w, leaseID)
 	default:
 		if rest, ok := strings.CutPrefix(action, "mcp-route/"); ok {
-			s.serveMCPRouteMutation(w, r, tenant, leaseID, rest)
+			s.serveMCPRouteMutation(w, r, tenant, keyID, leaseID, rest)
 			return
 		}
 		http.Error(w, "not found", http.StatusNotFound)

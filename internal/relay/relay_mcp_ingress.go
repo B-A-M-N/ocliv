@@ -204,10 +204,12 @@ func parseRouteRest(rest string, allowSlash bool) (string, bool) {
 }
 
 // createMCPRoute binds a route ID to a live lease for the exact external
-// host. It validates everything the resolver trusts: host canonicity,
-// route-ID charset, known profile, existing lease (via foreign key).
-// Mode/profile compatibility is enforced at admission (P0-B), not here,
-// so this stays a dumb mapping write.
+// host (test helper; production uses the publication create-or-rebind
+// path in relay_mgmt_routes.go). It validates everything the resolver
+// trusts: host canonicity, route-ID charset, known profile, ownership
+// triple derived from the bound lease. Mode/profile compatibility is
+// enforced at admission (P0-B), not here, so this stays a dumb mapping
+// write.
 func createMCPRoute(db *store.DB, externalHost, routeID, leaseID, profile string) error {
 	if canonicalHost(externalHost) != externalHost || externalHost == "" {
 		return errInvalidRoute("external host must be an exact canonical hostname")
@@ -224,18 +226,23 @@ func createMCPRoute(db *store.DB, externalHost, routeID, leaseID, profile string
 	if _, ok := parseIngressProfile(profile); !ok {
 		return errInvalidRoute("unknown ingress profile")
 	}
+	var tenant, key, label string
+	if err := db.SQL().QueryRow(`SELECT tenant_id, agent_key_id, label FROM leases WHERE id=?`,
+		leaseID).Scan(&tenant, &key, &label); err != nil {
+		return errInvalidRoute("unknown lease")
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err := db.SQL().Exec(
-		`INSERT INTO mcp_routes(route_id, lease_id, external_host, profile, target_path, created_at)
-		 VALUES(?,?,?,?,?,?)`,
-		routeID, leaseID, externalHost, profile, "/mcp",
-		time.Now().UTC().Format(time.RFC3339Nano))
+		`INSERT INTO mcp_publications(route_id, tenant_id, owner_key_id, external_host, profile, pub_name, target_path, lease_id, created_at, updated_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		routeID, tenant, key, externalHost, profile, label, "/mcp", leaseID, now, now)
 	return err
 }
 
-// deleteMCPRoute removes a route mapping. Lease and session state are
-// untouched: revocation and expiry already deny through admission.
+// deleteMCPRoute removes a publication mapping. Lease and session state
+// are untouched: revocation and expiry already deny through admission.
 func deleteMCPRoute(db *store.DB, routeID string) error {
-	_, err := db.SQL().Exec(`DELETE FROM mcp_routes WHERE route_id=?`, routeID)
+	_, err := db.SQL().Exec(`DELETE FROM mcp_publications WHERE route_id=?`, routeID)
 	return err
 }
 
@@ -245,27 +252,56 @@ func (e routeError) Error() string { return "mcp route: " + string(e) }
 
 func errInvalidRoute(reason string) error { return routeError(reason) }
 
+// denyMCPRoute audits and counts one failed MCP path-route resolution
+// (P1-D): unknown/revoked/mismatched publications and inadmissible
+// bound leases each emit exactly one bounded admission rejection.
+// No request detail enters the counter — cardinality stays fixed.
+func (s *Server) denyMCPRoute(leaseID, reason string, code int) (*routeTarget, *Session, IngressProfile, int) {
+	metrics.Global.MCPAdmissionRejects.Add(1)
+	s.db.Audit("visitor", "", leaseID, "route", "denied", reason)
+	return nil, nil, IngressInvalid, code
+}
+
 // admitRoutedLease is the single admission authority shared by wildcard
 // host routing and path-route resolution: TTL expiry (with eviction and
 // durable marking, matching route()), ACTIVE status, live session, and
 // generation match. Neither ingress path duplicates these checks.
 func (s *Server) admitRoutedLease(t *routeTarget, state string, expiresAt sql.NullString) (*routeTarget, *Session, int) {
+	// MCP-bound denials count as bounded admission rejections (P1-D);
+	// wildcard leases keep their existing counters. Generation
+	// mismatches already count as FencingRejects and are not
+	// double-counted here.
+	mcpDeny := func(reason string, code int) (*routeTarget, *Session, int) {
+		if IsMCPMode(t.AccessMode) {
+			metrics.Global.MCPAdmissionRejects.Add(1)
+			s.db.Audit("visitor", "", t.LeaseID, "route", "denied", reason)
+		}
+		return nil, nil, code
+	}
 	if expiresAt.Valid {
 		exp, err := time.Parse(time.RFC3339Nano, expiresAt.String)
 		if err != nil || time.Now().UTC().After(exp) {
 			s.evictLease(t.LeaseID)
 			_, _ = s.db.SQL().Exec(`UPDATE leases SET status=? WHERE id=?`, lease.StateExpired, t.LeaseID)
 			s.db.Audit("visitor", "", t.LeaseID, "route", "denied", "lease ttl expired")
+			if IsMCPMode(t.AccessMode) {
+				metrics.Global.MCPAdmissionRejects.Add(1)
+			}
 			return nil, nil, http.StatusNotFound
 		}
 		t.ExpiresAt = exp
 	}
 	if state != lease.StateActive {
-		return nil, nil, http.StatusServiceUnavailable
+		// Immediate termination (P0-A): a revocation/close racing an
+		// established session must kill forwarding on the next
+		// admission, not linger until the session idles out. The
+		// periodic supervise revalidation bounds the remainder.
+		s.evictLease(t.LeaseID)
+		return mcpDeny("route lease not active", http.StatusServiceUnavailable)
 	}
 	sess, live := s.liveSession(t.LeaseID)
 	if !live {
-		return nil, nil, http.StatusServiceUnavailable
+		return mcpDeny("route lease offline", http.StatusServiceUnavailable)
 	}
 	if sess.Generation != t.Generation {
 		metrics.Global.FencingRejects.Add(1)
@@ -304,6 +340,15 @@ func (s *Server) admitPathRoute(r *http.Request) (*routeTarget, *Session, *http.
 		s.db.Audit("visitor", "", "", "route", "denied", "path route inadmissible")
 		return nil, nil, nil, code
 	}
+	// Pending verification (P0-A): an unverified publication denies
+	// the tool path at admission. The discovery metadata path is
+	// unaffected so the publisher's verification probe can complete.
+	// serveRouted re-enforces this for both ingress surfaces.
+	if forwardPath == "/mcp" && !t.MCPVerified {
+		s.db.Audit("visitor", "", t.LeaseID, "route", "denied", "publication unverified")
+		metrics.Global.MCPAdmissionRejects.Add(1)
+		return nil, nil, nil, http.StatusNotFound
+	}
 	r2 := r.Clone(r.Context())
 	r2u := *r2.URL
 	r2u.Path = forwardPath
@@ -318,37 +363,53 @@ func (s *Server) admitPathRoute(r *http.Request) (*routeTarget, *Session, *http.
 // profiles, missing leases, and failed lease admission all fail closed
 // with wildcard-identical semantics (404 unknown/expired, 503 inactive).
 func (s *Server) resolveMCPRouteID(routeID string) (*routeTarget, *Session, IngressProfile, int) {
-	var rowHost, leaseID, profileStr string
+	var rowHost, profileStr string
+	// NULL-safe: revoked tombstones detached by lease reclaim carry a
+	// NULL active binding (P0-B); revocation is decided before the
+	// binding is dereferenced. verified_at NULL means the publication
+	// has not completed discovery verification and activation (P0-A).
+	var leaseID sql.NullString
+	var revoked, verified *string
 	err := s.db.SQL().QueryRow(
-		`SELECT external_host, lease_id, profile FROM mcp_routes WHERE route_id=?`,
-		routeID).Scan(&rowHost, &leaseID, &profileStr)
+		`SELECT external_host, lease_id, profile, revoked_at, verified_at FROM mcp_publications WHERE route_id=?`,
+		routeID).Scan(&rowHost, &leaseID, &profileStr, &revoked, &verified)
 	if err != nil {
-		return nil, nil, IngressInvalid, http.StatusNotFound
+		return s.denyMCPRoute("", "unknown route id", http.StatusNotFound)
 	}
+	// A revoked publication stays permanently denied: reconnecting or
+	// allocating a new lease must never revive it (P1-A).
+	if revoked != nil {
+		return s.denyMCPRoute(leaseID.String, "publication revoked", http.StatusNotFound)
+	}
+	// Past revocation, a live publication must have a bound lease: a
+	// NULL binding here violates the reclaim invariant — fail closed
+	// rather than resolving an unbound route (P0-B).
+	if !leaseID.Valid || leaseID.String == "" {
+		return s.denyMCPRoute("", "publication unbound", http.StatusNotFound)
+	}
+	bound := leaseID.String
 	if rowHost != s.mcpHost {
-		s.db.Audit("visitor", "", leaseID, "route", "denied", "route host mismatch")
-		return nil, nil, IngressInvalid, http.StatusNotFound
+		return s.denyMCPRoute(bound, "route host mismatch", http.StatusNotFound)
 	}
 	profile, ok := parseIngressProfile(profileStr)
 	if !ok || profile == IngressInvalid {
-		s.db.Audit("visitor", "", leaseID, "route", "denied", "unknown route profile")
-		return nil, nil, IngressInvalid, http.StatusNotFound
+		return s.denyMCPRoute(bound, "unknown route profile", http.StatusNotFound)
 	}
 	var t routeTarget
 	var state string
 	var expiresAt, reconnectUntil sql.NullString
 	err = s.db.SQL().QueryRow(
 		`SELECT id, label, hostname, port, access_mode, generation, token_generation, status, expires_at, reconnect_until FROM leases WHERE id=?`,
-		leaseID).Scan(&t.LeaseID, &t.Label, &t.Hostname, &t.Port, &t.AccessMode, &t.Generation, &t.TokenGen, &state, &expiresAt, &reconnectUntil)
+		bound).Scan(&t.LeaseID, &t.Label, &t.Hostname, &t.Port, &t.AccessMode, &t.Generation, &t.TokenGen, &state, &expiresAt, &reconnectUntil)
 	if err != nil {
-		return nil, nil, IngressInvalid, http.StatusNotFound
+		return s.denyMCPRoute(bound, "route lease missing", http.StatusNotFound)
 	}
 	if !mcpModeBinding(profile, t.AccessMode) {
-		s.db.Audit("visitor", "", leaseID, "route", "denied", "route profile/lease mode mismatch")
-		return nil, nil, IngressInvalid, http.StatusNotFound
+		return s.denyMCPRoute(bound, "route profile/lease mode mismatch", http.StatusNotFound)
 	}
 	t.MCPProfile = profile
 	t.ViaPathRoute = true
+	t.MCPVerified = verified != nil
 	admitted, sess, code := s.admitRoutedLease(&t, state, expiresAt)
 	if code != 0 {
 		return nil, nil, IngressInvalid, code

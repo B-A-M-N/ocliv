@@ -89,6 +89,24 @@ func (s *Server) supervise(sess *Session, leaseID string) {
 				s.detach(sess, leaseID)
 				return
 			}
+			// Bounded operator-revocation enforcement (P0-A): a
+			// CLI-driven key/tenant revocation lands in durable
+			// state without a running Server to evict sessions.
+			// Revalidate the lease each tick so idle streams die
+			// within one interval of terminal revocation instead
+			// of forwarding until the next visitor request.
+			var st string
+			if err := s.db.SQL().QueryRow(`SELECT status FROM leases WHERE id=?`, leaseID).Scan(&st); err != nil {
+				s.detach(sess, leaseID)
+				s.evictLease(leaseID)
+				return
+			}
+			if st == lease.StateRevoked || st == lease.StateClosed || st == lease.StateExpired {
+				s.db.Audit("agent", "", leaseID, "supervise", "evicted", "lease terminal ("+st+") under live session")
+				s.detach(sess, leaseID)
+				s.evictLease(leaseID)
+				return
+			}
 		}
 	}
 }

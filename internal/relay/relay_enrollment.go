@@ -120,6 +120,15 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 // *Server runs reconcileBoot, which mutates unrelated live lease rows.
 // The operator enroll path must never construct a Server (P0-01).
 func IssueEnrollmentCode(db *store.DB, tenantID string, ttl time.Duration, issuedBy string) (string, error) {
+	// Suspended tenants cannot enroll new publishers (P0-A): suspension
+	// is terminal for the tenant's authority until explicitly unsuspended.
+	// Unknown tenants (first enrollment) are unaffected.
+	if tenantID != "" {
+		var tst string
+		if err := db.SQL().QueryRow(`SELECT status FROM tenants WHERE id=?`, tenantID).Scan(&tst); err == nil && tst == "suspended" {
+			return "", apperr.E(apperr.CodeEnrollAuth, "tenant suspended", nil)
+		}
+	}
 	code, verifier, err := identity.MintEnrollmentCode()
 	if err != nil {
 		return "", err

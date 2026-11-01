@@ -25,6 +25,12 @@ import (
 // lease id falls through to a new separately authorized lease; the old URL
 // is never hijacked.
 func (s *Server) allocateOrResume(tenantID, keyID string, intent LeaseIntent) (*lease.Lease, attachedMsg, error) {
+	// Operator identity gate (P0-A): a revoked key or suspended tenant
+	// can neither resume nor allocate, closing the reconnect path that
+	// per-lease status checks alone do not cover.
+	if _, _, status, err := s.lookupKey(keyID); err != nil || !s.identityAdmitted(tenantID, status) {
+		return nil, attachedMsg{}, apperr.E(apperr.CodeEnrollAuth, "unknown, revoked, or suspended agent key", err)
+	}
 	now := time.Now().UTC()
 	if intent.LeaseID != "" {
 		ls, err := s.resumeLease(tenantID, keyID, intent)
@@ -307,10 +313,17 @@ func (s *Server) insertLease(tenantID, keyID, label string, intent LeaseIntent, 
 				if _, err := tx.Exec(`DELETE FROM visitor_sessions WHERE lease_id IN (SELECT id FROM leases WHERE hostname=?)`, hostname); err != nil {
 					return err
 				}
-				// Path routes never outlive their lease: the reclaimed
-				// hostname gets a fresh lease ID, and stale rows would
-				// otherwise fail the FK delete below (P0-A).
-				if _, err := tx.Exec(`DELETE FROM mcp_routes WHERE lease_id IN (SELECT id FROM leases WHERE hostname=?)`, hostname); err != nil {
+				// Publications are NOT deleted on reclaim (P1-A): the
+				// stable route rebinds to the replacement lease below,
+				// so the public URL survives ordinary restarts.
+				// Revoked tombstones stay revoked and never rebind; their
+				// lease_id is detached first so the deferred FK on the
+				// retired lease cannot fail the reclaim commit (P0-B).
+				// The tombstone keeps its route identity, ownership, and
+				// revoked state with a NULL active binding.
+				if _, err := tx.Exec(
+					`UPDATE mcp_publications SET lease_id=NULL, updated_at=? WHERE lease_id=? AND revoked_at IS NOT NULL`,
+					now.Format(time.RFC3339Nano), oldID); err != nil {
 					return err
 				}
 				if _, err := tx.Exec(`DELETE FROM leases WHERE hostname=?`, hostname); err != nil {
@@ -328,6 +341,16 @@ func (s *Server) insertLease(tenantID, keyID, label string, intent LeaseIntent, 
 			 VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
 			id, tenantID, keyID, hostname, label, intent.Port, mode, 1, lease.StateActive, expires, now.Format(time.RFC3339Nano)); err != nil {
 			return err
+		}
+		if retiredID != "" {
+			// Same-owner reclaim: carry live publications to the
+			// replacement lease atomically, preserving the stable
+			// public route. Revoked publications keep their tombstone.
+			if _, err := tx.Exec(
+				`UPDATE mcp_publications SET lease_id=?, updated_at=? WHERE lease_id=? AND revoked_at IS NULL`,
+				id, now.Format(time.RFC3339Nano), retiredID); err != nil {
+				return err
+			}
 		}
 		if sharePrepared {
 			if err := insertAccessTokenRow(tx, id, "visitor", 1, shareRow); err != nil {
