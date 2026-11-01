@@ -547,3 +547,15 @@ quirk only; public behavior is the oracle.
 - Verify: new test PASS; all 14 backup/restore tests PASS; full
   `go test ./internal/relay/ -count=1` → ok (35.3s); `go vet` + `gofmt` clean.
 - Disposition: FIXED.
+
+## Round 12 — agent lifecycle re-audit (2026-11-01)
+- Re-read `agent_serve.go`: session-scoped `AfterFunc` (P1-6 holds, no
+  per-reconnect waiter leak), single-reader `streamReader` (E04),
+  agent-side stale-generation abort (F13), trailer rejection (E12),
+  mid-body backend failure → abort not clean end (P0-05), shared
+  loopback-only `localClient` with no redirects (D06/D10).
+- `IsPermanent` is a typed `PermanentError` (errors.As), not message
+  matching — earlier P2 concern resolved. `rn.HTTP` has no post-construction
+  writers; unsynchronized read is safe.
+- `go test ./internal/agent/ -count=1` → ok; `-race` → ok.
+- Disposition: VERIFIED NON-ISSUE for this leg.
