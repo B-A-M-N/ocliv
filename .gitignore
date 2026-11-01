@@ -17,6 +17,22 @@ ocliv-root.crt
 /ocliv
 /ocliv-*
 *.tar.gz
+packaging/mcp/dist/
+
+# live/ run artifacts: only README, lab-ca.crt, and ocliv-dist/ are
+# tracked. Tokens, bindings, logs, state, and stray binaries stay local.
+live/*token*
+live/*.resource
+live/*.log
+live/relay-data/
+live/fakehome/
+live/fixture
+live/ocliv
+live/go.mod
 
 # Test and tool scratch.
 /tmp/
+
+# Negation: the lab CA public root is intentionally tracked (see
+# live/README.md). The private key never leaves the relay laptop.
+!live/lab-ca.crt

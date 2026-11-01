@@ -1,0 +1,6 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "ocliv-chatgpt-hosting",
+  "version": "0.1.2",
+  "description": "Access authenticated MCP tools hosted through Ocliv"
+}
