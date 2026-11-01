@@ -888,3 +888,19 @@ Drill (container removed afterwards, zero host footprint):
   /tmp/soak/run.sh (transient, outside the repo).
 - Disposition: PASS (bounded); 24h soak remains BLOCKED (needs time +
   production-like host).
+
+## Round 34 — relay laptop upgrade + cross-machine E2E (2026-11-01, joker3)
+- Found live staging on 10.9.66.20 (old binary, Funnel→Caddy:18081→
+  relay:8080) with CLOSED/EXPIRED leases only — safe to restart.
+- Drift fixed: laptop Caddyfile.funnel used `{scheme}` (wrongly reports
+  http behind Funnel TLS); replaced with repo `X-Forwarded-Proto https`.
+- Upgraded to tip (md5 3fcdd609): DB backed up pre-swap, old binary +
+  laptop Caddyfile preserved, schema migrated on boot, keys intact.
+- Funnel edge re-verified (401), plus new LAN edge (Caddy :8443,
+  tls internal): enroll → login → ACTIVE protected tunnel from this PC
+  → unauth 302/401 → redeem 200 → authorized 200 exact body → close →
+  503. Full cross-machine path on the release candidate.
+- `relay init` deployment files generated on the laptop and
+  `--check` passes. systemd activation still needs sudo on joker3
+  (operator step below).
+- Disposition: FIXED (edge drift); VERIFIED (upgrade + E2E).
