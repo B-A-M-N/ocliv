@@ -431,6 +431,18 @@ func cmdRelayDoctor(argv []string) int {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return apperr.ExitCLIValidation
 	}
+	// Honor an explicit --relay-host (Round 18): the relay doctor must
+	// probe the configured control authority, not a relay.<domain>
+	// guess that does not exist on --relay-host deployments.
+	relayHost := ""
+	if rawRelayHost, seen := relayHostFlag(argv); seen {
+		h, herr := parseHostname(rawRelayHost, "--relay-host")
+		if herr != nil {
+			fmt.Fprintln(os.Stderr, "error: "+herr.Error())
+			return apperr.ExitCLIValidation
+		}
+		relayHost = h
+	}
 	var cacert string
 	for i := 0; i < len(argv); i++ {
 		if strings.HasPrefix(argv[i], "--cacert=") {
@@ -443,7 +455,7 @@ func cmdRelayDoctor(argv []string) int {
 	if cacert == "" {
 		cacert = os.Getenv("OCLIV_CACERT")
 	}
-	res := doctor.CheckRelay(doctor.RelayInput{DataDir: dataDir, Domain: domain, CACertPath: cacert})
+	res := doctor.CheckRelay(doctor.RelayInput{DataDir: dataDir, Domain: domain, RelayHost: relayHost, CACertPath: cacert})
 	fmt.Print(res.Report())
 	if res.OK {
 		return apperr.ExitOK

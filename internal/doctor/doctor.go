@@ -52,11 +52,14 @@ func (r Result) Report() string {
 // insecure-skip flag: untrusted TLS is reported, never bypassed.
 // ProbePath/ProbeStatus carry the tunnel's recorded readiness contract
 // (Domain A): empty path means / and status 0 means any HTTP response.
+// IPv6 selects the [::1] loopback family recorded at tunnel startup;
+// without it the probe assumes 127.0.0.1 and misdiagnoses IPv6 tunnels.
 type AgentInput struct {
 	KeyPath     string
 	RelayURL    string
 	LeasePath   string
 	Port        int
+	IPv6        bool
 	CACertPath  string
 	ProbePath   string
 	ProbeStatus int
@@ -117,7 +120,14 @@ func CheckAgent(in AgentInput) Result {
 		if path == "" {
 			path = "/"
 		}
-		addr := fmt.Sprintf("127.0.0.1:%d", in.Port)
+		// Probe the exact loopback family the tunnel was started with
+		// (Round 18): an IPv6 tunnel has nothing on 127.0.0.1, so the
+		// historical hardcoded IPv4 target misdiagnosed it as down.
+		host := "127.0.0.1"
+		if in.IPv6 {
+			host = "::1"
+		}
+		addr := net.JoinHostPort(host, fmt.Sprintf("%d", in.Port))
 		lresp, lerr := (&http.Client{Timeout: 3 * time.Second}).Get("http://" + addr + path)
 		if lerr != nil {
 			add(false, true, "local service", addr+path+" unreachable ("+shortErr(lerr)+")")
@@ -183,11 +193,28 @@ func isTrustFailure(err error) bool {
 }
 
 // RelayInput for relay-side checks. CACertPath optionally points at a
-// staging CA root (PEM); empty means system roots only.
+// staging CA root (PEM); empty means system roots only. RelayHost
+// overrides the default relay.<domain> control authority when the relay
+// was started with --relay-host (e.g. temporary *.ts.net ingress);
+// without it the doctor probes (and misdiagnoses) the wrong hostname.
 type RelayInput struct {
 	DataDir    string
 	Domain     string
+	RelayHost  string
 	CACertPath string
+}
+
+// relayAuthorityHost resolves the exact control hostname the relay was
+// configured to serve: an explicit --relay-host wins, otherwise the
+// default relay.<domain>. Empty means no authority is known.
+func relayAuthorityHost(in RelayInput) string {
+	if strings.TrimSpace(in.RelayHost) != "" {
+		return strings.ToLower(strings.TrimSpace(in.RelayHost))
+	}
+	if strings.TrimSpace(in.Domain) != "" {
+		return "relay." + strings.ToLower(strings.TrimSpace(in.Domain))
+	}
+	return ""
 }
 
 // CheckRelay runs relay-side diagnostics.
@@ -206,8 +233,19 @@ func CheckRelay(in RelayInput) Result {
 		add(true, true, "data dir", in.DataDir+" present")
 	}
 	// Local DNS resolution of the relay authority: a verified fact about
-	// this machine's resolver, not proof of external/public DNS.
-	relayHost := "relay." + in.Domain
+	// this machine's resolver, not proof of external/public DNS. The
+	// authority is the explicitly configured one (Round 18), never a
+	// hardcoded relay.<domain> guess when --relay-host was set.
+	relayHost := relayAuthorityHost(in)
+	if relayHost == "" {
+		add(false, true, "relay DNS", "no relay authority known (domain and relay-host both empty)")
+		add(false, false, "relay TLS identity", "unprobed: no authority to dial")
+		add(false, false, "wildcard DNS", "unverifiable without a domain")
+		add(false, false, "wildcard TLS", "unverifiable without a domain")
+		add(false, false, "public internet", "not applicable to private staging; NOT VERIFIED for production")
+		add(true, false, "health endpoints", "/health/live, /health/ready, /metrics expected on loopback only (binding not verified by doctor)")
+		return res
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	addrs, err := net.DefaultResolver.LookupHost(ctx, relayHost)
 	cancel()
@@ -238,8 +276,13 @@ func CheckRelay(in RelayInput) Result {
 			add(true, true, "relay TLS identity", "trusted by the configured roots ("+leaf+")")
 		}
 	}
-	add(false, false, "wildcard DNS", "*.t."+in.Domain+" must resolve for visitors; verify from another network")
-	add(false, false, "wildcard TLS", "ACME DNS-01 certificate must be installed in Caddy; not verifiable locally")
+	if strings.TrimSpace(in.Domain) != "" {
+		add(false, false, "wildcard DNS", "*.t."+in.Domain+" must resolve for visitors; verify from another network")
+		add(false, false, "wildcard TLS", "ACME DNS-01 certificate must be installed in Caddy; not verifiable locally")
+	} else {
+		add(false, false, "wildcard DNS", "unverifiable: relay host is explicit, no wildcard namespace configured")
+		add(false, false, "wildcard TLS", "unverifiable: relay host is explicit, no wildcard namespace configured")
+	}
 	add(false, false, "public internet", "not applicable to private staging; NOT VERIFIED for production")
 	add(true, false, "health endpoints", "/health/live, /health/ready, /metrics expected on loopback only (binding not verified by doctor)")
 	return res

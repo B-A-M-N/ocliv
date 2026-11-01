@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -102,6 +103,83 @@ func TestAgentProbeHitsLocalHTTP(t *testing.T) {
 	}
 	if l := byName["local service"]; !l.Verified || !l.OK {
 		t.Errorf("local HTTP probe must verify: %+v", l)
+	}
+}
+
+// An IPv6 tunnel has nothing on 127.0.0.1: the doctor must probe the
+// recorded family (Round 18). An [::1] server verifies OK with
+// IPv6:true; the same port with IPv6:false must be a verified negative,
+// never a silent IPv4 misdiagnosis.
+func TestAgentProbeHonorsIPv6Family(t *testing.T) {
+	ln, err := net.Listen("tcp", "[::1]:0")
+	if err != nil {
+		t.Skipf("no IPv6 loopback here: %v", err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	defer srv.Close()
+	go func() { _ = srv.Serve(ln) }()
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := func(in AgentInput) map[string]Finding {
+		m := map[string]Finding{}
+		for _, f := range CheckAgent(in).Findings {
+			m[f.Name] = f
+		}
+		return m
+	}
+	base := AgentInput{KeyPath: "/nonexistent/key", RelayURL: "http://127.0.0.1:1", Port: n}
+	if got := byName(base)["local service"]; !got.Verified || got.OK {
+		t.Errorf("IPv4 probe of an IPv6-only server must be a verified negative: %+v", got)
+	}
+	v6 := base
+	v6.IPv6 = true
+	if got := byName(v6)["local service"]; !got.Verified || !got.OK {
+		t.Errorf("IPv6 probe of an IPv6 server must verify OK: %+v", got)
+	}
+}
+
+// relayAuthorityHost: explicit --relay-host wins, default is
+// relay.<domain>, nothing known is empty.
+func TestRelayAuthorityHostSelection(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   RelayInput
+		want string
+	}{
+		{"default", RelayInput{Domain: "ocliv.test"}, "relay.ocliv.test"},
+		{"explicit wins", RelayInput{Domain: "ocliv.test", RelayHost: "pop-os-3.tail1234.ts.net"}, "pop-os-3.tail1234.ts.net"},
+		{"case and space trimmed", RelayInput{RelayHost: "  RELAY.Example.ORG "}, "relay.example.org"},
+		{"nothing known", RelayInput{}, ""},
+	} {
+		if got := relayAuthorityHost(tc.in); got != tc.want {
+			t.Errorf("%s: got %q want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// An explicit relay host must drive the DNS finding line instead of a
+// relay.<domain> guess (Round 18): the finding names the probed host.
+func TestRelayDoctorProbesExplicitHost(t *testing.T) {
+	res := CheckRelay(RelayInput{DataDir: t.TempDir(), RelayHost: "relay.invalid"})
+	found := false
+	for _, f := range res.Findings {
+		if f.Name == "relay DNS" && strings.Contains(f.Detail, "relay.invalid") {
+			found = true
+		}
+		if f.Name == "relay DNS" && strings.Contains(f.Detail, "relay..") {
+			t.Errorf("doctor fell back to an empty-domain guess: %+v", f)
+		}
+	}
+	if !found {
+		t.Errorf("relay DNS finding does not name the explicit host: %+v", res.Findings)
 	}
 }
 

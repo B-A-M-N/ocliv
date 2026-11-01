@@ -640,3 +640,26 @@ quirk only; public behavior is the oracle.
   new test failed pre-fix, passes post-fix; legitimate restores (equal
   or absent generations) are not refused.
 - Disposition: VERIFIED NON-ISSUE (store); Round 11 FIXED stands.
+
+## Round 18 — REAL DEFECTS: doctor wrong-family + wrong-authority probes (2026-11-01)
+- Finding 1 (P1, misdiagnosis): `CheckAgent` hardcoded `127.0.0.1:port`
+  for the local-service probe while lease records already stored the
+  `IPv6` family ("so diagnostics probe the exact local target") — an
+  IPv6 tunnel with a healthy `[::1]` service was reported as a verified
+  "unreachable". Demonstrated: IPv4 probe of a live IPv6-only server
+  returns verified-negative under the old path.
+- Finding 2 (P1, misdiagnosis): `CheckRelay` hardcoded
+  `relay.<domain>` although the relay supports `--relay-host` (Funnel
+  `*.ts.net` ingress) — relay doctor probed a hostname the relay does
+  not serve.
+- Fix: `AgentInput.IPv6` → `net.JoinHostPort` family-exact probe, wired
+  from the latest lease record in `cmdStatus`; `RelayInput.RelayHost` +
+  `relayAuthorityHost()` (explicit wins, else `relay.<domain>`, empty
+  fails closed with explicit unknown-authority findings), wired from
+  `--relay-host` in `cmdRelayDoctor` (validated via `parseHostname`);
+  wildcard lines degrade honestly when no domain is configured.
+- Tests: `TestAgentProbeHonorsIPv6Family` (negative + positive),
+  `TestRelayAuthorityHostSelection` (4 cases),
+  `TestRelayDoctorProbesExplicitHost` (finding names the explicit host).
+  All PASS; full `doctor`/`cli`/`config` suites green; vet+gofmt clean.
+- Disposition: FIXED.

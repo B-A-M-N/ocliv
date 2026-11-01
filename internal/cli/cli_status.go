@@ -218,11 +218,13 @@ func cmdDoctor(argv []string) int {
 	// override it after the same edge validation the tunnel applies.
 	var leasePath string
 	var leasePort int
+	var leaseIPv6 bool
 	recPath, recStatus := "", 0
 	if store, serr := config.OpenLeaseStore(dir); serr == nil {
 		if rec, ok := store.Latest(); ok {
 			leasePath = filepath.Join(dir, config.LeaseStoreDir, rec.LeaseID+".json")
 			leasePort = rec.Port
+			leaseIPv6 = rec.IPv6
 			recPath, recStatus = rec.ProbePath, rec.ProbeStatus
 		}
 	}
@@ -233,7 +235,7 @@ func cmdDoctor(argv []string) int {
 	}
 	res := doctor.CheckAgent(doctor.AgentInput{
 		KeyPath: keyPath, RelayURL: relayURL,
-		LeasePath: leasePath, Port: leasePort,
+		LeasePath: leasePath, Port: leasePort, IPv6: leaseIPv6,
 		CACertPath: cacert,
 		ProbePath:  probePath, ProbeStatus: probeStatus,
 	})
