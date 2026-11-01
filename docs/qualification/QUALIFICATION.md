@@ -616,3 +616,14 @@ quirk only; public behavior is the oracle.
   TestOAuth|TestFixture`, cli `TestMCP|TestPublish|TestProbe|TestDoctor`)
   → all ok.
 - Disposition: VERIFIED NON-ISSUE for this leg.
+
+## Round 16 — MCP adapter/proxy re-audit (2026-11-01)
+- Re-read `internal/mcp/mcp.go` + `jsonrpc.go`: pinned executable
+  (LookPath once, no shell), scrubbed env, loopback-only listener,
+  id-correlated coordinator (single stdout reader, waiter drop on
+  cancel/timeout, late replies discarded), notifications → 202 without
+  waiting, duplicate in-flight ids rejected, `/`+`/mcp` path restriction,
+  body caps both directions, timeout retires adapter fail-closed,
+  Close order (listener → kill → reap).
+- `go test ./internal/mcp/ ./internal/proxy/ ./internal/protocol/ ./internal/access/ -count=1` → all ok.
+- Disposition: VERIFIED NON-ISSUE for this leg.
