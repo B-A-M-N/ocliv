@@ -602,3 +602,17 @@ quirk only; public behavior is the oracle.
 - `go test -count=1 -timeout 280s ./tests/integration/` → ok (205.3s).
 - `go test -race ./internal/relay/ -count=1` → ok (77.2s, post-backup-fix).
 - Worktree clean; all changes committed (67ed597 tip).
+
+## Round 15 — MCP ingress/publication re-audit (2026-11-01)
+- Re-read `relay_mgmt_routes.go` create-or-rebind: natural-key
+  `ON CONFLICT ... DO NOTHING` + CAS retry (8 attempts), atomic rebind
+  with `EXISTS(ACTIVE)` predicate, `INSERT...SELECT...WHERE EXISTS(ACTIVE)`
+  atomic mint, profile-clash rejection, tombstone handling. Unique index
+  `idx_mcp_publications_logical` present with dedup migration in store.go.
+- Re-read `relay_mcp_ingress.go`: EscapedPath parsing defeats %2e
+  traversal, route-ID charset, exact two-shape matching, mode/profile
+  binding (`mcpModeBinding`), single shared `admitRoutedLease` authority.
+- Focused tests (relay `TestMCP|TestPublication|TestRouteCreate|TestActivate|
+  TestOAuth|TestFixture`, cli `TestMCP|TestPublish|TestProbe|TestDoctor`)
+  → all ok.
+- Disposition: VERIFIED NON-ISSUE for this leg.
