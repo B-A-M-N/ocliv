@@ -1,0 +1,42 @@
+# Caddy edge for ocliv relay (staging template — replace {$OCLIV_DOMAIN} and {$OCLIV_ACME_EMAIL}).
+# The relay binds loopback only (127.0.0.1:8080); Caddy terminates public
+# TLS and asserts the client identity the relay trusts (see
+# docs/OPERATOR.md: the edge must overwrite, never append, forwarding
+# headers, and must strip anything the visitor smuggled in).
+{
+	auto_https disable_redirects
+}
+
+# Agent control plane + unlock pages.
+relay.{$OCLIV_DOMAIN} {
+	tls {$OCLIV_ACME_EMAIL}
+
+	reverse_proxy 127.0.0.1:8080 {
+		# Overwrite: the relay treats the rightmost entry as the
+		# client IP only from a loopback peer.
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+		# Strip anything the visitor smuggled in.
+		header_up -X-Forwarded-Host
+	}
+}
+
+# Visitor traffic: <label>.t.<domain>, one label per tunnel.
+*.t.{$OCLIV_DOMAIN} {
+	# Wildcard issuance REQUIRES DNS-01 (ACME HTTP/TLS-ALPN cannot
+	# validate a wildcard). OPERATOR MUST CONFIGURE: build Caddy with
+	# the provider plugin for your DNS host and uncomment:
+	#	tls {
+	#		dns <provider> {env.DNS_API_TOKEN}
+	#	}
+	# Scope the API credential to the ACME challenge zone only, and
+	# pre-provision/verify the wildcard before the first public tunnel.
+
+	reverse_proxy 127.0.0.1:8080 {
+		# Overwrite, never append (same trusted-edge contract as above).
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+		# Strip anything the visitor smuggled in.
+		header_up -X-Forwarded-Host
+	}
+}

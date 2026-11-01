@@ -1,0 +1,38 @@
+[Unit]
+Description=Ocliv relay (localhost tunnel broker)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ocliv
+Group=ocliv
+# No inbound ports: the relay binds loopback only; Caddy terminates TLS.
+# The domain has no default: startup refuses without it. The operator sets
+# OCLIV_DOMAIN in /etc/ocliv/relay.env (root-owned, 0600); staging uses
+# OCLIV_DOMAIN=ocliv.test, production uses the real public domain.
+# Single-host MCP ingress is explicit opt-in: set OCLIV_MCP_HOST to the
+# exact public relay hostname (e.g. relay.example.org) to enable
+# /r/<route-id>/mcp routes. When unset, the relay serves wildcard tunnel
+# hosts and control endpoints only, and mcp-route creation fails closed.
+EnvironmentFile=/etc/ocliv/relay.env
+# The launcher adds --mcp-host only when OCLIV_MCP_HOST is non-empty: an
+# explicitly empty --mcp-host= fails CLI validation (P0-B), so the flag
+# must never be passed unconditionally here.
+ExecStart=/usr/local/bin/ocliv-relay-launch.sh
+WorkingDirectory=/var/lib/ocliv
+Restart=on-failure
+RestartSec=5
+# Least privilege: fresh private FS view, no new privileges.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ocliv
+# Stop-then-revoke-then-restart is the supported takedown path: a plain
+# restart never resurrects REVOKED/EXPIRED/CLOSED leases (reconcileBoot
+# only transitions ACTIVE to RECONNECTING; terminal states stay terminal).
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

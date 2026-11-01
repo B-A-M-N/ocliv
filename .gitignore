@@ -1,0 +1,22 @@
+# Ocliv runtime data and build artifacts — never commit these.
+# Runtime state (SQLite, WAL, leases): identity and authorization records.
+ocliv-relay-data/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Local credentials, certificates, enrollment material.
+/etc/ocliv/
+*.pem
+*.key
+*-ca.crt
+ocliv-root.crt
+
+# Built binaries and release artifacts.
+/ocliv
+/ocliv-*
+*.tar.gz
+
+# Test and tool scratch.
+/tmp/

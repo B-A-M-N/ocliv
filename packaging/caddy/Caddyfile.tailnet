@@ -1,0 +1,45 @@
+# Staging-only Caddy edge for the Tailscale lab. NEVER use for public
+# deployment: `tls internal` issues certificates from a lab-local CA, and
+# the bind address is a private tailnet IP. Production uses
+# packaging/caddy/Caddyfile with public DNS-01 wildcard automation.
+#
+# Setup: replace 10.9.66.20 with the relay laptop's Tailscale IPv4
+# (`tailscale ip -4` on the laptop), then:
+#   sudo caddy validate --config /etc/caddy/Caddyfile.tailnet --adapter caddyfile
+# Trust: copy ONLY the CA root (never the key) from the laptop,
+#   /var/lib/caddy/pki/authorities/local/root.crt,
+# to each test client and trust it in the OS store (staging-only trust).
+{
+	auto_https disable_redirects
+}
+
+# Spec port is 443. STAGING_PORT exists only for the no-sudo fallback:
+# an unprivileged user cannot bind 443, so the lab may run Caddy on a
+# high port (STAGING_PORT=8443) with zero change to TLS, SNI/Host, or
+# header behavior. Production always uses 443.
+relay.ocliv.test:{$STAGING_PORT:443}, *.t.ocliv.test:{$STAGING_PORT:443} {
+	# Default: the relay laptop's Tailscale IPv4 (pop-os-3). Override
+	# with STAGING_BIND=<ip> when the tailnet is down — e.g. direct LAN
+	# (10.9.66.20). The carrier (tailnet vs LAN) is immaterial to every
+	# staged property; TLS, SNI/Host, and header behavior are identical.
+	# The relay itself stays on 127.0.0.1:8080; only Caddy listens here.
+	bind {$STAGING_BIND:100.113.85.107}
+
+	# Lab-local CA: no public DNS or ACME needed. Clients must trust the
+	# staging root explicitly; untrusting clients must fail closed.
+	tls internal
+
+	# One loopback upstream for both authorities. The relay dispatches
+	# agent control vs visitor traffic by Host (see internal/relay/relay.go
+	# authorizeHost); Caddy must preserve the public Host and never allow
+	# a visitor to choose the upstream.
+	reverse_proxy 127.0.0.1:8080 {
+		# Overwrite, never append: the relay treats the rightmost entry
+		# as the client IP only from a loopback peer, and ignores
+		# forwarding headers from any non-loopback peer.
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+		# Strip anything the visitor smuggled in.
+		header_up -X-Forwarded-Host
+	}
+}

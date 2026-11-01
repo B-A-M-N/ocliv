@@ -1,0 +1,67 @@
+// Package cli implements Ocliv's command dispatch and terminal UX.
+package cli
+
+import (
+	"fmt"
+	"os"
+	"strings"
+
+	"ocliv/internal/apperr"
+)
+
+// Run dispatches argv. Exit codes follow the spec contract.
+func Run(argv []string) int {
+	if len(argv) == 0 {
+		return usage(apperr.ExitCLIValidation)
+	}
+	switch argv[0] {
+	case "version", "--version", "-V":
+		fmt.Println("ocliv 1.0.0 (protocol ocliv/1)")
+		return apperr.ExitOK
+	case "help", "--help", "-h":
+		return usage(apperr.ExitOK)
+	case "login":
+		return cmdLogin(argv[1:])
+	case "logout":
+		return cmdLogout(argv[1:])
+	case "status":
+		return cmdStatus(argv[1:])
+	case "doctor":
+		return cmdDoctor(argv[1:])
+	case "relay":
+		return cmdRelay(argv[1:])
+	case "access":
+		return cmdAccess(argv[1:])
+	case "mcp":
+		return cmdMCP(argv[1:])
+	default:
+		if strings.HasPrefix(argv[0], "-") {
+			fmt.Fprintf(os.Stderr, "unknown flag %q; see `ocliv help`\n", argv[0])
+			return apperr.ExitCLIValidation
+		}
+		return cmdTunnel(argv)
+	}
+}
+
+func usage(code int) int {
+	fmt.Print(`Ocliv — secure instant HTTPS hosting.
+
+Usage:
+  ocliv PORT [--public] [--ipv6] [--name NAME] [--ttl 2h] [--upstream-host H] [--json] [--no-share-link] [--share-link-file PATH]
+  ocliv login --relay URL --code-file PATH
+  ocliv logout
+  ocliv status [--json]
+  ocliv access share|rotate|revoke [LEASE]
+  ocliv doctor
+  ocliv relay init --domain DOMAIN | relay serve --domain DOMAIN [--mcp-host HOST] [--relay-host HOST] | relay doctor | relay issue-enroll
+  ocliv mcp expose -- COMMAND [ARGS...]
+  ocliv mcp manage
+  ocliv mcp publish --local URL --auth upstream-oauth|fixture-anonymous [--name N] [--ttl D] ...
+  ocliv mcp serve --local URL --auth upstream-oauth|fixture-anonymous ...
+  ocliv mcp doctor [--lease ID] [--name LABEL]
+  ocliv version
+`)
+	return code
+}
+
+// agentFiles resolves key/config/lease paths.

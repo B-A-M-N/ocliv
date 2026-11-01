@@ -1,0 +1,32 @@
+# Single-host edge for ocliv relay MCP hosting (no wildcard DNS required).
+# Serves ONE fully qualified public hostname (e.g. relay.example.org)
+# with normal ACME HTTPS: agent control, unlock pages, AND path-based MCP
+# routes (/r/<route-id>/mcp) all share this host. The relay distinguishes
+# them by exact Host + path (internal/relay/relay_authority.go,
+# relay_mcp_ingress.go); Caddy must not rewrite paths or append
+# forwarding headers.
+#
+# The relay binds loopback only (127.0.0.1:8080); Caddy terminates public
+# TLS and asserts the client identity the relay trusts: overwrite, never
+# append, the forwarding headers, and strip anything the visitor
+# smuggled in (same trusted-edge contract as the wildcard Caddyfile).
+#
+# Replace {$OCLIV_HOST} and {$OCLIV_ACME_EMAIL} at deploy time. Validate
+# with: caddy validate --config Caddyfile.single-host --adapter caddyfile
+{
+	auto_https disable_redirects
+}
+
+{$OCLIV_HOST} {
+	tls {$OCLIV_ACME_EMAIL}
+
+	reverse_proxy 127.0.0.1:8080 {
+		# Overwrite: the relay treats the rightmost entry as the
+		# client IP only from a loopback peer.
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+		# Strip anything the visitor smuggled in: routing reads r.Host,
+		# never a forwarded host label.
+		header_up -X-Forwarded-Host
+	}
+}
