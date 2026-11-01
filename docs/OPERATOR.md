@@ -142,8 +142,10 @@ Do not represent single-node operation as highly available (H09).
 ## Public single-host deployment (production ingress)
 
 One public relay serves all publishers; publishers need no DNS, ports,
-or certificates of their own. On a host with a public IP and a domain
-you control:
+or certificates of their own. Host-specific walkthroughs:
+[home host behind a router](/home/bamn/ocliv/docs/HOME-HOST.md) ·
+[VPS with a public IP](/home/bamn/ocliv/docs/VPS.md).
+On a host with a public IP and a domain you control:
 
 1. DNS: one `A`/`AAAA` record for the relay hostname (e.g.
    `relay.hosting.test` → public IP). No wildcard needed for
