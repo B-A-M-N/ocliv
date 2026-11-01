@@ -385,3 +385,17 @@ in disposable dirs (`/tmp`, never the tree):
 - `relay init --domain hosting.test --mcp-host relay.hosting.test ...`
   → exit 0, four files generated; `--check` → exit 0 consistent.
 Disposition: documented flows behave as documented; no drift found.
+
+## Re-audit on committed HEAD (defect loop)
+
+- Activation-vs-revoke TOCTOU: VERIFIED NON-ISSUE. `serveMCPRouteActivate`
+  CAS-gates on ownership + unrevoked + unverified, but does not check
+  lease/key liveness — safe because admission is the enforcing point:
+  `revokeAgentKeyTx` terminally revokes all live leases in-tx with
+  post-commit session eviction, and `admitRoutedLease` denies anything
+  not ACTIVE with a live generation-matched session. A verified_at set
+  on a dead lease still denies at every ingress path.
+- Concurrent route create: re-verified FIXED. Single-statement
+  INSERT..SELECT..WHERE EXISTS(lease ACTIVE) + ON CONFLICT DO NOTHING
+  on `idx_mcp_publications_logical`; loser re-reads winner;
+  `TestMCPRouteConcurrentCreate` green.
