@@ -412,3 +412,18 @@ Disposition: documented flows behave as documented; no drift found.
   `TestRevokeDeniesLiveDispatchAtBoundary`); CLI-driven revocation lands
   in durable state and `supervise` revalidates lease status every 5s tick,
   evicting terminal (REVOKED/CLOSED/EXPIRED) leases under live sessions.
+
+## Re-audit on committed HEAD, round 3 (defect loop)
+
+- Restore atomicity/filesystem safety: VERIFIED (no edit). `BackupState`
+  snapshots via `VACUUM INTO` (consistent, WAL-free) + 0600 + rename +
+  dirSync. `RestoreState` enforces --relay-stopped attestation,
+  `ValidateBackup` (copy + open + integrity_check), data-dir symlink
+  refusal, same-file refusal, live-writer tripwire (BEGIN IMMEDIATE,
+  fail-closed), revocation rollback diff incl. terminal states,
+  token_generation watermark, deleted-publication resurrection guard,
+  optional --reset-authority, staged 0600 install + rename + WAL
+  sidecar cleanup + dirSync, post-install audit row. Residual honest
+  limit (documented in code): the tripwire cannot prove an idle relay
+  is stopped — operator attestation required; live drill stays BLOCKED
+  on disposable infra.
