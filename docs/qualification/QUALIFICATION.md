@@ -579,3 +579,18 @@ quirk only; public behavior is the oracle.
   explicit clean-host NOT YET QUALIFIED honesty.
 - `go test ./packaging/install/ -count=1` → ok.
 - Disposition: FIXED (installer slice); VERIFIED NON-ISSUE (unit/launcher).
+
+## Round 14 — edge/packaging re-audit (2026-11-01)
+- Finding (P2, misconfiguration risk): `Caddyfile.tailnet` defaulted
+  `bind {$STAGING_BIND:100.113.85.107}` — a stale machine-specific IP.
+  An operator following the doc ("replace with the laptop IP") but
+  missing the default would bind a dead address.
+- Fix: no default (`bind {$STAGING_BIND}`) so Caddy fails fast at adapt
+  time when unset; comments + `docs/OPERATOR.md` now mandate exporting
+  `STAGING_BIND=$(tailscale ip -4)`. No other references to the stale IP
+  exist in the repo.
+- Plugin gates re-verified: `build-plugin.sh --release` → exit 1 on
+  `REPLACE-WITH-*` placeholders; dev build → exit 0.
+- Full `caddy validate` remains BLOCKED (no caddy binary here; needs the
+  relay laptop + sudo). Placeholder syntax verified by inspection.
+- Disposition: FIXED (tailnet default); VERIFIED NON-ISSUE (plugin gates).

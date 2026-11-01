@@ -195,9 +195,11 @@ mkdir -p "$HOME/ocliv-lab" && chmod 700 "$HOME/ocliv-lab"
 ```
 
 In another terminal, stage Caddy with [Caddyfile.tailnet](/home/bamn/ocliv/packaging/caddy/Caddyfile.tailnet)
-(bound to the laptop's Tailscale IP, `tls internal`), then `sudo caddy
-validate --config /etc/caddy/Caddyfile.tailnet --adapter caddyfile` and
-start/reload Caddy. Mint enrollment codes with `./ocliv relay
+(bound to the laptop's Tailscale IP, `tls internal`). `STAGING_BIND` has
+no default and Caddy refuses to adapt without it — export the laptop's
+Tailscale IPv4 first (`export STAGING_BIND=$(tailscale ip -4)`), then
+`sudo -E caddy validate --config /etc/caddy/Caddyfile.tailnet --adapter
+caddyfile` and start/reload Caddy. Mint enrollment codes with `./ocliv relay
 issue-enroll --data="$HOME/ocliv-lab" --tenant=lab`. Relay stays on
 loopback; only Caddy listens on the tailnet IP.
 
