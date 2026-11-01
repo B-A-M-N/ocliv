@@ -788,3 +788,15 @@ quirk only; public behavior is the oracle.
   TestShare|TestClose|TestSuspend|TestUnsuspend|TestAtomic|TestEvict`)
   → all PASS.
 - Disposition: VERIFIED NON-ISSUE for this leg.
+
+## Round 29 — transport/enrollment/operator re-audit (2026-11-01)
+- Transport: `checkedTLS` refuses nil/InsecureSkipVerify (B01/B02),
+  plaintext only via explicit loopback-test flag; bounded control
+  messages, stream-open timeout, caller-must-close discipline (E06).
+  `isWSS` prefix check is loose ("httpsX") but fail-closed at dial.
+- Enrollment: one-time code consumed transactionally with key insert;
+  `IssueEnrollmentCode` is a narrow store op — no `Server`
+  construction, no `reconcileBoot` side effects on live leases (P0-01).
+- Operator revocation paths covered in Round 28.
+- Focused transport/enrollment/operator tests → ok.
+- Disposition: VERIFIED NON-ISSUE for this leg.
