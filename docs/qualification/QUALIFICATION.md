@@ -505,3 +505,15 @@ quirk only; public behavior is the oracle.
 - `go test ./internal/cli/ ./internal/config/ -count=1` → ok (4.8s / 0.2s).
 - Disposition: VERIFIED NON-ISSUE for this leg — no new defect; P2-1 (IPv6)
   and doctor-selection fixes hold.
+
+## Round 9 — limits/transport re-audit (2026-11-01)
+- `Throttle.Allow` in-place filter idiom is safe; cardinality capped + sweep.
+- `Registry.Drop` called on `evictLease` and reconnect-expiry paths; `detach`
+  (RECONNECTING, resumable) and `evictIfOlder` (replacement reuses budget)
+  correctly retain it.
+- Every declared cap wired: MaxHeaderBytes (relay servers), MaxBodyBytes
+  (protocol running total + MCP adapter), WSMaxLifetime/WSIdleTimeout
+  (relay_ws + agent_ws), HeaderTimeout/UpstreamTimeout (dialers/servers),
+  PreAuthBurst + MCPAdmissionBurst (admission pre-stream).
+- `go test ./internal/limits/ ./internal/transport/ -count=1` → ok.
+- Disposition: VERIFIED NON-ISSUE for this leg.
