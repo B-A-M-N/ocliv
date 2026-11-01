@@ -427,3 +427,19 @@ Disposition: documented flows behave as documented; no drift found.
   limit (documented in code): the tripwire cannot prove an idle relay
   is stopped — operator attestation required; live drill stays BLOCKED
   on disposable infra.
+
+## Re-audit on committed HEAD, round 4 (defect loop)
+
+- waitHead ctx.Done asymmetry (restartHeadDeadline without
+  armHeadSocketDeadline): VERIFIED NON-ISSUE. If the head already
+  arrived, no socket wait is pending (awaitHead clears the deadline on
+  delivery to the buffered headArrived channel). If not, the
+  coordinator returns via markStopped and the admission-site
+  `defer stream.Close()` (relay_public.go) releases the blocked
+  awaitHead reader. Goroutine-leak coverage:
+  `TestCancelWhileStalledLeaksNoGoroutines`.
+- Dispatch-time session substitution: VERIFIED enforced. Admission
+  site re-checks `admittedSessionCurrent(cur, sess, generation)` after
+  OpenStream (P1-5); stale-generation streams are rejected before the
+  request head is written, with a test barrier (`dispatchHold`)
+  landing exactly in the check-to-write window.
