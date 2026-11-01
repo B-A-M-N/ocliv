@@ -1001,3 +1001,15 @@ Drill (container removed afterwards, zero host footprint):
   mutation performed in this slice.
 - Disposition: FIXED (slice 2 scope). Bootstrap/systemd/enrollment
   (slice 3) pending.
+
+## Round 41 — setup render+verify+persist slice (2026-11-02)
+- `setup --auto --hostname Z --acme-email E [--out D]`: after the DNS
+  update, renders the single-host deployment via the existing init
+  machinery, self-checks it with checkInitDir, confirms the name
+  resolves to the observed egress, and only then persists relay_url
+  (mergeRelayURL) for `ocliv 3000`/`mcp publish`. Mismatch or
+  unresolvable DNS exits 5 with no persistence. Nothing activated.
+- Tests: render-persists-on-match, render-refuses-on-mismatch (stubbed
+  resolver, temp HOME, fixture endpoints). Focused suites PASS.
+- Disposition: FIXED (slice 3a scope). Caddy/systemd/enrollment
+  automation (slice 3b) pending.

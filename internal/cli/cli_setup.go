@@ -10,7 +10,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -34,6 +36,8 @@ func cmdSetup(argv []string) int {
 	dryRun := false
 	hostname := ""
 	tokenFile := ""
+	acmeEmail := ""
+	outDir := ""
 	echoV4, echoV6 := defaultEchoV4, defaultEchoV6
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
@@ -57,6 +61,16 @@ func cmdSetup(argv []string) int {
 		case a == "--token-file" && i+1 < len(argv):
 			i++
 			tokenFile = argv[i]
+		case strings.HasPrefix(a, "--acme-email="):
+			acmeEmail = strings.TrimPrefix(a, "--acme-email=")
+		case a == "--acme-email" && i+1 < len(argv):
+			i++
+			acmeEmail = argv[i]
+		case strings.HasPrefix(a, "--out="):
+			outDir = strings.TrimPrefix(a, "--out=")
+		case a == "--out" && i+1 < len(argv):
+			i++
+			outDir = argv[i]
 		case strings.HasPrefix(a, "--echo-v4="):
 			echoV4 = strings.TrimPrefix(a, "--echo-v4=")
 		case a == "--echo-v4" && i+1 < len(argv):
@@ -96,14 +110,17 @@ func cmdSetup(argv []string) int {
 		printSetupNext(d)
 		return apperr.ExitOK
 	}
-	return runSetupDNS(ctx, d, hostname, tokenFile, dryRun)
+	return runSetupDNS(ctx, d, hostname, tokenFile, acmeEmail, outDir, dryRun)
 }
 
 // runSetupDNS syncs the dynv6 zone to the observed egress addresses.
 // The token comes from DYNV6_TOKEN or an owner-only --token-file, never
 // from argv, logs, or errors. --dry-run prints the exact update with
-// the token redacted and sends nothing.
-func runSetupDNS(ctx context.Context, d setup.Detection, hostname, tokenFile string, dryRun bool) int {
+// the token redacted and sends nothing. With --acme-email, a successful
+// update additionally renders the single-host deployment, verifies the
+// name resolves to the observed egress, and persists relay_url for
+// `ocliv 3000` / `mcp publish`; nothing is activated yet.
+func runSetupDNS(ctx context.Context, d setup.Detection, hostname, tokenFile, acmeEmail, outDir string, dryRun bool) int {
 	token := strings.TrimSpace(os.Getenv("DYNV6_TOKEN"))
 	if tokenFile != "" {
 		fi, err := os.Stat(tokenFile)
@@ -126,10 +143,7 @@ func runSetupDNS(ctx context.Context, d setup.Detection, hostname, tokenFile str
 		fmt.Fprintf(os.Stderr, "dynv6 HTTP token needed for %q: create one at https://dynv6.com/keys (HTTP token for the zone), then export DYNV6_TOKEN or pass --token-file PATH (0600)\n", hostname)
 		return apperr.ExitAuth
 	}
-	endpoint := strings.TrimSpace(os.Getenv("OCLIV_DYNV6_ENDPOINT"))
-	if endpoint == "" {
-		endpoint = setup.Dynv6UpdateEndpoint
-	}
+	endpoint := dynv6Endpoint()
 	fmt.Printf("dns update: %s -> v4=%s v6=%s (token from %s, redacted)\n",
 		hostname, nonEmpty(d.EgressV4), nonEmpty(d.EgressV6), tokenSource(tokenFile))
 	if dryRun {
@@ -141,6 +155,59 @@ func runSetupDNS(ctx context.Context, d setup.Detection, hostname, tokenFile str
 		return apperr.ExitRelayTLS
 	}
 	fmt.Printf("dns updated for %s; verify with: dig +short %s A; dig +short %s AAAA\n", hostname, hostname, hostname)
+	if acmeEmail == "" {
+		return apperr.ExitOK
+	}
+	return runSetupRender(ctx, d, hostname, acmeEmail, outDir)
+}
+
+// runSetupRender generates the reviewable single-host deployment for
+// the dynv6 hostname, self-checks it, confirms the name resolves to
+// the observed egress, and only then persists relay_url. Caddy,
+// systemd, and enrollment stay manual until the next slice automates
+// them; this function activates nothing.
+func runSetupRender(ctx context.Context, d setup.Detection, hostname, acmeEmail, outDir string) int {
+	dir, _, _, err := agentFiles()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
+	}
+	if outDir == "" {
+		outDir = filepath.Join(dir, "setup-"+strings.ToLower(hostname))
+	}
+	initArgv := []string{"--domain", hostname, "--mcp-host", hostname,
+		"--acme-email", acmeEmail, "--out", outDir}
+	if code := cmdRelayInit(initArgv); code != apperr.ExitOK {
+		return code
+	}
+	if bad := checkInitDir(outDir); len(bad) > 0 {
+		for _, line := range bad {
+			fmt.Fprintln(os.Stderr, "init check: "+line)
+		}
+		return apperr.ExitInternal
+	}
+	matched, addrs, err := verifyDNSResolution(ctx, hostname, []string{d.EgressV4, d.EgressV6})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "dns for %s not resolving here yet (%v); wait for propagation, then re-run `ocliv setup --auto --hostname %s --acme-email %s`\n", hostname, err, hostname, acmeEmail)
+		return apperr.ExitRelayTLS
+	}
+	if !matched {
+		fmt.Fprintf(os.Stderr, "dns for %s resolves to %s here, not to observed egress %s/%s; refusing to persist an unverified endpoint (propagation delay or wrong zone?)\n",
+			hostname, strings.Join(addrs, ","), nonEmpty(d.EgressV4), nonEmpty(d.EgressV6))
+		return apperr.ExitRelayTLS
+	}
+	_, _, cfgPath, err := agentFiles()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
+	}
+	relayURL := "https://" + strings.ToLower(strings.TrimSuffix(strings.TrimSpace(hostname), "."))
+	if err := mergeRelayURL(cfgPath, relayURL); err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
+	}
+	fmt.Printf("deployment rendered to %s and relay_url persisted (%s)\n", outDir, relayURL)
+	fmt.Printf("not yet active: install the Caddyfile, enable the unit, enroll (see deployment dir), then verify externally\n")
 	return apperr.ExitOK
 }
 
@@ -149,6 +216,43 @@ func tokenSource(tokenFile string) string {
 		return "--token-file"
 	}
 	return "DYNV6_TOKEN"
+}
+
+// dynv6Endpoint is the update API base. OCLIV_DYNV6_ENDPOINT overrides
+// it for hermetic tests; production always uses the provider default.
+func dynv6Endpoint() string {
+	if v := strings.TrimSpace(os.Getenv("OCLIV_DYNV6_ENDPOINT")); v != "" {
+		return v
+	}
+	return setup.Dynv6UpdateEndpoint
+}
+
+// setupLookupHost resolves a name via the local resolver. It is a var
+// so tests can stub DNS without network access.
+var setupLookupHost = func(ctx context.Context, host string) ([]string, error) {
+	return net.DefaultResolver.LookupHost(ctx, host)
+}
+
+// verifyDNSResolution reports whether hostname currently resolves (from
+// this machine's resolver) to one of the observed egress addresses.
+// A miss usually means propagation delay, not a failed update.
+func verifyDNSResolution(ctx context.Context, hostname string, want []string) (matched bool, addrs []string, err error) {
+	addrs, err = setupLookupHost(ctx, hostname)
+	if err != nil {
+		return false, nil, err
+	}
+	wantSet := map[string]bool{}
+	for _, w := range want {
+		if w != "" {
+			wantSet[w] = true
+		}
+	}
+	for _, a := range addrs {
+		if wantSet[a] {
+			return true, addrs, nil
+		}
+	}
+	return false, addrs, nil
 }
 
 func printSetupReport(d setup.Detection) {
