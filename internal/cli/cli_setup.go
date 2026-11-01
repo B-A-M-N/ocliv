@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -207,7 +208,56 @@ func runSetupRender(ctx context.Context, d setup.Detection, hostname, acmeEmail,
 		return apperr.ExitInternal
 	}
 	fmt.Printf("deployment rendered to %s and relay_url persisted (%s)\n", outDir, relayURL)
-	fmt.Printf("not yet active: install the Caddyfile, enable the unit, enroll (see deployment dir), then verify externally\n")
+	return runSetupBootstrap(d, hostname, outDir)
+}
+
+// runSetupBootstrap executes the viable-path edge plan. Only steps the
+// planner marks auto run, and only as root; everything else prints as
+// the exact manual command. Live executors back up before replacing.
+func runSetupBootstrap(d setup.Detection, hostname, deployDir string) int {
+	_, caddyErr := exec.LookPath("caddy")
+	env := setup.BootstrapEnv{
+		AsRoot:       os.Geteuid() == 0,
+		CaddyPresent: caddyErr == nil,
+		Path:         d.Path,
+		Hostname:     hostname,
+		DeployDir:    deployDir,
+	}
+	steps, blockReason := setup.PlanBootstrap(env)
+	if blockReason != "" && len(steps) == 0 {
+		fmt.Printf("edge provisioning blocked: %s\n", blockReason)
+		return apperr.ExitOK
+	}
+	for _, s := range steps {
+		if !s.Auto {
+			fmt.Printf("manual: %s\n  %s\n", s.Title, s.Manual)
+			continue
+		}
+		fmt.Printf("auto: %s ... ", s.Title)
+		var err error
+		switch s.Title {
+		case "install Caddyfile":
+			err = setup.InstallCaddyfile(deployDir)
+		case "install systemd unit":
+			err = setup.InstallUnit(deployDir)
+		case "enable and start relay":
+			err = setup.StartRelay()
+		default:
+			err = fmt.Errorf("unknown step %q", s.Title)
+		}
+		if err != nil {
+			fmt.Printf("FAILED: %v\n", err)
+			fmt.Printf("manual recovery: %s\n  %s\n", s.Title, s.Manual)
+			return apperr.ExitInternal
+		}
+		fmt.Printf("done\n")
+	}
+	// Single-manual-step plans (e.g. install Caddy first) block with
+	// the re-run guidance instead of claiming progress.
+	if blockReason != "" {
+		fmt.Printf("next: %s\n", blockReason)
+	}
+	fmt.Printf("verify externally: from another network, curl -v https://%s/v1/agent/challenge (no -k)\n", hostname)
 	return apperr.ExitOK
 }
 

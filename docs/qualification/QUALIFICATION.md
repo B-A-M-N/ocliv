@@ -1013,3 +1013,18 @@ Drill (container removed afterwards, zero host footprint):
   resolver, temp HOME, fixture endpoints). Focused suites PASS.
 - Disposition: FIXED (slice 3a scope). Caddy/systemd/enrollment
   automation (slice 3b) pending.
+
+## Round 42 — setup bootstrap plan slice (2026-11-02)
+- New `PlanBootstrap`: viable paths (direct-v6/v4, NAT) produce
+  Caddyfile/unit/enable/enroll steps; CGNAT/unknown block with a
+  reason; non-root plans are all-manual with exact commands; missing
+  Caddy stops at a manual install step with re-run guidance.
+- Live executors (root only): InstallCaddyfile backs up the existing
+  edge config and restores it if `caddy validate` fails; InstallUnit
+  + StartRelay are separate steps. Enrollment stays manual until the
+  auto-enrollment loop (next slice) lands — planner enforces this.
+- Tests: 5 plan-matrix tests + full cli suite green, build clean.
+  Executors are live-only (need root/systemd/Caddy) and untested
+  in-repo; recorded as simulated-vs-live gap for the qualification
+  docs slice.
+- Disposition: FIXED (slice 3b scope). Auto-enrollment (3c) pending.
