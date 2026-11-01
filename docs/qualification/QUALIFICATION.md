@@ -775,3 +775,16 @@ quirk only; public behavior is the oracle.
 - `go test -count=1 -timeout 280s ./tests/integration/` → ok (211.7s).
 - `go test -race ./internal/doctor/ ./internal/cli/` → ok.
 - Worktree clean; all changes committed (af4853b tip at gate time).
+
+## Round 28 — lease management/revocation re-audit (2026-11-01)
+- `agentLeaseAuth`: ownership + skew + signature + one-time global
+  nonce (INSERT claim, replay denied); GET status needs no nonce
+  (read-only, correct).
+- `revokeLeaseTx` / `revokeAgentKeyTx`: single-tx revocation of
+  tokens, sessions, generation bump, lease status, publication
+  tombstones; post-commit session eviction kills in-flight forwarding;
+  tenant unsuspend never resurrects keys (explicit re-enrollment).
+- 11 focused tests (`TestMgmt|TestLease|TestRevoke|TestRotate|
+  TestShare|TestClose|TestSuspend|TestUnsuspend|TestAtomic|TestEvict`)
+  → all PASS.
+- Disposition: VERIFIED NON-ISSUE for this leg.
