@@ -627,3 +627,16 @@ quirk only; public behavior is the oracle.
   Close order (listener → kill → reap).
 - `go test ./internal/mcp/ ./internal/proxy/ ./internal/protocol/ ./internal/access/ -count=1` → all ok.
 - Disposition: VERIFIED NON-ISSUE for this leg.
+
+## Round 17 — store/persistence re-audit + Round 11 adversarial review (2026-11-01)
+- Schema: numbered transactional migrations (V1–V5), version stamp in the
+  same tx, unknown-newer fails closed, V2 invalidates pre-P0-4 session
+  rows, V3/V4 dedup before unique indexes. Matches the claimed design.
+- Round 11 adversarial review: `generation` exists in the base leases
+  schema (NOT NULL DEFAULT 1), and `readRevocations` only runs on
+  `store.Open`'d (migrated) DBs — the new `SELECT id, generation` cannot
+  hit a column-missing database. `--reset-authority` intentionally
+  bypasses all rollback checks (documented escape hatch). Mutation check:
+  new test failed pre-fix, passes post-fix; legitimate restores (equal
+  or absent generations) are not refused.
+- Disposition: VERIFIED NON-ISSUE (store); Round 11 FIXED stands.
