@@ -494,3 +494,14 @@ quirk only; public behavior is the oracle.
 ## Round 7 supplemental — race gate (2026-11-01)
 - `go test -race ./internal/relay/ -count=1 -timeout 280s` → ok (99.991s).
 - WS hijack-buffer + backpressure fixes hold under race detector. Round 7 dispositions unchanged (all FIXED).
+
+## Round 8 — CLI/doctor re-audit (2026-11-01)
+- Re-inspected `runMCPProbe` modern/legacy stages, `validateEnvelope` id echo,
+  `decodeJSONRPC` SSE handling, `selectDoctorLeaseID` (--lease > --name >
+  latest, fail-closed), `doctorLoopbackTarget` (IPv6 record honored;
+  `http://[::1]:port/mcp` is a valid URL), `parseMCPLocalURL` rejections.
+- Removed stray empty ignored dir `internal/cli/ocliv-relay-data/` (created by
+  a prior default-`--data` run; all tests pass explicit `--data`).
+- `go test ./internal/cli/ ./internal/config/ -count=1` → ok (4.8s / 0.2s).
+- Disposition: VERIFIED NON-ISSUE for this leg — no new defect; P2-1 (IPv6)
+  and doctor-selection fixes hold.
