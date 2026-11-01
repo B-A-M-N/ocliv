@@ -767,3 +767,11 @@ quirk only; public behavior is the oracle.
   verified relay dispatch (HTTP 401 on challenge), trusted TLS, and an
   honest verified-negative local probe. No state mutated.
 - Disposition: VERIFIED NON-ISSUE for this leg.
+
+## Milestone gate — Rounds 18–27 (2026-11-01)
+- `go build ./...` → ok; `go vet ./...` → ok;
+  `gofmt -l internal/ cmd/ tests/ packaging/` → clean.
+- `go test ./internal/... -count=1` → all ok.
+- `go test -count=1 -timeout 280s ./tests/integration/` → ok (211.7s).
+- `go test -race ./internal/doctor/ ./internal/cli/` → ok.
+- Worktree clean; all changes committed (af4853b tip at gate time).
