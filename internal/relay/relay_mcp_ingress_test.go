@@ -606,3 +606,180 @@ func TestCreateMCPRouteValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestMCPRouteOAuthPathParsing(t *testing.T) {
+	cases := []struct {
+		path string
+		id   string
+		fwd  string
+		ok   bool
+	}{
+		{"/r/abc123/oauth/authorize", "abc123", "/oauth/authorize", true},
+		{"/r/abc123/oauth/token", "abc123", "/oauth/token", true},
+		{"/r/abc123/oauth/register", "abc123", "/oauth/register", true},
+		{"/r/ABC-9_x/oauth/token", "ABC-9_x", "/oauth/token", true},
+		{"/r/abc123/oauth/admin", "", "", false},    // not allowlisted
+		{"/r/abc123/oauth/", "", "", false},         // empty endpoint
+		{"/r/abc123/oauth", "", "", false},          // missing endpoint
+		{"/r/abc123/oauth/token/", "", "", false},   // trailing slash
+		{"/r/abc123/mcp", "", "", false},            // tool shape is not OAuth
+		{"/r//oauth/token", "", "", false},          // empty route ID
+		{"/r/abc%2fdef/oauth/token", "", "", false}, // encoded separator stays literal
+		{"/r/abc123/OAuth/token", "", "", false},    // case-sensitive
+	}
+	for _, c := range cases {
+		id, fwd, ok := parseMCPRouteOAuthPath(c.path)
+		if ok != c.ok || id != c.id || fwd != c.fwd {
+			t.Errorf("parseMCPRouteOAuthPath(%q) = (%q, %q, %v), want (%q, %q, %v)",
+				c.path, id, fwd, ok, c.id, c.fwd, c.ok)
+		}
+	}
+}
+
+func TestMCPRouteASMetadataPathParsing(t *testing.T) {
+	cases := []struct {
+		path string
+		id   string
+		fwd  string
+		ok   bool
+	}{
+		{"/.well-known/oauth-authorization-server/r/abc123/oauth", "abc123", "/.well-known/oauth-authorization-server", true},
+		{"/.well-known/oauth-authorization-server/r/ABC-9_x/oauth", "ABC-9_x", "/.well-known/oauth-authorization-server", true},
+		{"/.well-known/oauth-authorization-server/r/abc123/oauth/", "", "", false},
+		{"/.well-known/oauth-authorization-server/r/abc123/mcp", "", "", false},
+		{"/.well-known/oauth-authorization-server/r/abc123", "", "", false},
+		{"/.well-known/oauth-authorization-server/r//oauth", "", "", false},
+		{"/.well-known/oauth-authorization-server/r/abc%2fdef/oauth", "", "", false},
+		{"/.well-known/oauth-authorization-server", "", "", false}, // server-root form is not route-scoped
+		{"/.well-known/openid-configuration/r/abc123/oauth", "", "", false},
+	}
+	for _, c := range cases {
+		id, fwd, ok := parseMCPRouteASMetadataPath(c.path)
+		if ok != c.ok || id != c.id || fwd != c.fwd {
+			t.Errorf("parseMCPRouteASMetadataPath(%q) = (%q, %q, %v), want (%q, %q, %v)",
+				c.path, id, fwd, ok, c.id, c.fwd, c.ok)
+		}
+	}
+}
+
+func TestMCPRouteOAuthAdmitted(t *testing.T) {
+	s, db := newMCPServer(t)
+	insertMCPLeaseRow(t, db, "lse-oa", "oa.t.example.test", AccessModeMCPUpstreamOAuth, lease.StateActive, 1, nil)
+	liveFabricatedSession(t, s, "lse-oa", 1)
+	if err := createMCPRoute(db, "public.example.org", "route-oa", "lse-oa", "upstream-oauth"); err != nil {
+		t.Fatal(err)
+	}
+	shapes := map[string]string{
+		"/r/route-oa/oauth/authorize":                              "/oauth/authorize",
+		"/r/route-oa/oauth/token":                                  "/oauth/token",
+		"/r/route-oa/oauth/register":                               "/oauth/register",
+		"/.well-known/oauth-authorization-server/r/route-oa/oauth": "/.well-known/oauth-authorization-server",
+	}
+	for public, wantFwd := range shapes {
+		r := httptest.NewRequest(http.MethodGet, public, nil)
+		r.Host = "public.example.org"
+		tgt, sess, out, code := s.admitPathRoute(r)
+		if code != 0 {
+			t.Fatalf("%s denied: code=%d", public, code)
+		}
+		if tgt.LeaseID != "lse-oa" || sess == nil || !tgt.ViaPathRoute {
+			t.Fatalf("%s admitted wrong target: %+v", public, tgt)
+		}
+		if out.URL.EscapedPath() != wantFwd {
+			t.Fatalf("%s forwarded to %q, want %q", public, out.URL.EscapedPath(), wantFwd)
+		}
+	}
+	// Unknown route IDs fail closed without reaching the lease.
+	r := httptest.NewRequest(http.MethodGet, "/r/no-such-route/oauth/token", nil)
+	r.Host = "public.example.org"
+	if _, _, _, code := s.admitPathRoute(r); code != http.StatusNotFound {
+		t.Fatalf("unknown OAuth route: got %d, want 404", code)
+	}
+	// A revoked lease denies OAuth endpoints exactly like tool traffic.
+	insertMCPLeaseRow(t, db, "lse-oar", "oar.t.example.test", AccessModeMCPUpstreamOAuth, lease.StateRevoked, 1, nil)
+	if err := createMCPRoute(db, "public.example.org", "route-oar", "lse-oar", "upstream-oauth"); err != nil {
+		t.Fatal(err)
+	}
+	r2 := httptest.NewRequest(http.MethodGet, "/r/route-oar/oauth/token", nil)
+	r2.Host = "public.example.org"
+	if _, _, _, code := s.admitPathRoute(r2); code != http.StatusServiceUnavailable {
+		t.Fatalf("revoked OAuth route: got %d, want 503", code)
+	}
+}
+
+// TestSharedHostOAuthFullHandler proves the complete authority →
+// admission → forwarding sequence for the route-scoped OAuth endpoints
+// on a shared relay/MCP hostname. A live route must forward (the fake
+// agent aborts, surfacing 5xx — never 421); a fixture-anonymous lease
+// must deny the OAuth shapes with 404 while its tool path still works;
+// unrelated paths keep the 421.
+func TestSharedHostOAuthFullHandler(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "ocliv.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	s, err := New(Options{
+		DB: db, Namespace: "t.example.test",
+		RelayHost: "public.example.org", MCPExternalHost: "public.example.org",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertMCPLeaseRow(t, db, "lse-oh", "oh.t.example.test", AccessModeMCPUpstreamOAuth, lease.StateActive, 1, nil)
+	if err := createMCPRoute(db, "public.example.org", "route-oh", "lse-oh", "upstream-oauth"); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"/r/route-oh/oauth/authorize", "/r/route-oh/oauth/token", "/r/route-oh/oauth/register", "/.well-known/oauth-authorization-server/r/route-oh/oauth"} {
+		// The dispatch harness serves exactly one stream: fresh
+		// harness and session per shape.
+		h := newDispatchHarness(t)
+		insertRegistrySession(s, &Session{LeaseID: "lse-oh", Generation: 1, Yamux: h.relayYS,
+			Budget: s.budgets.For("lse-oh"), closed: make(chan struct{})})
+		w := serveRoute(s, http.MethodGet, "public.example.org", p, nil)
+		select {
+		case head := <-h.gotHead:
+			if head.Generation != 1 || head.LeaseID != "lse-oh" {
+				t.Fatalf("%s forwarded wrong head: %+v", p, head)
+			}
+		case <-h.noHead:
+			t.Fatalf("live OAuth endpoint %s never reached the agent", p)
+		case <-time.After(12 * time.Second):
+			t.Fatalf("live OAuth endpoint %s stalled before the agent", p)
+		}
+		if w.Code == http.StatusMisdirectedRequest {
+			t.Fatalf("shared-host OAuth endpoint %s rejected at the authority gate (421)", p)
+		}
+		if w.Code/100 != 5 {
+			t.Fatalf("aborted OAuth endpoint %s: status=%d, want 5xx", p, w.Code)
+		}
+	}
+	// Fixture-anonymous leases deny OAuth shapes with 404 (serveRouted
+	// allowlist) while the tool path still admits.
+	insertMCPLeaseRow(t, db, "lse-of", "of.t.example.test", AccessModeMCPAnonymousFixture, lease.StateActive, 1, nil)
+	h2 := newDispatchHarness(t)
+	insertRegistrySession(s, &Session{LeaseID: "lse-of", Generation: 1, Yamux: h2.relayYS,
+		Budget: s.budgets.For("lse-of"), closed: make(chan struct{})})
+	if err := createMCPRoute(db, "public.example.org", "route-of", "lse-of", "fixture-anonymous"); err != nil {
+		t.Fatal(err)
+	}
+	if w := serveRoute(s, http.MethodPost, "public.example.org", "/r/route-of/oauth/token", nil); w.Code != http.StatusNotFound {
+		t.Fatalf("fixture OAuth endpoint: got %d, want 404", w.Code)
+	}
+	// Denial happens before any stream opens, so the fake agent sees
+	// nothing: assert no head arrived (gotHead would only fire if the
+	// relay forwarded). noHead fires at harness teardown; a head would
+	// be a failure.
+	select {
+	case head := <-h2.gotHead:
+		t.Fatalf("fixture OAuth endpoint reached the agent: %+v", head)
+	default:
+	}
+	// Unrelated OAuth-looking paths keep the 421.
+	if w := serveRoute(s, http.MethodGet, "public.example.org", "/r/route-oh/oauth/admin", nil); w.Code != http.StatusMisdirectedRequest {
+		t.Fatalf("non-allowlisted OAuth path: got %d, want 421", w.Code)
+	}
+	if w := serveRoute(s, http.MethodGet, "public.example.org", "/.well-known/oauth-authorization-server", nil); w.Code != http.StatusMisdirectedRequest {
+		t.Fatalf("server-root AS metadata on shared host: got %d, want 421", w.Code)
+	}
+}

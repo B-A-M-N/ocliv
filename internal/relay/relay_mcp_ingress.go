@@ -174,6 +174,34 @@ const mcpWellKnownPrefix = "/.well-known/oauth-protected-resource/r/"
 // route-scoped public shape after admission.
 const mcpWellKnownUpstreamPath = "/.well-known/oauth-protected-resource/mcp"
 
+// mcpASWellKnownPrefix is the standards-correct (RFC 8414) placement for
+// per-route authorization-server discovery: the well-known suffix is
+// inserted after the authority, before the route-scoped path. The issuer
+// for a route is https://<host>/r/<route-id>/oauth, so its metadata lives
+// at /.well-known/oauth-authorization-server/r/<route-id>/oauth.
+const mcpASWellKnownPrefix = "/.well-known/oauth-authorization-server/r/"
+
+// mcpASWellKnownUpstreamPath is the only backend path an AS discovery
+// request forwards to: the server-root well-known form.
+const mcpASWellKnownUpstreamPath = "/.well-known/oauth-authorization-server"
+
+// mcpOAuthRoutePrefix scopes the OAuth protocol endpoints (authorize,
+// token, registration) to one admitted route. The endpoint names are an
+// exact allowlist, not a path prefix open to extension.
+const mcpOAuthRoutePrefix = "/oauth/"
+
+// mcpOAuthUpstreamPrefix is the server-root form the route-scoped OAuth
+// endpoints rewrite to after admission.
+const mcpOAuthUpstreamPrefix = "/oauth/"
+
+// mcpOAuthEndpoints is the exact set of upstream OAuth protocol paths a
+// route may serve. Anything else under /oauth/ fails closed.
+var mcpOAuthEndpoints = map[string]bool{
+	"/oauth/authorize": true,
+	"/oauth/token":     true,
+	"/oauth/register":  true,
+}
+
 // parseMCPRouteMetadataPath matches escaped request paths of the exact
 // shape /.well-known/oauth-protected-resource/r/<route-id>/mcp (no
 // trailing slash: discovery URLs are exact). Same EscapedPath and
@@ -201,6 +229,48 @@ func parseRouteRest(rest string, allowSlash bool) (string, bool) {
 		return "", false
 	}
 	return seg, true
+}
+
+// parseMCPRouteOAuthPath matches escaped request paths of the exact shape
+// /r/<route-id>/oauth/<endpoint> where endpoint is one of authorize,
+// token, or register. It returns the route ID and the server-root
+// upstream path. Anything else under /oauth/ fails closed.
+func parseMCPRouteOAuthPath(escapedPath string) (string, string, bool) {
+	rest, ok := strings.CutPrefix(escapedPath, routePathPrefix)
+	if !ok {
+		return "", "", false
+	}
+	seg, after, ok := strings.Cut(rest, "/")
+	if !ok || !validRouteID(seg) {
+		return "", "", false
+	}
+	if !strings.HasPrefix(after, "oauth/") {
+		return "", "", false
+	}
+	upstream := mcpOAuthUpstreamPrefix + strings.TrimPrefix(after, "oauth/")
+	if !mcpOAuthEndpoints[upstream] {
+		return "", "", false
+	}
+	return seg, upstream, true
+}
+
+// parseMCPRouteASMetadataPath matches escaped request paths of the exact
+// shape /.well-known/oauth-authorization-server/r/<route-id>/oauth (no
+// trailing slash: discovery URLs are exact). It returns the route ID and
+// the server-root upstream well-known path.
+func parseMCPRouteASMetadataPath(escapedPath string) (string, string, bool) {
+	rest, ok := strings.CutPrefix(escapedPath, mcpASWellKnownPrefix)
+	if !ok {
+		return "", "", false
+	}
+	seg, after, ok := strings.Cut(rest, "/")
+	if !ok || !validRouteID(seg) {
+		return "", "", false
+	}
+	if after != "oauth" {
+		return "", "", false
+	}
+	return seg, mcpASWellKnownUpstreamPath, true
 }
 
 // createMCPRoute binds a route ID to a live lease for the exact external
@@ -328,6 +398,10 @@ func (s *Server) admitPathRoute(r *http.Request) (*routeTarget, *Session, *http.
 		routeID, forwardPath = id, "/mcp"
 	} else if id, ok := parseMCPRouteMetadataPath(escaped); ok {
 		routeID, forwardPath = id, mcpWellKnownUpstreamPath
+	} else if id, fwd, ok := parseMCPRouteOAuthPath(escaped); ok {
+		routeID, forwardPath = id, fwd
+	} else if id, fwd, ok := parseMCPRouteASMetadataPath(escaped); ok {
+		routeID, forwardPath = id, fwd
 	} else {
 		return nil, nil, nil, 0
 	}

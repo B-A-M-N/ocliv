@@ -47,10 +47,14 @@ func (s *Server) authorizeHost(w http.ResponseWriter, r *http.Request) bool {
 	if s.mcpHost != "" && host == s.mcpHost {
 		// Single-host ingress (P0-A): the configured external MCP
 		// hostname may share the control authority — one FQDN serves
-		// agent control, /r/<route-id>/mcp, AND the per-resource
-		// OAuth discovery shape
-		// /.well-known/oauth-protected-resource/r/<route-id>/mcp.
-		// Both route shapes pass through to handlePublic, which admits
+		// agent control, /r/<route-id>/mcp, the per-resource OAuth
+		// discovery shape
+		// /.well-known/oauth-protected-resource/r/<route-id>/mcp, the
+		// per-route authorization-server discovery shape
+		// /.well-known/oauth-authorization-server/r/<route-id>/oauth,
+		// AND the route-scoped OAuth protocol endpoints
+		// /r/<route-id>/oauth/{authorize,token,register}.
+		// All route shapes pass through to handlePublic, which admits
 		// them against the route binding, lease status, and generation,
 		// or fails closed (404/503) without reaching any other handler
 		// class. Every other path on the control authority keeps the
@@ -59,6 +63,12 @@ func (s *Server) authorizeHost(w http.ResponseWriter, r *http.Request) bool {
 			return true
 		}
 		if _, ok := parseMCPRouteMetadataPath(r.URL.EscapedPath()); ok {
+			return true
+		}
+		if _, _, ok := parseMCPRouteOAuthPath(r.URL.EscapedPath()); ok {
+			return true
+		}
+		if _, _, ok := parseMCPRouteASMetadataPath(r.URL.EscapedPath()); ok {
 			return true
 		}
 	}

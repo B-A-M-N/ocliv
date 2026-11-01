@@ -127,6 +127,29 @@ func (s *Server) handlePublic(w http.ResponseWriter, r *http.Request) {
 	s.serveRouted(w, r, t, sess)
 }
 
+// mcpUpstreamPathAllowed reports whether an already-admitted MCP-mode
+// request may be forwarded to its upstream backend path. The tool
+// endpoint and the protected-resource discovery document are allowed for
+// both MCP profiles. The authorization-server discovery document and the
+// OAuth protocol endpoints are allowed only for the upstream-oauth
+// profile: a fixture-anonymous publication must never grow an
+// authentication-shaped surface. The effective profile comes from the
+// path-route binding when present, else from the lease access mode (so
+// wildcard ingress enforces the same surface).
+func mcpUpstreamPathAllowed(t *routeTarget, escapedPath string) bool {
+	if escapedPath == "/mcp" || escapedPath == mcpWellKnownUpstreamPath {
+		return true
+	}
+	profile := t.MCPProfile
+	if profile == IngressInvalid && t.AccessMode == AccessModeMCPUpstreamOAuth {
+		profile = IngressMCPUpstreamOAuth
+	}
+	if profile != IngressMCPUpstreamOAuth {
+		return false
+	}
+	return escapedPath == mcpASWellKnownUpstreamPath || mcpOAuthEndpoints[escapedPath]
+}
+
 // serveRouted enforces visitor authorization for one admitted route
 // target — wildcard or path — and forwards it upstream. It is the only
 // place path-routed requests meet the auth policy: handlePublic admits,
@@ -156,16 +179,15 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request, t *routeTar
 			return
 		}
 	}
-	if IsMCPMode(t.AccessMode) && r.URL.EscapedPath() != "/mcp" &&
-		r.URL.EscapedPath() != mcpWellKnownUpstreamPath {
-		// P0-3: one MCP publication exposes exactly two endpoints: the
-		// tool endpoint (/mcp) and the OAuth discovery document the
-		// upstream resource server advertises (P0-E). A lease admitted
-		// in an MCP mode — via path route or wildcard hostname — must
-		// not carry unrelated application paths upstream. Reject here,
-		// before any yamux stream is opened; EscapedPath comparison
-		// also defeats %2e traversal without decoding
-		// attacker-controlled bytes.
+	if IsMCPMode(t.AccessMode) && !mcpUpstreamPathAllowed(t, r.URL.EscapedPath()) {
+		// P0-3: one MCP publication exposes exactly its tool endpoint
+		// (/mcp), the OAuth discovery documents, and — for the
+		// upstream-oauth profile only — the route's OAuth protocol
+		// endpoints. A lease admitted in an MCP mode — via path route
+		// or wildcard hostname — must not carry unrelated application
+		// paths upstream. Reject here, before any yamux stream is
+		// opened; EscapedPath comparison also defeats %2e traversal
+		// without decoding attacker-controlled bytes.
 		s.db.Audit("visitor", "", t.LeaseID, "mcp_path", "denied", "non-/mcp path on MCP lease")
 		http.Error(w, "not found", http.StatusNotFound)
 		return

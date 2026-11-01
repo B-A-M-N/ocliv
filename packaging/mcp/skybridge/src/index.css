@@ -1,0 +1,9 @@
+:root{font-family:Inter,system-ui,-apple-system,sans-serif;color-scheme:light dark}*{box-sizing:border-box}
+.ocliv{width:100%;max-width:680px;padding:14px;line-height:1.4;color:var(--text-primary,inherit)}
+.ocliv header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-bottom:12px;border-bottom:1px solid #9995}
+.ocliv header div{display:flex;flex-direction:column}.ocliv small{font-size:12px;opacity:.78;overflow-wrap:anywhere}
+.ocliv .count{font-size:12px;white-space:nowrap;opacity:.7}.ocliv ul{list-style:none;margin:0;padding:0}
+.ocliv li{display:flex;flex-direction:column;gap:4px;padding:12px 0;border-bottom:1px solid #9993}
+.ocliv .top{display:flex;justify-content:space-between;gap:10px}.ocliv .state{font-size:12px;border-radius:6px;border:1px solid #9997;padding:2px 7px}
+.ocliv .state.active{border-color:#39936d}.ocliv .state.revoked{opacity:.5}.ocliv .url{font-family:ui-monospace,monospace}
+.ocliv footer{padding-top:12px;opacity:.7;font-size:12px}
