@@ -748,3 +748,9 @@ quirk only; public behavior is the oracle.
   Round 11–14 milestone gate, 205s suite).
 - Focused relay WS tests + `go test -race ./internal/agent/` → ok.
 - Disposition: VERIFIED NON-ISSUE for this leg.
+
+## Round 26 — fuzz re-run (2026-11-01)
+- `FuzzCheckRequestSyntax` (proxy, 30s, 1.1M execs) → PASS.
+- `FuzzLeaseFenceMonotonic` (lease, 30s, 2.0M execs) → PASS.
+- No new corpus failures; worktree clean of fuzz artifacts.
+- Disposition: VERIFIED (continued).
