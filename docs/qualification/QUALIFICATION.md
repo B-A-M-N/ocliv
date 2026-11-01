@@ -517,3 +517,17 @@ quirk only; public behavior is the oracle.
   PreAuthBurst + MCPAdmissionBurst (admission pre-stream).
 - `go test ./internal/limits/ ./internal/transport/ -count=1` → ok.
 - Disposition: VERIFIED NON-ISSUE for this leg.
+
+## Round 10 — authority/routing re-audit (2026-11-01)
+- Re-read `authorizeHost` (strict relay authority, no loopback bypass;
+  single-host route/metadata shapes pass to `handlePublic`, all other paths
+  on the control authority 421), `route` (exact-Host → shared
+  `admitRoutedLease`), `serveRouted` (pending-verification 404 on both
+  ingresses, MCP two-endpoint surface, no visitor-credential fallback),
+  `checkVisitorToken`/`checkCookieSession` (conditional-UPDATE re-checks),
+  `serveProxied` (MCP admission pre-stream, dispatch-time generation
+  re-check `admittedSessionCurrent`, `dispatchHold` barrier honored).
+- Focused tests
+  `TestControlAuthority|TestMCP|TestRoute|TestAdmit|TestPathRoute|TestVisitor|TestWildcard`
+  → ok (3.9s).
+- Disposition: VERIFIED NON-ISSUE for this leg.
