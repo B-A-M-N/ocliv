@@ -809,3 +809,17 @@ quirk only; public behavior is the oracle.
 - `live/ocliv-dist/SHA256SUMS` verifies OK (both runtime zips).
 - `tests/staging/` harness present (edge/forwarding/recovery + fixtures).
 - Disposition: VERIFIED NON-ISSUE for this leg.
+
+## Round 31 — MCP publish/expose boundary re-audit (2026-11-01)
+- `parseMCPPublish` refuses `--stdio` under both auth modes (P0-1/P0-2:
+  bridge cannot enforce upstream OAuth, fixture profile cannot bound
+  an arbitrary child) and refuses anonymous-fixture publication (P0-F);
+  `mcp expose` is loopback-only with no tunnel path.
+- Publish order: local URL validation → local probe → protocol probe
+  (AUTH_REQUIRED accepted as presence only for upstream-oauth) →
+  tunnel → route; nothing registered remotely on local failure.
+- Unpublish: route-ID path deletes exactly one owned publication;
+  lease path deletes routes then closes lease with independently
+  recorded outcomes (404 already-gone is success, not failure).
+- 23 focused tests → all PASS.
+- Disposition: VERIFIED NON-ISSUE for this leg.
