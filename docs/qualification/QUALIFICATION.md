@@ -695,3 +695,18 @@ quirk only; public behavior is the oracle.
 - Focused tests `TestUnlock|TestRedeem|TestCookie|TestShare|TestVisitor|
   TestAccess|TestSession` → ok.
 - Disposition: VERIFIED NON-ISSUE for this leg.
+
+## Round 22 — connect/handshake re-audit (2026-11-01)
+- `handleChallenge` pre-auth limited; `handleConnect` requires full
+  header set, version match, 32-byte challenge nonce consumed exactly
+  once BEFORE signature verification (replay probing burns the nonce),
+  identity gate, domain-separated signature verify, distinct WS close
+  codes (4401/4409/4429) for terminal/conflict/quota.
+- Connect attempts are nonce-gated by the pre-auth-limited challenge
+  endpoint, so the missing direct pre-auth check on connect is not a
+  bypass (defense in depth holds).
+- Post-upgrade attach failure fences with the fenced generation
+  (`markReconnecting(ls.ID, ls.Generation)`, adversarial Finding 1 fix).
+- Focused tests `TestConnect|TestHandshake|TestChallenge|TestNonce|
+  TestAttach|TestAllocate|TestResume` → ok.
+- Disposition: VERIFIED NON-ISSUE for this leg.
