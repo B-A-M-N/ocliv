@@ -917,3 +917,23 @@ Drill (container removed afterwards, zero host footprint):
   (all leases were terminal before cutover).
 - Remaining: public DNS/ACME + ChatGPT perms (operator/infra).
 - Disposition: VERIFIED (systemd activation + full cycle).
+
+## Round 36 — wildcard DNS-01 + reserved-domain guards (2026-11-02)
+- Finding (P0, incomplete TLS config): `relay init --edge wildcard`
+  generated a Caddyfile whose DNS-01 block was commented out, and
+  `--check` passed it — a deployment that fails only at runtime.
+- Finding (P1, impossible config): wildcard on RFC-reserved/never-public
+  namespaces (`.test`, `.localhost`, `.local`, `.home.arpa`,
+  `example.*`, single-label) can never complete public DNS-01.
+- Fix: wildcard REQUIRES `--dns-provider` (+ `--dns-env`, default
+  `DNS_API_TOKEN`); both rendered verbatim only after token-shape
+  validation; template stanza is now active with placeholders;
+  reserved namespaces refused unless `--allow-reserved-domain`
+  (lab prep); provider flags rejected on single-host; `--check` fails
+  on dead (commented) dns stanzas, `<provider>` remnants, and staging
+  markers (`tls internal`, `STAGING_`, tailnet IP, `:10000`).
+- Tests: 6 new (provider required, single-host rejection, reserved
+  refusal matrix, escape hatch + --check, malformed provider/env,
+  dead-stanza/staging-marker --check); updated wildcard generation
+  test asserts the active stanza. All 16 init tests PASS.
+- Disposition: FIXED.

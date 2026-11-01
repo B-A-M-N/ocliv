@@ -34,13 +34,23 @@ type initConfig struct {
 	outDir    string
 	edge      string
 	checkOnly bool
+	// dnsProvider names the Caddy DNS plugin module used for wildcard
+	// DNS-01 issuance (e.g. cloudflare, digitalocean, route53, rfc2136).
+	// dnsEnv is the environment variable Caddy reads the provider
+	// credential from at runtime; it is never written into the files.
+	// allowReserved permits RFC-reserved/never-public domains on the
+	// wildcard edge for lab prep; without it such a deployment is
+	// refused because public DNS-01 can never complete.
+	dnsProvider   string
+	dnsEnv        string
+	allowReserved bool
 }
 
 func parseRelayInit(argv []string) (initConfig, int) {
 	c := initConfig{edge: "single-host"}
 	_, dataDir, _ := relayFlags(argv)
 	c.dataDir = dataDir
-	usage := "usage: ocliv relay init --domain DOMAIN [--mcp-host HOST] [--acme-email ADDR] [--edge single-host|wildcard] [--data DIR] [--out DIR]\n       ocliv relay init --check --out DIR"
+	usage := "usage: ocliv relay init --domain DOMAIN [--mcp-host HOST] [--acme-email ADDR] [--edge single-host|wildcard] [--dns-provider NAME [--dns-env VAR]] [--allow-reserved-domain] [--data DIR] [--out DIR]\n       ocliv relay init --check --out DIR"
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
 		switch {
@@ -71,6 +81,18 @@ func parseRelayInit(argv []string) (initConfig, int) {
 		case a == "--out" && i+1 < len(argv):
 			i++
 			c.outDir = argv[i]
+		case strings.HasPrefix(a, "--dns-provider="):
+			c.dnsProvider = strings.TrimPrefix(a, "--dns-provider=")
+		case a == "--dns-provider" && i+1 < len(argv):
+			i++
+			c.dnsProvider = argv[i]
+		case strings.HasPrefix(a, "--dns-env="):
+			c.dnsEnv = strings.TrimPrefix(a, "--dns-env=")
+		case a == "--dns-env" && i+1 < len(argv):
+			i++
+			c.dnsEnv = argv[i]
+		case a == "--allow-reserved-domain":
+			c.allowReserved = true
 		case a == "--data" && i+1 < len(argv):
 			i++
 		case strings.HasPrefix(a, "--data=") || strings.HasPrefix(a, "--listen=") || a == "--listen":
@@ -104,6 +126,40 @@ func parseRelayInit(argv []string) (initConfig, int) {
 		fmt.Fprintln(os.Stderr, "error: --edge single-host requires --mcp-host HOST (the one public hostname)")
 		return c, apperr.ExitCLIValidation
 	}
+	// A wildcard certificate can only be issued via DNS-01, so the
+	// wildcard edge must name its DNS plugin now — never ship a
+	// Caddyfile whose issuance path is still a commented placeholder.
+	// The single-host edge uses plain ACME and takes no provider flags.
+	if c.edge == "single-host" && (c.dnsProvider != "" || c.dnsEnv != "") {
+		fmt.Fprintln(os.Stderr, "error: --dns-provider/--dns-env apply only to --edge wildcard")
+		return c, apperr.ExitCLIValidation
+	}
+	if c.edge == "wildcard" {
+		if c.dnsProvider == "" {
+			fmt.Fprintln(os.Stderr, "error: --edge wildcard requires --dns-provider NAME (Caddy DNS plugin for DNS-01 issuance)")
+			return c, apperr.ExitCLIValidation
+		}
+		if err := validateDNSPluginName(c.dnsProvider); err != nil {
+			fmt.Fprintln(os.Stderr, "error: "+err.Error())
+			return c, apperr.ExitCLIValidation
+		}
+		if c.dnsEnv == "" {
+			c.dnsEnv = "DNS_API_TOKEN"
+		}
+		if err := validateDNSEnvName(c.dnsEnv); err != nil {
+			fmt.Fprintln(os.Stderr, "error: "+err.Error())
+			return c, apperr.ExitCLIValidation
+		}
+		if !c.allowReserved {
+			if tld := reservedPublicTLDSuffix(c.domain); tld != "" {
+				fmt.Fprintf(os.Stderr, "error: --edge wildcard with %q can never complete public DNS-01 (reserved %q); use a public domain or pass --allow-reserved-domain for lab prep\n", c.domain, tld)
+				return c, apperr.ExitCLIValidation
+			}
+		}
+	} else if c.allowReserved {
+		fmt.Fprintln(os.Stderr, "error: --allow-reserved-domain applies only to --edge wildcard")
+		return c, apperr.ExitCLIValidation
+	}
 	// ACME needs a contact address on both edges; the wildcard edge
 	// additionally needs manual DNS-01 provider configuration.
 	if addr, err := parseACMEEmail(c.acmeEmail); err != nil {
@@ -113,6 +169,61 @@ func parseRelayInit(argv []string) (initConfig, int) {
 		c.acmeEmail = addr
 	}
 	return c, apperr.ExitOK
+}
+
+// validateDNSPluginName keeps the DNS-01 provider module out of the
+// Caddyfile injection class: it must be a plain module token, since it
+// is rendered verbatim into the tls/dns stanza.
+func validateDNSPluginName(name string) error {
+	if name == "" || len(name) > 64 {
+		return fmt.Errorf("invalid --dns-provider %q: must be a Caddy DNS plugin module name", name)
+	}
+	for i := 0; i < len(name); i++ {
+		b := name[i]
+		ok := b == '_' || b == '.' || b == '-' ||
+			b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' ||
+			i > 0 && b >= '0' && b <= '9'
+		if !ok {
+			return fmt.Errorf("invalid --dns-provider %q: must be a Caddy DNS plugin module name", name)
+		}
+	}
+	return nil
+}
+
+// validateDNSEnvName keeps the credential variable a plain shell name so
+// the rendered {env.VAR} reference cannot escape into Caddyfile syntax.
+func validateDNSEnvName(name string) error {
+	if name == "" || len(name) > 64 {
+		return fmt.Errorf("invalid --dns-env %q: must be a shell environment variable name", name)
+	}
+	for i := 0; i < len(name); i++ {
+		b := name[i]
+		if b == '_' || b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z' || i > 0 && b >= '0' && b <= '9' {
+			continue
+		}
+		return fmt.Errorf("invalid --dns-env %q: must be a shell environment variable name", name)
+	}
+	return nil
+}
+
+// reservedPublicTLDSuffix reports the reserved suffix that makes public
+// DNS-01 impossible for domain (RFC 2606/6761/8375 and IANA reserved
+// names), or "" when the domain is publicly plausible. Single-label
+// names are never publicly issuable either.
+func reservedPublicTLDSuffix(domain string) string {
+	d := strings.ToLower(strings.TrimSuffix(domain, "."))
+	if !strings.Contains(d, ".") {
+		return d
+	}
+	for _, r := range []string{
+		".test", ".localhost", ".invalid", ".example", ".local",
+		".home.arpa", ".example.com", ".example.net", ".example.org",
+	} {
+		if strings.HasSuffix(d, r) {
+			return r
+		}
+	}
+	return ""
 }
 
 // parseACMEEmail validates the ACME contact address before it is
@@ -234,6 +345,8 @@ func buildInitFiles(cfg initConfig) map[string]string {
 	caddy = strings.ReplaceAll(caddy, "{$OCLIV_HOST}", host)
 	caddy = strings.ReplaceAll(caddy, "{$OCLIV_DOMAIN}", cfg.domain)
 	caddy = strings.ReplaceAll(caddy, "{$OCLIV_ACME_EMAIL}", cfg.acmeEmail)
+	caddy = strings.ReplaceAll(caddy, "{$OCLIV_DNS_PROVIDER}", cfg.dnsProvider)
+	caddy = strings.ReplaceAll(caddy, "{$OCLIV_DNS_ENV}", cfg.dnsEnv)
 	files["Caddyfile"] = caddy
 	files["ocliv-relay.service"] = edgesystemd.RelayUnit()
 	var dns strings.Builder
@@ -243,7 +356,7 @@ func buildInitFiles(cfg initConfig) map[string]string {
 	} else {
 		fmt.Fprintf(&dns, "relay.%s      A     <relay IPv4>\n", cfg.domain)
 		fmt.Fprintf(&dns, "*.t.%s        A     <relay IPv4>\n", cfg.domain)
-		dns.WriteString("ACME DNS-01: configure your DNS provider for wildcard issuance (manual step).\n")
+		fmt.Fprintf(&dns, "ACME DNS-01: build Caddy with the %s plugin (stock Caddy ships none), then export %s=<provider credential> in Caddy's environment (never commit it) and scope it to this zone only.\n", cfg.dnsProvider, cfg.dnsEnv)
 	}
 	files["dns-records.txt"] = dns.String()
 	return files
@@ -319,6 +432,32 @@ func checkInitDir(outDir string) []string {
 	}
 	if !strings.Contains(string(caddy), "tls ") || strings.Contains(string(caddy), "tls {$") {
 		fail("Caddyfile: no concrete tls directive (ACME email unresolved)")
+	}
+	// A wildcard edge without an ACTIVE dns line cannot issue its
+	// certificate: the issuance path must never be a commented
+	// placeholder that passes generation but dies at runtime.
+	for _, line := range strings.Split(string(caddy), "\n") {
+		t := strings.TrimSpace(line)
+		if strings.HasPrefix(t, "dns ") && !strings.HasPrefix(t, "#") {
+			goto dnsOK
+		}
+	}
+	// Only the wildcard edge needs DNS-01; the single-host edge uses
+	// plain ACME and carries no dns line by design.
+	if strings.Contains(string(caddy), "*.t.") {
+		fail("Caddyfile: wildcard edge has no active DNS-01 stanza (dns <provider> commented or missing)")
+	}
+dnsOK:
+	if strings.Contains(string(caddy), "<provider>") {
+		fail("Caddyfile: unresolved <provider> placeholder remains")
+	}
+	// Staging markers must never ship in generated production files:
+	// internal CA, tailnet/lab bind hints, or funnel overrides would
+	// silently downgrade a public deployment to lab trust.
+	for _, marker := range []string{"tls internal", "STAGING_", "100.113.85.107", ":10000"} {
+		if strings.Contains(string(caddy), marker) {
+			fail("Caddyfile: staging marker %q must not appear in generated production files", marker)
+		}
 	}
 	unit, err := os.ReadFile(filepath.Join(outDir, "ocliv-relay.service"))
 	if err != nil {

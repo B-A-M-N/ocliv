@@ -24,13 +24,17 @@ relay.{$OCLIV_DOMAIN} {
 # Visitor traffic: <label>.t.<domain>, one label per tunnel.
 *.t.{$OCLIV_DOMAIN} {
 	# Wildcard issuance REQUIRES DNS-01 (ACME HTTP/TLS-ALPN cannot
-	# validate a wildcard). OPERATOR MUST CONFIGURE: build Caddy with
-	# the provider plugin for your DNS host and uncomment:
-	#	tls {
-	#		dns <provider> {env.DNS_API_TOKEN}
-	#	}
-	# Scope the API credential to the ACME challenge zone only, and
-	# pre-provision/verify the wildcard before the first public tunnel.
+	# validate a wildcard). `ocliv relay init --edge wildcard` renders
+	# this stanza with your --dns-provider/--dns-env values; a file with
+	# no active dns line is incomplete and `relay init --check` rejects
+	# it. OPERATOR MUST STILL: build Caddy with the provider plugin
+	# (stock Caddy ships none; see docs), export the credential env var
+	# at Caddy runtime (never commit it), scope the API credential to
+	# the ACME challenge zone only, and pre-provision/verify the
+	# wildcard before the first public tunnel.
+	tls {
+		dns {$OCLIV_DNS_PROVIDER} {env.{$OCLIV_DNS_ENV}}
+	}
 
 	reverse_proxy 127.0.0.1:8080 {
 		# Overwrite, never append (same trusted-edge contract as above).
