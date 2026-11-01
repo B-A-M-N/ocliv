@@ -710,3 +710,17 @@ quirk only; public behavior is the oracle.
 - Focused tests `TestConnect|TestHandshake|TestChallenge|TestNonce|
   TestAttach|TestAllocate|TestResume` → ok.
 - Disposition: VERIFIED NON-ISSUE for this leg.
+
+## Round 23 — CLI tunnel lifecycle re-audit (2026-11-01)
+- `attachEvents`: non-blocking callback, generation-based delivery
+  (P1-01 holds); `runTunnel` fails fast on terminal runner errors with
+  corrective actions (P1-02); `runSteadyState` drains re-attachments,
+  runner self-exit is terminal; `closeTunnelWith` uses the live
+  attachment lease ID (never the store latest), nonzero exit on
+  unconfirmed remote close (P1-8); JSON output secret-free (A07),
+  share link only via TTY or explicit 0600 file.
+- Minor: `runnerExit` maps errors by message substring (CLI surface
+  only; agent retry uses typed `PermanentError`). ACCEPTED (no change).
+- Focused tests `TestTunnel|TestClose|TestAttach|TestCleanup|TestRunner|
+  TestSteady|TestShare` → ok.
+- Disposition: VERIFIED NON-ISSUE for this leg.
