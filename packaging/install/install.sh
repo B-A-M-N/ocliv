@@ -79,10 +79,16 @@ if ! "$NEW_BIN" relay --help >/dev/null 2>&1 && ! "$NEW_BIN" --help >/dev/null 2
   echo "candidate binary failed --help preflight; installed binary untouched" >&2
   exit 1
 fi
-# Preserve a rollback candidate before replacing a working install.
-if [ -f "$BIN" ]; then
-  cp -p "$BIN" "$BIN.prev"
-fi
+# Preserve a rollback candidate before replacing a working install. The
+# first candidate wins across consecutive upgrades: re-running the
+# installer must not overwrite the pre-upgrade binary with an already
+# upgraded one, or the original rollback point is silently lost.
+preserve_rollback() {
+  if [ -f "$BIN" ] && [ ! -f "$BIN.prev" ]; then
+    cp -p "$BIN" "$BIN.prev"
+  fi
+}
+preserve_rollback
 mv "$NEW_BIN" "$BIN"
 rollback_bin() {
   if [ -f "$BIN.prev" ]; then

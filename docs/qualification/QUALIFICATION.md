@@ -937,3 +937,14 @@ Drill (container removed afterwards, zero host footprint):
   dead-stanza/staging-marker --check); updated wildcard generation
   test asserts the active stanza. All 16 init tests PASS.
 - Disposition: FIXED.
+
+## Round 37 — installer rollback preservation (2026-11-02)
+- Finding (P1): `install.sh` overwrote `$BIN.prev` on every run, so a
+  second upgrade destroyed the first rollback point (verified by
+  reading the unconditional `cp -p` before the fix).
+- Fix: `preserve_rollback()` keeps the first candidate (first-wins);
+  re-runs no longer clobber it.
+- Test: `TestInstallPreservesRollbackCandidate` drills two upgrades
+  against the extracted function (red before: function absent; green
+  after). Full `packaging/install` package PASS (5/5).
+- Disposition: FIXED.

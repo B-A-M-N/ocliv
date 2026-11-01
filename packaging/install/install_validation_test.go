@@ -53,6 +53,35 @@ func TestInstallValidHostMatrix(t *testing.T) {
 	}
 }
 
+// Consecutive upgrades must not destroy the first rollback point:
+// run preserve_rollback() twice with different BIN contents and require
+// the original candidate to survive the second upgrade.
+func TestInstallPreservesRollbackCandidate(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	out, err := exec.Command("sh", "-c", `
+set -eu
+work="$(mktemp -d)"
+fn="$(mktemp)"
+trap 'rm -rf "$work"; rm -f "$fn"' EXIT
+sed -n '/^preserve_rollback() {/,/^}/p' install.sh > "$fn"
+. "$fn"
+export BIN="$work/ocliv"
+printf v1 > "$BIN"
+preserve_rollback
+printf v2 > "$BIN"
+preserve_rollback
+cat "$BIN.prev"
+`).CombinedOutput()
+	if err != nil {
+		t.Fatalf("preserve_rollback drill: %v: %s", err, out)
+	}
+	if s := strings.TrimSpace(string(out)); s != "v1" {
+		t.Fatalf("second upgrade clobbered rollback candidate: prev=%q want %q", s, "v1")
+	}
+}
+
 func TestInstallScriptSyntax(t *testing.T) {
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skip("sh not available")
