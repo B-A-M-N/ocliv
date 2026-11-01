@@ -1067,3 +1067,20 @@ Drill (container removed afterwards, zero host footprint):
   on-demand issuance against a public IP.
 - Disposition: FIXED (slice 4 scope). Provider adapter (slice 5)
   pending.
+
+## Round 45 — Oracle provider adapter slice (2026-11-02)
+- New `OracleAdapter`: Check (oci CLI + authorized session present,
+  else BLOCKED with the exact fix), Plan (A1.Flex shape, free-tier
+  limits, explicit no-capacity-guarantee), Create (refuses without
+  --confirm-create and without compartment/zone; executes the oci
+  launch only when both are given). No cloud SDK vendored; Ocliv
+  never handles cloud credentials.
+- CLI: `setup --auto --provider oracle` skips the provider when the
+  local path is viable, else check→plan→gated create. Unknown
+  providers rejected.
+- Tests: 4 adapter tests (check matrix, plan bounds, confirm gate,
+  scope refusal) + 2 CLI tests (read-only flow, unknown provider).
+  Focused suites green. Live launch needs the operator's OCI
+  account — recorded as BLOCKED-live, not simulated as done.
+- Disposition: FIXED (slice 5 scope). Diagnostics docs + full gates
+  pending.

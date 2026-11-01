@@ -229,6 +229,38 @@ func TestSetupAutoEnrollEndToEnd(t *testing.T) {
 	}
 }
 
+func TestSetupProviderFlowIsReadOnlyWithoutConfirm(t *testing.T) {
+	echo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("100.64.5.6\n"))
+	}))
+	defer echo.Close()
+	var code int
+	out := captureStdout(t, func() {
+		code = cmdSetup([]string{"--auto", "--provider", "oracle",
+			"--echo-v4", echo.URL, "--echo-v6", ""})
+	})
+	if code != apperr.ExitOK {
+		t.Fatalf("exit=%d", code)
+	}
+	if !strings.Contains(out, "cgnat-no-direct-ipv4") {
+		t.Fatalf("provider flow missing CGNAT verdict:\n%s", out)
+	}
+	if !strings.Contains(out, "Always Free") && !strings.Contains(out, "BLOCKED") {
+		t.Fatalf("provider flow shows neither plan nor blocker:\n%s", out)
+	}
+}
+
+func TestSetupRejectsUnknownProvider(t *testing.T) {
+	echo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("100.64.5.6\n"))
+	}))
+	defer echo.Close()
+	if code := cmdSetup([]string{"--auto", "--provider", "bedrock",
+		"--echo-v4", echo.URL, "--echo-v6", ""}); code != apperr.ExitCLIValidation {
+		t.Fatalf("exit=%d, want %d", code, apperr.ExitCLIValidation)
+	}
+}
+
 func TestSetupRejectsUnknownFlag(t *testing.T) {
 	if code := cmdSetup([]string{"--bogus"}); code != apperr.ExitCLIValidation {
 		t.Fatalf("exit=%d, want %d", code, apperr.ExitCLIValidation)

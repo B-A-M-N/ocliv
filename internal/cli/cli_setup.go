@@ -42,6 +42,10 @@ func cmdSetup(argv []string) int {
 	acmeEmail := ""
 	outDir := ""
 	dataDir := "/var/lib/ocliv"
+	provider := ""
+	compartment := ""
+	zone := ""
+	confirmCreate := false
 	echoV4, echoV6 := defaultEchoV4, defaultEchoV6
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
@@ -80,6 +84,23 @@ func cmdSetup(argv []string) int {
 		case a == "--data-dir" && i+1 < len(argv):
 			i++
 			dataDir = argv[i]
+		case strings.HasPrefix(a, "--provider="):
+			provider = strings.TrimPrefix(a, "--provider=")
+		case a == "--provider" && i+1 < len(argv):
+			i++
+			provider = argv[i]
+		case strings.HasPrefix(a, "--compartment="):
+			compartment = strings.TrimPrefix(a, "--compartment=")
+		case a == "--compartment" && i+1 < len(argv):
+			i++
+			compartment = argv[i]
+		case strings.HasPrefix(a, "--availability-domain="):
+			zone = strings.TrimPrefix(a, "--availability-domain=")
+		case a == "--availability-domain" && i+1 < len(argv):
+			i++
+			zone = argv[i]
+		case a == "--confirm-create":
+			confirmCreate = true
 		case strings.HasPrefix(a, "--echo-v4="):
 			echoV4 = strings.TrimPrefix(a, "--echo-v4=")
 		case a == "--echo-v4" && i+1 < len(argv):
@@ -114,6 +135,9 @@ func cmdSetup(argv []string) int {
 	printSetupReport(d)
 	if check || !auto {
 		return apperr.ExitOK
+	}
+	if provider != "" {
+		return runSetupProvider(ctx, d, provider, compartment, zone, confirmCreate)
 	}
 	if hostname == "" {
 		printSetupNext(d)
@@ -311,6 +335,38 @@ func autoEnroll(relayURL, dataDir, tenant string) (string, int) {
 		return "", apperr.ExitAuth
 	}
 	return performEnroll(relayURL, code, "")
+}
+
+// runSetupProvider handles the provider-relay path for hosts with no
+// direct inbound route. With a viable local path the provider is
+// unnecessary, so it says so and stops. Otherwise it checks the
+// operator's own cloud tooling, prints the free-tier plan, and creates
+// only with explicit --confirm-create plus compartment and zone.
+func runSetupProvider(ctx context.Context, d setup.Detection, provider, compartment, zone string, confirm bool) int {
+	if provider != "oracle" {
+		fmt.Fprintf(os.Stderr, "unknown provider %q (supported: oracle)\n", provider)
+		return apperr.ExitCLIValidation
+	}
+	if d.Path == setup.PathDirectV6 || d.Path == setup.PathDirectV4 || d.Path == setup.PathNATV4 {
+		fmt.Printf("local path is %s: self-hosting directly is simpler and free — omit --provider to bootstrap here\n", d.Path)
+		return apperr.ExitOK
+	}
+	a := setup.OracleAdapter{Compartment: compartment, Zone: zone}
+	msg, ok := a.Check(ctx)
+	fmt.Println(msg)
+	if !ok {
+		return apperr.ExitOK
+	}
+	fmt.Println(a.Plan())
+	if err := a.Create(ctx, confirm); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		if !confirm {
+			return apperr.ExitOK
+		}
+		return apperr.ExitInternal
+	}
+	fmt.Println("instance launch requested; continue in the OCI console, then point DNS at its public IP and re-run setup without --provider")
+	return apperr.ExitOK
 }
 
 func tokenSource(tokenFile string) string {
