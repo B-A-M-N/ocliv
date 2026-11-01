@@ -735,3 +735,16 @@ quirk only; public behavior is the oracle.
   teardown, revoke fail-closed, stale-detach fencing, newer-deadline
   expiry, stale-generation registration + disconnect → all PASS.
 - Disposition: VERIFIED NON-ISSUE for this leg.
+
+## Round 25 — WebSocket re-audit (2026-11-01)
+- Agent (`agent_ws.go`): buffered-reader preservation post-101 (P1-10),
+  accept validation before relay confirm (E10), verbatim handshake
+  replay with single upgrade pair (D11), short-write completion, idle
+  write deadlines, mgmt nonces (P1-07).
+- Relay (`relay_ws.go`): subprotocol-offer verification before
+  completing the public 101, hijack-buffer forwarding + 500-on-failure
+  (Round 7), hijack-failure closes stream fail-closed.
+- End-to-end WS covered by `tests/integration/ws_test.go` (green in the
+  Round 11–14 milestone gate, 205s suite).
+- Focused relay WS tests + `go test -race ./internal/agent/` → ok.
+- Disposition: VERIFIED NON-ISSUE for this leg.
