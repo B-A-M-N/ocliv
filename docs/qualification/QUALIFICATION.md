@@ -663,3 +663,14 @@ quirk only; public behavior is the oracle.
   `TestRelayDoctorProbesExplicitHost` (finding names the explicit host).
   All PASS; full `doctor`/`cli`/`config` suites green; vet+gofmt clean.
 - Disposition: FIXED.
+
+## Round 19 — metrics/identity/config re-audit (2026-11-01)
+- Metrics: fixed counter set, no unbounded labels (G08), gauges clamp
+  negatives instead of wrapping; exposition is internal-only.
+- Identity: CSPRNG seeds, domain-separated handshake bytes, 2-min
+  nonces, 5-min skew bound, verifier-only enrollment storage, 0600 key
+  files with unsafe-mode refusal. No defects found; in-memory seed
+  zeroing absent (standard Go limitation, ACCEPTED RISK).
+- Config/leases: IPv6/TTL/UpstreamHost/ProbePath recorded per lease and
+  honored by resume matching (P1-7) and now by doctor (Round 18).
+- Disposition: VERIFIED NON-ISSUE for this leg.
