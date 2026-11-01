@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -55,9 +56,9 @@ func TestParseMCPPublishFixtureAnonymousRefused(t *testing.T) {
 }
 
 // --strict-discovery constrains publish only: accepted in publish
-// mode, rejected in serve mode (no route, no discovery), and the
-// failure classifier sends unproven bindings down the fatal path only
-// when strict (P2-2).
+// mode, rejected in serve mode (no route, no discovery). Production
+// publication is strict by default (P0-B): unproven bindings abort
+// unless explicit dev-only --dev-allow-unverified-discovery is set.
 func TestParseMCPPublishStrictDiscovery(t *testing.T) {
 	pub := []string{"--local=http://127.0.0.1:8765/mcp", "--auth=upstream-oauth", "--strict-discovery"}
 	c, code := parseMCPPublish(pub, false)
@@ -66,11 +67,19 @@ func TestParseMCPPublishStrictDiscovery(t *testing.T) {
 	}
 	plain := []string{"--local=http://127.0.0.1:8765/mcp", "--auth=upstream-oauth"}
 	c, code = parseMCPPublish(plain, false)
-	if code != 0 || c.strictDiscovery {
-		t.Fatalf("default must stay warning-based: %+v code=%d", c, code)
+	if code != 0 || c.devAllowUnverified {
+		t.Fatalf("default must stay strict (no dev opt-out): %+v code=%d", c, code)
+	}
+	dev := []string{"--local=http://127.0.0.1:8765/mcp", "--auth=upstream-oauth", "--dev-allow-unverified-discovery"}
+	c, code = parseMCPPublish(dev, false)
+	if code != 0 || !c.devAllowUnverified {
+		t.Fatalf("publish --dev-allow-unverified-discovery rejected or dropped: %+v code=%d", c, code)
 	}
 	if _, code := parseMCPPublish(pub, true); code == 0 {
 		t.Fatal("serve --strict-discovery accepted, want rejection")
+	}
+	if _, code := parseMCPPublish(dev, true); code == 0 {
+		t.Fatal("serve --dev-allow-unverified-discovery accepted, want rejection")
 	}
 	for _, tc := range []struct {
 		name  string
@@ -79,16 +88,71 @@ func TestParseMCPPublishStrictDiscovery(t *testing.T) {
 		fatal bool
 	}{
 		{"nil is fine", mcpPublishConfig{}, nil, false},
-		{"unreachable default warns", mcpPublishConfig{auth: "upstream-oauth"}, errDiscoveryUnreachable, false},
+		{"unreachable default aborts", mcpPublishConfig{auth: "upstream-oauth"}, errDiscoveryUnreachable, true},
 		{"unreachable strict aborts", mcpPublishConfig{auth: "upstream-oauth", strictDiscovery: true}, errDiscoveryUnreachable, true},
+		{"unreachable dev warns", mcpPublishConfig{auth: "upstream-oauth", devAllowUnverified: true}, errDiscoveryUnreachable, false},
 		{"invalid default aborts", mcpPublishConfig{auth: "upstream-oauth"}, errors.New("resource mismatch"), true},
 		{"invalid strict aborts", mcpPublishConfig{auth: "upstream-oauth", strictDiscovery: true}, errors.New("resource mismatch"), true},
+		{"invalid dev still aborts", mcpPublishConfig{auth: "upstream-oauth", devAllowUnverified: true}, errors.New("resource mismatch"), true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := discoveryFailureFatal(tc.cfg, tc.err); got != tc.fatal {
 				t.Fatalf("discoveryFailureFatal = %v, want %v", got, tc.fatal)
 			}
 		})
+	}
+}
+
+func TestParseMCPPublishResourceFile(t *testing.T) {
+	pub := []string{"--local=http://127.0.0.1:8765/mcp", "--auth=upstream-oauth", "--resource-file", "/tmp/x.resource"}
+	c, code := parseMCPPublish(pub, false)
+	if code != 0 || c.resourceFile != "/tmp/x.resource" {
+		t.Fatalf("space form dropped: %+v code=%d", c, code)
+	}
+	pub = []string{"--local=http://127.0.0.1:8765/mcp", "--auth=upstream-oauth", "--resource-file=/tmp/y.resource"}
+	c, code = parseMCPPublish(pub, false)
+	if code != 0 || c.resourceFile != "/tmp/y.resource" {
+		t.Fatalf("equals form dropped: %+v code=%d", c, code)
+	}
+	pub = []string{"--local=http://127.0.0.1:8765/mcp", "--auth=upstream-oauth"}
+	c, code = parseMCPPublish(pub, false)
+	if code != 0 || c.resourceFile != "" {
+		t.Fatalf("default must be no handoff: %+v code=%d", c, code)
+	}
+}
+
+// The binding write must be atomic and owner-only: strict discovery
+// reads the file concurrently, so a torn write would misverify the
+// resource; a world-readable file would leak deployment topology.
+func TestWriteResourceBindingAtomic(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/resource.url"
+	if err := writeResourceBinding(path, "https://relay.example/r/route1/mcp"); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(raw)) != "https://relay.example/r/route1/mcp" {
+		t.Fatalf("binding=%q", raw)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o600 {
+		t.Fatalf("binding mode=%o, want 600", st.Mode().Perm())
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("leftover temp files in binding dir: %v", entries)
+	}
+	if err := writeResourceBinding(dir+"/no-such-dir/x", "https://x/"); err == nil {
+		t.Fatal("write into missing dir succeeded, want failure (caller abandons route)")
 	}
 }
 

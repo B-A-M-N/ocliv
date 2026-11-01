@@ -3,12 +3,14 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -32,7 +34,7 @@ func restrictFileCreation() {
 // cmdRelay handles relay-side operations.
 func cmdRelay(argv []string) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ocliv relay init|serve|doctor|issue-enroll ...")
+		fmt.Fprintln(os.Stderr, "usage: ocliv relay init|serve|doctor|issue-enroll|keys|revoke-key|tenants|backup|restore ...")
 		return apperr.ExitCLIValidation
 	}
 	switch argv[0] {
@@ -44,6 +46,16 @@ func cmdRelay(argv []string) int {
 		return cmdRelayDoctor(argv[1:])
 	case "issue-enroll":
 		return cmdIssueEnroll(argv[1:])
+	case "keys":
+		return cmdRelayKeys(argv[1:])
+	case "revoke-key":
+		return cmdRelayRevokeKey(argv[1:])
+	case "tenants":
+		return cmdRelayTenants(argv[1:])
+	case "backup":
+		return cmdRelayBackup(argv[1:])
+	case "restore":
+		return cmdRelayRestore(argv[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown relay command %q\n", argv[0])
 		return apperr.ExitCLIValidation
@@ -94,7 +106,9 @@ func parseHostname(value, flag string) (string, error) {
 	if value == "" {
 		return "", fmt.Errorf("relay %s is required (e.g. %s example.org)", flag, flag)
 	}
-	if value == "example.com" || value == "example.net" || value == "example.org" {
+	if value == "example.com" || value == "example.net" || value == "example.org" ||
+		strings.HasSuffix(value, ".example.com") || strings.HasSuffix(value, ".example.net") ||
+		strings.HasSuffix(value, ".example.org") {
 		return "", fmt.Errorf("relay %s %q is a placeholder; configure the real domain", flag, value)
 	}
 	labels := strings.Split(value, ".")
@@ -160,6 +174,23 @@ func relayFlags(argv []string) (addr, dataDir, domain string) {
 // means single-host MCP ingress stays disabled (P0-A).
 func mcpHostFlag(argv []string) (raw string, seen bool) {
 	return explicitRelayFlag(argv, "--mcp-host")
+}
+
+// mcpPortFlag scans relay argv for an explicitly passed --mcp-port,
+// accepting space and `=` forms per house style. Last wins.
+func mcpPortFlag(argv []string) (raw string, seen bool) {
+	return explicitRelayFlag(argv, "--mcp-port")
+}
+
+// parseMCPPort validates the public edge port minted into route URLs:
+// 1-65535, with 443 the ordinary public value. Anything else fails
+// closed rather than minting an unreachable URL.
+func parseMCPPort(raw string) (int, error) {
+	p, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || p < 1 || p > 65535 {
+		return 0, fmt.Errorf("relay --mcp-port %q must be 1-65535", raw)
+	}
+	return p, nil
 }
 
 // healthListenFlag scans relay argv for an explicitly passed
@@ -250,6 +281,23 @@ func cmdRelayServe(argv []string) int {
 		}
 		mcpHost = h
 	}
+	// --mcp-port carries a non-443 public edge port (lab Caddy on 8444)
+	// into minted route URLs. It never affects Host admission, which
+	// strips ports (canonicalHost). Without --mcp-host it is rejected:
+	// a port with no path-route ingress is a misconfiguration, not a default.
+	mcpPort := 0
+	if rawMCPPort, seen := mcpPortFlag(argv); seen {
+		p, err := parseMCPPort(rawMCPPort)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error: "+err.Error())
+			return apperr.ExitCLIValidation
+		}
+		if mcpHost == "" {
+			fmt.Fprintln(os.Stderr, "error: --mcp-port needs --mcp-host")
+			return apperr.ExitCLIValidation
+		}
+		mcpPort = p
+	}
 	restrictFileCreation()
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
@@ -263,7 +311,7 @@ func cmdRelayServe(argv []string) int {
 	defer db.Close()
 	srv, err := relay.New(relay.Options{
 		DB: db, Namespace: "t." + domain, RelayHost: relayHost,
-		MCPExternalHost: mcpHost,
+		MCPExternalHost: mcpHost, MCPExternalPort: mcpPort,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
@@ -296,7 +344,11 @@ func cmdRelayServe(argv []string) int {
 	fmt.Fprintf(os.Stderr, "health listener on %s\n", healthSrv.Addr)
 	fmt.Printf("ocliv relay serving behind TLS edge on %s (namespace t.%s)\n", addr, domain)
 	if mcpHost != "" {
-		fmt.Printf("mcp path-route ingress on https://%s/r/<route-id>/mcp\n", mcpHost)
+		base := "https://" + mcpHost
+		if mcpPort != 0 && mcpPort != 443 {
+			base += ":" + strconv.Itoa(mcpPort)
+		}
+		fmt.Printf("mcp path-route ingress on %s/r/<route-id>/mcp\n", base)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -326,29 +378,47 @@ func cmdRelayServe(argv []string) int {
 	return apperr.ExitCleanShutdown
 }
 
-// cmdRelayInit bootstraps relay config, secrets, and prints DNS records.
+// cmdRelayInit validates its inputs and generates a reviewable deployment
+// directory (relay.env, Caddyfile, systemd unit, DNS records). It never
+// touches live system paths and never activates anything: preparation-only
+// generation, with manual setup steps printed for the operator.
 func cmdRelayInit(argv []string) int {
-	_, dataDir, domain := relayFlags(argv)
-	if domain == "" {
-		fmt.Fprintln(os.Stderr, "usage: ocliv relay init --domain example.com [--data DIR]")
-		return apperr.ExitCLIValidation
+	cfg, code := parseRelayInit(argv)
+	if code != 0 {
+		return code
 	}
-	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+	if cfg.checkOnly {
+		if bad := checkInitDir(cfg.outDir); len(bad) > 0 {
+			for _, line := range bad {
+				fmt.Fprintln(os.Stderr, "init check: "+line)
+			}
+			return apperr.ExitInternal
+		}
+		fmt.Println("init check: deployment dir consistent (files, placeholders, edge contract, env, unit)")
+		fmt.Println("NOTE: internal consistency only — DNS, ACME, and live relay serving are not proven here; see `ocliv relay doctor`.")
+		return apperr.ExitOK
+	}
+	if err := runRelayInitFiles(cfg); err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return apperr.ExitInternal
 	}
-	fmt.Println("Ocliv relay bootstrap for domain " + domain)
-	fmt.Println("Data dir: " + dataDir)
-	fmt.Println("NOTE: preparation-only — this command prints manual setup steps;")
+	fmt.Println("Ocliv relay bootstrap for domain " + cfg.domain)
+	fmt.Println("Data dir: " + cfg.dataDir)
+	fmt.Println("Deployment dir: " + cfg.outDir + " (relay.env, Caddyfile, ocliv-relay.service, dns-records.txt)")
+	fmt.Println("NOTE: preparation-only — this command generates files and prints manual setup steps;")
 	fmt.Println("it does not provision Caddy, systemd, certificates, or DNS.")
 	fmt.Println()
-	fmt.Println("Create these DNS records once:")
-	fmt.Printf("  relay.%s      A     <VPS IPv4>\n", domain)
-	fmt.Printf("  *.t.%s        A     <VPS IPv4>\n", domain)
+	fmt.Println("Create these DNS records once (see dns-records.txt):")
+	if cfg.edge == "single-host" {
+		fmt.Printf("  %s      A     <relay IPv4>\n", cfg.mcpHost)
+	} else {
+		fmt.Printf("  relay.%s      A     <VPS IPv4>\n", cfg.domain)
+		fmt.Printf("  *.t.%s        A     <VPS IPv4>\n", cfg.domain)
+	}
 	fmt.Println()
-	fmt.Println("Then point Caddy at 127.0.0.1:8080; the edge must terminate TLS and strip inbound X-Forwarded-* headers (see docs/OPERATOR.md).")
-	fmt.Println("Run `ocliv relay serve --domain " + domain + " --data " + dataDir + " [--mcp-host HOST] [--relay-host HOST]` under systemd.")
-	fmt.Println("Run `ocliv relay issue-enroll --data " + dataDir + "` to mint an enrollment code.")
+	fmt.Println("Review the deployment dir, copy relay.env to /etc/ocliv/relay.env (root-owned, 0600),")
+	fmt.Println("install the Caddyfile and unit, then start the relay under systemd (see docs/OPERATOR.md).")
+	fmt.Println("Run `ocliv relay issue-enroll --data " + cfg.dataDir + "` to mint an enrollment code.")
 	return apperr.ExitOK
 }
 
@@ -374,7 +444,7 @@ func cmdRelayDoctor(argv []string) int {
 		cacert = os.Getenv("OCLIV_CACERT")
 	}
 	res := doctor.CheckRelay(doctor.RelayInput{DataDir: dataDir, Domain: domain, CACertPath: cacert})
-	fmt.Print(res.Report(false))
+	fmt.Print(res.Report())
 	if res.OK {
 		return apperr.ExitOK
 	}
@@ -406,6 +476,227 @@ func cmdIssueEnroll(argv []string) int {
 	}
 	fmt.Println("One-time enrollment code (valid 24h, show once):")
 	fmt.Println(code)
+	return apperr.ExitOK
+}
+
+// openRelayDB opens the relay database for operator-local commands.
+// Like issue-enroll, these never construct a Server (P0-01): they commit
+// durable state and the running relay converges via admission and its
+// supervise revalidation, so no restart is required.
+func openRelayDB(argv []string) (*store.DB, int) {
+	_, dataDir, _ := relayFlags(argv)
+	restrictFileCreation()
+	db, err := store.Open(filepath.Join(dataDir, "ocliv.db"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return nil, apperr.ExitInternal
+	}
+	return db, apperr.ExitOK
+}
+
+// exitForRelayErr maps a relay operation failure to a CLI exit status.
+func exitForRelayErr(err error) int {
+	var ae *apperr.Error
+	if errors.As(err, &ae) {
+		return apperr.ExitFor(ae.Code)
+	}
+	return apperr.ExitInternal
+}
+
+// cmdRelayKeys implements `ocliv relay keys list`.
+func cmdRelayKeys(argv []string) int {
+	if len(argv) == 0 || argv[0] != "list" {
+		fmt.Fprintln(os.Stderr, "usage: ocliv relay keys list [--data DIR]")
+		return apperr.ExitCLIValidation
+	}
+	db, code := openRelayDB(argv[1:])
+	if code != 0 {
+		return code
+	}
+	defer db.Close()
+	keys, err := relay.ListAgentKeys(db)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return exitForRelayErr(err)
+	}
+	if len(keys) == 0 {
+		fmt.Println("no enrolled agent keys")
+		return apperr.ExitOK
+	}
+	fmt.Printf("%-24s %-20s %-10s %s\n", "KEY ID", "TENANT", "STATUS", "ENROLLED")
+	for _, k := range keys {
+		fmt.Printf("%-24s %-20s %-10s %s\n", k.ID, k.TenantID, k.Status, k.CreatedAt)
+	}
+	return apperr.ExitOK
+}
+
+// cmdRelayRevokeKey implements `ocliv relay revoke-key --key-id ID`.
+func cmdRelayRevokeKey(argv []string) int {
+	var keyID, reason string
+	for i := 0; i < len(argv); i++ {
+		if v, ok := mcpFlagValue(argv, &i, "key-id"); ok {
+			keyID = v
+		} else if v, ok := mcpFlagValue(argv, &i, "reason"); ok {
+			reason = v
+		} else if argv[i] == "--data" && i+1 < len(argv) {
+			i++
+		} else if strings.HasPrefix(argv[i], "--data=") {
+			continue
+		} else {
+			fmt.Fprintln(os.Stderr, "usage: ocliv relay revoke-key --key-id ID [--reason TEXT] [--data DIR]")
+			return apperr.ExitCLIValidation
+		}
+	}
+	if keyID == "" {
+		fmt.Fprintln(os.Stderr, "usage: ocliv relay revoke-key --key-id ID [--reason TEXT] [--data DIR]")
+		return apperr.ExitCLIValidation
+	}
+	db, code := openRelayDB(argv)
+	if code != 0 {
+		return code
+	}
+	defer db.Close()
+	affected, err := relay.RevokeAgentKeyDB(db, keyID)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return exitForRelayErr(err)
+	}
+	if reason == "" {
+		reason = "operator revoke-key"
+	}
+	db.Audit("operator", "", keyID, "agent_key_revoke", "ok", reason)
+	fmt.Printf("revoked key %s (%d leases terminally revoked)\n", keyID, len(affected))
+	fmt.Println("a running relay terminates forwarding within its supervise interval; no restart required")
+	return apperr.ExitOK
+}
+
+// cmdRelayTenants implements `ocliv relay tenants suspend|unsuspend`.
+func cmdRelayTenants(argv []string) int {
+	if len(argv) == 0 || (argv[0] != "suspend" && argv[0] != "unsuspend") {
+		fmt.Fprintln(os.Stderr, "usage: ocliv relay tenants suspend|unsuspend --tenant ID [--reason TEXT] [--data DIR]")
+		return apperr.ExitCLIValidation
+	}
+	op := argv[0]
+	var tenant, reason string
+	for i := 1; i < len(argv); i++ {
+		if v, ok := mcpFlagValue(argv, &i, "tenant"); ok {
+			tenant = v
+		} else if v, ok := mcpFlagValue(argv, &i, "reason"); ok {
+			reason = v
+		} else if argv[i] == "--data" && i+1 < len(argv) {
+			i++
+		} else if strings.HasPrefix(argv[i], "--data=") {
+			continue
+		} else {
+			fmt.Fprintln(os.Stderr, "usage: ocliv relay tenants suspend|unsuspend --tenant ID [--reason TEXT] [--data DIR]")
+			return apperr.ExitCLIValidation
+		}
+	}
+	if tenant == "" {
+		fmt.Fprintln(os.Stderr, "usage: ocliv relay tenants suspend|unsuspend --tenant ID [--reason TEXT] [--data DIR]")
+		return apperr.ExitCLIValidation
+	}
+	db, code := openRelayDB(argv)
+	if code != 0 {
+		return code
+	}
+	defer db.Close()
+	if reason == "" {
+		reason = "operator tenants " + op
+	}
+	if op == "suspend" {
+		affected, err := relay.SuspendTenantDB(db, tenant)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error: "+err.Error())
+			return exitForRelayErr(err)
+		}
+		db.Audit("operator", tenant, "", "tenant_suspend", "ok", reason)
+		fmt.Printf("suspended tenant %s (%d leases terminally revoked; keys stay revoked on unsuspend)\n", tenant, len(affected))
+		return apperr.ExitOK
+	}
+	if err := relay.UnsuspendTenantDB(db, tenant); err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return exitForRelayErr(err)
+	}
+	db.Audit("operator", tenant, "", "tenant_unsuspend", "ok", reason)
+	fmt.Printf("unsuspended tenant %s (re-enroll publishers explicitly; old keys stay revoked)\n", tenant)
+	return apperr.ExitOK
+}
+
+// cmdRelayBackup implements `ocliv relay backup --data DIR --out FILE`.
+// The snapshot is a consistent VACUUM INTO image with owner-only
+// permissions; validating it (integrity + schema) is part of restore,
+// not backup, so backup stays usable while the relay runs.
+func cmdRelayBackup(argv []string) int {
+	out := ""
+	for i := 0; i < len(argv); i++ {
+		if v, ok := mcpFlagValue(argv, &i, "out"); ok {
+			out = v
+		} else if argv[i] == "--data" && i+1 < len(argv) {
+			i++
+		} else if strings.HasPrefix(argv[i], "--data=") {
+			continue
+		} else {
+			fmt.Fprintln(os.Stderr, "usage: ocliv relay backup --data DIR --out FILE")
+			return apperr.ExitCLIValidation
+		}
+	}
+	if out == "" {
+		fmt.Fprintln(os.Stderr, "usage: ocliv relay backup --data DIR --out FILE")
+		return apperr.ExitCLIValidation
+	}
+	db, code := openRelayDB(argv)
+	if code != 0 {
+		return code
+	}
+	defer db.Close()
+	if err := relay.BackupState(db, out); err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return exitForRelayErr(err)
+	}
+	fmt.Printf("backup written: %s (stop the relay before restoring from it)\n", out)
+	return apperr.ExitOK
+}
+
+// cmdRelayRestore implements
+// `ocliv relay restore --data DIR --in FILE [--reset-authority] --relay-stopped`.
+// The operator must stop the relay first and attest it; restore refuses
+// revocation rollback unless --reset-authority explicitly distrusts
+// everything restored (re-enrollment required afterwards).
+func cmdRelayRestore(argv []string) int {
+	in := ""
+	reset := false
+	stopped := false
+	for i := 0; i < len(argv); i++ {
+		if v, ok := mcpFlagValue(argv, &i, "in"); ok {
+			in = v
+		} else if argv[i] == "--reset-authority" {
+			reset = true
+		} else if argv[i] == "--relay-stopped" {
+			stopped = true
+		} else if argv[i] == "--data" && i+1 < len(argv) {
+			i++
+		} else if strings.HasPrefix(argv[i], "--data=") {
+			continue
+		} else {
+			fmt.Fprintln(os.Stderr, "usage: ocliv relay restore --data DIR --in FILE [--reset-authority] --relay-stopped")
+			return apperr.ExitCLIValidation
+		}
+	}
+	if in == "" {
+		fmt.Fprintln(os.Stderr, "usage: ocliv relay restore --data DIR --in FILE [--reset-authority] --relay-stopped")
+		return apperr.ExitCLIValidation
+	}
+	_, dataDir, _ := relayFlags(argv)
+	if err := relay.RestoreState(dataDir, in, reset, stopped); err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return exitForRelayErr(err)
+	}
+	if reset {
+		fmt.Println("restore complete with reset-authority: all keys, leases, and publications revoked; re-enroll publishers, then start the relay")
+	} else {
+		fmt.Println("restore complete: start the relay (restored image takes effect at next start)")
+	}
 	return apperr.ExitOK
 }
 

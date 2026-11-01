@@ -7,6 +7,31 @@ import (
 	"testing"
 )
 
+// Publication tiers (P1-D) must never report active unless the relay
+// says active, the lease is ACTIVE, the attachment is live, and the
+// local probe passed. Anything else degrades honestly.
+func TestDoctorPublicationTier(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		pub, lease  string
+		live, local bool
+		want        string
+	}{
+		{"active", "active", "ACTIVE", true, true, "active"},
+		{"revoked wins", "revoked", "ACTIVE", true, true, "revoked"},
+		{"expired lease", "active", "EXPIRED", false, false, "expired"},
+		{"active lease no attachment", "active", "ACTIVE", false, true, "offline"},
+		{"attached but local down", "active", "ACTIVE", true, false, "degraded"},
+		{"closed lease", "active", "CLOSED", false, true, "offline"},
+		{"unknown state", "active", "RECONNECTING", false, false, "offline"},
+		{"unknown pubstate", "bogus", "ACTIVE", true, true, "active"},
+	} {
+		if got := doctorPublicationTier(tc.pub, tc.lease, tc.live, tc.local); got != tc.want {
+			t.Fatalf("%s: got %q want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
 // The staged probe must validate envelopes, not just shapes: id echo,
 // result/error exclusivity, and a negotiated protocol version.
 func TestProbeValidatesEnvelopes(t *testing.T) {

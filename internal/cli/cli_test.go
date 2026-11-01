@@ -394,12 +394,13 @@ func TestRelayServeRefusesPublicListen(t *testing.T) {
 // malformed values must refuse startup instead of serving the wrong
 // namespace (A05, A06, D01, H02).
 func TestParseRelayDomain(t *testing.T) {
-	for _, ok := range []string{"tunnels.example.net", "a-b.c12.dev", "relay.mydomain.io"} {
+	for _, ok := range []string{"tunnels.hosting.test", "a-b.c12.dev", "relay.mydomain.io"} {
 		if _, err := parseRelayDomain(ok); err != nil {
 			t.Fatalf("domain %q rejected: %v", ok, err)
 		}
 	}
 	for _, bad := range []string{"", "  ", "example.com", "example.net", "example.org",
+		"relay.example.org", "sub.example.net", "deep.sub.example.com",
 		"localhost", "single", ".lead.dot", "trail.dot.", "bad_char!.com", "-lead.com", "toolonglabel" + strings.Repeat("x", 60) + ".com"} {
 		if _, err := parseRelayDomain(bad); err == nil {
 			t.Fatalf("domain %q accepted", bad)
@@ -410,7 +411,7 @@ func TestParseRelayDomain(t *testing.T) {
 // --mcp-host must name one exact public hostname: no scheme, port,
 // path, placeholder, or bare label may enable path-route ingress.
 func TestParseMCPHost(t *testing.T) {
-	for _, ok := range []string{"relay.example.org", "Relay.Example.ORG", "a-b.c12.dev"} {
+	for _, ok := range []string{"relay.hosting.test", "Relay.Hosting.TEST", "a-b.c12.dev"} {
 		got, err := parseMCPHost(ok)
 		if err != nil {
 			t.Fatalf("mcp host %q rejected: %v", ok, err)
@@ -420,10 +421,26 @@ func TestParseMCPHost(t *testing.T) {
 		}
 	}
 	for _, bad := range []string{"", "  ", "example.com", "single", "localhost",
-		"bad_char!.com", "-lead.com", "https://relay.example.org",
-		"relay.example.org:8080", "relay.example.org/mcp"} {
+		"bad_char!.com", "-lead.com", "relay.example.org", "https://relay.hosting.test",
+		"relay.hosting.test:8080", "relay.hosting.test/mcp"} {
 		if _, err := parseMCPHost(bad); err == nil {
 			t.Fatalf("mcp host %q accepted", bad)
+		}
+	}
+}
+
+// --mcp-port must be a valid TCP port when given, and is meaningless
+// without --mcp-host: a port with no path-route ingress is rejected
+// rather than silently ignored.
+func TestParseMCPPort(t *testing.T) {
+	for _, ok := range []string{"443", "8444", "1", "65535"} {
+		if _, err := parseMCPPort(ok); err != nil {
+			t.Fatalf("mcp port %q rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "0", "65536", "-1", "https", "84.44", "  "} {
+		if _, err := parseMCPPort(bad); err == nil {
+			t.Fatalf("mcp port %q accepted", bad)
 		}
 	}
 }
@@ -465,6 +482,25 @@ func TestRelayServeRefusesBadMCPHost(t *testing.T) {
 	}
 }
 
+// A bad --mcp-port, or a port with no --mcp-host to attach to, must
+// refuse before binding anything or creating relay state.
+func TestRelayServeRefusesBadMCPPort(t *testing.T) {
+	for _, argv := range [][]string{
+		{"--listen=127.0.0.1:18081", "--domain=ocliv.test", "--mcp-host=relay.ocliv.test", "--mcp-port=0"},
+		{"--listen=127.0.0.1:18081", "--domain=ocliv.test", "--mcp-host=relay.ocliv.test", "--mcp-port", "99999"},
+		{"--listen=127.0.0.1:18081", "--domain=ocliv.test", "--mcp-host=relay.ocliv.test", "--mcp-port=https"},
+		{"--listen=127.0.0.1:18081", "--domain=ocliv.test", "--mcp-port=8444"},
+	} {
+		dir := filepath.Join(t.TempDir(), "data")
+		if code := cmdRelayServe(append(argv, "--data", dir)); code != apperr.ExitCLIValidation {
+			t.Fatalf("argv %v: exit %d, want %d", argv, code, apperr.ExitCLIValidation)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "ocliv.db")); !os.IsNotExist(err) {
+			t.Fatalf("argv %v created relay state before refusal", argv)
+		}
+	}
+}
+
 // The installed entry point must refuse a missing or placeholder domain
 // before binding anything.
 func TestRelayServeRefusesPlaceholderDomain(t *testing.T) {
@@ -483,7 +519,12 @@ func TestRelayServeRefusesPlaceholderDomain(t *testing.T) {
 // it provisions the deployment.
 func TestRelayInitLabelsPreparationOnly(t *testing.T) {
 	out := captureStdout(t, func() {
-		if code := cmdRelayInit([]string{"--domain", "example.com", "--data", t.TempDir()}); code != apperr.ExitOK {
+		// Valid (non-placeholder) domain: init now refuses placeholders
+		// before generating, so the fixture uses a real-shaped domain.
+		// The assertion is unchanged: init stays preparation-only.
+		argv := []string{"--domain", "init.test", "--mcp-host", "relay.init.test",
+			"--acme-email", "ops@init.test", "--data", t.TempDir(), "--out", t.TempDir()}
+		if code := cmdRelayInit(argv); code != apperr.ExitOK {
 			t.Fatalf("exit %d", code)
 		}
 	})
@@ -724,5 +765,33 @@ func TestAttachEventsSlowAttachObserved(t *testing.T) {
 	a, ok = events.next(context.Background())
 	if !ok || a.Generation != 2 {
 		t.Fatalf("superseding attachment not delivered: %+v %v", a, ok)
+	}
+}
+
+// Probe flags let apps that don't answer usefully at / declare their own
+// readiness contract; unsafe paths and bad statuses fail validation.
+func TestParseTunnelOptionsProbeFlags(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	opts, code := parseTunnelOptions([]string{"3000", "--probe-path=/healthz", "--probe-status=200"})
+	if code != 0 {
+		t.Fatalf("valid probe flags: code=%d", code)
+	}
+	if opts.probePath != "/healthz" || opts.probeStatus != 200 {
+		t.Fatalf("probe flags not carried: %+v", opts)
+	}
+	def, code := parseTunnelOptions([]string{"3000"})
+	if code != 0 || def.probePath != "" || def.probeStatus != 0 {
+		t.Fatalf("probe defaults changed: %+v code=%d", def, code)
+	}
+	for _, argv := range [][]string{
+		{"3000", "--probe-path=http://x/"},
+		{"3000", "--probe-path=/../x"},
+		{"3000", "--probe-path=/ok", "--probe-status=abc"},
+		{"3000", "--probe-path=/ok", "--probe-status=99"},
+		{"3000", "--probe-path=/ok", "--probe-status=600"},
+	} {
+		if _, code := parseTunnelOptions(argv); code == 0 {
+			t.Fatalf("unsafe probe flags accepted: %v", argv)
+		}
 	}
 }

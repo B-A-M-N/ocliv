@@ -186,14 +186,17 @@ func prepareTunnel(opts tunnelOptions) (tunnelReady, int) {
 		return tunnelReady{}, apperr.ExitAuth
 	}
 	target := config.LoopbackTarget(opts.port, cfg.IPv6)
-	if perr := agent.ProbeLocal(target, 3*time.Second); perr != nil {
+	if perr := agent.ProbeLocalPath(target, opts.probePath, opts.probeStatus, 3*time.Second); perr != nil {
 		fmt.Fprintf(os.Stderr, "local service unreachable at %s: %v\n", target, perr)
 		return tunnelReady{}, apperr.ExitLocalTarget
 	}
 	dir, keyPath, _, _ := agentFiles()
 	cfg.DataDir = dir
 	cfg.KeyPath = keyPath
-	rn := &agent.Runner{Cfg: cfg, Key: k, KeyID: keyID, Target: target}
+	// The reconnect re-probe reuses the startup contract (P1-09):
+	// same path, same expected status, re-verified not redefined.
+	rn := &agent.Runner{Cfg: cfg, Key: k, KeyID: keyID, Target: target,
+		ProbePath: opts.probePath, ProbeStatus: opts.probeStatus}
 	return tunnelReady{opts: opts, target: target, dir: dir, key: k, keyID: keyID, runner: rn}, 0
 }
 

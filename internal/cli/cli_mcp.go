@@ -35,7 +35,7 @@ var manageTools = []string{"ocliv_status", "ocliv_share", "ocliv_revoke"}
 
 func cmdMCP(argv []string) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ocliv mcp expose|manage|publish|serve|doctor ...")
+		fmt.Fprintln(os.Stderr, "usage: ocliv mcp expose|manage|publish|serve|doctor|list|unpublish ...")
 		return apperr.ExitCLIValidation
 	}
 	switch argv[0] {
@@ -49,6 +49,10 @@ func cmdMCP(argv []string) int {
 		return cmdMCPServe(argv[1:])
 	case "doctor":
 		return cmdMCPDoctor(argv[1:])
+	case "list":
+		return cmdMCPList(argv[1:])
+	case "unpublish":
+		return cmdMCPUnpublish(argv[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown mcp command %q\n", argv[0])
 		return apperr.ExitCLIValidation

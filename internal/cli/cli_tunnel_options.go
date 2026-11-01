@@ -4,9 +4,11 @@ package cli
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
+	"ocliv/internal/agent"
 	"ocliv/internal/apperr"
 	"ocliv/internal/config"
 )
@@ -39,6 +41,11 @@ type tunnelOptions struct {
 	cfg      config.Agent
 	showJSON bool
 	port     int
+	// probePath/probeStatus declare the local readiness contract for
+	// apps that don't answer usefully at / (Domain A). Empty path
+	// means /; status 0 means any HTTP response counts.
+	probePath   string
+	probeStatus int
 }
 
 // tunnelReady is a validated tunnel invocation with enrollment loaded,
@@ -53,6 +60,7 @@ func parseTunnelOptions(argv []string) (tunnelOptions, int) {
 	cfg := config.Agent{RelayURL: config.DefaultRelayURL}
 	var showJSON bool
 	var relayFlag, upstreamFlag, ttlFlag bool
+	var probePath, probeStatusStr string
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
 		switch {
@@ -105,6 +113,16 @@ func parseTunnelOptions(argv []string) (tunnelOptions, int) {
 		case strings.HasPrefix(a, "--relay="):
 			cfg.RelayURL = strings.TrimPrefix(a, "--relay=")
 			relayFlag = true
+		case a == "--probe-path" && i+1 < len(argv):
+			i++
+			probePath = argv[i]
+		case strings.HasPrefix(a, "--probe-path="):
+			probePath = strings.TrimPrefix(a, "--probe-path=")
+		case a == "--probe-status" && i+1 < len(argv):
+			i++
+			probeStatusStr = argv[i]
+		case strings.HasPrefix(a, "--probe-status="):
+			probeStatusStr = strings.TrimPrefix(a, "--probe-status=")
 		case strings.HasPrefix(a, "--"):
 			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
 			return tunnelOptions{}, apperr.ExitCLIValidation
@@ -121,6 +139,23 @@ func parseTunnelOptions(argv []string) (tunnelOptions, int) {
 		return tunnelOptions{}, apperr.ExitCLIValidation
 	}
 	cfg.Port = port
+	// Local readiness contract (Domain A): validated here, before any
+	// network use. The agent re-probe reuses the same contract.
+	var probeStatus int
+	if probeStatusStr != "" {
+		n, nerr := strconv.Atoi(probeStatusStr)
+		if nerr != nil || n < 100 || n > 599 {
+			fmt.Fprintln(os.Stderr, "error: --probe-status wants 100-599")
+			return tunnelOptions{}, apperr.ExitCLIValidation
+		}
+		probeStatus = n
+	}
+	if probePath != "" {
+		if verr := agent.ValidateProbePath(probePath); verr != nil {
+			fmt.Fprintln(os.Stderr, "error: "+verr.Error())
+			return tunnelOptions{}, apperr.ExitCLIValidation
+		}
+	}
 	// Precedence: flags > non-secret env > config file > compiled defaults
 	// (A06). Every accepted key has a live consumer (AS-057); a file-level
 	// default_access_mode other than "protected" is rejected loudly rather
@@ -162,7 +197,7 @@ func parseTunnelOptions(argv []string) (tunnelOptions, int) {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return tunnelOptions{}, apperr.ExitCLIValidation
 	}
-	return tunnelOptions{cfg: cfg, showJSON: showJSON, port: port}, 0
+	return tunnelOptions{cfg: cfg, showJSON: showJSON, port: port, probePath: probePath, probeStatus: probeStatus}, 0
 }
 
 // prepareTunnel loads enrollment, probes the local target, and constructs

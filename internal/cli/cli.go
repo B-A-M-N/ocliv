@@ -7,7 +7,20 @@ import (
 	"strings"
 
 	"ocliv/internal/apperr"
+	"ocliv/internal/protocol"
 )
+
+// BinaryVersion is the client/relay build version reported by
+// `ocliv version` alongside the wire-protocol range. Bump together
+// with protocol.MinVersion/MaxVersion when the wire changes.
+const BinaryVersion = "1.0.0"
+
+// versionString renders the build and wire-protocol identity from the
+// single-source constants, never hardcoded literals that can drift.
+func versionString() string {
+	return fmt.Sprintf("ocliv %s (protocol %s, supported %s-%s)",
+		BinaryVersion, protocol.Version, protocol.MinVersion, protocol.MaxVersion)
+}
 
 // Run dispatches argv. Exit codes follow the spec contract.
 func Run(argv []string) int {
@@ -16,7 +29,7 @@ func Run(argv []string) int {
 	}
 	switch argv[0] {
 	case "version", "--version", "-V":
-		fmt.Println("ocliv 1.0.0 (protocol ocliv/1)")
+		fmt.Println(versionString())
 		return apperr.ExitOK
 	case "help", "--help", "-h":
 		return usage(apperr.ExitOK)
@@ -53,7 +66,7 @@ Usage:
   ocliv status [--json]
   ocliv access share|rotate|revoke [LEASE]
   ocliv doctor
-  ocliv relay init --domain DOMAIN | relay serve --domain DOMAIN [--mcp-host HOST] [--relay-host HOST] | relay doctor | relay issue-enroll
+  ocliv relay init --domain DOMAIN | relay serve --domain DOMAIN [--mcp-host HOST] [--mcp-port PORT] [--relay-host HOST] | relay doctor | relay issue-enroll
   ocliv mcp expose -- COMMAND [ARGS...]
   ocliv mcp manage
   ocliv mcp publish --local URL --auth upstream-oauth|fixture-anonymous [--name N] [--ttl D] ...

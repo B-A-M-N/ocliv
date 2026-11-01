@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -222,10 +223,20 @@ func publishDumbFixture(t *testing.T) (int, func()) {
 	return ln.Addr().(*net.TCPAddr).Port, func() { _ = ln.Close() }
 }
 
+// routeVerifiedCount counts publications with completed verification.
+func routeVerifiedCount(t *testing.T, db *store.DB) int {
+	t.Helper()
+	var n int
+	if err := db.SQL().QueryRow(`SELECT COUNT(*) FROM mcp_publications WHERE verified_at IS NOT NULL`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
 func routeRowCount(t *testing.T, db *store.DB) int {
 	t.Helper()
 	var n int
-	if err := db.SQL().QueryRow(`SELECT COUNT(*) FROM mcp_routes`).Scan(&n); err != nil {
+	if err := db.SQL().QueryRow(`SELECT COUNT(*) FROM mcp_publications`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	return n
@@ -240,10 +251,12 @@ func leaseStatus(t *testing.T, db *store.DB, hostname string) string {
 	return st
 }
 
-// TestMCPPublishFullCycleCleansUpRouteAndLease: a published route is
-// removed and its owning lease closed on SIGINT shutdown, and the exit
-// is clean when both remote revocations confirm.
-func TestMCPPublishFullCycleCleansUpRouteAndLease(t *testing.T) {
+// TestMCPPublishFullCycleRetainsRouteAndClosesLease: SIGINT shutdown
+// closes the owning lease but RETAINS the durable publication (P1-A),
+// so a later authorized republish rebinds the same stable route. The
+// exit is clean when the remote lease close confirms. The retained
+// offline route must deny forwarding until rebound.
+func TestMCPPublishFullCycleRetainsRouteAndClosesLease(t *testing.T) {
 	home := t.TempDir()
 	db, relayURL := publishFlowRelay(t, "mcp.example.test")
 	publishFlowEnroll(t, home, relayURL, db)
@@ -251,7 +264,8 @@ func TestMCPPublishFullCycleCleansUpRouteAndLease(t *testing.T) {
 	defer closeFixture()
 
 	argv := []string{"--local", fmt.Sprintf("http://127.0.0.1:%d/mcp", port),
-		"--auth", "upstream-oauth", "--name", "flowtest", "--ttl", "30m"}
+		"--auth", "upstream-oauth", "--name", "flowtest", "--ttl", "30m",
+		"--dev-allow-unverified-discovery"}
 	done := make(chan int, 1)
 	go func() { done <- runMCPPublish(argv, false) }()
 
@@ -278,13 +292,132 @@ func TestMCPPublishFullCycleCleansUpRouteAndLease(t *testing.T) {
 	case <-time.After(45 * time.Second):
 		t.Fatal("publish did not shut down after SIGINT")
 	}
-	// The DELETE targets the route-owning lease: no orphan rows, no
-	// abandoned ACTIVE lease.
-	if n := routeRowCount(t, db); n != 0 {
-		t.Fatalf("route rows after shutdown: %d, want 0", n)
+	// Shutdown retains the durable publication (P1-A) bound to the
+	// now-CLOSED lease: the stable route survives for the next
+	// authorized republish, and the closed lease denies forwarding.
+	if n := routeRowCount(t, db); n != 1 {
+		t.Fatalf("route rows after shutdown: %d, want retained 1", n)
+	}
+	// The dev-allow path still activates explicitly (P0-A): a killed
+	// publisher fails closed only because activation is the separate
+	// readiness step, even when discovery itself was skipped.
+	if n := routeVerifiedCount(t, db); n != 1 {
+		t.Fatalf("verified rows after shutdown: %d, want 1", n)
 	}
 	if st := leaseStatus(t, db, "flowtest.t.example.test"); st != "CLOSED" {
 		t.Fatalf("lease status %q, want CLOSED", st)
+	}
+	var bound string
+	if err := db.SQL().QueryRow(`SELECT lease_id FROM mcp_publications`).Scan(&bound); err != nil {
+		t.Fatal(err)
+	}
+	if bound != flowLeaseID(t, db, "flowtest.t.example.test") {
+		t.Fatalf("retained publication bound to %q, want the closed lease", bound)
+	}
+}
+
+// TestMCPPublishUnverifiedDiscoveryFailsClosedByDefault: the flow
+// fixture speaks MCP but serves no OAuth discovery document, so the
+// public discovery probe is unreachable. Default publication (no dev
+// flag) must fail closed (P0-B items 1, 3, 8): nonzero exit, the
+// registered route abandoned, the owning lease closed, and the route
+// URL never printed because it refers to a closed lease.
+func TestMCPPublishUnverifiedDiscoveryFailsClosedByDefault(t *testing.T) {
+	home := t.TempDir()
+	db, relayURL := publishFlowRelay(t, "mcp.example.test")
+	publishFlowEnroll(t, home, relayURL, db)
+	port, closeFixture := publishFlowFixture(t)
+	defer closeFixture()
+
+	argv := []string{"--local", fmt.Sprintf("http://127.0.0.1:%d/mcp", port),
+		"--auth", "upstream-oauth", "--name", "flowstrict", "--ttl", "30m"}
+	var code int
+	out := captureStdout(t, func() { code = runMCPPublish(argv, false) })
+	if code == apperr.ExitOK {
+		t.Fatalf("exit=0 with unverified discovery; want fail-closed nonzero (got %d)", code)
+	}
+	if n := routeRowCount(t, db); n != 0 {
+		t.Fatalf("route rows after fail-closed discovery: %d, want 0", n)
+	}
+	if st := leaseStatus(t, db, "flowstrict.t.example.test"); st != "CLOSED" {
+		t.Fatalf("lease status %q after fail-closed discovery, want CLOSED", st)
+	}
+	if strings.Contains(out, "https://mcp.example.test/r/") {
+		t.Fatalf("abandoned route URL was printed for a closed lease:\n%s", out)
+	}
+}
+
+// TestProveRouteReady* pins the P0-A readiness ordering: discovery
+// verification runs first; activation runs only when verification
+// passes or is explicitly excused by --dev-allow-unverified-discovery;
+// a fatal verification error never activates; a failed activation is
+// always fatal. The relay-side tests prove the admission effect; these
+// prove the CLI never advertises a URL without a confirmed activation.
+func TestProveRouteReadyVerifiedThenActivates(t *testing.T) {
+	cfg := mcpPublishConfig{}
+	activated := false
+	devOnly, err := proveRouteReady(cfg,
+		func() error { return nil },
+		func() (int, string) { activated = true; return http.StatusOK, `{"status":"verified"}` })
+	if err != nil || devOnly || !activated {
+		t.Fatalf("verified path: devOnly=%v err=%v activated=%v", devOnly, err, activated)
+	}
+}
+
+func TestProveRouteReadyInvalidDiscoveryNeverActivates(t *testing.T) {
+	cfg := mcpPublishConfig{}
+	activated := false
+	_, err := proveRouteReady(cfg,
+		func() error { return errors.New("upstream advertises resource \"x\"") },
+		func() (int, string) { activated = true; return http.StatusOK, `` })
+	if err == nil {
+		t.Fatal("invalid discovery accepted")
+	}
+	if activated {
+		t.Fatal("activation ran after fatal discovery failure")
+	}
+	if errors.Is(err, errActivationFailed) {
+		t.Fatal("discovery failure misreported as activation failure")
+	}
+}
+
+func TestProveRouteReadyUnreachableFailsClosedByDefault(t *testing.T) {
+	cfg := mcpPublishConfig{}
+	activated := false
+	_, err := proveRouteReady(cfg,
+		func() error { return fmt.Errorf("%w: dial refused", errDiscoveryUnreachable) },
+		func() (int, string) { activated = true; return http.StatusOK, `` })
+	if !errors.Is(err, errDiscoveryUnreachable) {
+		t.Fatalf("want unreachable error, got %v", err)
+	}
+	if activated {
+		t.Fatal("activation ran after fatal unreachable discovery")
+	}
+}
+
+func TestProveRouteReadyDevAllowExcusesUnreachableButStillActivates(t *testing.T) {
+	cfg := mcpPublishConfig{devAllowUnverified: true}
+	activated := false
+	devOnly, err := proveRouteReady(cfg,
+		func() error { return fmt.Errorf("%w: dial refused", errDiscoveryUnreachable) },
+		func() (int, string) { activated = true; return http.StatusOK, `` })
+	if err != nil || !devOnly || !activated {
+		t.Fatalf("dev path: devOnly=%v err=%v activated=%v", devOnly, err, activated)
+	}
+}
+
+func TestProveRouteReadyFailedActivationIsFatal(t *testing.T) {
+	for _, cfg := range []mcpPublishConfig{{}, {devAllowUnverified: true}} {
+		activated := false
+		_, err := proveRouteReady(cfg,
+			func() error { return nil },
+			func() (int, string) { activated = true; return http.StatusConflict, `publication not activatable` })
+		if !errors.Is(err, errActivationFailed) {
+			t.Fatalf("cfg %+v: want activation error, got %v", cfg, err)
+		}
+		if !activated {
+			t.Fatalf("cfg %+v: activation was not attempted", cfg)
+		}
 	}
 }
 
@@ -352,10 +485,10 @@ func TestMCPPublishRouteFailureClosesLeaseAndPropagatesExit(t *testing.T) {
 }
 
 // TestMCPPublishLeaseCloseFailurePropagates: revoking the agent key
-// mid-publish makes both remote cleanup calls fail closed (403). The
-// shutdown must report an explicit nonzero exit and must not pretend the
-// remote route or lease is gone: the route row survives and the lease is
-// not CLOSED.
+// mid-publish makes the remote lease close fail closed (403). The
+// shutdown must report an explicit nonzero exit and must not pretend
+// the remote lease is gone: the retained route row survives and the
+// lease is not CLOSED.
 func TestMCPPublishLeaseCloseFailurePropagates(t *testing.T) {
 	home := t.TempDir()
 	db, relayURL := publishFlowRelay(t, "mcp.example.test")
@@ -364,7 +497,8 @@ func TestMCPPublishLeaseCloseFailurePropagates(t *testing.T) {
 	defer closeFixture()
 
 	argv := []string{"--local", fmt.Sprintf("http://127.0.0.1:%d/mcp", port),
-		"--auth", "upstream-oauth", "--name", "flowclose", "--ttl", "30m"}
+		"--auth", "upstream-oauth", "--name", "flowclose", "--ttl", "30m",
+		"--dev-allow-unverified-discovery"}
 	done := make(chan int, 1)
 	go func() { done <- runMCPPublish(argv, false) }()
 
@@ -403,40 +537,30 @@ func TestMCPPublishLeaseCloseFailurePropagates(t *testing.T) {
 	}
 }
 
-// TestMCPPublishRouteDeleteFailurePropagates: deleting the route
-// out-of-band before shutdown makes the shutdown DELETE miss (404) while
-// the lease close still confirms. The exit must be nonzero (unconfirmed
-// route revocation) even though the lease closed cleanly.
-func TestMCPPublishRouteDeleteFailurePropagates(t *testing.T) {
+// TestMCPUnpublishRemovesRouteAndClosesLease: after an orderly
+// shutdown retains the publication, `mcp unpublish --lease` deletes
+// every bound route and closes the lease, exiting clean when both
+// remote operations confirm. An already-gone route (404) counts as
+// removed: the end state, not the transition, is asserted.
+func TestMCPUnpublishRemovesRouteAndClosesLease(t *testing.T) {
 	home := t.TempDir()
 	db, relayURL := publishFlowRelay(t, "mcp.example.test")
-	k, keyID, err := publishFlowKey(t, home, relayURL, db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("OCLIV_RELAY_URL", relayURL)
+	publishFlowEnroll(t, home, relayURL, db)
 	port, closeFixture := publishFlowFixture(t)
 	defer closeFixture()
 
 	argv := []string{"--local", fmt.Sprintf("http://127.0.0.1:%d/mcp", port),
-		"--auth", "upstream-oauth", "--name", "flowroute", "--ttl", "30m"}
+		"--auth", "upstream-oauth", "--name", "flowroute", "--ttl", "30m",
+		"--dev-allow-unverified-discovery"}
 	done := make(chan int, 1)
 	go func() { done <- runMCPPublish(argv, false) }()
 
 	deadline := time.Now().Add(25 * time.Second)
-	routeID := ""
-	for routeID == "" {
+	for routeRowCount(t, db) != 1 {
 		if time.Now().After(deadline) {
 			t.Fatal("route was never registered")
 		}
 		time.Sleep(200 * time.Millisecond)
-		_ = db.SQL().QueryRow(`SELECT route_id FROM mcp_routes`).Scan(&routeID)
-	}
-	// Remove the route behind the publisher's back: the shutdown DELETE
-	// will 404 while the lease close confirms.
-	status, _ := mgmtCall(relayURL, k, keyID, "DELETE", "/v1/agent/lease/"+flowLeaseID(t, db, "flowroute.t.example.test")+"/mcp-route/"+routeID)
-	if status != http.StatusOK {
-		t.Fatalf("out-of-band route delete: want 200 got %d", status)
 	}
 	self, err := os.FindProcess(os.Getpid())
 	if err != nil {
@@ -447,16 +571,105 @@ func TestMCPPublishRouteDeleteFailurePropagates(t *testing.T) {
 	}
 	select {
 	case code := <-done:
-		if code != apperr.ExitInternal {
-			t.Fatalf("exit=%d, want ExitInternal for unconfirmed route revocation", code)
+		if code != apperr.ExitOK {
+			t.Fatalf("shutdown exit=%d, want clean 0", code)
 		}
 	case <-time.After(45 * time.Second):
 		t.Fatal("publish did not shut down after SIGINT")
 	}
-	if st := leaseStatus(t, db, "flowroute.t.example.test"); st != "CLOSED" {
-		t.Fatalf("lease status %q, want CLOSED (lease close confirmed)", st)
+	if n := routeRowCount(t, db); n != 1 {
+		t.Fatalf("route rows after shutdown: %d, want retained 1", n)
+	}
+	// Permanent removal by exact lease ID (the shutdown output prints
+	// this command): route deleted, lease closed, clean exit.
+	if code := cmdMCPUnpublish([]string{"--lease", flowLeaseID(t, db, "flowroute.t.example.test")}); code != apperr.ExitOK {
+		t.Fatalf("unpublish exit=%d, want clean 0", code)
 	}
 	if n := routeRowCount(t, db); n != 0 {
-		t.Fatalf("route rows after shutdown: %d", n)
+		t.Fatalf("route rows after unpublish: %d, want 0", n)
+	}
+	if st := leaseStatus(t, db, "flowroute.t.example.test"); st != "CLOSED" {
+		t.Fatalf("lease status %q, want CLOSED", st)
+	}
+	// Idempotent: unpublishing again finds no routes but still
+	// confirms the (already closed) lease state cleanly.
+	if code := cmdMCPUnpublish([]string{"--lease", flowLeaseID(t, db, "flowroute.t.example.test")}); code != apperr.ExitOK {
+		t.Fatalf("second unpublish exit=%d, want clean 0", code)
+	}
+}
+
+// TestMCPUnpublishByPublicationIDIsolatesSiblings: two publications owned
+// by one key; unpublishing puba by publication ID removes exactly that
+// route and never touches pubb's route or lease (P0-D). `mcp list`
+// reports both before and only the survivor after.
+func TestMCPUnpublishByPublicationIDIsolatesSiblings(t *testing.T) {
+	home := t.TempDir()
+	db, relayURL := publishFlowRelay(t, "mcp.example.test")
+	publishFlowEnroll(t, home, relayURL, db)
+	portA, closeA := publishFlowFixture(t)
+	defer closeA()
+	portB, closeB := publishFlowFixture(t)
+	defer closeB()
+
+	mkargv := func(port int, name string) []string {
+		return []string{"--local", fmt.Sprintf("http://127.0.0.1:%d/mcp", port),
+			"--auth", "upstream-oauth", "--name", name, "--ttl", "30m",
+			"--dev-allow-unverified-discovery"}
+	}
+	doneA := make(chan int, 1)
+	doneB := make(chan int, 1)
+	go func() { doneA <- runMCPPublish(mkargv(portA, "siba"), false) }()
+	go func() { doneB <- runMCPPublish(mkargv(portB, "sibb"), false) }()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for routeRowCount(t, db) != 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("routes registered: %d, want 2", routeRowCount(t, db))
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if code := cmdMCPList(nil); code != apperr.ExitOK {
+		t.Fatalf("mcp list exit=%d, want 0", code)
+	}
+	if code := cmdMCPList([]string{"--name", "siba"}); code != apperr.ExitOK {
+		t.Fatalf("mcp list --name siba exit=%d, want 0", code)
+	}
+	if code := cmdMCPList([]string{"--name", "nope"}); code == apperr.ExitOK {
+		t.Fatal("mcp list --name nope exited 0, want nonzero")
+	}
+	var routeA string
+	if err := db.SQL().QueryRow(`SELECT route_id FROM mcp_publications WHERE pub_name='siba'`).Scan(&routeA); err != nil {
+		t.Fatal(err)
+	}
+	if code := cmdMCPUnpublish([]string{"--publication-id", routeA}); code != apperr.ExitOK {
+		t.Fatalf("unpublish --publication-id exit=%d, want 0", code)
+	}
+	var survivors int
+	var name string
+	if err := db.SQL().QueryRow(`SELECT COUNT(*), MAX(pub_name) FROM mcp_publications`).Scan(&survivors, &name); err != nil {
+		t.Fatal(err)
+	}
+	if survivors != 1 || name != "sibb" {
+		t.Fatalf("survivors=%d name=%q, want 1 sibb", survivors, name)
+	}
+	if st := leaseStatus(t, db, "sibb.t.example.test"); st != "ACTIVE" {
+		t.Fatalf("sibling lease status %q, want ACTIVE", st)
+	}
+	self, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := self.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	for i, done := range []chan int{doneA, doneB} {
+		select {
+		case code := <-done:
+			if code != apperr.ExitOK {
+				t.Fatalf("publisher %d shutdown exit=%d, want 0", i, code)
+			}
+		case <-time.After(45 * time.Second):
+			t.Fatalf("publisher %d did not shut down after SIGINT", i)
+		}
 	}
 }

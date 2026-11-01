@@ -90,11 +90,15 @@ ocliv mcp publish --local http://127.0.0.1:8765/mcp \
 
 The server must serve exactly `/mcp`; there is no `--public` flag and
 `mcp manage` is never exposed remotely. The printed
-`https://<relay-host>/r/<route-id>/mcp` is stable for the lease.
-Ctrl+C deletes the route, then closes the lease (outcomes reported
-separately). Add `--strict-discovery` to delete the route and fail
-closed when OAuth discovery is unreachable instead of warning and
-serving. `ocliv mcp doctor [--lease ID] [--name LABEL]` reports
+`https://<relay-host>/r/<route-id>/mcp` is stable across leases for the
+same `--name` (durable publication); republish rebinds it.
+Ctrl+C closes the lease and RETAINS the publication offline (same URL
+on republish); `mcp unpublish --lease ID` removes it permanently.
+OAuth discovery verification is strict by default:
+unreachable/invalid discovery deletes the route and fails closed.
+Explicit dev-only `--dev-allow-unverified-discovery` warns and serves
+with the URL marked NOT VERIFIED (never for ChatGPT).
+`ocliv mcp doctor [--lease ID] [--name LABEL]` reports
 lease, route, local service, and MCP protocol separately.
 
 ## Workflow C — temporary Funnel public test
@@ -102,9 +106,10 @@ lease, route, local service, and MCP protocol separately.
 On the relay machine (reversible; reset when done):
 
 ```sh
+./caddy run --config packaging/caddy/Caddyfile.funnel --adapter caddyfile &
 ocliv relay serve --listen=127.0.0.1:8080 --data "$HOME/ocliv-lab" \
   --domain <anything-valid> --relay-host <funnel-host> --mcp-host <funnel-host>
-tailscale funnel 8080
+tailscale funnel 18081
 tailscale funnel status   # note the https://<host> name
 # ... publish from the publisher machine against https://<host> ...
 tailscale funnel reset
