@@ -961,3 +961,15 @@ Drill (container removed afterwards, zero host footprint):
 - Invalid-certificate rejection stays NOT VERIFIED locally (harness
   is plain-HTTP loopback; needs the external TLS gate).
 - Disposition: FIXED (locally testable portion).
+
+## Convergence checkpoint — Rounds 36-38 gates (2026-11-02)
+- `go build ./...`, `go vet ./...`, `gofmt -l` (clean), full
+  `go test ./internal/...`, integration suite 210s PASS, race
+  (relay/agent/cli/mcp/doctor) PASS — all on the Round 38 tree.
+- Code-controlled work complete: wildcard DNS-01 init guards,
+  installer rollback preservation, offline-route negative test,
+  home-host + VPS guides, funnel relay-host rule.
+- NOT VERIFIED (external infra required): live public DNS-01 wildcard
+  issuance, off-network HTTPS tunnel test, ChatGPT registration
+  (workspace permission), invalid-certificate rejection over real TLS,
+  24h soak. No PUBLIC READY claim.
