@@ -754,3 +754,16 @@ quirk only; public behavior is the oracle.
 - `FuzzLeaseFenceMonotonic` (lease, 30s, 2.0M execs) → PASS.
 - No new corpus failures; worktree clean of fuzz artifacts.
 - Disposition: VERIFIED (continued).
+
+## Round 27 — docs reconciliation + CLI convention check (2026-11-01)
+- Swept OPERATOR.md / MCP-HOSTING.md / GATE3 / QUALIFICATION.md for
+  stale claims after Rounds 11–26: loopback examples accurate,
+  STAGING_BIND mandate documented, placeholder gates described, no
+  references to removed defaults. No contradictions found.
+- `ocliv relay --help` / `ocliv mcp --help` fail as unknown commands —
+  consistent CLI-wide convention (only top-level `ocliv --help`
+  exists). Not a defect; no change.
+- Live read-only probe: `ocliv doctor` in this environment reports
+  verified relay dispatch (HTTP 401 on challenge), trusted TLS, and an
+  honest verified-negative local probe. No state mutated.
+- Disposition: VERIFIED NON-ISSUE for this leg.
