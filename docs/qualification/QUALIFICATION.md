@@ -455,3 +455,23 @@ Disposition: documented flows behave as documented; no drift found.
 - serve-loop goroutine scope: VERIFIED fixed (P1-6). Cancellation
   watcher uses `context.AfterFunc` bound to the session lifetime and
   disarms on serve return; no per-reconnect waiter accumulation.
+
+## Operational note (2026-11-01): funnel moved to relay host
+
+Public edge re-established on joker3 as Gate 3 specifies: Funnel
+:10000 → Caddy 127.0.0.1:18081 → relay 127.0.0.1:8080
+(--relay-host/--mcp-host pop-os-3.tail8d285a.ts.net --mcp-port 10000).
+Verified from public internet: valid Let's Encrypt cert, `/` → 421
+relay authority denial, unknown route → 404. `tailscale funnel
+status` locally prints "No serve config" despite serving — display
+quirk only; public behavior is the oracle.
+
+## Re-audit on committed HEAD, round 6 (defect loop)
+
+- Per-lease budget lifecycle: VERIFIED. `TryAcquire`/`Release`
+  symmetric with `defer Release` at admission; `Registry.Drop` on
+  `evictLease` and on reconnect-grace expiry; supervise eviction of
+  terminal leases funnels through `evictLease`. Restart starts empty
+  (in-memory only). No leak path found.
+- MCP admission pre-forwarding budget (P1-10): present —
+  `MCPAdmissionBurst` per (source, lease) before stream allocation.
