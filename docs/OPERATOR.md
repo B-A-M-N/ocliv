@@ -19,32 +19,33 @@ before touching the network so the fresh code is not burned; destruction
 of local credentials is explicit via `ocliv logout`, after which the
 operator must revoke the relay-side key (below).
 
-## Compromised-key takedown (C10, B09, H04)
+## Compromised-key takedown (C10, B09, H04, P0-A)
 
-There is no in-band operator endpoint; the procedure is direct database
-revocation on the relay host, identical in effect to the agent-signed
-revoke handler, plus an explicit audit row:
+Use the supported operator commands on the relay host (no Server
+construction, no restart required):
 
-```sql
-UPDATE access_tokens   SET revoked_at='<now>' WHERE lease_id='<lease>' AND revoked_at IS NULL;
-UPDATE visitor_sessions SET revoked_at='<now>' WHERE lease_id='<lease>' AND revoked_at IS NULL;
-UPDATE leases SET token_generation=token_generation+1 WHERE id='<lease>';
-UPDATE leases SET status='REVOKED' WHERE id='<lease>';
-UPDATE agent_keys SET status='revoked' WHERE id='<key>';
-INSERT INTO audit_events(time, actor, tenant_id, lease_id, category, result, detail)
-VALUES('<now>', 'operator', '', '<lease>', 'takedown', 'ok', 'compromised key revoked by operator');
+```sh
+ocliv relay keys list --data /var/lib/ocliv
+ocliv relay revoke-key --key-id key-XXXX --reason "compromised" --data /var/lib/ocliv
+ocliv relay tenants suspend --tenant TENANT --reason "abuse" --data /var/lib/ocliv
+ocliv relay tenants unsuspend --tenant TENANT --data /var/lib/ocliv
 ```
 
-Effect: new visitor requests — including `--public` requests, which skip
-visitor authentication but are still gated on live `ACTIVE` status by the
-router — and every later attach/resume with the key are denied immediately
-without a relay restart (per-request checks read `revoked_at`,
-`token_generation`, lease status, and key status from the database).
-The `REVOKED` status update is what stops a public tunnel: without it the
-lease still reads `ACTIVE` and public traffic keeps flowing.
-Already-established in-flight streams on the live agent session drain
-naturally; killing them immediately requires a relay restart. Bound all
-leases with TTLs so the worst case is time-boxed.
+One coordinated transaction marks the key revoked, terminally revokes
+all its live leases and visitor credentials, tombstones affected
+publications, and records the audit row. Effect: new visitor requests —
+including `--public` requests, which skip visitor authentication but are
+still gated on live `ACTIVE` status by the router — and every later
+challenge/connect/allocate/resume with the key are denied; suspension
+additionally denies enrollment for the tenant. Keys stay revoked on
+unsuspend: restoring service requires explicit re-enrollment, never a
+silent resurrection of old authority.
+
+Forwarding termination: the in-process path evicts live sessions at
+commit, and per-request admission evicts on the next denied request; a
+CLI-driven revocation without a local Server converges through the
+relay's 5s supervise revalidation. Bound all leases with TTLs so the
+worst case stays time-boxed.
 
 ## Restart semantics (P1 — fail-closed session invalidation)
 
@@ -62,12 +63,120 @@ generation bumps, and audit history all survive restarts — restore from
 an older backup can still resurrect revoked identities (H06), so treat
 backups as point-in-time copies, never as revocation truth.
 
-## Backup and restore (H06 — not yet provided)
+## Publication management (P0-D — durable identities)
 
-No backup/restore procedure ships in v1. Copying `ocliv.db` while the
-relay runs is untested; stop the relay first. Restore from backup has no
-automated test. Do not represent single-node operation as highly
-available (H09).
+A publication (`route_id`) is the stable public endpoint; a lease is the
+transient tunnel attachment behind it. Manage the publication, not the
+lease:
+
+```sh
+ocliv mcp list                              # every publication you own
+ocliv mcp list --name dev-tools             # one label
+ocliv mcp unpublish --publication-id ROUTE  # revoke exactly this route
+ocliv mcp unpublish --lease LEASE           # legacy lease administration
+```
+
+`unpublish --publication-id` deletes only that route (already-gone is
+OK); it never closes a lease or touches sibling publications.
+`mcp list` is a routing hint, not liveness: ACTIVE comes from relay
+admission, verified with `mcp doctor`.
+
+Key rotation does not transfer publications (fail-closed): a newly
+enrolled replacement key owns nothing. Re-enroll, then republish under
+the replacement key; the old key's routes stay tombstoned under the old
+key. Revoking a key denies its management plane (list/delete return
+403) and tombstones its publications — revival requires a fresh
+authorized publish, never a resume.
+
+## Local readiness probing (Domain A)
+
+Apps that do not answer usefully at `/` get an explicit probe contract
+instead of a silent always-ready assumption:
+
+```sh
+ocliv 3000 --probe-path /healthz --probe-status 200
+```
+
+The path must be an origin-form loopback path (no query, no `..`,
+validated before any network use); the status is one expected code
+100–599, or `0`/omitted for any HTTP response. The contract is part of
+the tunnel's deployment identity: changing it allocates a fresh lease
+rather than resuming the old one, and every reconnect re-probes the
+same contract. `ocliv status` shows the recorded contract (`Probe:`),
+and `ocliv doctor` judges the local target against it — override with
+`doctor --probe-path/--probe-status` only to test a different contract,
+never to claim reachability.
+
+## Backup and restore (H06, P0-E)
+
+```sh
+ocliv relay backup --data /var/lib/ocliv --out /root/ocliv-snap.db
+systemctl stop ocliv-relay
+ocliv relay restore --data /var/lib/ocliv --in /root/ocliv-snap.db --relay-stopped
+systemctl start ocliv-relay
+```
+
+`backup` is a consistent online snapshot (VACUUM INTO, owner-only);
+`restore` is explicitly offline and fail-closed:
+
+- The relay must be stopped first; without `--relay-stopped` restore
+  refuses, and an active writer on the live database also refuses.
+- The backup must pass integrity_check and open through the current
+  schema (older snapshots migrate forward in a scratch copy; newer
+  schemas refuse).
+- Revocation never rolls back: every revoked key, suspended tenant,
+  revoked lease, and tombstoned publication in the live database must
+  already be revoked/absent in the backup, or restore refuses and
+  names the resurrected identity.
+- `--reset-authority` is the explicit escape hatch: it installs the
+  backup, then revokes every key, lease, token, session, and
+  publication in it. Nothing restored is trusted until the operator
+  re-enrolls. The restore (and reset) is audited in the new database.
+
+The restored image takes effect at the next relay start; a running
+relay keeps its pre-restore handle until restart. Writes between
+restore and restart are lost — stop first, restore, start.
+
+Do not represent single-node operation as highly available (H09).
+
+## Public single-host deployment (production ingress)
+
+One public relay serves all publishers; publishers need no DNS, ports,
+or certificates of their own. On a host with a public IP and a domain
+you control:
+
+1. DNS: one `A`/`AAAA` record for the relay hostname (e.g.
+   `relay.hosting.test` → public IP). No wildcard needed for
+   single-host MCP ingress.
+2. Relay env `/etc/ocliv/relay.env` (root-owned, `0600`):
+   `OCLIV_DOMAIN=hosting.test`,
+   `OCLIV_MCP_HOST=relay.hosting.test`
+   (plus `OCLIV_RELAY_HOST=` only when the public control hostname is
+   not `relay.<domain>`). Reserved `example.*` hostnames refuse startup.
+   Generate, don't hand-write: `ocliv relay init --domain hosting.test
+   --mcp-host relay.hosting.test --acme-email ops@hosting.test
+   --out ./ocliv-relay-deploy` renders `relay.env`, the edge
+   `Caddyfile`, the unit, and `dns-records.txt` from the reviewed
+   packaging sources (placeholders refuse before anything is written;
+   re-runs are idempotent, conflicting re-runs fail closed).
+3. Edge: install `packaging/caddy/Caddyfile.single-host` with
+   `OCLIV_HOST`/`OCLIV_ACME_EMAIL` set, then
+   `caddy validate --config Caddyfile.single-host --adapter caddyfile`
+   before `systemctl reload caddy`. Caddy terminates ACME TLS and
+   forwards to `127.0.0.1:8080`; the relay never binds publicly.
+4. Relay: `systemctl enable --now ocliv-relay` (uses
+   `packaging/systemd/ocliv-relay.service` + launcher, fixed
+   loopback `--listen`, explicit `--domain`, conditional `--mcp-host`).
+5. Enroll: `ocliv relay issue-enroll --data /var/lib/ocliv --tenant NAME`
+   on the relay host; publishers `ocliv login` against
+   `https://relay.hosting.test`.
+
+Failure is loud, not silent: missing/placeholder domain or host, a
+port without `--mcp-host`, a non-loopback `--listen`, or an
+unreachable Caddy upstream each refuse startup or reload. A route is
+production-ready only when an independent machine outside the relay's
+network reaches it over normal public DNS with default TLS
+verification — tailnet or loopback success never counts.
 
 ## Private staging lab (tailnet, no VPS)
 

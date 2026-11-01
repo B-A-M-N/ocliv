@@ -25,18 +25,32 @@ unprotected public tool endpoint is never created implicitly.)
    opaque identifier, not a secret: it authorizes nothing by itself.
    Before serving, publish proves the upstream OAuth resource binding
    by fetching the discovery document through the live route. If
-   discovery is unreachable, publish warns (`resource binding NOT
-   verified`) and continues; pass `--strict-discovery` to delete the
-   route and fail closed instead, so an unproven binding never serves.
+   discovery is unreachable or invalid, publish deletes the route and
+   fails closed, so an unproven binding never serves
+   (`--strict-discovery` is accepted for back-compat and is the
+   default). Explicit dev-only `--dev-allow-unverified-discovery` warns
+   (`resource binding NOT verified`) and serves with the URL marked NOT
+   VERIFIED — never register that URL with ChatGPT.
+   The discovery document must name the published route URL exactly.
+   Since the route URL is minted at registration (after the MCP server
+   started), pass `--resource-file PATH` and point the server at the same
+   path (the staging fixture reads `MCP_RESOURCE_FILE`): the publisher
+   atomically writes the canonical URL there before probing, so the
+   server advertises exactly that resource. Without the handoff the
+   server must already be configured with the stable public URL,
+   otherwise strict discovery fails closed.
 4. Point the MCP client at that URL with your OAuth issuer/audience/
    scopes. The relay forwards `Authorization` byte-identical for your
    upstream server to validate; Ocliv visitor credentials are neither
    demanded nor consulted on this route.
 5. Check health anytime: `ocliv mcp doctor` (lease, route, local
    service, and MCP protocol status separately; never prints secrets).
-6. Ctrl+C shuts down cleanly: the route is deleted, then the lease is
-   closed, each outcome reported. Revoking the lease denies the route
-   immediately (HTTP 503, no further forwarding).
+6. Ctrl+C shuts down cleanly: the lease is closed and the
+   publication is RETAINED offline (503) so the next authorized
+   `publish --name SAME` rebinds the identical URL — no ChatGPT
+   re-registration. Permanent removal is explicit:
+   `ocliv mcp unpublish --lease ID`. Revoking the lease tombstones
+   the publication permanently (HTTP 404, never revived).
 
 Remote publication of stdio MCP servers (`--stdio`) is currently
 disabled: the stdio bridge cannot enforce upstream authentication yet
@@ -63,7 +77,11 @@ never as a public route.
    FQDN that serves agent control (single-host edge): the relay keeps
    the two authorities separated by exact host plus strict path split,
    admitting only route-shaped `/r/<route-id>/mcp` paths through
-   visitor routing.
+   visitor routing. If the edge terminates on a non-443 port (lab Caddy
+   on 8444), add `--mcp-port <port>` so minted route URLs carry it;
+   Host admission strips numeric ports and is unaffected, but a URL
+   without the port points at a closed port and strict discovery
+   correctly refuses it.
 3. Make public ingress independently reachable (TLS valid, Host routed)
    BEFORE enrolling agents or publishing routes.
 4. The Caddy edge must overwrite (never append) `X-Forwarded-For` /

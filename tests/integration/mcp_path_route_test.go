@@ -49,18 +49,49 @@ func setLeaseMode(t *testing.T, h *harness, mode string) {
 	}
 }
 
+// insertTestPublication writes a durable publication row for the
+// attached lease (P1-A): ownership and label derive from the lease,
+// mirroring what the production create-or-rebind path stores.
+func insertTestPublication(t *testing.T, h *harness, routeID, externalHost, profile string) {
+	t.Helper()
+	var tenant, key, label string
+	if err := h.db.SQL().QueryRow(
+		`SELECT tenant_id, agent_key_id, label FROM leases WHERE id=?`,
+		h.attached.LeaseID).Scan(&tenant, &key, &label); err != nil {
+		t.Fatal(err)
+	}
+	// Verified fixture: mirrors post-activation state. Tests that
+	// need the pending state create it through the real management
+	// API (mgmtRouteCreate) instead, so a pending-deny can never
+	// mask the defect a negative test targets.
+	if _, err := h.db.SQL().Exec(
+		`INSERT INTO mcp_publications(route_id, tenant_id, owner_key_id, external_host, profile, pub_name, target_path, lease_id, created_at, updated_at, verified_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+		routeID, tenant, key, externalHost, profile, label, "/mcp", h.attached.LeaseID,
+		"2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// mgmtRouteActivate activates a just-created route through the signed
+// management API (P0-A): creation registers pending, activation admits.
+// Tests that forward traffic through API-created routes must activate
+// first; anything else asserts the pending denial.
+func mgmtRouteActivate(t *testing.T, h *harness, routeID string) {
+	t.Helper()
+	code, raw := h.mgmt(t, h.agentKey, h.keyID, "POST", "mcp-route/"+routeID+"/activate")
+	if code != http.StatusOK {
+		t.Fatalf("route activate status=%d body=%q, want 200", code, raw)
+	}
+}
+
 func insertTestRoute(t *testing.T, h *harness, routeID string, host ...string) {
 	t.Helper()
 	externalHost := "public.example.org"
 	if len(host) > 0 {
 		externalHost = host[0]
 	}
-	if _, err := h.db.SQL().Exec(
-		`INSERT INTO mcp_routes(route_id, lease_id, external_host, profile, target_path, created_at)
-		 VALUES(?,?,?,?,?,?)`,
-		routeID, h.attached.LeaseID, externalHost, "upstream-oauth", "/mcp", "2026-01-01T00:00:00Z"); err != nil {
-		t.Fatal(err)
-	}
+	insertTestPublication(t, h, routeID, externalHost, "upstream-oauth")
 }
 
 // TestPathRouteForwardsStrippedPath is the P0-A vertical slice: a route
@@ -319,6 +350,9 @@ func TestMCPRouteMgmtLifecycle(t *testing.T) {
 		t.Fatalf("republish minted %q, want stable %q", rid2, rid)
 	}
 
+	// Creation registers pending: activation admits (P0-A).
+	mgmtRouteActivate(t, h, rid)
+
 	// Listing reports the route (mcp doctor's source).
 	code, raw := h.mgmt(t, h.agentKey, h.keyID, "GET", "mcp-route")
 	if code != http.StatusOK || !strings.Contains(string(raw), rid) {
@@ -402,7 +436,7 @@ func TestMCPRouteConcurrentCreate(t *testing.T) {
 	}
 	var count int
 	if err := h.db.SQL().QueryRow(
-		`SELECT COUNT(*) FROM mcp_routes WHERE lease_id=? AND external_host=? AND profile=?`,
+		`SELECT COUNT(*) FROM mcp_publications WHERE lease_id=? AND external_host=? AND profile=?`,
 		h.attached.LeaseID, "public.example.org", "upstream-oauth").Scan(&count); err != nil || count != 1 {
 		t.Fatalf("mapping rows=%d err=%v, want exactly 1", count, err)
 	}
@@ -468,9 +502,11 @@ func TestMCPModeLeaseResumeSurvivesRestart(t *testing.T) {
 	h.startAgentOpts(t, app.Port, config.Agent{AccessMode: "mcp_upstream_oauth"})
 	firstID := h.attached.LeaseID
 
-	if code, _, _, _ := mgmtRouteCreate(t, h, "upstream-oauth"); code != http.StatusOK {
+	code, rid, _, _ := mgmtRouteCreate(t, h, "upstream-oauth")
+	if code != http.StatusOK {
 		t.Fatalf("route create status=%d", code)
 	}
+	mgmtRouteActivate(t, h, rid)
 	h.restartAgent(t, app.Port)
 	if h.attached.LeaseID != firstID {
 		t.Fatalf("restart minted %q, want resumed %q", h.attached.LeaseID, firstID)
@@ -593,12 +629,7 @@ func TestMCPAdmissionRateBoundsFlood(t *testing.T) {
 	h.startAgent(t, app.Port)
 	setLeaseMode(t, h, "mcp_anonymous_fixture")
 
-	if _, err := h.db.SQL().Exec(
-		`INSERT INTO mcp_routes(route_id, lease_id, external_host, profile, target_path, created_at)
-		 VALUES(?,?,?,?,?,?)`,
-		"route-flood", h.attached.LeaseID, "public.example.org", "fixture-anonymous", "/mcp", "2026-01-01T00:00:00Z"); err != nil {
-		t.Fatal(err)
-	}
+	insertTestPublication(t, h, "route-flood", "public.example.org", "fixture-anonymous")
 	const total = 300
 	var ok, rejected int
 	before := app.postHits.Load()
@@ -640,12 +671,7 @@ func TestPathRouteAnonymousFixture(t *testing.T) {
 	h.startAgent(t, app.Port)
 	setLeaseMode(t, h, "mcp_anonymous_fixture")
 
-	if _, err := h.db.SQL().Exec(
-		`INSERT INTO mcp_routes(route_id, lease_id, external_host, profile, target_path, created_at)
-		 VALUES(?,?,?,?,?,?)`,
-		"route-fixture", h.attached.LeaseID, "public.example.org", "fixture-anonymous", "/mcp", "2026-01-01T00:00:00Z"); err != nil {
-		t.Fatal(err)
-	}
+	insertTestPublication(t, h, "route-fixture", "public.example.org", "fixture-anonymous")
 	before := app.postHits.Load()
 	resp := routeReq(t, h, "public.example.org", "/r/route-fixture/mcp", map[string]string{
 		"Content-Type": "application/json",

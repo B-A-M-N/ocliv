@@ -1,0 +1,38 @@
+# LAB-ONLY funnel edge for ocliv staging (never a production path).
+# Tailscale Funnel terminates public TLS itself and forwards decrypted
+# HTTP to this loopback listener, so this file does NO TLS: the public
+# certificate is Funnel's, not Caddy's. The relay still enforces exact
+# Host + strict path split, and Caddy still asserts the trusted-edge
+# header contract (overwrite X-Forwarded-For, strip smuggled
+# X-Forwarded-Host). SNI/Host consistency cannot be verified behind
+# Funnel (SNI terminates at Funnel); that check stays NOT VERIFIED for
+# funnel-fronted deployments.
+#
+# Run on the relay host (example port 18081, unprivileged):
+#   ./caddy run --config Caddyfile.funnel --adapter caddyfile
+# Expose it (stable tailnet operator action, needs funnel allowed):
+#   tailscale funnel 18081
+# The relay must then run with --relay-host/--mcp-host set to the exact
+# public funnel hostname (e.g. pop-os-3.tail8d285a.ts.net).
+{
+	auto_https off
+	admin off
+}
+
+:18081 {
+	bind 127.0.0.1
+
+	reverse_proxy 127.0.0.1:8080 {
+		# Overwrite: the relay treats the rightmost entry as the
+		# client IP only from a loopback peer.
+		header_up X-Forwarded-For {remote_host}
+		# Hardcoded https: this listener exists ONLY behind Funnel TLS
+		# termination, so {scheme} would always (and wrongly) report
+		# http and the relay would forward the wrong public origin
+		# downstream. Never copy this line into a non-Funnel file.
+		header_up X-Forwarded-Proto https
+		# Strip anything the visitor smuggled in: routing reads r.Host,
+		# never a forwarded host label.
+		header_up -X-Forwarded-Host
+	}
+}

@@ -1,0 +1,9 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "ocliv": {
+      "type": "streamable-http",
+      "url": "https://REPLACE-WITH-QUALIFIED-ROUTE/r/REPLACE-WITH-ROUTE-ID/mcp"
+    }
+  }
+}

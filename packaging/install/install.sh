@@ -13,13 +13,15 @@ ENV_DIR="/etc/ocliv"
 ENV_FILE="$ENV_DIR/relay.env"
 DOMAIN="${DOMAIN:-}"
 MCP_HOST="${MCP_HOST:-}"
+MCP_PORT="${MCP_PORT:-}"
+RELAY_HOST="${RELAY_HOST:-}"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "run as root" >&2
   exit 1
 fi
 if [ -z "$DOMAIN" ]; then
-  echo "usage: DOMAIN=<public relay domain> [MCP_HOST=<exact mcp host>] $0" >&2
+  echo "usage: DOMAIN=<public relay domain> [MCP_HOST=<exact mcp host>] [MCP_PORT=<edge port>] [RELAY_HOST=<control host>] $0" >&2
   echo "  staging example: DOMAIN=ocliv.test ./install.sh" >&2
   exit 1
 fi
@@ -38,7 +40,23 @@ if ! go build -o "$NEW_BIN" ./cmd/ocliv 2>/dev/null; then
   exit 1
 fi
 chmod 0755 "$NEW_BIN"
+# Validate the candidate before it replaces anything live.
+if ! "$NEW_BIN" relay --help >/dev/null 2>&1 && ! "$NEW_BIN" --help >/dev/null 2>&1; then
+  rm -f "$NEW_BIN"
+  echo "candidate binary failed --help preflight; installed binary untouched" >&2
+  exit 1
+fi
+# Preserve a rollback candidate before replacing a working install.
+if [ -f "$BIN" ]; then
+  cp -p "$BIN" "$BIN.prev"
+fi
 mv "$NEW_BIN" "$BIN"
+rollback_bin() {
+  if [ -f "$BIN.prev" ]; then
+    mv -f "$BIN.prev" "$BIN"
+    echo "restored previous binary from $BIN.prev" >&2
+  fi
+}
 
 if ! id ocliv >/dev/null 2>&1; then
   useradd --system --home-dir "$DATA_DIR" --no-create-home --shell /usr/sbin/nologin ocliv
@@ -56,6 +74,12 @@ umask 077
   if [ -n "$MCP_HOST" ]; then
     echo "OCLIV_MCP_HOST=$MCP_HOST"
   fi
+  if [ -n "$MCP_PORT" ]; then
+    echo "OCLIV_MCP_PORT=$MCP_PORT"
+  fi
+  if [ -n "$RELAY_HOST" ]; then
+    echo "OCLIV_RELAY_HOST=$RELAY_HOST"
+  fi
 } > "$ENV_FILE.new.$$"
 mv "$ENV_FILE.new.$$" "$ENV_FILE"
 chmod 0600 "$ENV_FILE"
@@ -64,13 +88,13 @@ install -m 0755 packaging/systemd/ocliv-relay-launch.sh "$LAUNCHER"
 install -m 0644 packaging/systemd/ocliv-relay.service /etc/systemd/system/ocliv-relay.service
 systemctl daemon-reload
 
-# Preflight: binary runs, unit parses, domain configured.
-if ! "$BIN" relay --help >/dev/null 2>&1 && ! "$BIN" --help >/dev/null 2>&1; then
-  echo "warning: installed binary failed --help preflight" >&2
-fi
+# Post-activation checks: the candidate was already validated before
+# the move, so these verify the installed unit/edge. A unit failure
+# after replacement restores the rollback candidate.
 if command -v systemd-analyze >/dev/null 2>&1; then
   systemd-analyze verify /etc/systemd/system/ocliv-relay.service || {
     echo "unit verification failed" >&2
+    rollback_bin
     exit 1
   }
 fi
@@ -82,5 +106,8 @@ if command -v caddy >/dev/null 2>&1 && [ -f /etc/caddy/Caddyfile ]; then
 fi
 
 echo "installed $BIN; env $ENV_FILE (0600); data dir $DATA_DIR"
+if [ -f "$BIN.prev" ]; then
+  echo "rollback candidate preserved at $BIN.prev (restore manually if the new binary misbehaves)"
+fi
 echo "NOT YET QUALIFIED on a clean host until install/restore tests pass (Gate E open)."
 echo "next: edit /etc/caddy/Caddyfile, enroll operator key, then: systemctl enable --now ocliv-relay"

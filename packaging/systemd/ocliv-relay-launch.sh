@@ -15,10 +15,23 @@ if [ -z "${OCLIV_DOMAIN:-}" ]; then
 fi
 
 # shellcheck disable=SC2086
-if [ -n "${OCLIV_MCP_HOST:-}" ]; then
-  exec "$BIN" relay serve --listen="$LISTEN" --data="$DATA_DIR" \
-    --domain="$OCLIV_DOMAIN" --mcp-host="$OCLIV_MCP_HOST"
-else
-  exec "$BIN" relay serve --listen="$LISTEN" --data="$DATA_DIR" \
-    --domain="$OCLIV_DOMAIN"
+# --relay-host overrides the relay.<domain> control authority for public
+# hostnames not named relay.<domain> (e.g. temporary *.ts.net Funnel
+# ingress, where the funnel hostname must match the control authority
+# as well as the MCP authority). Like --mcp-host, it is passed only
+# when explicitly configured; an empty value would fail validation.
+ARGS="relay serve --listen=$LISTEN --data=$DATA_DIR --domain=$OCLIV_DOMAIN"
+if [ -n "${OCLIV_RELAY_HOST:-}" ]; then
+  ARGS="$ARGS --relay-host=$OCLIV_RELAY_HOST"
 fi
+if [ -n "${OCLIV_MCP_HOST:-}" ]; then
+  ARGS="$ARGS --mcp-host=$OCLIV_MCP_HOST"
+fi
+# Optional non-443 public edge port minted into route URLs (lab Caddy on
+# 8444). The relay CLI rejects a port with no --mcp-host, so a stray
+# OCLIV_MCP_PORT fails closed at startup instead of minting silently.
+if [ -n "${OCLIV_MCP_PORT:-}" ]; then
+  ARGS="$ARGS --mcp-port=$OCLIV_MCP_PORT"
+fi
+# shellcheck disable=SC2086
+exec $BIN $ARGS

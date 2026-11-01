@@ -1,0 +1,94 @@
+# Supervised MCP publisher lifecycle (P1-B): runs
+# `ocliv mcp publish` in the foreground under systemd supervision.
+#
+# LIFECYCLE CONTRACT (see internal/cli/cli_mcp_publish.go runMCPPublish):
+# the publisher registers the single-host route, prints the stable
+# endpoint, runs until signalled, then deletes the route and closes the
+# lease with independently recorded outcomes (CleanupResult).
+#
+# GRACEFUL STOP vs PERMANENT UNPUBLISH — READ THIS:
+# - `systemctl stop ocliv-mcp-publisher` (SIGTERM) is a GRACEFUL stop:
+#   the process catches SIGTERM, deletes the route, closes the lease,
+#   and exits. `systemctl start` re-publishes (possibly a new route ID).
+# - There is NO in-unit permanent unpublish. If the publication itself
+#   must end (route gone for good), stop the unit AND disable it
+#   (`systemctl disable --now ocliv-mcp-publisher`), then verify with
+#   `ocliv mcp doctor` that no route remains. Stopping alone leaves the
+#   unit enabled and a later boot/start will re-publish.
+#
+# ENROLLMENT: the service user (ocliv) must already be enrolled
+# (`ocliv login` run as that user: key + relay URL live in
+# ~ocliv/.config/ocliv). An unenrolled user exits 4 (auth) and, by
+# RestartPreventExitStatus below, does NOT restart-loop.
+#
+# NETWORK: strict discovery is the publisher default: the unit's host
+# must be able to reach the minted public route URL (OAuth
+# well-known document) or startup fails closed. Set OCLIV_STRICT=1 in
+# the env file to pass the explicit --strict-discovery flag (same as
+# the default; documents intent). Probes from elsewhere do not help;
+# it is THIS host's egress that must reach the public URL.
+#
+# No TTY is required: the process never prompts (failure is an exit
+# code, never a question).
+
+[Unit]
+Description=Ocliv MCP publisher (supervised `ocliv mcp publish` lifecycle)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ocliv
+Group=ocliv
+# All publication parameters come from the env file (root-owned, 0600;
+# see ocliv-mcp-publisher.env.example). A per-instance override may be
+# dropped at /etc/ocliv/publisher-<instance>.env when this unit is
+# started as an instance; the "-" prefix makes it optional.
+EnvironmentFile=/etc/ocliv/publisher.env
+EnvironmentFile=-/etc/ocliv/publisher-%i.env
+# Lease/record state lives in ~ocliv/.config/ocliv (enrollment store);
+# WorkingDirectory only sets the process cwd. StateDirectory provides a
+# root-owned backing dir for the optional OCLIV_RESOURCE_FILE handoff
+# (default path below lives under it).
+WorkingDirectory=/var/lib/ocliv
+StateDirectory=ocliv-mcp-publisher
+# Foreground publish: explicit flags only, no defaults smuggled in.
+# $$ escapes$-expansion so the SHELL (not systemd) reads the env file
+# values at start time; optional flags are appended only when set.
+# Missing OCLIV_LOCAL_URL fails with exit 2 (config error, no restart).
+ExecStart=/bin/sh -c '\
+[ -n "$${OCLIV_LOCAL_URL:-}" ] || { echo "ocliv-mcp-publisher: OCLIV_LOCAL_URL is unset (see /etc/ocliv/publisher.env)" >&2; exit 2; }; \
+set -- mcp publish --local="$${OCLIV_LOCAL_URL}" --auth="$${OCLIV_AUTH:-upstream-oauth}"; \
+[ -n "$${OCLIV_NAME:-}" ] && set -- "$$@" --name="$${OCLIV_NAME}"; \
+[ -n "$${OCLIV_TTL:-}" ] && set -- "$$@" --ttl="$${OCLIV_TTL}"; \
+[ -n "$${OCLIV_STRICT:-}" ] && set -- "$$@" --strict-discovery; \
+[ -n "$${OCLIV_RESOURCE_FILE:-}" ] && set -- "$$@" --resource-file="$${OCLIV_RESOURCE_FILE}"; \
+exec $${OCLIV_BIN:-/usr/local/bin/ocliv} "$$@"'
+# Supervision: restart transient failures with backoff, never loop
+# permanent ones. RestartPreventExitStatus maps to internal/apperr
+# codes (see exit-code table in the delivery report):
+#   2 cli-validation/config, 4 auth, 6 protocol, 7 quota/lease-denied.
+# Restarted: 3 local-target down (server may come up), 5 relay/TLS
+# transient, 8 internal (incl. unconfirmed remote cleanup -> retry
+# until TTL bounds exposure; TTL itself bounds a stuck lease).
+Restart=on-failure
+RestartPreventExitStatus=2 4 6 7
+RestartSec=30
+# SIGTERM triggers the orderly unpublish path (route DELETE + lease
+# close); allow time for both remote calls before SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+SuccessExitStatus=0
+# Hardening, matching ocliv-relay.service style: no new privileges,
+# private /tmp, strict system-view with the state dirs writable.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# NOTE: unlike ocliv-relay.service, ProtectHome is intentionally NOT set:
+# enrollment (key + relay URL) and the lease store live in
+# ~ocliv/.config/ocliv (config.DataDir), and orderly cleanup REMOVES the
+# closed lease record there — a protected $HOME would break unpublish.
+ReadWritePaths=/var/lib/ocliv-mcp-publisher /var/lib/ocliv
+
+[Install]
+WantedBy=multi-user.target

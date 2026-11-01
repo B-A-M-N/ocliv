@@ -1,0 +1,27 @@
+[Unit]
+Description=Ocliv authenticated MCP server (loopback fixture/operator server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ocliv-mcp
+Group=ocliv-mcp
+EnvironmentFile=/etc/ocliv/mcp-server.env
+# The server binary and port are fixed here by the operator: remote
+# clients can never select executables or arguments (no argv from network).
+ExecStart=/usr/local/bin/mcp-server -port 18766
+# Loopback only is enforced by the server itself (127.0.0.1 bind); the
+# unit additionally denies all network except loopback.
+IPAddressAllow=localhost
+IPAddressDeny=any
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ocliv-mcp-server
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

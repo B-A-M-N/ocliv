@@ -1,0 +1,24 @@
+[Unit]
+Description=Ocliv MCP publisher (outbound tunnel + route)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ocliv-publisher
+Group=ocliv-publisher
+EnvironmentFile=/etc/ocliv/publisher.env
+# Foreground publication: route registration, steady state, and cleanup
+# (route delete + lease close) on exit. No restart hides a revocation:
+# a revoked credential exits the publisher instead of reconnecting.
+ExecStart=/usr/local/bin/ocliv mcp publish --local http://127.0.0.1:18766/mcp --auth upstream-oauth --ttl 2h --strict-discovery --resource-file ${MCP_BINDING_FILE}
+WorkingDirectory=/var/lib/ocliv-publisher
+Restart=no
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ocliv-publisher
+
+[Install]
+WantedBy=multi-user.target
