@@ -61,11 +61,6 @@ func PlanBootstrap(env BootstrapEnv) (steps []Step, blockReason string) {
 		mk("enroll this machine",
 			fmt.Sprintf("ocliv relay issue-enroll --data /var/lib/ocliv --tenant home && ocliv login --relay https://%s --code-file -", env.Hostname)),
 	}
-	// Enrollment stays manual until the auto-enrollment loop lands:
-	// minting a code and completing login in one motion needs the
-	// running relay's data dir and key handling that the next slice
-	// wires up. Marking it auto now would overclaim.
-	steps[len(steps)-1].Auto = false
 	return steps, ""
 }
 

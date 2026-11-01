@@ -54,12 +54,6 @@ func TestPlanRootWithCaddyIsAllAuto(t *testing.T) {
 		t.Fatal("no steps planned")
 	}
 	for _, s := range steps {
-		if s.Title == "enroll this machine" {
-			if s.Auto {
-				t.Error("enrollment must stay manual until the auto-enrollment loop lands")
-			}
-			continue
-		}
 		if !s.Auto {
 			t.Errorf("root+caddy step %q not auto", s.Title)
 		}

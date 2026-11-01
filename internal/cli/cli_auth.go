@@ -78,10 +78,32 @@ func cmdLogin(argv []string) int {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return apperr.ExitCLIValidation
 	}
+	if _, _, _, err := agentFiles(); err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
+	}
+	keyID, exitCode := performEnroll(relayURL, code, cacert)
+	if exitCode != apperr.ExitOK {
+		return exitCode
+	}
+	fmt.Println("Enrolled as " + keyID)
+	fmt.Println("Relay: " + relayURL)
+	return apperr.ExitOK
+}
+
+// performEnroll exchanges a one-time code for registration: generate a
+// keypair, POST the code plus public key, save the key, record the
+// relay URL. Shared by `login` and `setup --auto` so both paths enforce
+// the same guards (TLS-only remote enrollment, no key overwrite).
+func performEnroll(relayURL, code, cacert string) (string, int) {
+	if err := config.CheckRelayTLS(relayURL); err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return "", apperr.ExitCLIValidation
+	}
 	_, keyPath, cfgPath, err := agentFiles()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
-		return apperr.ExitInternal
+		return "", apperr.ExitInternal
 	}
 	// Refuse before touching the network: overwriting an existing
 	// enrollment would silently destroy the secret and burn the one-time
@@ -89,12 +111,12 @@ func cmdLogin(argv []string) int {
 	// logout, which tells the operator to revoke the relay-side key.
 	if _, err := os.Stat(keyPath); err == nil {
 		fmt.Fprintln(os.Stderr, "already enrolled: run `ocliv logout` first (then ask the operator to revoke the old key)")
-		return apperr.ExitInternal
+		return "", apperr.ExitInternal
 	}
 	k, err := identity.Generate()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
-		return apperr.ExitInternal
+		return "", apperr.ExitInternal
 	}
 	pub := base64.StdEncoding.EncodeToString(k.Public())
 	body, _ := json.Marshal(map[string]string{"code": code, "public_key": pub})
@@ -106,7 +128,7 @@ func cmdLogin(argv []string) int {
 		pem, err := os.ReadFile(cacert)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error: cannot read --cacert file: "+err.Error())
-			return apperr.ExitCLIValidation
+			return "", apperr.ExitCLIValidation
 		}
 		pool, err := x509.SystemCertPool()
 		if err != nil || pool == nil {
@@ -114,7 +136,7 @@ func cmdLogin(argv []string) int {
 		}
 		if !pool.AppendCertsFromPEM(pem) {
 			fmt.Fprintln(os.Stderr, "error: --cacert file holds no certificates")
-			return apperr.ExitCLIValidation
+			return "", apperr.ExitCLIValidation
 		}
 		tlsCfg.RootCAs = pool
 	}
@@ -125,13 +147,13 @@ func cmdLogin(argv []string) int {
 	resp, err := client.Post(strings.TrimRight(relayURL, "/")+"/v1/agent/enroll", "application/json", bytes.NewReader(body))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "enrollment failed: relay unreachable; check the URL and try again")
-		return apperr.ExitAuth
+		return "", apperr.ExitAuth
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode != http.StatusOK {
 		fmt.Fprintln(os.Stderr, loginDeniedMessage(resp.StatusCode, string(respBody)))
-		return apperr.ExitAuth
+		return "", apperr.ExitAuth
 	}
 	var out struct {
 		KeyID    string `json:"key_id"`
@@ -139,21 +161,19 @@ func cmdLogin(argv []string) int {
 	}
 	if err := json.Unmarshal(respBody, &out); err != nil {
 		fmt.Fprintln(os.Stderr, "enrollment failed: bad relay response")
-		return apperr.ExitAuth
+		return "", apperr.ExitAuth
 	}
 	if err := k.Save(keyPath); err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
-		return apperr.ExitInternal
+		return "", apperr.ExitInternal
 	}
 	// Preserve operator/user settings already in the file: login only
 	// records the relay URL, never truncates the config (R6).
 	if err := mergeRelayURL(cfgPath, relayURL); err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
-		return apperr.ExitInternal
+		return "", apperr.ExitInternal
 	}
-	fmt.Println("Enrolled as " + out.KeyID)
-	fmt.Println("Relay: " + relayURL)
-	return apperr.ExitOK
+	return out.KeyID, apperr.ExitOK
 }
 
 // loginDeniedMessage renders an honest enrollment denial. Only a 401

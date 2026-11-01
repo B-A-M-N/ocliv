@@ -6,6 +6,7 @@ package cli
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +15,8 @@ import (
 	"testing"
 
 	"ocliv/internal/apperr"
+	"ocliv/internal/relay"
+	"ocliv/internal/store"
 )
 
 func TestSetupCheckReportsEchoVerdict(t *testing.T) {
@@ -176,6 +179,53 @@ func TestSetupRenderRefusesOnDNSMismatch(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join(home, ".config", "ocliv", "config.toml"))
 	if err == nil && strings.Contains(string(raw), "relay_url") {
 		t.Fatalf("unverified relay_url persisted:\n%s", raw)
+	}
+}
+
+// enrollFixture starts a live relay against a temp store and returns
+// the data dir and its loopback URL (plain http is loopback-only, so
+// enrollment may proceed per B01/B02).
+func enrollFixture(t *testing.T) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "ocliv.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	srv, err := relay.New(relay.Options{
+		DB: db, Namespace: "t.example.test", RelayHost: "127.0.0.1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hs := &http.Server{Handler: srv.Handler()}
+	go func() { _ = hs.Serve(ln) }()
+	t.Cleanup(func() { _ = hs.Close() })
+	return dir, "http://" + ln.Addr().String()
+}
+
+func TestSetupAutoEnrollEndToEnd(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir, url := enrollFixture(t)
+	keyID, code := autoEnroll(url, dir, "home")
+	if code != apperr.ExitOK {
+		t.Fatalf("auto-enroll exit=%d", code)
+	}
+	if keyID == "" {
+		t.Fatal("auto-enroll returned no key id")
+	}
+	if _, err := os.Stat(filepath.Join(home, ".config", "ocliv", "agent.key")); err != nil {
+		t.Fatalf("agent key not saved: %v", err)
+	}
+	// Second run must not burn a new code over the existing key (H07).
+	if _, code := autoEnroll(url, dir, "home"); code != apperr.ExitOK {
+		t.Fatalf("re-run exit=%d, want clean already-enrolled no-op", code)
 	}
 }
 

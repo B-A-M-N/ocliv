@@ -1028,3 +1028,18 @@ Drill (container removed afterwards, zero host footprint):
   in-repo; recorded as simulated-vs-live gap for the qualification
   docs slice.
 - Disposition: FIXED (slice 3b scope). Auto-enrollment (3c) pending.
+
+## Round 43 — setup auto-enrollment slice (2026-11-02)
+- Extracted `performEnroll` from `cmdLogin` (byte-identical behavior;
+  all 5 login tests green) and reused it in setup.
+- New `autoEnroll`: already-enrolled machines untouched (H07, empty
+  key id + exit 0); otherwise mint a one-time code directly from the
+  relay store (never constructs a Server, never prints the code) and
+  complete the exchange. The enroll POST doubles as full-chain
+  liveness proof (DNS → Caddy → loopback relay).
+- Planner enroll step is auto for root again (executor exists); the
+  run loop threads --data-dir (default /var/lib/ocliv) through.
+- Tests: end-to-end mint→exchange→key-saved→re-run-no-op against a
+  live in-process relay. Focused suites green.
+- Disposition: FIXED (slice 3c scope). Wildcard/on-demand TLS (slice
+  4) and provider adapter (slice 5) pending.

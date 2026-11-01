@@ -18,7 +18,9 @@ import (
 	"time"
 
 	"ocliv/internal/apperr"
+	"ocliv/internal/relay"
 	"ocliv/internal/setup"
+	"ocliv/internal/store"
 )
 
 // Default echo endpoints observe the egress address per family. They
@@ -39,6 +41,7 @@ func cmdSetup(argv []string) int {
 	tokenFile := ""
 	acmeEmail := ""
 	outDir := ""
+	dataDir := "/var/lib/ocliv"
 	echoV4, echoV6 := defaultEchoV4, defaultEchoV6
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
@@ -72,6 +75,11 @@ func cmdSetup(argv []string) int {
 		case a == "--out" && i+1 < len(argv):
 			i++
 			outDir = argv[i]
+		case strings.HasPrefix(a, "--data-dir="):
+			dataDir = strings.TrimPrefix(a, "--data-dir=")
+		case a == "--data-dir" && i+1 < len(argv):
+			i++
+			dataDir = argv[i]
 		case strings.HasPrefix(a, "--echo-v4="):
 			echoV4 = strings.TrimPrefix(a, "--echo-v4=")
 		case a == "--echo-v4" && i+1 < len(argv):
@@ -111,7 +119,7 @@ func cmdSetup(argv []string) int {
 		printSetupNext(d)
 		return apperr.ExitOK
 	}
-	return runSetupDNS(ctx, d, hostname, tokenFile, acmeEmail, outDir, dryRun)
+	return runSetupDNS(ctx, d, hostname, tokenFile, acmeEmail, outDir, dataDir, dryRun)
 }
 
 // runSetupDNS syncs the dynv6 zone to the observed egress addresses.
@@ -121,7 +129,7 @@ func cmdSetup(argv []string) int {
 // update additionally renders the single-host deployment, verifies the
 // name resolves to the observed egress, and persists relay_url for
 // `ocliv 3000` / `mcp publish`; nothing is activated yet.
-func runSetupDNS(ctx context.Context, d setup.Detection, hostname, tokenFile, acmeEmail, outDir string, dryRun bool) int {
+func runSetupDNS(ctx context.Context, d setup.Detection, hostname, tokenFile, acmeEmail, outDir, dataDir string, dryRun bool) int {
 	token := strings.TrimSpace(os.Getenv("DYNV6_TOKEN"))
 	if tokenFile != "" {
 		fi, err := os.Stat(tokenFile)
@@ -159,7 +167,7 @@ func runSetupDNS(ctx context.Context, d setup.Detection, hostname, tokenFile, ac
 	if acmeEmail == "" {
 		return apperr.ExitOK
 	}
-	return runSetupRender(ctx, d, hostname, acmeEmail, outDir)
+	return runSetupRender(ctx, d, hostname, acmeEmail, outDir, dataDir)
 }
 
 // runSetupRender generates the reviewable single-host deployment for
@@ -167,7 +175,7 @@ func runSetupDNS(ctx context.Context, d setup.Detection, hostname, tokenFile, ac
 // the observed egress, and only then persists relay_url. Caddy,
 // systemd, and enrollment stay manual until the next slice automates
 // them; this function activates nothing.
-func runSetupRender(ctx context.Context, d setup.Detection, hostname, acmeEmail, outDir string) int {
+func runSetupRender(ctx context.Context, d setup.Detection, hostname, acmeEmail, outDir, dataDir string) int {
 	dir, _, _, err := agentFiles()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
@@ -208,13 +216,13 @@ func runSetupRender(ctx context.Context, d setup.Detection, hostname, acmeEmail,
 		return apperr.ExitInternal
 	}
 	fmt.Printf("deployment rendered to %s and relay_url persisted (%s)\n", outDir, relayURL)
-	return runSetupBootstrap(d, hostname, outDir)
+	return runSetupBootstrap(d, hostname, outDir, dataDir)
 }
 
 // runSetupBootstrap executes the viable-path edge plan. Only steps the
 // planner marks auto run, and only as root; everything else prints as
 // the exact manual command. Live executors back up before replacing.
-func runSetupBootstrap(d setup.Detection, hostname, deployDir string) int {
+func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir string) int {
 	_, caddyErr := exec.LookPath("caddy")
 	env := setup.BootstrapEnv{
 		AsRoot:       os.Geteuid() == 0,
@@ -242,6 +250,15 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir string) int {
 			err = setup.InstallUnit(deployDir)
 		case "enable and start relay":
 			err = setup.StartRelay()
+		case "enroll this machine":
+			keyID, exit := autoEnroll("https://"+hostname, dataDir, "home")
+			if exit != apperr.ExitOK {
+				err = fmt.Errorf("enrollment failed (exit %d)", exit)
+			} else if keyID != "" {
+				fmt.Printf("enrolled as %s ", keyID)
+			} else {
+				fmt.Printf("already enrolled, key untouched ")
+			}
 		default:
 			err = fmt.Errorf("unknown step %q", s.Title)
 		}
@@ -259,6 +276,41 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir string) int {
 	}
 	fmt.Printf("verify externally: from another network, curl -v https://%s/v1/agent/challenge (no -k)\n", hostname)
 	return apperr.ExitOK
+}
+
+// mintSetupCode mints a one-time enrollment code against the relay's
+// own store. It opens the store directly (never constructs a Server,
+// which would reconcile unrelated live lease rows) and never prints
+// the code: it flows straight into the enroll exchange below.
+func mintSetupCode(dataDir, tenant string) (string, error) {
+	db, err := store.Open(filepath.Join(dataDir, "ocliv.db"))
+	if err != nil {
+		return "", err
+	}
+	defer db.Close()
+	return relay.IssueEnrollmentCode(db, tenant, time.Hour, "setup")
+}
+
+// autoEnroll completes enrollment against the just-provisioned relay:
+// mint a code from the relay store, exchange it for registration.
+// Already-enrolled machines are left untouched and report success with
+// an empty key id. The enroll POST itself proves the full chain
+// (DNS → Caddy → loopback relay) works.
+func autoEnroll(relayURL, dataDir, tenant string) (string, int) {
+	_, keyPath, _, err := agentFiles()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return "", apperr.ExitInternal
+	}
+	if _, err := os.Stat(keyPath); err == nil {
+		return "", apperr.ExitOK
+	}
+	code, err := mintSetupCode(dataDir, tenant)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: cannot mint enrollment code: "+err.Error())
+		return "", apperr.ExitAuth
+	}
+	return performEnroll(relayURL, code, "")
 }
 
 func tokenSource(tokenFile string) string {
