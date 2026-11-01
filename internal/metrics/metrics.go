@@ -42,18 +42,30 @@ func Snapshot() string {
 		return name + " " + itoa(v) + "\n"
 	}
 	out += f("ocliv_http_requests_total", g.HTTPRequests.Load())
+	out += "ocliv_http_inflight " + itoa64(g.HTTPInflight.Load()) + "\n"
 	out += f("ocliv_visitor_auth_failures_total", g.VisitorAuthFails.Load())
 	out += f("ocliv_session_reconnect_total", g.SessionReconnects.Load())
 	out += f("ocliv_lease_fencing_rejections_total", g.FencingRejects.Load())
 	out += f("ocliv_capacity_rejections_total", g.CapacityRejects.Load())
 	out += f("ocliv_preauth_rejections_total", g.PreAuthRejects.Load())
 	out += f("ocliv_mcp_admission_rejections_total", g.MCPAdmissionRejects.Load())
-	out += "ocliv_nonce_entries " + itoa(uint64(g.NonceEntries.Load())) + "\n"
-	out += "ocliv_throttle_keys " + itoa(uint64(g.ThrottleKeys.Load())) + "\n"
+	out += f("ocliv_upstream_dials_total", g.UpstreamDials.Load())
+	out += "ocliv_nonce_entries " + itoa64(g.NonceEntries.Load()) + "\n"
+	out += "ocliv_throttle_keys " + itoa64(g.ThrottleKeys.Load()) + "\n"
+	out += "ocliv_ws_active " + itoa64(g.WSActive.Load()) + "\n"
 	out += f("ocliv_ws_closed_total", g.WSClosed.Load())
 	out += f("ocliv_stream_bytes_up", g.BytesUp.Load())
 	out += f("ocliv_stream_bytes_down", g.BytesDown.Load())
 	return out
+}
+
+// itoa64 renders a gauge, clamping a negative (inc/dec pairing bug) to
+// zero rather than wrapping to a huge counter that hides the defect.
+func itoa64(v int64) string {
+	if v < 0 {
+		return "0"
+	}
+	return itoa(uint64(v))
 }
 
 func itoa(v uint64) string {

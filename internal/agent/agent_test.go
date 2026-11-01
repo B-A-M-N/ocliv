@@ -363,3 +363,88 @@ func TestConcurrentTunnelsKeepSeparateLeases(t *testing.T) {
 		t.Fatalf("moved-relay resume = %q, want empty", got)
 	}
 }
+
+// TestProbeLocalPathHonorsStatus: a custom probe path checks the exact
+// path served, and an expected status pins the response; status 0 keeps
+// the legacy any-response-counts policy.
+func TestProbeLocalPathHonorsStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/healthz" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	target := srv.Listener.Addr().String()
+	if err := ProbeLocalPath(target, "/healthz", 204, 2*time.Second); err != nil {
+		t.Fatalf("exact status match failed: %v", err)
+	}
+	if err := ProbeLocalPath(target, "/healthz", 0, 2*time.Second); err != nil {
+		t.Fatalf("any-status probe failed: %v", err)
+	}
+	if err := ProbeLocalPath(target, "/healthz", 200, 2*time.Second); err == nil {
+		t.Fatal("wrong expected status passed the probe")
+	}
+	if err := ProbeLocalPath(target, "/missing", 0, 2*time.Second); err != nil {
+		t.Fatalf("any-status probe on 404 failed: %v", err)
+	}
+	if err := ProbeLocalPath(target, "/missing", 204, 2*time.Second); err == nil {
+		t.Fatal("expected status passed for a different path's response")
+	}
+}
+
+// TestProbeLocalPathRejectsUnsafe: paths that escape origin-form (absolute
+// URLs, whitespace, traversal) are rejected without any network use.
+func TestProbeLocalPathRejectsUnsafe(t *testing.T) {
+	for _, p := range []string{"", "healthz", "http://x/", "https://x/h", "/a b", "/a\tb",
+		"/../x", "/a/../b", `\/x`, "/a?b=c", "/a#b", "//evil-host/path"} {
+		if err := ProbeLocalPath("127.0.0.1:1", p, 0, time.Second); err == nil {
+			t.Fatalf("unsafe probe path %q accepted", p)
+		}
+	}
+}
+
+// TestRunnerReprobesCustomPath: the reconnect readiness check uses the
+// runner's configured probe path, so a service healthy only off-root
+// stays verifiable across reconnects.
+func TestRunnerReprobesCustomPath(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/healthz" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	rn := &Runner{Target: srv.Listener.Addr().String(), ProbePath: "/healthz", ProbeStatus: 200}
+	if !rn.leaseIntentReady() {
+		t.Fatal("custom-path lease intent not ready against a serving app")
+	}
+	rn.ProbeStatus = 201
+	if rn.leaseIntentReady() {
+		t.Fatal("mismatched expected status reported ready")
+	}
+}
+
+// A relay speaking a protocol outside this binary's supported range must
+// fail the handshake permanently: signing an intent under an unknown
+// version would produce an attachment the relay cannot honor, and
+// retrying cannot help (distribution row: version/protocol reporting).
+func TestChallengeVersionMismatchIsPermanent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","origin":"https://relay.example.test","version":"ocliv/9"}`))
+	}))
+	defer srv.Close()
+	rn := &Runner{Cfg: config.Agent{RelayURL: srv.URL}, KeyID: "key-test"}
+	_, _, _, _, err := rn.fetchChallenge(http.DefaultClient, srv.URL)
+	if err == nil {
+		t.Fatal("future protocol version accepted")
+	}
+	if !IsPermanent(err) {
+		t.Fatalf("version mismatch retryable, want permanent: %v", err)
+	}
+	if !strings.Contains(err.Error(), "ocliv/9") || !strings.Contains(err.Error(), protocol.Version) {
+		t.Fatalf("version error hides the mismatch: %v", err)
+	}
+}

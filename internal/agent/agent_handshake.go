@@ -50,6 +50,14 @@ func (rn *Runner) fetchChallenge(httpClient *http.Client, relayURL string) (nonc
 		return nil, "", "", "", fmt.Errorf("bad challenge: %w", err)
 	}
 	resp.Body.Close()
+	// Version compatibility is enforced before signing: an intent signed
+	// under an unknown protocol version could attach to a relay that
+	// cannot honor it. Outside the supported range the relay cannot help,
+	// so the failure is permanent, never retried.
+	if ch.Version < protocol.MinVersion || ch.Version > protocol.MaxVersion {
+		return nil, "", "", "", Permanent(fmt.Errorf("relay protocol %q outside supported range %s-%s: upgrade ocliv",
+			ch.Version, protocol.MinVersion, protocol.MaxVersion))
+	}
 	nonce, err = base64.StdEncoding.DecodeString(ch.Nonce)
 	if err != nil {
 		return nil, "", "", "", fmt.Errorf("bad challenge nonce: %w", err)

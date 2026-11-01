@@ -144,3 +144,34 @@ func TestLeaseStoreMigratesLegacyOnce(t *testing.T) {
 		t.Fatalf("records after re-open: %d, want 1", got)
 	}
 }
+
+// Probe contract is deployment identity (Domain A): a changed probe
+// path or expected status misses resume, so the caller allocates a
+// fresh lease instead of inheriting another contract's readiness.
+func TestFindResumeProbeContractMismatch(t *testing.T) {
+	s, err := OpenLeaseStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := LeaseRecord{LeaseID: "lse-probe", Hostname: "p.t", Port: 3000,
+		RelayURL: "https://r.test", KeyID: "key-1",
+		ProbePath: "/healthz", ProbeStatus: 200}
+	if err := s.Save(rec); err != nil {
+		t.Fatal(err)
+	}
+	base := ResumeQuery{RelayURL: "https://r.test", KeyID: "key-1", Port: 3000,
+		ProbePath: "/healthz", ProbeStatus: 200}
+	if _, ok := s.FindResume(base); !ok {
+		t.Fatal("identical probe contract missed")
+	}
+	changed := base
+	changed.ProbePath = "/readyz"
+	if _, ok := s.FindResume(changed); ok {
+		t.Fatal("changed probe path resumed the old lease")
+	}
+	changed = base
+	changed.ProbeStatus = 201
+	if _, ok := s.FindResume(changed); ok {
+		t.Fatal("changed expected status resumed the old lease")
+	}
+}

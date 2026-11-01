@@ -83,6 +83,46 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_routes_logical
   ON mcp_routes(lease_id, external_host, profile);
 `
 
+// schemaV4 replaces lease-bound mcp_routes with durable publications
+// (P1-A): one stable route per (tenant, owner key, external host,
+// profile, publication label), rebound across leases. Legacy rows
+// migrate with their route_id preserved (stable URL); duplicate
+// natural keys keep the earliest route; rows whose lease is gone could
+// never admit and are dropped. mcp_routes is retired afterwards.
+const schemaV4 = `
+CREATE TABLE IF NOT EXISTS mcp_publications (
+  route_id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL, owner_key_id TEXT NOT NULL,
+  external_host TEXT NOT NULL, profile TEXT NOT NULL,
+  pub_name TEXT NOT NULL, target_path TEXT NOT NULL DEFAULT '/mcp',
+  -- Deferred: named-lease reclaim deletes the old lease and rebinds
+  -- its publications to the replacement within one transaction; the
+  -- commit state is always consistent (P1-A).
+  lease_id TEXT REFERENCES leases(id) DEFERRABLE INITIALLY DEFERRED, revoked_at TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+INSERT INTO mcp_publications(route_id, tenant_id, owner_key_id, external_host, profile, pub_name, target_path, lease_id, created_at, updated_at)
+  SELECT r.route_id, l.tenant_id, l.agent_key_id, r.external_host, r.profile, l.label, r.target_path, r.lease_id, r.created_at, r.created_at
+  FROM mcp_routes r JOIN leases l ON l.id = r.lease_id;
+DELETE FROM mcp_publications WHERE rowid NOT IN
+  (SELECT MIN(rowid) FROM mcp_publications GROUP BY tenant_id, owner_key_id, external_host, profile, pub_name);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_publications_logical
+  ON mcp_publications(tenant_id, owner_key_id, external_host, profile, pub_name);
+DROP TABLE mcp_routes;
+`
+
+// schemaV5 adds pending-verification publication state (P0-A): new
+// rows register unverified (verified_at NULL) and deny tool traffic
+// until the publisher completes discovery verification and
+// activation. Existing rows grandfather as verified — they are live,
+// operator-established bindings, not new unverified supply. The
+// lease_id index serves the wildcard pending check without
+// re-scanning the logical-key index.
+const schemaV5 = `
+ALTER TABLE mcp_publications ADD COLUMN verified_at TEXT;
+UPDATE mcp_publications SET verified_at = created_at WHERE verified_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_mcp_publications_lease ON mcp_publications(lease_id);
+`
+
 // applyMigration runs one versioned migration body and its version
 // stamp in a single transaction: a failure anywhere rolls back the
 // body, so a version is never recorded for half-applied work (P1-2).
@@ -107,7 +147,7 @@ func applyMigration(sqldb *sql.DB, version int, body string) error {
 }
 
 // currentSchema is the newest version Open must reach.
-const currentSchema = 3
+const currentSchema = 5
 
 // DB wraps the SQLite handle.
 type DB struct {
@@ -210,6 +250,8 @@ func Open(path string) (*DB, error) {
 	}{
 		{2, schemaV2},
 		{3, schemaV3},
+		{4, schemaV4},
+		{5, schemaV5},
 	}
 	for _, m := range migrations {
 		var v int

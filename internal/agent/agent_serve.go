@@ -40,6 +40,7 @@ func (rn *Runner) resumeLeaseID() string {
 		RelayURL: rn.Cfg.RelayURL, KeyID: rn.KeyID, Port: rn.Cfg.Port,
 		AccessMode: rn.Cfg.AccessMode, Name: rn.Cfg.Name, Public: rn.Cfg.Public,
 		IPv6: rn.Cfg.IPv6, TTLSeconds: rn.Cfg.TTLSeconds, UpstreamHost: rn.Cfg.UpstreamHost,
+		ProbePath: rn.ProbePath, ProbeStatus: rn.ProbeStatus,
 	})
 	if !ok {
 		return ""
@@ -70,6 +71,7 @@ func (rn *Runner) saveLease(att Attached) error {
 		Name: rn.Cfg.Name, RelayURL: rn.Cfg.RelayURL, KeyID: rn.KeyID,
 		Generation: att.Generation, IPv6: rn.Cfg.IPv6,
 		TTLSeconds: rn.Cfg.TTLSeconds, UpstreamHost: rn.Cfg.UpstreamHost,
+		ProbePath: rn.ProbePath, ProbeStatus: rn.ProbeStatus,
 	})
 }
 

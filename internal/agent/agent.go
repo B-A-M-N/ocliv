@@ -40,15 +40,20 @@ type Attached struct {
 
 // Runner holds agent runtime state.
 type Runner struct {
-	Cfg      config.Agent
-	Key      *identity.KeyPair
-	KeyID    string
-	Target   string // literal loopback:port (D06)
-	Upstream string // Host to present locally (D09)
-	OnAttach func(a Attached)
-	OnState  func(state string) // CONNECTED / RECONNECTING
-	HTTP     *http.Client       // test hook: local upstream client
-	WSURL    string             // test hook: ws base for upgrades (unused, raw TCP used)
+	Cfg    config.Agent
+	Key    *identity.KeyPair
+	KeyID  string
+	Target string // literal loopback:port (D06)
+	// ProbePath/ProbeStatus declare the local readiness contract for apps
+	// that don't answer usefully at / (Domain A). Empty path means /;
+	// status 0 means any HTTP response counts.
+	ProbePath   string
+	ProbeStatus int
+	Upstream    string // Host to present locally (D09)
+	OnAttach    func(a Attached)
+	OnState     func(state string) // CONNECTED / RECONNECTING
+	HTTP        *http.Client       // test hook: local upstream client
+	WSURL       string             // test hook: ws base for upgrades (unused, raw TCP used)
 	// HandshakeTransport overrides the agent handshake transport
 	// (challenge POST + WSS dial). Test hook only: lets a harness
 	// present the public relay authority while dialing loopback.
@@ -64,6 +69,49 @@ type Runner struct {
 // Only an actual HTTP response counts: a bare TCP listener with no HTTP
 // stack is not local readiness (AS-023).
 func ProbeLocal(target string, timeout time.Duration) error {
+	return ProbeLocalPath(target, "/", 0, timeout)
+}
+
+// validateProbePath keeps the probe on a safe origin-form path. The probe
+// only ever talks to the operator's loopback target, but an absolute URL,
+// whitespace/control characters, or dot-dot segments would let a flag
+// mean something other than a local path — reject them outright.
+func ValidateProbePath(path string) error {
+	if !strings.HasPrefix(path, "/") || strings.HasPrefix(path, "//") {
+		return fmt.Errorf("invalid probe path %q: want an origin-form path like /healthz", path)
+	}
+	if strings.Contains(path, "://") || strings.Contains(path, "\\") {
+		return fmt.Errorf("invalid probe path %q: want an origin-form path like /healthz", path)
+	}
+	for _, r := range path {
+		if r < 0x20 || r == 0x7f || r == ' ' {
+			return fmt.Errorf("invalid probe path %q: unsafe characters", path)
+		}
+	}
+	if strings.Contains(path, "?") || strings.Contains(path, "#") {
+		return fmt.Errorf("invalid probe path %q: query and fragment are not probed", path)
+	}
+	for _, seg := range strings.Split(path, "/") {
+		if seg == ".." {
+			return fmt.Errorf("invalid probe path %q: dot-dot segments rejected", path)
+		}
+	}
+	return nil
+}
+
+// ProbeLocalPath verifies a responsive local HTTP service at path,
+// requiring wantStatus when non-zero (0 keeps the any-response-counts
+// policy). Path validation happens before any network use.
+func ProbeLocalPath(target, path string, wantStatus int, timeout time.Duration) error {
+	if wantStatus < 0 || wantStatus > 599 {
+		return fmt.Errorf("invalid probe status %d: want 0 (any) or 100-599", wantStatus)
+	}
+	if path == "" {
+		path = "/"
+	}
+	if err := ValidateProbePath(path); err != nil {
+		return err
+	}
 	// Redirects are not followed: a redirect is itself proof of a local
 	// HTTP listener, and following it could report a foreign service as
 	// local readiness (R3).
@@ -73,11 +121,14 @@ func ProbeLocal(target string, timeout time.Duration) error {
 			return http.ErrUseLastResponse
 		},
 	}
-	resp, err := c.Get("http://" + target + "/")
+	resp, err := c.Get("http://" + target + path)
 	if err != nil {
 		return err
 	}
 	resp.Body.Close()
+	if wantStatus != 0 && resp.StatusCode != wantStatus {
+		return fmt.Errorf("local probe %s: status %d, want %d", path, resp.StatusCode, wantStatus)
+	}
 	return nil
 }
 
@@ -119,13 +170,14 @@ func (rn *Runner) Run(ctx context.Context) error {
 }
 
 // leaseIntentReady re-probes the local HTTP service for the lease
-// intent. Any HTTP status counts as responsive (same as the CLI
-// pre-probe); only reachability is re-verified (P1-09).
+// intent under the runner's configured probe contract (same path and
+// expected status as the CLI pre-probe); only readiness is re-verified,
+// never redefined (P1-09).
 func (rn *Runner) leaseIntentReady() bool {
 	if rn.Target == "" {
 		return false
 	}
-	return ProbeLocal(rn.Target, 3*time.Second) == nil
+	return ProbeLocalPath(rn.Target, rn.ProbePath, rn.ProbeStatus, 3*time.Second) == nil
 }
 
 // PermanentError marks a definitive runner failure that retries cannot

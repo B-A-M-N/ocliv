@@ -47,11 +47,18 @@ type LeaseRecord struct {
 	// lease instead of silently resuming under new terms.
 	TTLSeconds   int64  `json:"ttl_seconds,omitempty"`
 	UpstreamHost string `json:"upstream_host,omitempty"`
+	// ProbePath and ProbeStatus record the local readiness contract
+	// (Domain A): a changed contract allocates a fresh lease, so a
+	// tunnel never silently inherits another contract's definition of
+	// ready. Empty path means /; status 0 means any HTTP response.
+	ProbePath   string `json:"probe_path,omitempty"`
+	ProbeStatus int    `json:"probe_status,omitempty"`
 }
 
-// ResumeQuery is the canonical deployment identity (P1-5). Every field
-// must match a stored record for resume; any change allocates a fresh
-// lease, never a silent resume of a differently-configured tunnel.
+// ResumeQuery is the canonical deployment identity (P1-5, Domain A).
+// Every field must match a stored record for resume; any change
+// allocates a fresh lease, never a silent resume of a
+// differently-configured tunnel.
 type ResumeQuery struct {
 	RelayURL, KeyID string
 	Port            int
@@ -61,6 +68,8 @@ type ResumeQuery struct {
 	IPv6            bool
 	TTLSeconds      int64
 	UpstreamHost    string
+	ProbePath       string
+	ProbeStatus     int
 }
 
 // LeaseStore persists lease records under dir/leases/.
@@ -223,8 +232,8 @@ func (s *LeaseStore) Remove(leaseID string) error {
 
 // FindResume returns the record matching the canonical deployment
 // identity. Any change — relay, key, port, mode, name, public flag,
-// loopback family, TTL, or upstream host — misses, so the caller
-// allocates a fresh lease instead of resuming the wrong one.
+// loopback family, TTL, upstream host, or probe contract — misses, so
+// the caller allocates a fresh lease instead of resuming the wrong one.
 func (s *LeaseStore) FindResume(q ResumeQuery) (LeaseRecord, bool) {
 	if q.RelayURL == "" || q.KeyID == "" {
 		return LeaseRecord{}, false
@@ -232,7 +241,8 @@ func (s *LeaseStore) FindResume(q ResumeQuery) (LeaseRecord, bool) {
 	for _, rec := range s.List() {
 		if rec.RelayURL == q.RelayURL && rec.KeyID == q.KeyID && rec.Port == q.Port &&
 			rec.AccessMode == q.AccessMode && rec.Name == q.Name && rec.Public == q.Public &&
-			rec.IPv6 == q.IPv6 && rec.TTLSeconds == q.TTLSeconds && rec.UpstreamHost == q.UpstreamHost {
+			rec.IPv6 == q.IPv6 && rec.TTLSeconds == q.TTLSeconds && rec.UpstreamHost == q.UpstreamHost &&
+			rec.ProbePath == q.ProbePath && rec.ProbeStatus == q.ProbeStatus {
 			return rec, true
 		}
 	}

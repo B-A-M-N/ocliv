@@ -33,7 +33,7 @@ type Result struct {
 }
 
 // Report renders human-readable diagnostics with secrets redacted.
-func (r Result) Report(jsonOut bool) string {
+func (r Result) Report() string {
 	var sb strings.Builder
 	for _, f := range r.Findings {
 		mark := "?"
@@ -50,12 +50,16 @@ func (r Result) Report(jsonOut bool) string {
 // AgentInput for agent-side checks. CACertPath optionally points at a
 // staging CA root (PEM); empty means system roots only. There is no
 // insecure-skip flag: untrusted TLS is reported, never bypassed.
+// ProbePath/ProbeStatus carry the tunnel's recorded readiness contract
+// (Domain A): empty path means / and status 0 means any HTTP response.
 type AgentInput struct {
-	KeyPath    string
-	RelayURL   string
-	LeasePath  string
-	Port       int
-	CACertPath string
+	KeyPath     string
+	RelayURL    string
+	LeasePath   string
+	Port        int
+	CACertPath  string
+	ProbePath   string
+	ProbeStatus int
 }
 
 // CheckAgent runs agent-side diagnostics.
@@ -104,15 +108,26 @@ func CheckAgent(in AgentInput) Result {
 	default:
 		add(false, false, "relay reachability", "unverified from here ("+shortErr(err)+")")
 	}
-	// Local target: a real HTTP probe, not just a TCP open.
+	// Local target: judged against the tunnel's recorded probe contract
+	// (Domain A), never a hardcoded GET /. A path the tunnel never
+	// promised, or a status outside the recorded expectation, is a
+	// verified negative.
 	if in.Port > 0 {
+		path := in.ProbePath
+		if path == "" {
+			path = "/"
+		}
 		addr := fmt.Sprintf("127.0.0.1:%d", in.Port)
-		lresp, lerr := (&http.Client{Timeout: 3 * time.Second}).Get("http://" + addr + "/")
+		lresp, lerr := (&http.Client{Timeout: 3 * time.Second}).Get("http://" + addr + path)
 		if lerr != nil {
-			add(false, true, "local service", addr+" unreachable ("+shortErr(lerr)+")")
+			add(false, true, "local service", addr+path+" unreachable ("+shortErr(lerr)+")")
 		} else {
 			lresp.Body.Close()
-			add(true, true, "local service", addr+" answered HTTP "+lresp.Status)
+			if in.ProbeStatus != 0 && lresp.StatusCode != in.ProbeStatus {
+				add(false, true, "local service", fmt.Sprintf("%s%s answered HTTP %s, want %d under the recorded probe contract", addr, path, lresp.Status, in.ProbeStatus))
+			} else {
+				add(true, true, "local service", fmt.Sprintf("%s%s answered HTTP %s (probe contract: expect %s)", addr, path, lresp.Status, wantStatus(in.ProbeStatus)))
+			}
 		}
 	}
 	// Explicit non-claims: doctor cannot prove these from here.
@@ -121,6 +136,15 @@ func CheckAgent(in AgentInput) Result {
 	// Clock skew: reported, not verified against NTP (H05).
 	add(true, false, "clock", "system time "+time.Now().UTC().Format(time.RFC3339)+" (unverified locally)")
 	return res
+}
+
+// wantStatus renders the recorded expected status: 0 means the tunnel
+// accepts any HTTP response as a live local target.
+func wantStatus(n int) string {
+	if n == 0 {
+		return "any status"
+	}
+	return fmt.Sprintf("%d", n)
 }
 
 // rootPool returns system roots plus the optional staging CA file.

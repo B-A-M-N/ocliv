@@ -81,32 +81,39 @@ func TestApplyMigrationRollsBackPartialFailure(t *testing.T) {
 	}
 }
 
-// One logical publication — one (lease, host, profile) mapping — must
-// have exactly one route row (P1-4). The unique constraint makes
-// concurrent check-then-act inserts converge instead of duplicating.
+// One logical publication — one (tenant, owner, host, profile, name)
+// mapping — must have exactly one row (P1-4, P1-A). The unique
+// constraint makes concurrent check-then-act inserts converge instead
+// of duplicating, including across replacement leases.
 func TestMCPRouteMappingUnique(t *testing.T) {
 	db, err := Open(t.TempDir() + "/ocliv.db")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err := db.SQL().Exec(
-		`INSERT INTO leases(id, tenant_id, agent_key_id, hostname, label, port, access_mode, generation, status, created_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?)`,
-		"lse-mcp", "t1", "k1", "mcp.t", "mcp", 3000, "mcp_upstream_oauth", 1, "ACTIVE", utcNow()); err != nil {
-		t.Fatal(err)
+	mklease := func(id, label, hostname string) {
+		t.Helper()
+		if _, err := db.SQL().Exec(
+			`INSERT INTO leases(id, tenant_id, agent_key_id, hostname, label, port, access_mode, generation, status, created_at)
+			 VALUES(?,?,?,?,?,?,?,?,?,?)`,
+			id, "t1", "k1", hostname, label, 3000, "mcp_upstream_oauth", 1, "ACTIVE", utcNow()); err != nil {
+			t.Fatal(err)
+		}
 	}
-	ins := `INSERT INTO mcp_routes(route_id, lease_id, external_host, profile, target_path, created_at)
-		VALUES(?,?,?,?,?,?)`
-	if _, err := db.SQL().Exec(ins, "r1", "lse-mcp", "public.example.org", "upstream-oauth", "/mcp", utcNow()); err != nil {
+	mklease("lse-mcp", "mcp", "mcp.t")
+	mklease("lse-mcp2", "mcp", "mcp2.t")
+	ins := `INSERT INTO mcp_publications(route_id, tenant_id, owner_key_id, external_host, profile, pub_name, target_path, lease_id, created_at, updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`
+	if _, err := db.SQL().Exec(ins, "r1", "t1", "k1", "public.example.org", "upstream-oauth", "mcp", "/mcp", "lse-mcp", utcNow(), utcNow()); err != nil {
 		t.Fatalf("first mapping rejected: %v", err)
 	}
-	if _, err := db.SQL().Exec(ins, "r2", "lse-mcp", "public.example.org", "upstream-oauth", "/mcp", utcNow()); err == nil {
-		t.Fatal("duplicate (lease, host, profile) mapping accepted")
+	// Same logical publication on a replacement lease: still one row.
+	if _, err := db.SQL().Exec(ins, "r2", "t1", "k1", "public.example.org", "upstream-oauth", "mcp", "/mcp", "lse-mcp2", utcNow(), utcNow()); err == nil {
+		t.Fatal("duplicate (tenant, owner, host, profile, name) mapping accepted")
 	}
 	var n int
 	if err := db.SQL().QueryRow(
-		`SELECT COUNT(*) FROM mcp_routes WHERE lease_id='lse-mcp'`).Scan(&n); err != nil || n != 1 {
+		`SELECT COUNT(*) FROM mcp_publications WHERE pub_name='mcp'`).Scan(&n); err != nil || n != 1 {
 		t.Fatalf("mapping rows=%d err=%v, want exactly 1", n, err)
 	}
 }
@@ -202,18 +209,120 @@ func TestOpenDedupesLegacyRouteDuplicates(t *testing.T) {
 		t.Fatalf("Open legacy db: %v", err)
 	}
 	defer db.Close()
+	// v4 retires mcp_routes: duplicates collapse to one durable
+	// publication keeping the earliest route.
 	var kept string
 	var n int
 	if err := db.SQL().QueryRow(
-		`SELECT route_id FROM mcp_routes WHERE lease_id='lse-dup'`).Scan(&kept); err != nil {
-		t.Fatalf("no route row survived: %v", err)
+		`SELECT route_id FROM mcp_publications WHERE lease_id='lse-dup'`).Scan(&kept); err != nil {
+		t.Fatalf("no publication survived: %v", err)
 	}
 	if err := db.SQL().QueryRow(
-		`SELECT COUNT(*) FROM mcp_routes WHERE lease_id='lse-dup'`).Scan(&n); err != nil || n != 1 {
-		t.Fatalf("duplicate rows survived: n=%d err=%v", n, err)
+		`SELECT COUNT(*) FROM mcp_publications WHERE lease_id='lse-dup'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("duplicate publications survived: n=%d err=%v", n, err)
 	}
 	if kept != "r-old" {
 		t.Fatalf("kept %q, want earliest r-old", kept)
+	}
+	var v int
+	if err := db.SQL().QueryRow(`SELECT MAX(v) FROM schema_version`).Scan(&v); err != nil || v != currentSchema {
+		t.Fatalf("schema version after migration: v=%d err=%v", v, err)
+	}
+}
+
+// A pre-P1-A database holds lease-bound mcp_routes rows. Opening it
+// must migrate each live row to a durable publication preserving its
+// route_id (stable URL), keyed by (tenant, owner, host, profile,
+// label); duplicate natural keys keep the earliest route, orphan rows
+// whose lease is gone are dropped, and mcp_routes is retired (P1-A).
+func TestOpenMigratesLegacyMCPRoutes(t *testing.T) {
+	path := t.TempDir() + "/legacy-routes.db"
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE schema_version (v INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`,
+		`CREATE TABLE leases (
+		   id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_key_id TEXT NOT NULL,
+		   hostname TEXT NOT NULL UNIQUE, label TEXT NOT NULL, port INTEGER NOT NULL,
+		   access_mode TEXT NOT NULL, generation INTEGER NOT NULL DEFAULT 1,
+		   token_generation INTEGER NOT NULL DEFAULT 0,
+		   status TEXT NOT NULL, expires_at TEXT, reconnect_until TEXT,
+		   created_at TEXT NOT NULL)`,
+		`CREATE TABLE mcp_routes (
+		   route_id TEXT PRIMARY KEY, lease_id TEXT NOT NULL REFERENCES leases(id),
+		   external_host TEXT NOT NULL, profile TEXT NOT NULL,
+		   target_path TEXT NOT NULL DEFAULT '/mcp', created_at TEXT NOT NULL)`,
+	} {
+		if _, err := raw.Exec(stmt); err != nil {
+			raw.Close()
+			t.Fatalf("fixture schema: %v", err)
+		}
+	}
+	if _, err := raw.Exec(`INSERT INTO schema_version(v, applied_at) VALUES(1, ?)`, utcNow()); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	mklease := func(id, label, hostname string) {
+		t.Helper()
+		if _, err := raw.Exec(
+			`INSERT INTO leases(id, tenant_id, agent_key_id, hostname, label, port, access_mode, generation, status, created_at)
+			 VALUES(?,?,?,?,?,?,?,?,?,?)`,
+			id, "t1", "k1", hostname, label, 3000, "mcp_upstream_oauth", 1, "ACTIVE", utcNow()); err != nil {
+			raw.Close()
+			t.Fatal(err)
+		}
+	}
+	mklease("lse-a", "alpha", "alpha.t")
+	// Two live leases share one publication label: the v4 natural key
+	// (not the v3 lease key) must collapse them to the earliest route.
+	mklease("lse-b1", "beta", "beta1.t")
+	mklease("lse-b2", "beta", "beta2.t")
+	for _, rr := range [][2]string{
+		{"r-keep", "lse-a"}, {"r-dup1", "lse-b1"}, {"r-dup2", "lse-b2"}, {"r-orphan", "lse-gone"},
+	} {
+		// The orphan row's FK would fail: legacy DBs predate strict
+		// enforcement here, so insert it with keys off like old code.
+		if _, err := raw.Exec(`PRAGMA foreign_keys=OFF`); err != nil {
+			raw.Close()
+			t.Fatal(err)
+		}
+		if _, err := raw.Exec(
+			`INSERT INTO mcp_routes(route_id, lease_id, external_host, profile, target_path, created_at)
+			 VALUES(?,?,?,?,?,?)`,
+			rr[0], rr[1], "public.example.org", "upstream-oauth", "/mcp", utcNow()); err != nil {
+			raw.Close()
+			t.Fatal(err)
+		}
+	}
+	raw.Close()
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open legacy routes db: %v", err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.SQL().QueryRow(`SELECT COUNT(*) FROM mcp_publications`).Scan(&n); err != nil || n != 2 {
+		t.Fatalf("publications=%d err=%v, want 2 (keep + earliest dup)", n, err)
+	}
+	var bound string
+	if err := db.SQL().QueryRow(`SELECT lease_id FROM mcp_publications WHERE route_id='r-keep'`).Scan(&bound); err != nil || bound != "lse-a" {
+		t.Fatalf("r-keep bound to %q err=%v, want lse-a", bound, err)
+	}
+	if err := db.SQL().QueryRow(`SELECT COUNT(*) FROM mcp_publications WHERE route_id IN ('r-dup1','r-dup2')`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("dup natural key rows=%d err=%v, want exactly 1", n, err)
+	}
+	if err := db.SQL().QueryRow(`SELECT lease_id FROM mcp_publications WHERE route_id='r-dup1'`).Scan(&bound); err != nil || bound != "lse-b1" {
+		t.Fatalf("dup natural key kept bound to %q err=%v, want earliest lse-b1", bound, err)
+	}
+	if err := db.SQL().QueryRow(`SELECT COUNT(*) FROM mcp_publications WHERE route_id='r-orphan'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("orphan route migrated: n=%d err=%v", n, err)
+	}
+	var tbl string
+	if err := db.SQL().QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='mcp_routes'`).Scan(&tbl); err == nil {
+		t.Fatalf("legacy mcp_routes table survived migration")
 	}
 	var v int
 	if err := db.SQL().QueryRow(`SELECT MAX(v) FROM schema_version`).Scan(&v); err != nil || v != currentSchema {

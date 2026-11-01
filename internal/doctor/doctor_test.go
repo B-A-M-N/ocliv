@@ -130,3 +130,43 @@ func TestNoUnverifiedGreens(t *testing.T) {
 		}
 	}
 }
+
+// Doctor must judge the local target by the tunnel's recorded probe
+// contract (Domain A), not by a hardcoded GET /: the wrong path or the
+// wrong expected status must be a verified negative, never a green
+// "answered" line for a contract the tunnel never promised.
+func TestAgentProbeHonorsRecordedContract(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+	byName := func(in AgentInput) map[string]Finding {
+		m := map[string]Finding{}
+		for _, f := range CheckAgent(in).Findings {
+			m[f.Name] = f
+		}
+		return m
+	}
+	base := AgentInput{KeyPath: "/nonexistent/key", RelayURL: "http://127.0.0.1:1",
+		Port: localPort(t, ts.URL), ProbePath: "/healthz", ProbeStatus: 204}
+	got, ok := byName(base)["local service"]
+	if !ok || !got.Verified || !got.OK {
+		t.Fatalf("matching probe contract not verified-OK: %+v", got)
+	}
+	mismatch := base
+	mismatch.ProbeStatus = 200
+	got, ok = byName(mismatch)["local service"]
+	if !ok || !got.Verified || got.OK {
+		t.Fatalf("wrong expected status not a verified negative: %+v", got)
+	}
+	wrongPath := base
+	wrongPath.ProbePath = "/other"
+	got, ok = byName(wrongPath)["local service"]
+	if !ok || !got.Verified || got.OK {
+		t.Fatalf("wrong probe path not a verified negative: %+v", got)
+	}
+}
