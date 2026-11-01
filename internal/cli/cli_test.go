@@ -174,6 +174,42 @@ func TestLoginMergesConfig(t *testing.T) {
 	}
 }
 
+// A non-401 enrollment refusal must never masquerade as a bad code: the
+// clean-host drill showed a 421 authority rejection surfacing as
+// "invalid or expired code". The helper names the real status; the
+// end-to-end case proves a 421 login fails without saving a key.
+func TestLoginDeniedMessageHonestStatus(t *testing.T) {
+	if got := loginDeniedMessage(401, ""); got != "enrollment denied: invalid or expired code" {
+		t.Errorf("401 must stay the bad-code message, got %q", got)
+	}
+	got := loginDeniedMessage(421, "misdirected: agent control requires the relay hostname\n")
+	if !strings.Contains(got, "HTTP 421") || strings.Contains(got, "invalid or expired code") {
+		t.Errorf("421 must name its status, got %q", got)
+	}
+	if !strings.Contains(got, "not consumed") {
+		t.Errorf("non-401 denial must state the code survived, got %q", got)
+	}
+}
+
+func TestLoginAuthorityRejectionSavesNothing(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	codePath := filepath.Join(home, "code.txt")
+	if err := os.WriteFile(codePath, []byte("CODE-421"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deny := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "misdirected: agent control requires the relay hostname", http.StatusMisdirectedRequest)
+	}))
+	defer deny.Close()
+	if code := cmdLogin([]string{"--relay", deny.URL, "--code-file", codePath}); code != apperr.ExitAuth {
+		t.Fatalf("421 login: want ExitAuth got %d", code)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".config", "ocliv", "agent.key")); !os.IsNotExist(err) {
+		t.Fatalf("421 login must not save a key: %v", err)
+	}
+}
+
 // TestLoginRefusesOverwriteBeforeNetwork: a second login over an existing
 // enrollment must fail BEFORE contacting the relay, so the one-time
 // enrollment code is not burned by a doomed attempt (H07: no silent secret

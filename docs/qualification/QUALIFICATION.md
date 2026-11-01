@@ -849,3 +849,27 @@ Disposition ledger (this loop):
   registration + real provider OAuth; load/soak/24h stability;
   production backup recovery on live infra.
 No unresolved actionable finding remains. Loop converged.
+
+## Round 32 — clean-host install drill (docker Debian, disposable) + login fix
+Drill (container removed afterwards, zero host footprint):
+- `install.sh` on clean debian:stable-slim + Go 1.26: build ok, `--help`
+  preflight ok, binary/launcher/unit/env installed, perms verified
+  (`relay.env` 0600 root, `/var/lib/ocliv` 0700 ocliv:ocliv), ocliv user
+  created, re-run preserves `$BIN.prev` rollback candidate.
+- `systemctl daemon-reload` fails without init (exit 127) — expected:
+  install.sh needs a systemd host for activation; everything before that
+  point verified. Residual: activation + `systemd-analyze verify` still
+  need a VM/systemd host (narrowed BLOCKED).
+- Relay boots from installed artifacts (namespace t.drill.test).
+- Caddy 2.11.7 edge (`tls internal`, header-overwrite discipline):
+  `caddy validate` ok; staging CA trusted via system store.
+- Enroll → login → named tunnel ACTIVE/protected → unauth browser 302,
+  API 401 → redeem 200 → authorized cookie 200 with exact fixture body
+  → tunnel close → authorized cookie 503. Full lifecycle proven.
+- Drill finding (P1, FIXED): direct-IP enroll is correctly rejected at
+  the authority gate (421), but login mapped every non-200 to "invalid
+  or expired code", sending the operator to re-issue a live code.
+  `loginDeniedMessage` now names the real status (401 keeps the
+  bad-code message) and states the code was not consumed.
+- Tests: `TestLoginDeniedMessageHonestStatus`,
+  `TestLoginAuthorityRejectionSavesNothing` → PASS; full cli suite green.

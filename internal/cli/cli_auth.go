@@ -130,7 +130,7 @@ func cmdLogin(argv []string) int {
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode != http.StatusOK {
-		fmt.Fprintln(os.Stderr, "enrollment denied: invalid or expired code")
+		fmt.Fprintln(os.Stderr, loginDeniedMessage(resp.StatusCode, string(respBody)))
 		return apperr.ExitAuth
 	}
 	var out struct {
@@ -154,6 +154,23 @@ func cmdLogin(argv []string) int {
 	fmt.Println("Enrolled as " + out.KeyID)
 	fmt.Println("Relay: " + relayURL)
 	return apperr.ExitOK
+}
+
+// loginDeniedMessage renders an honest enrollment denial. Only a 401
+// means the code was rejected; any other status is a transport or
+// authority problem (421 misdirected authority, 429, 5xx) that must
+// never masquerade as a bad code — the one-time code is unconsumed and
+// the operator needs the real cause. Found by the clean-host drill
+// (direct-IP enroll rejected at the authority gate, Round 32).
+func loginDeniedMessage(status int, body string) string {
+	if status == http.StatusUnauthorized {
+		return "enrollment denied: invalid or expired code"
+	}
+	msg := fmt.Sprintf("enrollment denied: relay reported HTTP %d", status)
+	if d := shortDetail(body); d != "" {
+		msg += " (" + d + ")"
+	}
+	return msg + "; the enrollment code was not consumed"
 }
 
 // mergeRelayURL records the relay URL while preserving every other key
