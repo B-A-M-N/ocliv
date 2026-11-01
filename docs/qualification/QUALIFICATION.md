@@ -594,3 +594,11 @@ quirk only; public behavior is the oracle.
 - Full `caddy validate` remains BLOCKED (no caddy binary here; needs the
   relay laptop + sudo). Placeholder syntax verified by inspection.
 - Disposition: FIXED (tailnet default); VERIFIED NON-ISSUE (plugin gates).
+
+## Milestone gate — Rounds 11–14 (2026-11-01)
+- `go build ./...` → ok; `go vet ./...` → ok;
+  `gofmt -l internal/ cmd/ tests/ packaging/` → clean.
+- `go test ./internal/... -count=1` → all ok.
+- `go test -count=1 -timeout 280s ./tests/integration/` → ok (205.3s).
+- `go test -race ./internal/relay/ -count=1` → ok (77.2s, post-backup-fix).
+- Worktree clean; all changes committed (67ed597 tip).
