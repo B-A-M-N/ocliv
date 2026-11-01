@@ -490,3 +490,7 @@ quirk only; public behavior is the oracle.
   `TestWSHijackFailureReports500`). Red→green observed (undefined
   helper, then PASS); vet clean (fixed a t.Fatal-from-goroutine);
   full relay package green.
+
+## Round 7 supplemental — race gate (2026-11-01)
+- `go test -race ./internal/relay/ -count=1 -timeout 280s` → ok (99.991s).
+- WS hijack-buffer + backpressure fixes hold under race detector. Round 7 dispositions unchanged (all FIXED).
