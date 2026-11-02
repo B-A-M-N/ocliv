@@ -83,7 +83,7 @@ export const app = new Skybridge({
     })
     .registerTool({
       name:'list-publications', title:'List Ocliv publications',
-      description:'List real Ocliv-published MCP endpoints owned by this publisher key, with durable publication state and a verification view.',
+      description:'List real Ocliv-published MCP endpoints owned by this publisher key, with durable publication state, relay-observed lease/session reachability (active does not mean reachable), and a verification view.',
       annotations:readOnly, auth:{scopes:['ocliv:read']},
       view:{component:'list-publications',description:'Published Ocliv MCP endpoints'}
     }, async (_,extra)=>{

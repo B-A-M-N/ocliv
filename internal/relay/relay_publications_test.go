@@ -7,12 +7,16 @@
 package relay
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/coder/websocket"
 
 	"ocliv/internal/lease"
 )
@@ -195,6 +199,75 @@ func TestMgmtFailClosedOnStorageError(t *testing.T) {
 	}
 	if code, _ := postMCPDelete(t, s, priv, "key-test", "lse-a", r1); code < 400 {
 		t.Fatalf("lease route delete with dead storage: status=%d, want denial", code)
+	}
+}
+
+// TestKeyPublicationsCarryReachability (P1): the listing separates
+// durable publication state from relay-observed reachability. A stored
+// ACTIVE publication with no live session reports lease_state ACTIVE
+// with session_live=false (the funnel-oauth discrepancy: recorded but
+// unreachable must never read as healthy); once a live session of the
+// current generation registers, session_live becomes true.
+func TestKeyPublicationsCarryReachability(t *testing.T) {
+	s, db := newMCPServer(t)
+	priv := enrollTestKey(t, db.SQL(), "key-test", "tenant-test")
+	insertMCPLeaseRow(t, db, "lse-a", "alpha.t.example.test", AccessModeMCPUpstreamOAuth, lease.StateActive, 1, nil)
+	insertMCPLeaseRow(t, db, "lse-b", "beta.t.example.test", AccessModeMCPUpstreamOAuth, lease.StateActive, 1, nil)
+	r1 := publishRoute(t, s, priv, "key-test", "lse-a", "upstream-oauth")
+	publishRoute(t, s, priv, "key-test", "lse-b", "upstream-oauth")
+
+	byRoute := func() map[string]map[string]any {
+		t.Helper()
+		code, body := getKeyPublications(t, s, priv, "key-test")
+		if code != http.StatusOK {
+			t.Fatalf("list: status=%d body=%s", code, body)
+		}
+		m := map[string]map[string]any{}
+		for _, p := range decodePubs(t, body) {
+			id, _ := p["route_id"].(string)
+			m[id] = p
+		}
+		return m
+	}
+	reach := func(p map[string]any) (string, bool) {
+		st, _ := p["lease_state"].(string)
+		live, _ := p["session_live"].(bool)
+		return st, live
+	}
+	m := byRoute()
+	if st, live := reach(m[r1]); st != lease.StateActive || live {
+		t.Fatalf("no session: lease_state=%q session_live=%v, want ACTIVE/false", st, live)
+	}
+
+	ws := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		<-r.Context().Done()
+	}))
+	defer ws.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, ws.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	go s.registerSession(context.Background(), conn,
+		&lease.Lease{ID: "lse-a", Hostname: "alpha.t.example.test", Generation: 1},
+		"tenant-test", "key-test", "")
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		m = byRoute()
+		if _, live := reach(m[r1]); live {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("live session for lse-a never surfaced: %v", m[r1])
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

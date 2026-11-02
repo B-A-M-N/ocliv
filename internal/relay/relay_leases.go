@@ -355,9 +355,11 @@ func (s *Server) insertLease(tenantID, keyID, label string, intent LeaseIntent, 
 		if retiredID != "" {
 			// Same-owner reclaim: carry live publications to the
 			// replacement lease atomically, preserving the stable
-			// public route. Revoked publications keep their tombstone.
+			// public route — but never its verification: the new
+			// upstream binding is unproven until re-verified (P0).
+			// Revoked publications keep their tombstone.
 			if _, err := tx.Exec(
-				`UPDATE mcp_publications SET lease_id=?, updated_at=? WHERE lease_id=? AND revoked_at IS NULL`,
+				`UPDATE mcp_publications SET lease_id=?, verified_at=NULL, updated_at=? WHERE lease_id=? AND revoked_at IS NULL`,
 				id, now.Format(time.RFC3339Nano), retiredID); err != nil {
 				return err
 			}

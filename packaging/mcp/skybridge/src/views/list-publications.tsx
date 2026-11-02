@@ -4,6 +4,7 @@ import { useState } from 'react';
 
 type Publication = {
   id: string; label?: string; profile?: string; state?: string;
+  leaseState?: string | null; sessionLive?: boolean;
   publicUrl?: string | null; leaseId?: string | null;
 };
 type ListOutput = {
@@ -26,7 +27,7 @@ export default function ListPublications() {
     <p className="metric">{pubs.length} endpoint(s) · durable publication state (not tunnel liveness)</p>
     {pubs.length === 0 && <p>No endpoints have been published.</p>}
     {pubs.map((p: Publication) => <div key={p.id} className="entry">
-      <strong>{p.label || p.id}</strong> <small>Status: {p.state} · ID: {p.id}</small>
+      <strong>{p.label || p.id}</strong> <small>Status: {p.state} · ID: {p.id} · Lease: {p.leaseState ?? 'unknown'} · Session: {p.sessionLive ? 'live' : 'down'}</small>
       {p.publicUrl && <small>{p.publicUrl}</small>}
       <button type="button" disabled={isVerifying} onClick={async()=>{
         setMessage('Verifying…');

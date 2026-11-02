@@ -144,6 +144,13 @@ func (s *Server) serveKeyPublications(w http.ResponseWriter, tenant, keyID strin
 		CreatedAt  string  `json:"created_at"`
 		RevokedAt  *string `json:"revoked_at"`
 		VerifiedAt *string `json:"verified_at"`
+		// LeaseState is the durable lease row status (ACTIVE, EXPIRED,
+		// CLOSED, REVOKED, ...), nil when the row has no lease binding.
+		// SessionLive reports whether a live transport session for the
+		// current lease generation exists right now. Durable state and
+		// reachability are deliberately separate: active ≠ reachable.
+		LeaseState  *string `json:"lease_state"`
+		SessionLive bool    `json:"session_live"`
 	}
 	out := []pub{}
 	for rows.Next() {
@@ -153,6 +160,29 @@ func (s *Server) serveKeyPublications(w http.ResponseWriter, tenant, keyID strin
 			return
 		}
 		out = append(out, p)
+	}
+	// Enrich after the cursor is closed: the store allows a single
+	// open connection, so a nested lease lookup inside the scan loop
+	// would self-deadlock the listing handler.
+	rows.Close()
+	for i := range out {
+		if out[i].LeaseID == nil {
+			continue
+		}
+		var status string
+		var generation uint64
+		switch err := s.db.SQL().QueryRow(
+			`SELECT status, generation FROM leases WHERE id=?`, *out[i].LeaseID,
+		).Scan(&status, &generation); {
+		case err == nil:
+			out[i].LeaseState = &status
+			if sess, live := s.liveSession(*out[i].LeaseID); live && sess.Generation == generation {
+				out[i].SessionLive = true
+			}
+		default:
+			unknown := "unknown"
+			out[i].LeaseState = &unknown
+		}
 	}
 	if err := rows.Err(); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -311,7 +341,7 @@ func (s *Server) serveMCPRouteMutation(w http.ResponseWriter, r *http.Request, t
 					// cannot bind a dead lease (P0-C).
 					oldBinding := boundLease.String
 					res, err := s.db.SQL().Exec(
-						`UPDATE mcp_publications SET lease_id=?, updated_at=? WHERE route_id=? AND lease_id=? AND revoked_at IS NULL AND EXISTS(SELECT 1 FROM leases WHERE id=? AND status='ACTIVE' AND (expires_at IS NULL OR expires_at > ?))`,
+						`UPDATE mcp_publications SET lease_id=?, verified_at=NULL, updated_at=? WHERE route_id=? AND lease_id=? AND revoked_at IS NULL AND EXISTS(SELECT 1 FROM leases WHERE id=? AND status='ACTIVE' AND (expires_at IS NULL OR expires_at > ?))`,
 						leaseID, now, routeID, oldBinding, leaseID, now)
 					if err != nil {
 						http.Error(w, "internal error", http.StatusInternalServerError)
@@ -393,8 +423,9 @@ func (s *Server) serveMCPRouteMutation(w http.ResponseWriter, r *http.Request, t
 
 // serveMCPRouteActivate marks one pending publication verified. The
 // CAS predicate makes activation conditional on the publication still
-// being owned, unrevoked, and bound to the calling lease: a close,
-// revoke, unpublish, or rebind racing the publisher's verification
+// being owned, unrevoked, and bound to the calling lease, with that
+// lease ACTIVE, unexpired, and owned by the caller: a close, revoke,
+// unpublish, expiry, or rebind racing the publisher's verification
 // invalidates the stale attempt with 409. An already-verified row
 // reports 200 (idempotent replay); a row bound elsewhere, revoked, or
 // missing reports 409/404 without revealing which.
@@ -405,8 +436,8 @@ func (s *Server) serveMCPRouteActivate(w http.ResponseWriter, tenant, keyID, lea
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	res, err := s.db.SQL().Exec(
-		`UPDATE mcp_publications SET verified_at=?, updated_at=? WHERE route_id=? AND tenant_id=? AND owner_key_id=? AND lease_id=? AND revoked_at IS NULL AND verified_at IS NULL`,
-		now, now, routeID, tenant, keyID, leaseID)
+		`UPDATE mcp_publications SET verified_at=?, updated_at=? WHERE route_id=? AND tenant_id=? AND owner_key_id=? AND lease_id=? AND revoked_at IS NULL AND verified_at IS NULL AND EXISTS(SELECT 1 FROM leases WHERE id=? AND tenant_id=? AND agent_key_id=? AND status='ACTIVE' AND (expires_at IS NULL OR expires_at > ?))`,
+		now, now, routeID, tenant, keyID, leaseID, leaseID, tenant, keyID, now)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return

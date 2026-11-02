@@ -174,6 +174,11 @@ function cleanPublication(p) {
     label: typeof p.pub_name === 'string' ? p.pub_name.slice(0, 120) : '',
     profile: typeof p.profile === 'string' ? p.profile.slice(0, 48) : 'unknown',
     state, // durable publication state, NOT tunnel liveness
+    // Lease/session reachability is relay-observed and deliberately
+    // separate from durable state: active ≠ reachable. Absent fields
+    // (older relays) surface as null, never as healthy.
+    leaseState: typeof p.lease_state === 'string' ? p.lease_state.slice(0, 32) : null,
+    sessionLive: p.session_live === true,
     publicUrl: `https://${host}/r/${id}/mcp`,
     leaseId: typeof p.lease_id === 'string' ? p.lease_id : null,
   };

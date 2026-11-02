@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"ocliv/internal/lease"
 )
@@ -130,6 +131,120 @@ func TestPendingSurvivesReplacementGeneration(t *testing.T) {
 	r.Host = "public.example.org"
 	if _, _, _, code := s.admitPathRoute(r); code != http.StatusNotFound {
 		t.Fatalf("unactivated rebound publication tool path: code=%d, want 404", code)
+	}
+}
+
+// A verified publication rebound to a replacement lease must not
+// inherit verification: the new upstream binding is unproven until it
+// passes discovery verification and activation itself. Same-lease
+// re-publish stays idempotent and keeps its verified state.
+func TestRebindResetsVerification(t *testing.T) {
+	s, db := newMCPServer(t)
+	priv := enrollTestKey(t, db.SQL(), "key-test", "tenant-test")
+	insertMCPLeaseRow(t, db, "lse-v1", "vlab.t.example.test", AccessModeMCPUpstreamOAuth, lease.StateActive, 1, nil)
+	r1 := publishRoute(t, s, priv, "key-test", "lse-v1", "upstream-oauth")
+	if code, _ := postMCPActivate(t, s, priv, "key-test", "lse-v1", r1); code != http.StatusOK {
+		t.Fatalf("initial activate: status=%d, want 200", code)
+	}
+	// Same-lease re-publish is idempotent: verified state preserved.
+	if r := publishRoute(t, s, priv, "key-test", "lse-v1", "upstream-oauth"); r != r1 {
+		t.Fatalf("same-lease republish minted %q, want stable %q", r, r1)
+	}
+	// Replacement lease under the same name rebinds the stable route.
+	if err := s.closeLeaseDurable("lse-v1"); err != nil {
+		t.Fatal(err)
+	}
+	insertMCPLeaseRow(t, db, "lse-v2", "other.t.example.test", AccessModeMCPUpstreamOAuth, lease.StateActive, 1, nil)
+	relabel(t, db, "lse-v2", "vlab")
+	liveFabricatedSession(t, s, "lse-v2", 1)
+	if r2 := publishRoute(t, s, priv, "key-test", "lse-v2", "upstream-oauth"); r2 != r1 {
+		t.Fatalf("rebind minted %q, want stable %q", r2, r1)
+	}
+	var verified *string
+	if err := db.SQL().QueryRow(`SELECT verified_at FROM mcp_publications WHERE route_id=?`, r1).Scan(&verified); err != nil {
+		t.Fatal(err)
+	}
+	if verified != nil {
+		t.Fatalf("rebound publication kept verified_at=%q without fresh qualification", *verified)
+	}
+	toolReq := func() int {
+		r := httptest.NewRequest(http.MethodPost, "/r/"+r1+"/mcp", nil)
+		r.Host = "public.example.org"
+		_, _, _, code := s.admitPathRoute(r)
+		return code
+	}
+	if code := toolReq(); code != http.StatusNotFound {
+		t.Fatalf("rebound unverified tool path: code=%d, want 404 (no upstream execution)", code)
+	}
+	// Stale activation from the superseded lease must fail.
+	if code, _ := postMCPActivate(t, s, priv, "key-test", "lse-v1", r1); code != http.StatusConflict {
+		t.Fatalf("stale-lease activate: status=%d, want 409", code)
+	}
+	// Fresh qualification on the replacement binding re-opens the path.
+	if code, _ := postMCPActivate(t, s, priv, "key-test", "lse-v2", r1); code != http.StatusOK {
+		t.Fatalf("re-activate: status=%d, want 200", code)
+	}
+	if code := toolReq(); code != 0 {
+		t.Fatalf("re-verified tool path denied: code=%d", code)
+	}
+}
+
+// Automatic named-lease reclaim carries the publication to the
+// replacement lease, but must not carry its verification: the new
+// upstream binding admits no tool traffic until re-verified.
+func TestReclaimResetsVerification(t *testing.T) {
+	s, db := newMCPServer(t)
+	priv := enrollTestKey(t, db.SQL(), "key-test", "tenant-test")
+	label := "reclaim-verify"
+	ls, _, err := s.insertLease("tenant-test", "key-test", label,
+		LeaseIntent{Port: 3000, AccessMode: AccessModeMCPUpstreamOAuth}, time.Now().UTC(), &label)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r1 := publishRoute(t, s, priv, "key-test", ls.ID, "upstream-oauth")
+	if code, _ := postMCPActivate(t, s, priv, "key-test", ls.ID, r1); code != http.StatusOK {
+		t.Fatalf("initial activate: status=%d, want 200", code)
+	}
+	ls2, _, err := s.insertLease("tenant-test", "key-test", label,
+		LeaseIntent{Port: 3000, AccessMode: AccessModeMCPUpstreamOAuth}, time.Now().UTC(), &label)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bound string
+	var verified *string
+	if err := db.SQL().QueryRow(`SELECT lease_id, verified_at FROM mcp_publications WHERE route_id=?`, r1).Scan(&bound, &verified); err != nil {
+		t.Fatal(err)
+	}
+	if bound != ls2.ID {
+		t.Fatalf("reclaim bound publication to %q, want %s", bound, ls2.ID)
+	}
+	if verified != nil {
+		t.Fatalf("reclaimed publication kept verified_at=%q without fresh qualification", *verified)
+	}
+	liveFabricatedSession(t, s, ls2.ID, 1)
+	r := httptest.NewRequest(http.MethodPost, "/r/"+r1+"/mcp", nil)
+	r.Host = "public.example.org"
+	if _, _, _, code := s.admitPathRoute(r); code != http.StatusNotFound {
+		t.Fatalf("reclaimed unverified tool path: code=%d, want 404 (no upstream execution)", code)
+	}
+	if code, _ := postMCPActivate(t, s, priv, "key-test", ls2.ID, r1); code != http.StatusOK {
+		t.Fatalf("re-activate after reclaim: status=%d, want 200", code)
+	}
+}
+
+// Activation requires an ACTIVE, unexpired, correctly owned lease at
+// activation time: a lease that died after registration cannot be
+// used to verify the binding.
+func TestActivateRequiresActiveLease(t *testing.T) {
+	s, db := newMCPServer(t)
+	priv := enrollTestKey(t, db.SQL(), "key-test", "tenant-test")
+	insertMCPLeaseRow(t, db, "lse-doomed", "doomed.t.example.test", AccessModeMCPUpstreamOAuth, lease.StateActive, 1, nil)
+	r1 := publishRoute(t, s, priv, "key-test", "lse-doomed", "upstream-oauth")
+	if err := s.closeLeaseDurable("lse-doomed"); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := postMCPActivate(t, s, priv, "key-test", "lse-doomed", r1); code != http.StatusConflict {
+		t.Fatalf("activate on closed lease: status=%d, want 409", code)
 	}
 }
 
