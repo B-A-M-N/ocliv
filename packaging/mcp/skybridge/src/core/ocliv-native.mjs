@@ -129,15 +129,25 @@ export function checkTrustedIssuer(publicUrl, issuerRaw, trustedIssuers = []) {
  * endpoint on the same host but outside the issuer path is still
  * rejected. */
 export function assertIssuerScoped(issuerUrl, endpointRaw, ep) {
-  let endpoint;
+  let issuer, endpoint;
+  try { issuer = new URL(issuerUrl); } catch {
+    throw new NativeError('AS_ENDPOINT', `AS issuer unparseable: ${issuerUrl}`);
+  }
   try { endpoint = new URL(endpointRaw); } catch {
     throw new NativeError('AS_ENDPOINT', `AS metadata endpoint unparseable: ${ep}`);
   }
-  if (endpoint.protocol !== 'https:') throw new NativeError('AS_ENDPOINT', `AS metadata endpoint not https: ${ep}`);
-  if (endpoint.origin !== new URL(issuerUrl).origin) {
+  for (const [u, what] of [[issuer, 'issuer'], [endpoint, 'endpoint']]) {
+    if (u.protocol !== 'https:') throw new NativeError('AS_ENDPOINT', `AS ${what} not https: ${ep}`);
+    if (u.username || u.password) throw new NativeError('AS_ENDPOINT', `AS ${what} carries userinfo: ${ep}`);
+    if (u.hash) throw new NativeError('AS_ENDPOINT', `AS ${what} carries a fragment: ${ep}`);
+  }
+  if (endpoint.origin !== issuer.origin) {
     throw new NativeError('AS_ENDPOINT', `AS metadata endpoint outside issuer origin: ${ep}`);
   }
-  if (!endpoint.toString().startsWith(issuerUrl)) {
+  const base = issuer.pathname;
+  const path = endpoint.pathname;
+  const within = base === '/' || path === base || path.startsWith(base.endsWith('/') ? base : base + '/');
+  if (!within) {
     throw new NativeError('AS_ENDPOINT', `AS metadata endpoint outside issuer scope: ${ep}`);
   }
   return endpoint.toString();

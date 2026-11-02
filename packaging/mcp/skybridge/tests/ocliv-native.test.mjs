@@ -414,6 +414,22 @@ test('hostname-prefix endpoints rejected (exact origin compare)', () => {
   ]) assert.throws(() => assertIssuerScoped(iss, evil, 'token_endpoint'), { code: 'AS_ENDPOINT' });
 });
 
+test('sibling-prefix endpoints rejected (segment-scoped path)', () => {
+  const iss = 'https://relay.example/r/a/oauth';
+  assert.equal(assertIssuerScoped(iss, 'https://relay.example/r/a/oauth/authorize', 'x'), 'https://relay.example/r/a/oauth/authorize');
+  assert.equal(assertIssuerScoped(iss, 'https://relay.example/r/a/oauth/token', 'x'), 'https://relay.example/r/a/oauth/token');
+  for (const evil of [
+    'https://relay.example/r/a/oauth-evil/token',
+    'https://relay.example/r/a/oauthevil',
+    'https://relay.example/r/a/oauth/../evil',
+    'https://relay.example/r/a/oauth#frag',
+    'https://relay.example/r/a/oauth?x=1#frag',
+    'https://user:pass@relay.example/r/a/oauth/token',
+    'https://relay.example/r/a/oauth%2fevil',
+  ]) assert.throws(() => assertIssuerScoped(iss, evil, 'x'), { code: 'AS_ENDPOINT' });
+  assert.throws(() => assertIssuerScoped('https://relay.example/r/a/oauth#frag', 'https://relay.example/r/a/oauth/token', 'x'), { code: 'AS_ENDPOINT' });
+});
+
 test('allowlisted different-host issuer verifies without same-host pin', async () => {
   const rid = 'route-ext-iss';
   const rurl = `https://relay.example.org/r/${rid}/mcp`;
