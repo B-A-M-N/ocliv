@@ -393,6 +393,27 @@ func TestRelayListenEnforcesLoopback(t *testing.T) {
 	}
 }
 
+// parseRelayListen normalizes to the numeric address actually bound:
+// a hostname must resolve now, and net.Listen must receive the
+// resolved literal — never re-resolve the name at bind time (TOCTOU).
+func TestRelayListenNormalizesToNumeric(t *testing.T) {
+	got, err := parseRelayListen("localhost:8080", "listen")
+	if err != nil {
+		t.Fatalf("localhost rejected: %v", err)
+	}
+	if got != "127.0.0.1:8080" {
+		t.Fatalf("localhost normalized to %q, want numeric 127.0.0.1:8080", got)
+	}
+	got, err = parseRelayListen("127.0.0.1:8080", "listen")
+	if err != nil || got != "127.0.0.1:8080" {
+		t.Fatalf("literal changed: %q, %v", got, err)
+	}
+	got, err = parseRelayListen("[::1]:8080", "listen")
+	if err != nil || got != "[::1]:8080" {
+		t.Fatalf("ipv6 literal changed: %q, %v", got, err)
+	}
+}
+
 // Both `--listen HOST:PORT` and `--listen=HOST:PORT` parse identically:
 // a space-form public listener must also refuse before binding anything
 // (silent flag-drop on a security-relevant flag is not acceptable).

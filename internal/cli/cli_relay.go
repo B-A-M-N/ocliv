@@ -80,10 +80,10 @@ func parseRelayListen(addr, flag string) (string, error) {
 		if !ip.IsLoopback() {
 			return "", fmt.Errorf("invalid --"+flag+" %q: non-loopback listeners would bypass the TLS edge", addr)
 		}
-		return addr, nil
+		return net.JoinHostPort(ip.String(), port), nil
 	}
 	if strings.EqualFold(host, "localhost") {
-		return addr, nil
+		return net.JoinHostPort("127.0.0.1", port), nil
 	}
 	addrs, err := net.LookupIP(host)
 	if err != nil || len(addrs) == 0 {
@@ -94,7 +94,9 @@ func parseRelayListen(addr, flag string) (string, error) {
 			return "", fmt.Errorf("invalid --"+flag+" %q: resolves outside loopback", addr)
 		}
 	}
-	return addr, nil
+	// Bind the resolved numeric literal, not the hostname: re-resolving
+	// at Listen time would let a DNS change bypass this check (TOCTOU).
+	return net.JoinHostPort(addrs[0].String(), port), nil
 }
 
 // parseHostname validates an exact dotted hostname used for relay
@@ -247,10 +249,14 @@ func startHealthListener(addr string, h http.Handler) (*http.Server, error) {
 // cmdRelayServe runs the relay in the foreground (systemd runs this).
 func cmdRelayServe(argv []string) int {
 	addr, dataDir, rawDomain := relayFlags(argv)
-	if _, err := parseRelayListen(addr, "listen"); err != nil {
+	bindAddr, err := parseRelayListen(addr, "listen")
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return apperr.ExitCLIValidation
 	}
+	// Bind the validated numeric literal, never re-resolve the raw
+	// hostname at ListenAndServe time.
+	addr = bindAddr
 	domain, err := parseRelayDomain(rawDomain)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
