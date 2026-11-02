@@ -278,6 +278,47 @@ func TestExpiredClosedResumeCodes(t *testing.T) {
 	}
 }
 
+// TestCorruptTimestampsTerminal (F12): unparseable expires_at or
+// reconnect_until deny with CodeClosed — no resume and no 4410
+// replacement. A well-formed elapsed timestamp stays CodeExpired
+// (replaceable). Corrupt state must never be readable as valid.
+func TestCorruptTimestampsTerminal(t *testing.T) {
+	s, db := newLifecycleServer(t)
+	enrollTestKey(t, db.SQL(), "key-test", "tenant-test")
+	mk := func(id, status string, exp, ru any) {
+		t.Helper()
+		_, err := db.SQL().Exec(
+			`INSERT INTO leases(id, tenant_id, agent_key_id, hostname, label, port, access_mode, generation, status, expires_at, reconnect_until, created_at)
+			 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+			id, "tenant-test", "key-test", "h-"+id, "label-"+id, 3000, "private", 1, status, exp, ru,
+			time.Now().UTC().Format(time.RFC3339Nano))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	garbage := "not-a-time"
+	mk("lse-badexp", "ACTIVE", garbage, nil)
+	mk("lse-badru", "RECONNECTING", nil, garbage)
+	past := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano)
+	mk("lse-past", "ACTIVE", past, nil)
+	intent := func(id string) LeaseIntent {
+		return LeaseIntent{Port: 3000, Ready: true, Version: "1", LeaseID: id}
+	}
+	var ae *apperr.Error
+	_, _, err := s.allocateOrResume("tenant-test", "key-test", intent("lse-badexp"))
+	if !errors.As(err, &ae) || ae.Code != apperr.CodeClosed {
+		t.Fatalf("garbage expires_at: want CodeClosed got %v", err)
+	}
+	_, _, err = s.allocateOrResume("tenant-test", "key-test", intent("lse-badru"))
+	if !errors.As(err, &ae) || ae.Code != apperr.CodeClosed {
+		t.Fatalf("garbage reconnect_until: want CodeClosed got %v", err)
+	}
+	_, _, err = s.allocateOrResume("tenant-test", "key-test", intent("lse-past"))
+	if !errors.As(err, &ae) || ae.Code != apperr.CodeExpired {
+		t.Fatalf("elapsed expires_at: want CodeExpired got %v", err)
+	}
+}
+
 // TestStaleDisconnectCannotDowngradeNewGeneration: a stale generation's
 // disconnect transition must not overwrite a newer generation's ACTIVE
 // row (adversarial Finding 1). Pre-fix, markReconnecting updated by id +

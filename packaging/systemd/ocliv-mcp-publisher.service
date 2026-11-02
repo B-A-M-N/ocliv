@@ -3,13 +3,16 @@
 #
 # LIFECYCLE CONTRACT (see internal/cli/cli_mcp_publish.go runMCPPublish):
 # the publisher registers the single-host route, prints the stable
-# endpoint, runs until signalled, then deletes the route and closes the
-# lease with independently recorded outcomes (CleanupResult).
+# endpoint only after readiness, runs until signalled, then closes the
+# lease with independently recorded outcomes (CleanupResult). The
+# publication (route binding) is RETAINED across shutdown: the stable
+# public URL survives restarts and republish rebinds it.
 #
 # GRACEFUL STOP vs PERMANENT UNPUBLISH — READ THIS:
 # - `systemctl stop ocliv-mcp-publisher` (SIGTERM) is a GRACEFUL stop:
-#   the process catches SIGTERM, deletes the route, closes the lease,
-#   and exits. `systemctl start` re-publishes (possibly a new route ID).
+#   the process catches SIGTERM, closes the lease, and exits; the route
+#   stays registered but offline (503) until republished. `systemctl
+#   start` re-publishes and rebinds the same stable route ID.
 # - There is NO in-unit permanent unpublish. If the publication itself
 #   must end (route gone for good), stop the unit AND disable it
 #   (`systemctl disable --now ocliv-mcp-publisher`), then verify with
@@ -74,8 +77,10 @@ exec $${OCLIV_BIN:-/usr/local/bin/ocliv} "$$@"'
 Restart=on-failure
 RestartPreventExitStatus=2 4 6 7
 RestartSec=30
-# SIGTERM triggers the orderly unpublish path (route DELETE + lease
-# close); allow time for both remote calls before SIGKILL.
+# SIGTERM triggers the orderly shutdown path (lease close; the route
+# binding is retained for stable republish); allow time for the remote
+# call before SIGKILL. Permanent removal is only via
+# `ocliv mcp unpublish`.
 KillSignal=SIGTERM
 TimeoutStopSec=60
 SuccessExitStatus=0

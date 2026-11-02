@@ -147,10 +147,20 @@ func (s *Server) resumeLease(tenantID, keyID string, intent LeaseIntent) (*lease
 	}
 	// TTL expiry is terminal: a lease past expires_at never resumes (V1).
 	// The row is marked EXPIRED so traffic and status agree (F01). An
-	// unparseable timestamp fails closed rather than reading as valid (F12).
+	// unparseable timestamp fails closed rather than reading as valid
+	// (F12): corrupt state is terminal (CodeClosed — no resume and no
+	// replacement), while a well-formed lapse stays replaceable
+	// (CodeExpired → 4410). Never conflate the two.
 	if expiresAt.Valid {
 		exp, err := time.Parse(time.RFC3339Nano, expiresAt.String)
-		if err != nil || time.Now().UTC().After(exp) {
+		if err != nil {
+			// Evict first: a live session must not survive its lease (R4).
+			s.evictLease(ls.ID)
+			_, _ = s.db.SQL().Exec(`UPDATE leases SET status=? WHERE id=?`, lease.StateExpired, ls.ID)
+			s.db.Audit("agent", ls.TenantID, ls.ID, "resume", "denied", "unparseable expires_at")
+			return nil, apperr.E(apperr.CodeClosed, "lease timestamp unreadable", nil)
+		}
+		if time.Now().UTC().After(exp) {
 			// Evict first: a live session must not survive its lease (R4).
 			s.evictLease(ls.ID)
 			_, _ = s.db.SQL().Exec(`UPDATE leases SET status=? WHERE id=?`, lease.StateExpired, ls.ID)
@@ -160,7 +170,10 @@ func (s *Server) resumeLease(tenantID, keyID string, intent LeaseIntent) (*lease
 	}
 	if reconnectUntil.Valid {
 		t, err := time.Parse(time.RFC3339Nano, reconnectUntil.String)
-		if err != nil || time.Now().UTC().After(t) {
+		if err != nil {
+			return nil, apperr.E(apperr.CodeClosed, "reconnect window unreadable", nil)
+		}
+		if time.Now().UTC().After(t) {
 			return nil, apperr.E(apperr.CodeExpired, "reconnect grace elapsed", nil)
 		}
 	}

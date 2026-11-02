@@ -44,9 +44,9 @@ relay through the public Funnel edge (2026-11-02).
 | Operation | HTTP method | Required response |
 |---|---|---|
 | Status | local composition (relay reachability + list) | `{ relay, relayReachable, publications: {active,pending,revoked}, listError }` — never tunnel liveness |
-| List | `GET /v1/agent/mcp-routes` (signed) | `{ publications: [{ route_id, external_host, profile, pub_name, lease_id, created_at, revoked_at, verified_at }] }` → `{ id, label, profile, state, publicUrl, leaseId }` |
+| List | `GET /v1/agent/mcp-routes` (signed) | `{ publications: [{ route_id, external_host, profile, pub_name, lease_id, created_at, revoked_at, verified_at, lease_state, session_live }] }` → `{ id, label, profile, state, leaseState, sessionLive, publicUrl, leaseId }` (durable state and relay-observed reachability are separate fields; active ≠ reachable) |
 | Get | filter of owned list by exact route ID | Single typed publication; `NOT_FOUND` otherwise |
-| Verify | public OAuth+MCP handshake (no relay key used) | discovery + DCR + 401-on-anonymous required; with `OCLIV_VERIFY_TOKEN`, authenticated initialize + tools/list; without a token, `OAUTH_REQUIRED`, never verified |
+| Verify | public OAuth+MCP handshake (no relay key used) | discovery + 401-on-anonymous required; the registration endpoint is advertised but never exercised by verify (DCR is onboarding-only, not part of verification); with a resource-bound `OCLIV_VERIFY_TOKEN` (JWT aud = publication URL), authenticated initialize + notifications/initialized + tools/list; without a bound token, `OAUTH_REQUIRED`, never verified, and no authenticated probe is sent |
 | Unpublish | `DELETE /v1/agent/mcp-routes/{id}` (signed, one-time nonce) | `{ status: "deleted" }` + re-list must not contain the id (`UNCONFIRMED` otherwise) |
 
 Publication `state` is durable publication state only
@@ -55,9 +55,10 @@ tombstoned). There is deliberately no publish operation: publishing
 needs a live local publisher lifecycle, not a management call.
 
 ## Hard release gates
-- [x] Native signed management adapter, boundary rules, 27 Node tests green
+- [x] Native signed management adapter, boundary rules, 81 Node tests green (Node v22.22.3)
 - [x] TypeScript compilation (`tsc --noEmit` clean) and `skybridge build` (server)
-- [x] Live read-only smoke test: signed list/status/verify against the real relay + public OAuth handshake with real JWT (`verified:true`)
+- [x] Public OAuth/MCP handshake against the live Funnel edge with real JWT (2026-11-02: PRM 200 exact resource, anon 401, `tools/call ping` → `pong:ocliv-oauth-lab-1`, revoked JWT → 401)
+- [ ] Signed list/status/verify through the Skybridge connector against the real relay — reported 2026-11-02 but no dated, redacted evidence on file: UNVERIFIED until re-demonstrated
 - [ ] React view bundle (`skybridge/vite` subpath missing from installed skybridge 2.1.0 — scaffold/SDK skew, view optional)
 - [ ] OAuth provider configured for the hosted app, unauthorized MCP request returns 401
 - [ ] Live unpublish approval test in an isolated staging service (adapter implemented + unit-tested, never run live)

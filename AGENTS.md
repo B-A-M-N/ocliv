@@ -180,3 +180,13 @@ own claims (red-before/green-after where practical), not the absence
 of a failure. Do not advance to the next audit phase while an
 unresolved finding invalidates it; carry it as BLOCKED or DEFERRED
 with its reason instead of silently dropping it.
+
+### 2026-11-02 evidence-driven remediation register
+
+- Task A issuer segment-scope (`ocliv-native.mjs`, sibling-prefix/userinfo/fragment rejection): FIXED — red-before (33/1) / green-after (34/34), full gates green.
+- Task B listener normalization (`cli_relay.go`, numeric bind, TOCTOU closed): FIXED — red-before / green-after, `internal/cli` + race green.
+- Task C edge identity (spoofed XFF): VERIFIED NON-ISSUE for code — no code change needed; proven by live 130-rotating-spoof probe (120x401 then 10x429, one bucket) plus new isolated-edge regression test.
+- AUDIT_2026-11-02 "no security vulnerabilities / P0 NONE": REFUTED as a qualification finding — Tasks A and B were real defects, now FIXED above; the audit's architecture description itself is SUPERSEDED where it conflicts with the fixed code.
+- Skybridge ChatGPT/Auth0 live-integration claim: UNVERIFIED (no dated redacted evidence on file) — README/SPEC downgraded accordingly; public OAuth/MCP handshake half re-verified live 2026-11-02 (PRM 200, pong, anon/revoked 401s).
+- Metis public integration (HTTP+OAuth upstream, publish/revoke through public route): BLOCKED on Metis owner — loopback expose legs pass (`TestOclivLoopbackExposeServesMetisTools`, `TestOclivLoopbackRemoteMessageChain`), `--stdio` prohibition preserved.
+- Gate 4 ChatGPT registration, clean-host install, permanent ingress, soak: NOT VERIFIED (operator-gated, unchanged).

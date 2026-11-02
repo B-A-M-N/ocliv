@@ -4,7 +4,7 @@ This project is a **real Skybridge MCP server + React MCP view source package**,
 
 ## Current state
 
-The platform-independent Ocliv control adapter and its tests run under Node 22+. The Skybridge server and React view target **Skybridge 2.1.0 / Node 24+**. Runtime build and deployment have **not** been verified: npm registry access was unavailable in the build sandbox. The Ocliv management API schema itself is not accessible here, so its paths and JSON contracts must be confirmed before the server can manage real Ocliv resources. This is **source-complete but not live-integrated**.
+The Ocliv control adapter, publisher controller, approvals, and their tests run under Node **22+** (qualified on v22.22.3; `engines` requires `>=22`). The Skybridge server and React view target Skybridge 2.1.0. The signed management adapter matches the relay implementation (routes and JSON contracts below verified against `internal/relay` source plus 81 green unit tests). Read-only management calls through an authenticated ChatGPT/Auth0 connector were reported working on 2026-11-02, but no dated, redacted request/response evidence is on file in this checkout, so that integration is classified **UNVERIFIED** until re-demonstrated. Deployment and ChatGPT UI registration remain operator actions (see SPEC hard gates).
 
 ## MCP tools
 
@@ -20,7 +20,7 @@ All tools additionally require the verified OAuth subject to match `OCLIV_ALLOWE
 
 ## Build and run on a hosted development environment
 
-Requires Node **24+**, npm, an actual Ocliv **management** API accessible from the deployment, and a compatible OAuth identity provider that issues JWT access tokens and publishes OAuth discovery + JWKS.
+Requires Node **22+**, npm, an actual Ocliv **management** API accessible from the deployment, and a compatible OAuth identity provider that issues JWT access tokens and publishes OAuth discovery + JWKS.
 
 ```sh
 npm ci                         # when a lockfile has been generated in a networked environment
@@ -49,9 +49,9 @@ Use Skybridge/Alpic to create a public HTTPS `/mcp` endpoint. Configure an OAuth
 
 ## Known issues / required matching work
 
-1. Obtain Ocliv's control-plane API contract (actual routes and schemas); adapt `src/core/ocliv.mjs` plus tests. Do **not** guess routes in production.
-2. Complete dependency installation/build with supported Node 24+ (not available in source-generation environment).
-3. Complete end-to-end OAuth, host connectivity and MCP protocol tests, then deploy with Alpic.
-4. For actual high-assurance operator approval, replace text confirmation with a durable, user-bound, single-use approval workflow before enabling production write scopes. Current confirmation arguments and host warnings are **not** proof of human approval.
+1. Ocliv's control-plane routes are matched (`src/core/ocliv-native.mjs` + tests); do **not** guess routes in production — extend only against the real relay.
+2. Dependency installation/build runs on Node 22+ (qualified on v22.22.3; full suite green).
+3. Complete deployment with Alpic, then the end-to-end OAuth/host/MCP qualification gates in SPEC.
+4. Production write scopes additionally require the single-use, user-bound, expiring approval workflow (`request-approval` + operator-private code channel); text confirmation alone is **not** proof of human approval. Keep `OCLIV_WRITE_ENABLED=false` until that channel is provisioned.
 
 See [SPEC.md](SPEC.md) for design, trust boundaries and release gates.

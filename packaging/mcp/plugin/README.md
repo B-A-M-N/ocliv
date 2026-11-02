@@ -68,9 +68,11 @@ and enter its ID/secret in ChatGPT instead.
 4. Approve the consent page.
 5. In a chat, `@` the plugin and invoke a read-only tool.
 
-Current lab status (2026-11-02): fixture handshake verified end-to-end
+Current status (2026-11-02): read-path integration is verified live —
+ChatGPT → Auth0 → signed relay management returns status/list/get for
+both publication records. Fixture handshake verified end-to-end
 through the Funnel edge (register → PKCE consent → JWT →
 `pong:ocliv-oauth-lab-1`); Auth0 PRM/AS discovery verified live for
-the management route (issuer + `ocliv:read`/`ocliv:write` scopes);
-real ChatGPT registration pending operator action above. The lab IdP
+the management route. ChatGPT UI registration of this plugin remains
+pending operator action above. The lab IdP
 (`tests/staging/mcp-oauth-lab`) is staging-only.
