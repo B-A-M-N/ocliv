@@ -8,6 +8,7 @@ package integration
 import (
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -162,6 +163,68 @@ func TestPathRouteForwardsStrippedPath(t *testing.T) {
 // profile there is no fallback to (and no validation of) Ocliv visitor
 // credentials. A garbage Ocliv header alongside the upstream bearer
 // still forwards — the relay never consults it.
+// TestPathRouteDiscoveryForwardsUpstream404: protected-resource
+// discovery on a path route is admitted (even pending) and rewritten
+// to the server-root well-known form; an upstream without OAuth
+// answers 404 and the relay forwards it unmasked. A 404 here means
+// the upstream serves no discovery document — not a broken route —
+// and verify must report discovery failure, never success.
+func TestPathRouteDiscoveryForwardsUpstream404(t *testing.T) {
+	var mu sync.Mutex
+	var upstreamPaths []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+	})
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		upstreamPaths = append(upstreamPaths, r.URL.Path)
+		mu.Unlock()
+		mux.ServeHTTP(w, r) // unregistered paths (incl. well-known) 404
+	})}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	go func() { _ = srv.Serve(ln) }()
+	appPort := ln.Addr().(*net.TCPAddr).Port
+
+	h := newHarnessNS(t, "t.example.test", "relay.example.test", "public.example.org")
+	defer h.db.Close()
+	defer h.relaySrv.Close()
+	h.startAgent(t, appPort)
+	setLeaseMode(t, h, "mcp_upstream_oauth")
+	insertTestRoute(t, h, "route-disc404")
+
+	req, err := http.NewRequest(http.MethodGet,
+		h.relaySrv.URL+"/.well-known/oauth-protected-resource/r/route-disc404/mcp", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "public.example.org"
+	resp, err := visitorClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("discovery status=%d, want upstream 404 forwarded unmasked", resp.StatusCode)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	found := false
+	for _, p := range upstreamPaths {
+		if p == "/.well-known/oauth-protected-resource/mcp" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("upstream never saw the rewritten discovery path: %v", upstreamPaths)
+	}
+}
+
 func TestPathRouteIgnoresInvalidOclivCredential(t *testing.T) {
 	app := startLocalApp(t)
 	defer app.srv.Close()

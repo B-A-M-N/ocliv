@@ -309,7 +309,11 @@ export class PublisherController extends EventEmitter {
     };
     const buffers = new Map();
     const watch = (stream) => (chunk) => {
-      const acc = (buffers.get(stream) ?? '') + String(chunk);
+      // Cap the partial line: a child that never emits a newline must
+      // not grow this buffer without bound. The tail is kept so a
+      // route URL ending the stream is still adoptable.
+      let acc = (buffers.get(stream) ?? '') + String(chunk);
+      if (acc.length > 65536) acc = acc.slice(-65536);
       const parts = acc.split('\n');
       buffers.set(stream, parts.pop());
       for (const line of parts) scan(line);

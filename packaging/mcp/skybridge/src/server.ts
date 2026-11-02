@@ -8,6 +8,9 @@ import { Approvals } from './core/approvals.mjs';
 const issuer = process.env.OCLIV_OAUTH_ISSUER;
 const audience = process.env.OCLIV_OAUTH_AUDIENCE;
 const serverUrl = process.env.SERVER_URL;
+// Least privilege: the write scope is advertised only when write
+// operations are actually enabled. Discovery otherwise offers read-only.
+const writeEnabled = (process.env.OCLIV_WRITE_ENABLED ?? 'false').trim() === 'true';
 // Never start a remotely accessible management MCP server without an IdP and explicit token audience.
 if (!issuer || !audience || !serverUrl || !issuer.startsWith('https://') || !serverUrl.startsWith('https://')) {
   throw new Error('OCLIV_OAUTH_ISSUER, OCLIV_OAUTH_AUDIENCE and HTTPS SERVER_URL required');
@@ -39,7 +42,6 @@ export const app = new Skybridge({
     const verifyToken = (process.env.OCLIV_VERIFY_TOKEN ?? '').trim() || null;
     // Write tools stay fully disabled unless the operator explicitly opts
     // in AND the publisher-side controller config validates. Default off.
-    const writeEnabled = (process.env.OCLIV_WRITE_ENABLED ?? 'false').trim() === 'true';
     // Approval codes are never returned in tool results and never logged
     // by default. Display on the server console requires explicit opt-in
     // on a console only the operator can read; otherwise only metadata
@@ -49,7 +51,7 @@ export const app = new Skybridge({
     if (writeEnabled) publisher = new PublisherController(loadPublisherConfig());
     return { subjects, verifyToken, client:new NativeOclivClient(nativeConfig), publisher, approvals:new Approvals(), approvalConsole };
   },
-  oauth: customProvider({issuer, audience, baseUrl:serverUrl, scopes:['ocliv:read','ocliv:write'], requiredScopes:['ocliv:read']}),
+  oauth: customProvider({issuer, audience, baseUrl:serverUrl, scopes: writeEnabled ? ['ocliv:read','ocliv:write'] : ['ocliv:read'], requiredScopes:['ocliv:read']}),
   handler:(server, {subjects, verifyToken, client, publisher, approvals, approvalConsole}) => server
     .registerTool({
       name:'request-approval', title:'Request a write approval',

@@ -194,6 +194,16 @@ test('emitted route URLs must be strict https route paths (no userinfo)', async 
   }
 });
 
+test('megabyte line without newline stays bounded, route still adopted', async () => {
+  const c = new PublisherController(cfg(), { spawnImpl: fakeSpawnFactory() });
+  const p = c.publish('lab', 'PUBLISH lab', { readyTimeoutMs: 5000, probe: false });
+  await new Promise((r) => setTimeout(r, 20));
+  c.children.get('lab').child.stderr.emit('data', 'x'.repeat(300000));
+  c.children.get('lab').child.stderr.emit('data', '\nhttps://edge.example/r/route-abc-9/mcp\n');
+  const out = await p;
+  assert.equal(out.routeUrl, 'https://edge.example/r/route-abc-9/mcp');
+});
+
 test('decorated output around an exact route URL adopts the clean URL only', async () => {
   for (const line of [
     'ready https://edge.example/r/route-abc-9/mcp?x=1 done',
