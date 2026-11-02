@@ -232,3 +232,26 @@ test('verify fails closed on resource mismatch and missing issuer', async () => 
   assert.equal((await evil.verifyPublication('route-abc-123')).code, 'RESOURCE_MISMATCH');
   void bad;
 });
+
+test('adapter refuses to sign outside the publication API', async () => {
+  const client = new NativeOclivClient(loadNativeConfig(keyEnv()), async () => json({}));
+  for (const p of ['/v1/agent/lease/x/close', '/v1/agent/enroll', '/v1/agent/mcp-routes/../x', '/v1/agent/mcp-routes/']) {
+    await assert.rejects(client.request('POST', p), { code: 'INVALID_PATH' });
+  }
+});
+
+test('offline relay maps to UPSTREAM_UNAVAILABLE, slow relay aborts', async () => {
+  const down = new NativeOclivClient(loadNativeConfig(keyEnv()), async () => { throw new Error('connect refused'); });
+  await assert.rejects(down.list(), { code: 'UPSTREAM_UNAVAILABLE' });
+  const hanging = new NativeOclivClient(loadNativeConfig(keyEnv()), () => new Promise((_, rej) => {
+    setTimeout(() => rej(new DOMException('The operation was aborted.', 'AbortError')), 50);
+  }));
+  await assert.rejects(hanging.list(), { code: 'UPSTREAM_UNAVAILABLE' });
+});
+
+test('safeError preserves typed codes, redacts everything else', async () => {
+  const { safeError } = await import('../src/core/ocliv.mjs');
+  assert.deepEqual(safeError(new NativeError('UPSTREAM_AUTH', 'x')), { ok: false, code: 'UPSTREAM_AUTH', message: 'x' });
+  assert.equal(safeError(new Error('boom')).code, 'INTERNAL_ERROR');
+  assert.equal(safeError(new NativeError('lowercase', 'x')).code, 'INTERNAL_ERROR');
+});

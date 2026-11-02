@@ -198,5 +198,13 @@ export class OclivClient {
 
 export function safeError(e) {
   // Never pass upstream bodies, tokens, fetch URLs, stack traces, or provider errors to the model.
-  return { ok:false, code:e instanceof OclivError ? e.code : 'INTERNAL_ERROR', message: e instanceof OclivError ? e.message : 'Ocliv operation failed' };
+  // Typed errors (OclivError, NativeError, PublisherError) carry curated
+  // messages; anything else keeps a generic message so fetch errors —
+  // which can embed URLs, tokens, or stack fragments — never leak.
+  const typed = typeof e?.code === 'string' && /^[A-Z_]{3,40}$/.test(e.code);
+  return {
+    ok: false,
+    code: typed ? e.code : 'INTERNAL_ERROR',
+    message: typed && typeof e.message === 'string' && e.message ? e.message.slice(0, 300) : 'Ocliv operation failed',
+  };
 }

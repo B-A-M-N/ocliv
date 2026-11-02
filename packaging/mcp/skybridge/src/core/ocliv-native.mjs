@@ -111,11 +111,21 @@ function cleanPublication(p, relayHost) {
   };
 }
 
+/** The only relay paths this adapter may sign for. The agent key stays
+ * publisher-side, but even a confused caller cannot turn it into a
+ * lease-close, rebind, or enrollment signature. */
+export function assertMgmtPath(path) {
+  if (path === '/v1/agent/mcp-routes' ||
+      /^\/v1\/agent\/mcp-routes\/[A-Za-z0-9_-]{3,64}$/.test(path)) return path;
+  throw new NativeError('INVALID_PATH', 'Refusing to sign outside the publication management API');
+}
+
 export class NativeOclivClient {
   constructor(config, fetchImpl = fetch) { this.c = config; this.fetch = fetchImpl; }
   relayHost() { return new URL(this.c.relay).hostname; }
 
   async request(method, path) {
+    assertMgmtPath(path);
     const headers = signMgmt(this.c.seed, this.c.keyID, method, path);
     headers.accept = 'application/json';
     let response;
