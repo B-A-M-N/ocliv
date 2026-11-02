@@ -316,6 +316,23 @@ test('absent length with small body parses, split UTF-8 decodes intact', async (
   assert.deepEqual(await readCappedJson(new Response('{"a":1}'), 'probe', 65536), { a: 1 });
 });
 
+test('upstream tool error body never reaches the caller', async () => {
+  const client = new NativeOclivClient(loadNativeConfig(keyEnv()), async (url, opts = {}) => {
+    if (url === 'https://relay.example.org/v1/agent/mcp-routes') return json(PUBS);
+    if (url.includes('/.well-known/oauth-authorization-server/')) return json(ASM);
+    if (url.startsWith('https://relay.example.org/.well-known/')) return json(PRM);
+    const body = JSON.parse(opts.body);
+    if (!opts.headers.authorization) return new Response('unauthorized', { status: 401 });
+    if (body.method === 'notifications/initialized') return new Response('', { status: 202 });
+    if (body.method === 'initialize') return json({ jsonrpc: '2.0', id: body.id, result: { protocolVersion: '2026-07-28' } });
+    return json({ jsonrpc: '2.0', id: body.id, error: { code: -32001, message: 'db password hunter2 at 10.0.0.9' } });
+  });
+  const out = await client.verifyPublication('route-abc-123', { verifyToken: GOOD_TOKEN });
+  assert.equal(out.verified, false);
+  assert.equal(out.code, 'MCP_TOOL_ERROR');
+  assert.ok(!out.message.includes('hunter2') && !out.message.includes('10.0.0.9'), 'upstream error body must not surface');
+});
+
 test('oversized signed management response fails closed as contract error', async () => {
   const client = new NativeOclivClient(loadNativeConfig(keyEnv()), async () => new Response('x'.repeat(300000)));
   await assert.rejects(client.list(), { code: 'UPSTREAM_CONTRACT' });

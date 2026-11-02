@@ -144,6 +144,29 @@ test('early exit terminates the child and clears the record', async (t) => {
   assert.equal(child.killed, 'SIGTERM');
 });
 
+test('publish failure never leaks child output (synthetic credential)', async () => {
+  const secret = 'tok-live-' + 'x'.repeat(24);
+  const c = new PublisherController(cfg(), { spawnImpl: fakeSpawnFactory() });
+  const p = c.publish('lab', 'PUBLISH lab', { readyTimeoutMs: 5000, probe: false });
+  await new Promise((r) => setTimeout(r, 20));
+  const rec = c.children.get('lab');
+  rec.child.stderr.emit('data', `operator token: ${secret}\n`);
+  rec.child.emit('exit', 1);
+  const err = await p.catch((e) => e);
+  assert.equal(err.code, 'PUBLISH_FAILED');
+  assert.ok(!err.message.includes(secret), 'child secret must not surface in the error');
+  assert.equal(err.message, 'Publisher exited before reporting a route (code 1)');
+});
+
+test('readiness probe failure never leaks transport errors', async () => {
+  const leak = 'https://edge.example/secret-path?tok=abc123';
+  const c = new PublisherController(cfg(), { fetchImpl: async () => { throw new Error(`connect refused: ${leak}`); } });
+  const err = await c.probeRoute('https://edge.example/r/route-x/mcp').catch((e) => e);
+  assert.equal(err.code, 'PUBLISH_UNHEALTHY');
+  assert.ok(!err.message.includes('secret-path') && !err.message.includes('tok='), 'transport error must not surface');
+  assert.equal(err.message, 'Route not reachable for readiness probe');
+});
+
 test('routeIdOf extracts the route id or null', () => {
   assert.equal(routeIdOf('https://edge.example/r/route-abc-9/mcp'), 'route-abc-9');
   assert.equal(routeIdOf('https://edge.example/other'), null);

@@ -99,8 +99,10 @@ export class PublisherController extends EventEmitter {
         headers: { 'content-type': 'application/json', accept: 'application/json' },
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
       });
-    } catch (e) {
-      throw new PublisherError('PUBLISH_UNHEALTHY', `Route not reachable for readiness probe: ${e?.message ?? e}`);
+    } catch {
+      // Fixed message: raw fetch errors can embed URLs, tokens, or
+      // stack fragments and must never reach MCP results.
+      throw new PublisherError('PUBLISH_UNHEALTHY', 'Route not reachable for readiness probe');
     }
     if (r.status !== 401) {
       throw new PublisherError('PUBLISH_UNHEALTHY', `Readiness probe answered HTTP ${r.status} (want 401 auth challenge)`);
@@ -314,8 +316,11 @@ export class PublisherController extends EventEmitter {
       }
       if (rec.exited) {
         cleanup();
+        // Fixed message: child stdout/stderr may carry credentials and
+        // must never reach MCP results. The exit code (a number) is the
+        // only dynamic detail; full lines stay in the in-memory record.
         throw new PublisherError('PUBLISH_FAILED',
-          `Publisher exited before reporting a route (code ${rec.exitCode}): ${rec.log.slice(-5).join(' | ').slice(0, 500)}`);
+          `Publisher exited before reporting a route (code ${rec.exitCode})`);
       }
       if (this.now() >= deadline) {
         cleanup();

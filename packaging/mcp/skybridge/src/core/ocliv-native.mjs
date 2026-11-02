@@ -408,7 +408,12 @@ export class NativeOclivClient {
       }
       const hasResult = doc.result !== undefined, hasError = doc.error !== undefined;
       if (hasResult === hasError) throw new NativeError('MCP_CONTRACT', `${method}: result/error exclusivity violated`);
-      if (hasError) throw new NativeError('MCP_TOOL_ERROR', `${method}: upstream error ${JSON.stringify(doc.error).slice(0, 200)}`);
+      // Upstream error bodies may carry sensitive data: report the
+      // numeric code only, never the message text.
+      if (hasError) {
+        const errCode = typeof doc.error.code === 'number' ? ` (code ${doc.error.code})` : '';
+        throw new NativeError('MCP_TOOL_ERROR', `${method}: upstream tool error${errCode}`);
+      }
       return doc.result;
     };
     try {
