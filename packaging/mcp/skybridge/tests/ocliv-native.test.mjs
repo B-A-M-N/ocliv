@@ -43,6 +43,13 @@ test('config requires bare https origin and a 0600 seed key file', () => {
   assert.throws(() => loadNativeConfig({ ...good, OCLIV_AGENT_KEY_FILE: '/nonexistent/key' }), { code: 'INVALID_CONFIG' });
 });
 
+test('trusted issuers default empty, entries must be https', () => {
+  assert.deepEqual(loadNativeConfig(keyEnv()).trustedIssuers, []);
+  assert.deepEqual(loadNativeConfig(keyEnv({ OCLIV_TRUSTED_ISSUERS: 'https://idp.example.com/, https://other.example/x' })).trustedIssuers,
+    ['https://idp.example.com/', 'https://other.example/x']);
+  assert.throws(() => loadNativeConfig(keyEnv({ OCLIV_TRUSTED_ISSUERS: 'http://evil.test/' })), { code: 'INVALID_CONFIG' });
+});
+
 test('unsafe key permissions fail closed', () => {
   const dir = mkdtempSync(join(tmpdir(), 'ocliv-native-test-'));
   const kf = join(dir, 'agent.key');
@@ -273,7 +280,7 @@ test('verify pins all egress to the publication host (SSRF guard)', async () => 
   // Evil issuer host: must fail before any off-host fetch.
   const evil = await mk({ resource: rurl, authorization_servers: ['https://evil.test/oauth'] }).verifyPublication(rid);
   assert.equal(evil.verified, false);
-  assert.equal(evil.code, 'ISSUER_HOST_MISMATCH');
+  assert.equal(evil.code, 'ISSUER_UNTRUSTED');
   // Endpoint escaping issuer scope.
   const asmOff = { ...goodAsm, token_endpoint: 'https://relay.example.org/other/token' };
   const off = await mk({ resource: rurl, authorization_servers: [iss] }, asmOff).verifyPublication(rid);
@@ -287,6 +294,54 @@ test('verify pins all egress to the publication host (SSRF guard)', async () => 
   const bigOut = await big.verifyPublication('route-ssrf-1');
   assert.equal(bigOut.verified, false);
   assert.equal(bigOut.code, 'DISCOVERY_TOO_LARGE');
+});
+
+test('allowlisted different-host issuer verifies without same-host pin', async () => {
+  const rid = 'route-ext-iss';
+  const rurl = `https://relay.example.org/r/${rid}/mcp`;
+  const iss = 'https://idp.example.com/';
+  const base = { publications: [{ route_id: rid, external_host: 'relay.example.org', profile: 'upstream-oauth', pub_name: 's', lease_id: null, created_at: '', revoked_at: null, verified_at: 't' }] };
+  const fetched = [];
+  const client = new NativeOclivClient(
+    loadNativeConfig(keyEnv({ OCLIV_TRUSTED_ISSUERS: iss })),
+    async (url, opts = {}) => {
+      fetched.push(url);
+      if (url === 'https://relay.example.org/v1/agent/mcp-routes') return json(base);
+      if (url === 'https://relay.example.org/.well-known/oauth-protected-resource/r/route-ext-iss/mcp') {
+        return json({ resource: rurl, authorization_servers: [iss] });
+      }
+      if (url === iss + '.well-known/oauth-authorization-server/') {
+        return json({ issuer: iss, authorization_endpoint: iss + 'authorize', token_endpoint: iss + 'oauth/token',
+          registration_endpoint: iss + 'register', code_challenge_methods_supported: ['S256'] });
+      }
+      if (url === iss + 'register' && opts.method === 'POST') return json({ client_id: 'ext-cid' });
+      if (url === rurl && opts.method === 'POST') return new Response('unauthorized', { status: 401 });
+      throw new Error('off-host fetch attempted: ' + url);
+    });
+  const out = await client.verifyPublication(rid);
+  assert.equal(out.verified, false);
+  assert.equal(out.code, 'OAUTH_REQUIRED');
+  assert.equal(out.issuer, iss);
+  assert.equal(out.registeredClient, 'ext-cid');
+});
+
+test('verification without advertised DCR skips registration', async () => {
+  const rid = 'route-nodcr-1';
+  const rurl = `https://relay.example.org/r/${rid}/mcp`;
+  const iss = `https://relay.example.org/r/${rid}/oauth`;
+  const base = { publications: [{ route_id: rid, external_host: 'relay.example.org', profile: 'upstream-oauth', pub_name: 's', lease_id: null, created_at: '', revoked_at: null, verified_at: 't' }] };
+  const asm = { issuer: iss, authorization_endpoint: iss + '/authorize', token_endpoint: iss + '/token', code_challenge_methods_supported: ['S256'] };
+  const client = new NativeOclivClient(loadNativeConfig(keyEnv()), async (url, opts = {}) => {
+    if (url === 'https://relay.example.org/v1/agent/mcp-routes') return json(base);
+    if (url.includes('/.well-known/oauth-authorization-server/')) return json(asm);
+    if (url.startsWith('https://relay.example.org/.well-known/')) return json({ resource: rurl, authorization_servers: [iss] });
+    if (url === rurl && opts.method === 'POST') return new Response('unauthorized', { status: 401 });
+    throw new Error('unexpected fetch (DCR must not run): ' + url);
+  });
+  const out = await client.verifyPublication(rid);
+  assert.equal(out.verified, false);
+  assert.equal(out.code, 'OAUTH_REQUIRED');
+  assert.equal(out.registeredClient, null);
 });
 
 test('public URL uses the publication external_host, never the control host', async () => {

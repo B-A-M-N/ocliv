@@ -48,13 +48,15 @@ export const app = new Skybridge({
   handler:(server, {subjects, verifyToken, client, publisher, approvals}) => server
     .registerTool({
       name:'request-approval', title:'Request a write approval',
-      description:'Propose a publish/unpublish for human approval. Returns an approval ID and a single-use code: the human reads the code and types it back for exactly that action. The code authorizes one bound action only and expires in minutes.',
+      description:'Propose a publish/unpublish for human approval. Returns an approval ID only — the single-use code is printed to the server OPERATOR CONSOLE, never to this tool result. The human reads the code off-console and provides it back for exactly that action. A model that only sees tool results cannot complete its own approval.',
       inputSchema:{action:z.enum(['publish','unpublish']),target:z.string().min(1).max(64)},
       annotations:{readOnlyHint:false,openWorldHint:false,destructiveHint:false}, auth:{scopes:['ocliv:write']}
     }, async ({action,target},extra)=>{
       try {
         const subject = authorize(extra.http?.authInfo,subjects,'ocliv:write');
-        return done({ok:true,...approvals.request({subject,action,target})});
+        const grant = approvals.request({subject,action,target});
+        console.error(`[ocliv-approval] action=${action} target=${target} subject=${subject} approvalId=${grant.approvalId} code=${grant.code} expires=${new Date(grant.expiresAt).toISOString()} (human reads this code off-console; it is never returned to tool callers)`);
+        return done({ok:true,...approvals.publicReceipt(grant), codeChannel:'operator-console'});
       }
       catch(e) {return failed(e);}
     })
@@ -103,7 +105,7 @@ export const app = new Skybridge({
     })
     .registerTool({
       name:'publish-service', title:'Publish an allowlisted local service',
-      description:'Start (or reattach to) the supervised local publisher for an operator-allowlisted service. Requires a single-use human approval (approvalId + code from request-approval) bound to this exact service, the ocliv:write scope, and OCLIV_WRITE_ENABLED=true. Only allowlisted loopback targets; no arbitrary commands, paths, or URLs.',
+      description:'Start (or reattach to) the supervised local publisher for an operator-allowlisted service. Requires a single-use human approval (approvalId from request-approval plus the code printed to the operator console) bound to this exact service, the ocliv:write scope, and OCLIV_WRITE_ENABLED=true. Only allowlisted loopback targets; no arbitrary commands, paths, or URLs.',
       inputSchema:{serviceName:z.string().min(1).max(48),approvalId:z.string().min(1).max(128),approvalCode:z.string().min(1).max(128)},
       annotations:{readOnlyHint:false,openWorldHint:false,destructiveHint:false}, auth:{scopes:['ocliv:write']}
     }, async ({serviceName,approvalId,approvalCode},extra)=>{
@@ -117,7 +119,7 @@ export const app = new Skybridge({
     })
     .registerTool({
       name:'unpublish-service', title:'Unpublish one publication',
-      description:'Stop the supervised local publisher (if it owns the route) and revoke exactly one publication via the signed native adapter. Requires a single-use human approval (approvalId + code from request-approval) bound to this exact publication ID. Requires ocliv:write and OCLIV_WRITE_ENABLED=true.',
+      description:'Stop the supervised local publisher (if it owns the route) and revoke exactly one publication via the signed native adapter. Requires a single-use human approval (approvalId from request-approval plus the code printed to the operator console) bound to this exact publication ID. Requires ocliv:write and OCLIV_WRITE_ENABLED=true.',
       inputSchema:{publicationId:z.string().min(3).max(64),approvalId:z.string().min(1).max(128),approvalCode:z.string().min(1).max(128)},
       annotations:{readOnlyHint:false,openWorldHint:false,destructiveHint:true}, auth:{scopes:['ocliv:write']}
     }, async ({publicationId,approvalId,approvalCode},extra)=>{

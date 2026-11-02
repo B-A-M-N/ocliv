@@ -53,7 +53,15 @@ export function loadNativeConfig(env = process.env) {
   if (keyID.startsWith('key-')) keyID = keyID.slice(4);
   if (keyID === '') keyID = deriveKeyID(seed);
   if (!/^[0-9a-f]{16}$/.test(keyID)) throw new NativeError('INVALID_CONFIG', 'OCLIV_AGENT_KEY_ID must be 16 lowercase hex chars (optional key- prefix allowed)');
-  return { relay: relay.origin, keyFile, seed, keyID: 'key-' + keyID };
+  // Exact trusted-issuer allowlist for verification egress. The issuer named
+  // by upstream metadata rarely shares the publication host (e.g. an Auth0
+  // tenant); same-host issuers need no configuration, anything else must
+  // match this list byte-for-byte (compare against the discovery `issuer`).
+  const trustedIssuers = (env.OCLIV_TRUSTED_ISSUERS ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+  for (const iss of trustedIssuers) {
+    if (!iss.startsWith('https://')) throw new NativeError('INVALID_CONFIG', 'OCLIV_TRUSTED_ISSUERS entries must be https URLs');
+  }
+  return { relay: relay.origin, keyFile, seed, keyID: 'key-' + keyID, trustedIssuers };
 }
 
 export function deriveKeyID(seed) {
@@ -94,20 +102,24 @@ export function wellKnown(resourceUrl, suffix) {
   return `${u.origin}${suffix}${u.pathname}`;
 }
 
-/** SSRF pinning for verification egress: every verification request must
- * stay on the publication's own HTTPS origin. The endpoint's metadata
- * may name an issuer and endpoints, but never a different host — a
- * malicious or compromised MCP server cannot turn verify into a scanner
- * or credential-forwarder for third parties. */
-export function pinVerificationHost(publicUrl, candidate, what) {
-  let base, target;
-  try { base = new URL(publicUrl); target = new URL(candidate); } catch {
-    throw new NativeError('AS_ENDPOINT', `Unparseable verification URL for ${what}`);
+/** SSRF pinning for verification egress, split by trust domain:
+ * - the PUBLIC endpoint (tool calls, resource metadata) stays on the
+ *   publication's own HTTPS origin (tool calls use publicUrl directly);
+ * - the ISSUER and its endpoints may live on a different host, but only an
+ *   explicitly allowlisted one. Same-host issuers need no configuration;
+ *   anything else must exactly match OCLIV_TRUSTED_ISSUERS, and every
+ *   endpoint must stay inside the issuer origin (plus no-redirect fetches).
+ * A malicious or compromised MCP server still cannot turn verify into a
+ * scanner or credential-forwarder for unlisted third parties. */
+export function checkTrustedIssuer(publicUrl, issuerRaw, trustedIssuers = []) {
+  let base, issuer;
+  try { base = new URL(publicUrl); issuer = new URL(issuerRaw); } catch {
+    throw new NativeError('ISSUER_MISSING', 'Authorization server is not a parseable URL');
   }
-  if (target.protocol !== 'https:' || target.host !== base.host) {
-    throw new NativeError('ISSUER_HOST_MISMATCH', `Verification URL for ${what} leaves the publication host`);
-  }
-  return target.toString();
+  if (issuer.protocol !== 'https:') throw new NativeError('ISSUER_UNTRUSTED', 'Authorization server must be an https URL');
+  if (issuer.host === base.host) return issuer.toString();
+  if (trustedIssuers.includes(issuer.toString())) return issuer.toString();
+  throw new NativeError('ISSUER_UNTRUSTED', 'Authorization server is not allowlisted (set OCLIV_TRUSTED_ISSUERS)');
 }
 
 /** Bounded metadata read: reject oversized discovery documents before
@@ -242,7 +254,7 @@ export class NativeOclivClient {
     }
     const issuerRaw = prm.authorization_servers[0];
     let issuer;
-    try { issuer = pinVerificationHost(pub.publicUrl, issuerRaw, 'issuer'); } catch (e) { return fail(e.code || 'ISSUER_HOST_MISMATCH', e.message); }
+    try { issuer = checkTrustedIssuer(pub.publicUrl, issuerRaw, this.c.trustedIssuers); } catch (e) { return fail(e.code || 'ISSUER_UNTRUSTED', e.message); }
     let asm;
     try {
       const r = await this.fetch(wellKnown(issuer, '/.well-known/oauth-authorization-server'), { redirect: 'manual', signal: AbortSignal.timeout(8000) });
@@ -256,29 +268,43 @@ export class NativeOclivClient {
     if (!Array.isArray(asm.code_challenge_methods_supported) || !asm.code_challenge_methods_supported.includes('S256')) {
       return fail('PKCE_UNSUPPORTED', 'AS metadata does not advertise S256');
     }
-    for (const ep of ['authorization_endpoint', 'token_endpoint', 'registration_endpoint']) {
+    for (const ep of ['authorization_endpoint', 'token_endpoint']) {
       if (typeof asm[ep] !== 'string') return fail('AS_ENDPOINT', `AS metadata endpoint missing: ${ep}`);
-      try { asm[ep] = pinVerificationHost(pub.publicUrl, asm[ep], ep); } catch (e) { return fail(e.code || 'AS_ENDPOINT', e.message); }
-      if (!asm[ep].startsWith(issuer)) return fail('AS_ENDPOINT', `AS metadata endpoint outside issuer scope: ${ep}`);
-    }
-    // Dynamic registration must succeed with a usable client_id: a live
-    // token endpoint that cannot register this verifier proves nothing.
-    let clientId = null;
-    try {
-      const r = await this.fetch(asm.registration_endpoint, {
-        method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(8000),
-        headers: { 'content-type': 'application/json', accept: 'application/json' },
-        body: JSON.stringify({ redirect_uris: [`${issuer}/local-verify`], grant_types: ['authorization_code'] }),
-      });
-      if (r.status !== 200 && r.status !== 201) return fail('REGISTER_HTTP', `Registration endpoint answered HTTP ${r.status} (want 200/201)`);
-      const reg = await readCappedJson(r, 'Registration response');
-      if (!reg || typeof reg.client_id !== 'string' || !reg.client_id) {
-        return fail('REGISTER_CONTRACT', 'Registration did not return a client_id');
+      let u;
+      try { u = new URL(asm[ep]); } catch { return fail('AS_ENDPOINT', `AS metadata endpoint unparseable: ${ep}`); }
+      if (u.protocol !== 'https:' || !asm[ep].startsWith(issuer)) {
+        return fail('AS_ENDPOINT', `AS metadata endpoint outside issuer scope: ${ep}`);
       }
-      clientId = reg.client_id;
-    } catch (e) {
-      if (e instanceof NativeError) return fail(e.code, e.message);
-      return fail('REGISTER_UNREACHABLE', 'Registration endpoint unreachable');
+    }
+    // Dynamic registration is onboarding, not health: attempt it only when
+    // the AS advertises a registration endpoint, and never fail verification
+    // for its absence. Registration here must never become a per-check
+    // client factory — at most one attempt per verify run.
+    let clientId = null;
+    let dcrAdvertised = false;
+    if (typeof asm.registration_endpoint === 'string') {
+      dcrAdvertised = true;
+      let regUrl;
+      try { regUrl = new URL(asm.registration_endpoint); } catch { return fail('AS_ENDPOINT', 'AS metadata endpoint unparseable: registration_endpoint'); }
+      if (regUrl.protocol !== 'https:' || !asm.registration_endpoint.startsWith(issuer)) {
+        return fail('AS_ENDPOINT', 'AS metadata endpoint outside issuer scope: registration_endpoint');
+      }
+      try {
+        const r = await this.fetch(asm.registration_endpoint, {
+          method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(8000),
+          headers: { 'content-type': 'application/json', accept: 'application/json' },
+          body: JSON.stringify({ redirect_uris: [`${issuer}/local-verify`], grant_types: ['authorization_code'] }),
+        });
+        if (r.status !== 200 && r.status !== 201) return fail('REGISTER_HTTP', `Registration endpoint answered HTTP ${r.status} (want 200/201)`);
+        const reg = await readCappedJson(r, 'Registration response');
+        if (!reg || typeof reg.client_id !== 'string' || !reg.client_id) {
+          return fail('REGISTER_CONTRACT', 'Registration did not return a client_id');
+        }
+        clientId = reg.client_id;
+      } catch (e) {
+        if (e instanceof NativeError) return fail(e.code, e.message);
+        return fail('REGISTER_UNREACHABLE', 'Registration endpoint unreachable');
+      }
     }
     // Unauthenticated tools/list must 401: no anonymous execution.
     try {
@@ -292,7 +318,9 @@ export class NativeOclivClient {
     if (!verifyToken) {
       return {
         id, publicUrl: pub.publicUrl, verified: false, code: 'OAUTH_REQUIRED',
-        message: 'Discovery + registration verified; user consent + token still required (no access token provisioned)',
+        message: dcrAdvertised
+          ? 'Discovery + registration verified; user consent + token still required (no access token provisioned)'
+          : 'Discovery verified (no registration endpoint advertised); user consent + token still required (no access token provisioned)',
         issuer, authorizeUrl: asm.authorization_endpoint, registeredClient: clientId,
       };
     }

@@ -2,13 +2,19 @@
  * confirmation string (`PUBLISH x`, a route ID) is not an independent
  * approval: any tool caller can supply it. Approvals fix that by binding
  * each grant to the authenticated operator subject, the exact action and
- * target, and a short expiry — consumed atomically, never replayable.
+ * target, and a short expiry — consumed atomically, never replayable —
+ * AND by delivering the code out-of-band: the code is emitted to the
+ * server operator console, never returned in a tool result. A model that
+ * only sees tool results can propose an action but can never complete its
+ * own approval; the human reads the code off-console and provides it for
+ * exactly that action.
  *
- * Flow: model calls request-approval (proposes action+target) → the
- * approval code is shown to the HUMAN, who reads it and types it back
- * for exactly that action → redeem validates subject/action/target/
- * expiry/code and consumes the grant in the same synchronous block.
- * A code authorizes one bound action only; guessing is infeasible
+ * Flow: model calls request-approval (proposes action+target) → the tool
+ * result carries only the approval ID (see publicReceipt); the approval
+ * code is printed to the OPERATOR CONSOLE → human reads it and provides
+ * it back for exactly that action → redeem validates subject/action/
+ * target/expiry/code and consumes the grant in the same synchronous
+ * block. A code authorizes one bound action only; guessing is infeasible
  * (128-bit) and replays fail closed.
  */
 import { randomBytes } from 'node:crypto';
@@ -39,6 +45,15 @@ export class Approvals {
     const code = randomBytes(16).toString('base64url');
     this.pending.set(id, { code, subject, action, target, expiresAt: this.now() + this.ttlMs });
     return { approvalId: id, code, action, target, expiresAt: this.pending.get(id).expiresAt };
+  }
+
+  /** Tool-safe receipt: everything the model may see. The code is
+   * deliberately absent — returning it in-band would let the requester
+   * complete its own approval. Emit the full grant (with code) to the
+   * operator console instead. */
+  publicReceipt(grant) {
+    const { code: _dropped, ...receipt } = grant;
+    return receipt;
   }
 
   /** Validate and atomically consume a grant. Any mismatch — subject,
