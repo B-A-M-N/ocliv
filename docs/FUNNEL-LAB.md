@@ -44,6 +44,14 @@ curl $R -X POST -H 'Content-Type: application/json' \
 - Fixture or tunnel dies: restart that process only; relay keeps state.
 - Relay dies: restart with same `--data`; leases re-attach on agent resume.
 - Route revoked (`mcp unpublish`): re-run `mcp publish` (route ID changes).
+- `tunnel credential rejected` usually means the lease lapsed (check
+  `leases/` status in the relay DB), not a bad agent key: move the stale
+  `leases/lse-*.json` aside and republish fresh (stable route IDs kept).
+  Verify the key with `SELECT id,status FROM agent_keys`.
+- Reboot wipes `/tmp` and all services. Restore order: relay →
+  Skybridge (`:18772`) → publisher → `sudo tailscale funnel --bg 18082`;
+  the publisher only attaches once the public URL answers.
+  Rollback build: `~/ocliv-funnel-lab/rollback/dist-de31fd5`.
 
 ## Shutdown
 
@@ -84,3 +92,21 @@ route IDs are retained).
 Release plugin ZIP with the live route URL is built per-publication
 via `packaging/mcp/build-plugin.sh --release` (never commit a
 transient route URL into `plugin/mcp.json`).
+
+## Auth0 mgmt route (operator checklist, 2026-11-02)
+
+Live route `.../r/oadEddDa1TGACd9aW-762w/mcp` (Skybridge `:18772`,
+scopes `ocliv:read`/`ocliv:write`, audience = route URL). ChatGPT needs:
+
+- Application client (Regular Web App) with the exact callback URL from
+  ChatGPT's custom-MCP form in Allowed Callback URLs (verbatim match;
+  mismatch fails at `/authorize/resume`).
+- `ocliv` API granting `ocliv:read` (and `ocliv:write` when writes are
+  qualified); RS256; "Resource Parameter Compatibility" + "Include
+  Issuer in Authorization Responses" toggles on; **login connection
+  enabled for the app** (missing piece found 2026-11-02).
+- ChatGPT form: Default + Base scopes `ocliv:read` (not `mcp:tools`),
+  client ID/secret pasted (no open DCR on Auth0 Free), `offline_access`
+  unchecked unless granted.
+- Skybridge env: `OCLIV_TRUSTED_ISSUERS` must contain the Auth0 issuer
+  or `verify-publication` reports `ISSUER_UNTRUSTED`.
