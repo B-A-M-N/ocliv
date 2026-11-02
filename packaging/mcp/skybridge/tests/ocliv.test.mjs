@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { loadConfig, authorize, validId, OclivClient, parsePublicUrl, safeError } from '../src/core/ocliv.mjs';
+import { loadConfig, authorize, validId, OclivClient, parsePublicUrl, safeError, buildPrMetadata } from '../src/core/ocliv.mjs';
 
 const env = {
   OCLIV_CONTROL_URL:'https://control.ocliv.example', OCLIV_CONTROL_TOKEN:'TOP_SECRET_CONTROL_TOKEN',
@@ -139,4 +139,13 @@ test('writes default disabled even with a valid control credential',async()=>{
 test('missing content-length cannot bypass upstream body-size cap',async()=>{
   const c=new OclivClient(cfg(),async()=>new Response('x'.repeat(1024*1024+1)));
   await assert.rejects(c.list(),{code:'UPSTREAM_CONTRACT'});
+});
+
+test('PRM server-root form matches relay discovery contract',()=>{
+  const doc = buildPrMetadata({resource:'https://relay.example/r/abc/mcp',issuer:'https://idp.example/',scopes:['ocliv:read','ocliv:write']});
+  assert.equal(doc.resource,'https://relay.example/r/abc/mcp');
+  assert.deepEqual(doc.authorization_servers,['https://idp.example/']);
+  assert.deepEqual(doc.scopes_supported,['ocliv:read','ocliv:write']);
+  assert.throws(()=>buildPrMetadata({resource:'http://x/mcp',issuer:'https://idp.example/',scopes:['ocliv:read']}));
+  assert.throws(()=>buildPrMetadata({resource:'https://relay.example/r/abc/mcp',issuer:'https://idp.example/',scopes:[]}));
 });

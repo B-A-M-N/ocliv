@@ -1,6 +1,6 @@
 import { Skybridge, customProvider } from 'skybridge/server';
 import { z } from 'zod';
-import { authorize, safeError } from './core/ocliv.mjs';
+import { authorize, buildPrMetadata, safeError } from './core/ocliv.mjs';
 import { loadNativeConfig, NativeOclivClient } from './core/ocliv-native.mjs';
 import { loadPublisherConfig, PublisherController, PublisherError } from './core/publisher.mjs';
 import { Approvals } from './core/approvals.mjs';
@@ -129,5 +129,12 @@ export const app = new Skybridge({
       }
       catch(e) {return failed(e);}
     })
+});
+// Server-root protected-resource metadata in the exact form the Ocliv relay
+// forwards route discovery to (upstream
+// `/.well-known/oauth-protected-resource/mcp`). Without this, the relay's
+// strict discovery probe 404s and publication can never verify.
+app.use('/.well-known/oauth-protected-resource/mcp', (_req, res) => {
+  res.json(buildPrMetadata({resource: serverUrl as string, issuer: issuer as string, scopes:['ocliv:read','ocliv:write']}));
 });
 export type AppType = typeof app;

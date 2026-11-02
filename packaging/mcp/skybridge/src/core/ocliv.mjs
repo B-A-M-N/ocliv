@@ -31,6 +31,18 @@ export function validId(id) {
   return id;
 }
 
+// Server-root protected-resource metadata document, in the exact shape the
+// Ocliv relay forwards route discovery to: upstream
+// `/.well-known/oauth-protected-resource/mcp`. Skybridge's own OAuth setup
+// only serves the resource-path form, so without this the relay's strict
+// discovery probe 404s and publication can never verify.
+export function buildPrMetadata({resource, issuer, scopes}) {
+  if (typeof resource !== 'string' || !resource.startsWith('https://')) throw new OclivError('INVALID_INPUT', 'resource must be an https URL');
+  if (typeof issuer !== 'string' || !issuer.startsWith('https://')) throw new OclivError('INVALID_INPUT', 'issuer must be an https URL');
+  if (!Array.isArray(scopes) || !scopes.length) throw new OclivError('INVALID_INPUT', 'scopes must be a non-empty array');
+  return {resource, authorization_servers:[issuer], scopes_supported:[...scopes]};
+}
+
 export function loadConfig(env = process.env) {
   const required = (k) => { const v = env[k]?.trim(); if (!v) throw new OclivError('NOT_CONFIGURED', `${k} must be configured`); return v; };
   const base = new URL(required('OCLIV_CONTROL_URL'));
