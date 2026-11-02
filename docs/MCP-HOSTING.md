@@ -117,11 +117,30 @@ profile/mode mismatch denial, header boundary (Authorization preserved,
 Ocliv credentials stripped), mode-at-allocation with strict resume
 equality, idempotent publish, route cleanup, and revocation denial.
 
+Proven against the lab Funnel edge 2026-11-02 (public `*.ts.net`
+ingress, relay rebuilt from HEAD): exact-Host single-host routing and
+strict path split through Funnel; OAuth discovery bound to the exact
+published resource (PRM 200); anonymous initialize/list/call denied
+(401); authorized initialize (version echo), tools/list, and one
+`tools/call ping` → `pong` with an audience-bound JWT; revoked JWT
+denied remotely (401); 130 rotating-spoof X-Forwarded-For probes
+shared one admission bucket (spoof-proof ingress); publication rebind
+retaining the stable route ID after lease expiry; unpublish permanently
+removing the route. The upstream in this qualification was the Ocliv
+OAuth lab fixture, not a production IdP.
+
 NOT VERIFIED until exercised against real infrastructure: public DNS +
-ACME issuance, cross-network TLS/SNI behavior, ChatGPT endpoint
-registration and tool calls (initialize, tools/list, tools/call),
-token expiry/revocation against a live IdP, and any OAuth discovery
-against the path-based route URL. Until the live OAuth path is proven
-with the actual client, keep the path route as the proven-local route
-shape and treat wildcard `https://<lease>.t.<domain>/mcp` as the
-production shape for OAuth discovery.
+ACME issuance, ChatGPT workspace endpoint registration and tool calls
+from ChatGPT itself, token flows against a live IdP (Auth0 etc.),
+clean-host installation, permanent ingress, and soak behavior. The
+wildcard `https://<lease>.t.<domain>/mcp` shape remains the production
+shape for generic tunnels; the path route is qualified for MCP
+hosting through the lab edge only.
+
+Five distinct levels — do not conflate them: (1) local stdio-to-HTTP
+(`mcp expose`, loopback only); (2) authenticated HTTP MCP (Metis
+`mcp serve-http`, JWT from the configured external issuer, loopback
+only); (3) public Ocliv publication (`mcp publish --local`,
+single-host route); (4) real remote-client OAuth qualification
+(lab-proven with fixture IdP; live-IdP and ChatGPT-app proofs
+pending); (5) production infrastructure qualification (pending).
