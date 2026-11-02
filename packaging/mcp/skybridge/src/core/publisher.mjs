@@ -10,7 +10,7 @@
  * revocation as UNKNOWN — never as success.
  */
 import { spawn } from 'node:child_process';
-import { constants as fsConstants, accessSync, readFileSync, writeFileSync, renameSync, unlinkSync, mkdirSync } from 'node:fs';
+import { constants as fsConstants, accessSync, chmodSync, readFileSync, writeFileSync, renameSync, unlinkSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 
@@ -69,6 +69,22 @@ export function loadPublisherConfig(env = process.env) {
 
 const ROUTE_URL = /https:\/\/\S+\/r\/[A-Za-z0-9_-]{3,64}\/mcp/;
 const ROUTE_ID = /\/r\/([A-Za-z0-9_-]{3,64})\/mcp/;
+const HOSTNAME = /^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
+
+/** Strict route-URL validation for child-emitted and persisted URLs:
+ * https only, no userinfo/query/fragment, valid hostname, and exactly
+ * /r/<id>/mcp. Returns { url, id } or null. The child process prints
+ * these URLs, so a loose match could adopt a foreign or decorated
+ * address; only a structurally exact route URL is adoptable. */
+export function parseRouteUrl(raw) {
+  let u;
+  try { u = new URL(typeof raw === 'string' ? raw.trim() : ''); } catch { return null; }
+  if (u.protocol !== 'https:' || u.username || u.password || u.search || u.hash) return null;
+  if (!HOSTNAME.test(u.hostname)) return null;
+  const m = u.pathname.match(/^\/r\/([A-Za-z0-9_-]{3,64})\/mcp$/);
+  if (!m) return null;
+  return { url: u.toString(), id: m[1] };
+}
 const STATE_FILE = '.ocliv-publisher-state.json';
 
 /** Route id embedded in a route URL, or null. */
@@ -127,6 +143,7 @@ export class PublisherController extends EventEmitter {
       }
       const tmp = this.statePath() + '.tmp';
       writeFileSync(tmp, JSON.stringify(records));
+      chmodSync(tmp, 0o600); // owner-only regardless of umask: routes are not secrets, but the file must not be group/world-writable
       renameSync(tmp, this.statePath());
     } catch { /* degraded: memory state remains authoritative */ }
   }
@@ -137,9 +154,15 @@ export class PublisherController extends EventEmitter {
       if (!raw || typeof raw !== 'object') return {};
       const out = {};
       for (const [name, r] of Object.entries(raw)) {
-        if (this.c.registry.has(name) && typeof r?.routeUrl === 'string' && routeIdOf(r.routeUrl)) {
-          out[name] = { routeUrl: r.routeUrl, startedAt: r.startedAt ?? null };
-        }
+        // Validate persisted records: only structurally exact route
+        // URLs for allowlisted services load; decorated or foreign
+        // addresses and mistyped fields are ignored, never adopted.
+        if (!this.c.registry.has(name)) continue;
+        if (typeof r !== 'object' || !r) continue;
+        const parsed = parseRouteUrl(r.routeUrl);
+        if (!parsed) continue;
+        if (r.startedAt != null && typeof r.startedAt !== 'number') continue;
+        out[name] = { routeUrl: parsed.url, startedAt: r.startedAt ?? null };
       }
       return out;
     } catch { return {}; }
@@ -152,6 +175,7 @@ export class PublisherController extends EventEmitter {
       delete all[name];
       const tmp = this.statePath() + '.tmp';
       writeFileSync(tmp, JSON.stringify(all));
+      chmodSync(tmp, 0o600);
       renameSync(tmp, this.statePath());
     } catch { /* degraded */ }
   }
@@ -276,7 +300,12 @@ export class PublisherController extends EventEmitter {
     const scan = (line) => {
       if (rec.log.push(line) > 200) rec.log.shift();
       const m = line.match(ROUTE_URL);
-      if (m && !rec.routeUrl) { rec.routeUrl = m[0]; this.persistState(); this.emit('route', { name, routeUrl: rec.routeUrl }); }
+      // Adopt only a structurally exact route URL: userinfo, query,
+      // fragment, or non-https output never becomes the route.
+      if (m && !rec.routeUrl) {
+        const parsed = parseRouteUrl(m[0]);
+        if (parsed) { rec.routeUrl = parsed.url; this.persistState(); this.emit('route', { name, routeUrl: rec.routeUrl }); }
+      }
     };
     const buffers = new Map();
     const watch = (stream) => (chunk) => {

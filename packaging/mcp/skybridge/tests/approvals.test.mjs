@@ -58,6 +58,24 @@ test('list exposes metadata only, never codes', () => {
   assert.ok(!('code' in pending[0]));
 });
 
+test('pending approvals are bounded; expired grants pruned on request', () => {
+  const a = new Approvals({ ttlMs: 60000, now: () => 0 });
+  for (let i = 0; i < 128; i++) a.request({ subject: SUB, action: 'publish', target: 'lab' });
+  assert.throws(() => a.request({ subject: SUB, action: 'publish', target: 'lab' }), { code: 'APPROVAL_BUSY' });
+  // earlier grants still redeemable: the bound rejects only the overflow
+  assert.equal(a.pending.size, 128);
+});
+
+test('expired grants do not consume the pending bound', () => {
+  let t = 0;
+  const a = new Approvals({ ttlMs: 100, now: () => t });
+  for (let i = 0; i < 10; i++) a.request({ subject: SUB, action: 'publish', target: 'lab' });
+  t = 1000; // all ten expired
+  for (let i = 0; i < 128; i++) a.request({ subject: SUB, action: 'publish', target: 'lab' });
+  assert.equal(a.pending.size, 128);
+  assert.throws(() => a.request({ subject: SUB, action: 'publish', target: 'lab' }), { code: 'APPROVAL_BUSY' });
+});
+
 test('grantNotice withholds code by default, reveals only on opt-in', () => {
   const a = new Approvals({ now: () => 0 });
   const g = a.request({ subject: SUB, action: 'publish', target: 'lab' });

@@ -28,6 +28,11 @@ const ACTIONS = new Set(['publish', 'unpublish']);
 const ID = /^[A-Za-z0-9_-]{3,64}$/;
 const NAME = /^[A-Za-z][A-Za-z0-9_-]{0,47}$/;
 
+/** Pending-grant ceiling: fail-closed on overflow. Operator-driven
+ * approvals are rare; an unbounded map would let a faulty or hostile
+ * caller exhaust memory one grant at a time. */
+export const MAX_PENDING = 128;
+
 export class Approvals {
   constructor({ ttlMs = 5 * 60 * 1000, now = Date.now } = {}) {
     this.ttlMs = ttlMs;
@@ -42,6 +47,13 @@ export class Approvals {
     if (!ACTIONS.has(action)) throw new ApprovalError('INVALID_APPROVAL', 'Unknown approval action');
     const okTarget = action === 'publish' ? NAME.test(target) : ID.test(target);
     if (typeof target !== 'string' || !okTarget) throw new ApprovalError('INVALID_APPROVAL', 'Approval target malformed');
+    // Prune expired grants first so dead entries never consume the
+    // bound; then enforce the ceiling.
+    const now = this.now();
+    for (const [id, r] of this.pending) {
+      if (r.expiresAt <= now) this.pending.delete(id);
+    }
+    if (this.pending.size >= MAX_PENDING) throw new ApprovalError('APPROVAL_BUSY', 'Too many pending approvals; redeem or wait for expiry');
     const id = randomBytes(12).toString('base64url');
     const code = randomBytes(16).toString('base64url');
     this.pending.set(id, { code, subject, action, target, expiresAt: this.now() + this.ttlMs });

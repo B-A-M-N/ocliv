@@ -167,6 +167,48 @@ test('readiness probe failure never leaks transport errors', async () => {
   assert.equal(err.message, 'Route not reachable for readiness probe');
 });
 
+test('state file is owner-only and malformed records are ignored', async (t) => {
+  const c = await publishRoute(t, 'https://edge.example/r/route-abc-9/mcp');
+  const st = (await import('node:fs')).statSync(c.statePath());
+  assert.equal(st.mode & 0o777, 0o600);
+  const fs = await import('node:fs');
+  const raw = JSON.parse(fs.readFileSync(c.statePath(), 'utf8'));
+  raw.lab.routeUrl = 'https://user:pass@evil.test/r/route-abc-9/mcp?x=1';
+  raw.lab.startedAt = 'not-a-number';
+  fs.writeFileSync(c.statePath(), JSON.stringify(raw));
+  assert.deepEqual(c.loadPersisted(), {}, 'unvalidated persisted state must not load');
+});
+
+test('emitted route URLs must be strict https route paths (no userinfo)', async () => {
+  for (const bad of [
+    'https://user:pass@edge.example/r/route-abc-9/mcp',
+    'http://edge.example/r/route-abc-9/mcp',
+  ]) {
+    const c = new PublisherController(cfg(), { spawnImpl: fakeSpawnFactory() });
+    const p = c.publish('lab', 'PUBLISH lab', { readyTimeoutMs: 300, probe: false });
+    await new Promise((r) => setTimeout(r, 20));
+    c.children.get('lab').child.stderr.emit('data', bad + '\n');
+    c.children.get('lab').child.stderr.emit('data', 'no route here\n');
+    await assert.rejects(p, { code: 'PUBLISH_TIMEOUT' });
+    assert.equal(c.children.get('lab')?.routeUrl ?? null, null);
+  }
+});
+
+test('decorated output around an exact route URL adopts the clean URL only', async () => {
+  for (const line of [
+    'ready https://edge.example/r/route-abc-9/mcp?x=1 done',
+    'ready https://edge.example/r/route-abc-9/mcp#frag done',
+  ]) {
+    const c = new PublisherController(cfg(), { spawnImpl: fakeSpawnFactory() });
+    const p = c.publish('lab', 'PUBLISH lab', { readyTimeoutMs: 5000, probe: false });
+    await new Promise((r) => setTimeout(r, 20));
+    c.children.get('lab').child.stderr.emit('data', line + '\n');
+    const out = await p;
+    // the adopted value itself carries no decoration
+    assert.equal(out.routeUrl, 'https://edge.example/r/route-abc-9/mcp');
+  }
+});
+
 test('routeIdOf extracts the route id or null', () => {
   assert.equal(routeIdOf('https://edge.example/r/route-abc-9/mcp'), 'route-abc-9');
   assert.equal(routeIdOf('https://edge.example/other'), null);
