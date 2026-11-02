@@ -1,8 +1,9 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
-import { skybridge } from '@skybridge/vite-plugin';
+import { skybridge } from 'skybridge/vite';
+import path from 'node:path';
 
 export default defineConfig({
-  plugins: [react(), skybridge()],
-  server: { host: '127.0.0.1' },
+  plugins: [skybridge(), react()],
+  resolve: { alias: { '@': path.resolve(import.meta.dirname, './src') } },
 });

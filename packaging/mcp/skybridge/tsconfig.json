@@ -1,10 +1,26 @@
 {
   "compilerOptions": {
-    "target": "ES2022", "module": "NodeNext", "moduleResolution": "NodeNext",
-    "jsx": "react-jsx", "strict": true, "noEmit": true,
-    "skipLibCheck": true, "esModuleInterop": true,
-    "allowImportingTsExtensions": false, "types": ["node"],
-    "baseUrl": ".", "paths": { "@/*": ["src/*"] }
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": [
+      "ES2022",
+      "DOM"
+    ],
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "allowJs": true,
+    "checkJs": false,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "types": [
+      "node"
+    ]
   },
-  "include": ["src/**/*"]
+  "include": [
+    "src/**/*",
+    ".skybridge/views.d.ts"
+  ]
 }

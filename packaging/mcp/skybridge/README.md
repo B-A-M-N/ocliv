@@ -1,44 +1,57 @@
-# Ocliv Hosting Management — Skybridge
+# Ocliv MCP Hosting (Skybridge)
 
-A separate OAuth-gated MCP management app for **Ocliv**. Does not modify the Go relay or expose its local administrative interface.
+This project is a **real Skybridge MCP server + React MCP view source package**, not a prompt, visual mockup, or ping fixture. It deliberately does not use Lovable, devdesktop, Kontrol, or the user's PC.
 
-## Prerequisites
+## Current state
 
-- Node.js **24+** and `npm install` (install dependencies and retain the resulting lockfile).
-- Existing Ocliv CLI on the same host as the enrolled publisher; no remote shell.
-- A real OAuth IdP issuing signed JWT **access** tokens with issuer, audience, `ocliv.manage` scope, and the allowlisted operator's `sub`. Configure the identity provider before public ingress.
-- One or more explicitly allowlisted, locally running, OAuth-protected native HTTP MCP servers.
+The platform-independent Ocliv control adapter and its tests run under Node 22+. The Skybridge server and React view target **Skybridge 2.1.0 / Node 24+**. Runtime build and deployment have **not** been verified: npm registry access was unavailable in the build sandbox. The Ocliv management API schema itself is not accessible here, so its paths and JSON contracts must be confirmed before the server can manage real Ocliv resources. This is **source-complete but not live-integrated**.
 
-## Configure
+## MCP tools
 
-Copy `.env.example` to `.env` and set its values using secure local secret storage (do not commit `.env`). Ensure `OCLIV_HOME` is the same isolated HOME as the publisher's enrollment. Skybridge OAuth integration is fail-closed: missing issuer, audience, subject, or Ocliv binary causes startup to fail. Do not use any `--dev-allow-unverified-discovery` override. The app does not implement an OAuth server.
+| Tool | Behavior | Permission |
+|---|---|---|
+| `get-ocliv-status` | Read actual Ocliv management status | `ocliv:read` |
+| `list-publications` | Read endpoint list, render an inline React view | `ocliv:read` |
+| `verify-publication` | Real MCP initialize, initialized, tools/list handshake; no fake green status | `ocliv:read` |
+| `publish-mcp` | Publish an **already enrolled** service, authenticated-only; requires `confirm=PUBLISH` | `ocliv:write` |
+| `unpublish-mcp` | Delete exact publication; matching confirmation ID required | `ocliv:write` |
 
-`OCLIV_SERVICES_JSON` is a JSON array of static operator-approved `{name, localUrl, resourceFile?}` entries. URLs must use `127.0.0.1` or `[::1]`, an explicit port, exactly `/mcp`, and no userinfo, query, or fragment. New service targets require changing this operator-controlled configuration. No remote caller can supply a URL or process command.
+All tools additionally require the verified OAuth subject to match `OCLIV_ALLOWED_SUBJECTS`. Credentials are never placed in MCP tool output or UI state. The OAuth provider must issue access tokens with the configured audience and scopes.
 
-```
+## Build and run on a hosted development environment
+
+Requires Node **24+**, npm, an actual Ocliv **management** API accessible from the deployment, and a compatible OAuth identity provider that issues JWT access tokens and publishes OAuth discovery + JWKS.
+
+```sh
+npm ci                         # when a lockfile has been generated in a networked environment
+# or on a fresh workspace without a lockfile:
 npm install
-npm run typecheck
+cp .env.example .env          # configure all required variables securely
 npm test
-npm run dev
+npm run check
+npm run dev                    # local DevTools; localhost:3000/mcp
+npm run deploy                 # Alpic CLI authorization + hosted deployment required
 ```
 
-With a compatible IdP configured, Skybridge serves `/mcp`, and DevTools on `/`. **Do not put the app on Funnel or a public Alpic tunnel before checking OAuth access controls and revocation**. This app is the management *control plane*, not a published public tool fixture. The existing `pop-os.tail8d285a.ts.net` URL remains the Ocliv relay and is not automatically the URL of this Skybridge app.
+Before running, set `SERVER_URL`, `OCLIV_OAUTH_ISSUER`, `OCLIV_OAUTH_AUDIENCE`, `OCLIV_ALLOWED_SUBJECTS`, `OCLIV_CONTROL_URL`, `OCLIV_CONTROL_TOKEN`, every `OCLIV_*_PATH`, and `OCLIV_PUBLIC_HOSTS`. Enable `OCLIV_WRITE_ENABLED=true` only after staging qualification. On Alpic, set these as **server-side environment secrets**, not frontend variables. **Never reuse the Ocliv management token as the public MCP probe token.**
 
-## Security model
+Important: `OCLIV_CONTROL_URL` is the HTTPS origin of Ocliv's management API. It is **not** a published `/r/.../mcp` tool endpoint. That published endpoint is what `verify-publication` can probe, if returned by the management API and in the exact hostname allowlist.
 
-- Every tool requires OAuth (signed access token, issuer, audience, `ocliv.manage`) and a matching operator `sub`.
-- All mutations require exact `PUBLISH <name>` or `REVOKE <publicationId>` text after human confirmation; callers cannot bypass server-side checking.
-- Publishing uses a fixed binary, allowlisted target, and Ocliv's strict OAuth discovery; no shell or extra CLI flags from user input.
-- Revocation checks ownership from Ocliv's live list, revokes exact ID, re-queries state. A failed recheck is not reported as success.
-- Discovery/CLI output is sanitized at the API boundary; no key material is returned.
-- A publisher subprocess must remain alive to keep the publication online; restarting the app does not automatically republish. Ocliv's retained route becomes offline until republished.
+If Ocliv has no network-reachable management API yet, that is a hard integration blocker: hosting a Skybridge UI cannot create the missing relay-side management interface or make a private machine reachable automatically.
 
-## Validation levels
+## Security tests
 
-1. Unit tests: parsing, target allowlist, publication IDs, and defensive behavior.
-2. Typecheck/build: Skybridge API compatibility on Node 24+.
-3. Local integration: real CLI with a private enrolled publisher; no public ingress needed.
-4. OAuth: assert unauthenticated=401, wrong scope=403, wrong user denied; authorized operations pass.
-5. External: verify public TLS/host/auth from off-LAN and actual host-tool call. **Not yet claimed.**
+`npm test` runs the adapter tests with an in-process fake **test HTTP transport** (not a fake production server). It covers invalid configuration, denial of unauthorized subjects/scopes, path injection, credential exclusion, publish/unpublish confirmation, redirects, true JSON-RPC MCP handshake, and refused probe auth. Tests never contact live services or change Ocliv state.
 
-This is an independent app: Ocliv's existing Funnel ping endpoint is not the Skybridge endpoint and it does not prove ChatGPT app registration.
+## Deployment and ChatGPT registration
+
+Use Skybridge/Alpic to create a public HTTPS `/mcp` endpoint. Configure an OAuth identity provider; it is **not appropriate to select No Authentication** for a hosting manager. In ChatGPT, custom app creation must be available to the workspace, otherwise registration cannot be completed from the app source alone. Existing devdesktop integration remains untouched.
+
+## Known issues / required matching work
+
+1. Obtain Ocliv's control-plane API contract (actual routes and schemas); adapt `src/core/ocliv.mjs` plus tests. Do **not** guess routes in production.
+2. Complete dependency installation/build with supported Node 24+ (not available in source-generation environment).
+3. Complete end-to-end OAuth, host connectivity and MCP protocol tests, then deploy with Alpic.
+4. For actual high-assurance operator approval, replace text confirmation with a durable, user-bound, single-use approval workflow before enabling production write scopes. Current confirmation arguments and host warnings are **not** proof of human approval.
+
+See [SPEC.md](SPEC.md) for design, trust boundaries and release gates.

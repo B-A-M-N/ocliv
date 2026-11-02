@@ -1,36 +1,56 @@
-# Ocliv Hosting Management — Skybridge MCP App
+# Ocliv MCP Hosting — implementation specification
 
-## Value proposition
-Operators manage their own hosted Ocliv MCP services from a conversational assistant without shell command composition. The underlying relay is not changed. The assistant interprets intent; Ocliv retains its authoritative admission, enrollment, and OAuth checks.
+## Problem, user, value proposition
+Provide one conversational, authenticated control surface for operating MCP services already enrolled in Ocliv. The operator should be able to inspect public endpoints, publish a known service safely, remove an endpoint with confirmation, and verify an actual MCP protocol handshake. This is **not** a replacement for the Ocliv relay, nor a wrapper around a ping fixture.
 
-## Core actions
-1. List enrolled operator's publications and display their bound/unbound/revoked state.
-2. Publish a **preallowlisted local** HTTP MCP service with explicit operator confirmation.
-3. Diagnose a publication with `ocliv mcp doctor`, distinguishing local qualification from external OAuth/ChatGPT checks.
-4. Permanently revoke a specific publication by verified publication ID with explicit operator confirmation.
+## Why an MCP app?
+The assistant can turn an instruction such as "show my published MCP servers and verify the broken one" into read-only tool calls and render a concise list with interactive verification. Publishing or unpublishing requires explicit approval. The host does not know Ocliv's enrolled services, service lifecycle, or network reachability without a real backend.
 
 ## UX flows
-- First view: compact list of publications with name, route and state, plus non-authoritative URL if configured.
-- Publish: user names allowlisted service → assistant explains public exposure → user supplies exact `PUBLISH <name>` → tool reports verified-discovery readiness or failure.
-- Verify: user identifies publication → doctor tool runs → report local verdict with external limitations.
-- Revoke: user selects exact publication → assistant explains irreversible revocation → user supplies exact `REVOKE <publicationId>` → tool rechecks relay state.
+- Inspect: user asks for status or publications → tool reads management control API → view lists endpoints.
+- Verify: user asks to check a publication or clicks Verify MCP → tool retrieves its published URL from control API → checks exact allowlist → sends initialize / notifications/initialized / tools/list → reports result.
+- Publish: user identifies an **existing enrolled** Ocliv service → confirms PUBLISH → tool sends controlled authenticated-access publish to Ocliv management API → reports actual upstream acknowledgement.
+- Unpublish: user identifies publication ID → confirms same ID → tool invokes delete on management API → only reports success if control API explicitly confirms it.
 
-## Architecture
-- Skybridge `list-publications` view and three tools: `publish-service`, `verify-publication`, `revoke-publication`.
-- No new Ocliv management listener or relay protocol changes.
-- Local subprocess adapter invokes a fixed Ocliv CLI binary, never an arbitrary shell command.
-- Allowlisted IP-literal loopback MCP targets only; process lifetime supervised by the app.
-- OAuth mandatory for all tools (audience, issuer, scope `ocliv.manage`), additionally allowlisted subject. No anonymous development bypass.
-- Ocliv native publisher enforces its own upstream OAuth resource binding. Never enable `--dev-allow-unverified-discovery`.
+## Skybridge tools and view
+- `get-ocliv-status` (read-only)
+- `list-publications` (read-only; `list-publications.tsx` view)
+- `publish-mcp` (mutating, open-world; authenticated-only access)
+- `unpublish-mcp` (destructive, open-world)
+- `verify-publication` (read-only, public network contact)
 
-## Non-goals
-- Generic tunnel management, shell execution, dynamic DNS, IdP implementation, account registration, production ingress, or arbitrary remote URL proxying.
+## Security / authority boundaries
+1. MCP caller → OAuth JWT with issuer, audience, scopes, **operator subject allowlist**. No anonymous management tools.
+2. MCP handler → trusted Ocliv management API, via static HTTPS origin + explicit exact API paths + server-only management bearer secret.
+3. Management response → normalized publication records; discard unknown fields, credentials, internal addresses.
+4. Published MCP probe → exact public hostname allowlist, HTTPS only, no redirects, separate optional probe bearer. Never send management credential to a public endpoint.
+5. No arbitrary shell execution, local process access, remote PTY, or coupling to Kontrol, devdesktop, or Lovable.
+6. Writes disabled by default; enable only after contract/staging verification. Fail closed on missing configuration, unknown JSON contracts, network failure, failed OAuth, or missing explicit confirmation.
 
-## External prerequisites
-- Node.js 24+ and Skybridge dependencies.
-- OAuth IdP with JWT access tokens, JWKS discovery and appropriate scope/subject/audience.
-- Existing enrolled Ocliv publisher and its exact HOME; Ocliv binary and a real auth-protected local MCP service.
-- ChatGPT app registration permission remains independent of working MCP protocol.
+## Ocliv control API contract (REQUIRES REAL VERIFICATION)
+The Ocliv control plane API could not be read during this build. No endpoint route is invented or assumed correct: each method's path must be set from the deployed Ocliv management API.
 
-## Status
-Source scaffold and CLI adapter tests can be performed independently. Deployment and real OAuth/ChatGPT qualification require operator-provided IdP configuration and ChatGPT permission; they must not be represented as complete without evidence.
+| Operation | HTTP method | Required response |
+|---|---|---|
+| Status | GET configured path | `{ "status": "healthy" }` (actual status may differ) |
+| List | GET configured path | `{ "publications": [{ "id": "...", "status": "...", "publicUrl": "https://...", "serviceId": "...", "label": "..." }] }` |
+| Get | GET configured path with `{id}` | Single publication object |
+| Publish | POST configured path | `{ "publication": { "id": "...", ... } }` |
+| Unpublish | DELETE configured path with `{id}` | `{ "deleted": true }` or `{ "success": true }` |
+
+Publish input: `{ "serviceId": "...", "label": "...", "kind": "mcp", "access": "authenticated" }`.
+
+This is an **adapter contract**, not a claim that the current Ocliv daemon implements these routes or payloads. Integration must adapt to real Ocliv responses, with contract tests, before any live write is authorized.
+
+## Hard release gates
+- [x] Management adapter, boundary rules, pure Node tests
+- [x] Skybridge 2.1.0 server/view source assembled
+- [ ] Skybridge dependency installation with Node >=24, TypeScript compilation and build
+- [ ] OAuth provider configured, verified issuer/audience/scope, unauthorized MCP request returns 401
+- [ ] Confirm actual Ocliv management API endpoints and payload contracts; live read-only smoke test
+- [ ] Verify live publish/unpublish in an isolated staging service after operator approval
+- [ ] Verify published endpoint initialize/initialized/tools/list with real auth
+- [ ] Deploy to Alpic with server-only secrets; inspect logs and `/mcp` and playground
+- [ ] Register the deployed URL in ChatGPT, contingent on workspace support
+
+Do not claim READY or DEPLOYED unless every applicable gate is proven.
