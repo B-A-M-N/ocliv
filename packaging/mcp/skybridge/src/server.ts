@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { authorize, safeError } from './core/ocliv.mjs';
 import { loadNativeConfig, NativeOclivClient } from './core/ocliv-native.mjs';
 import { loadPublisherConfig, PublisherController, PublisherError } from './core/publisher.mjs';
+import { Approvals } from './core/approvals.mjs';
 
 const issuer = process.env.OCLIV_OAUTH_ISSUER;
 const audience = process.env.OCLIV_OAUTH_AUDIENCE;
@@ -25,7 +26,7 @@ const done = (structuredContent: unknown) => ({
 });
 const failed = (e: unknown) => {
   const s = safeError(e);
-  return { content: `error ${s.code}: ${s.message}`, structuredContent: s };
+  return { content: `error ${s.code}: ${s.message}`, structuredContent: s, isError: true as const };
 };
 
 export const app = new Skybridge({
@@ -41,10 +42,30 @@ export const app = new Skybridge({
     const writeEnabled = (process.env.OCLIV_WRITE_ENABLED ?? 'false').trim() === 'true';
     let publisher: PublisherController | null = null;
     if (writeEnabled) publisher = new PublisherController(loadPublisherConfig());
-    return { subjects, verifyToken, client:new NativeOclivClient(nativeConfig), publisher };
+    return { subjects, verifyToken, client:new NativeOclivClient(nativeConfig), publisher, approvals:new Approvals() };
   },
   oauth: customProvider({issuer, audience, baseUrl:serverUrl, scopes:['ocliv:read','ocliv:write'], requiredScopes:['ocliv:read']}),
-  handler:(server, {subjects, verifyToken, client, publisher}) => server
+  handler:(server, {subjects, verifyToken, client, publisher, approvals}) => server
+    .registerTool({
+      name:'request-approval', title:'Request a write approval',
+      description:'Propose a publish/unpublish for human approval. Returns an approval ID and a single-use code: the human reads the code and types it back for exactly that action. The code authorizes one bound action only and expires in minutes.',
+      inputSchema:{action:z.enum(['publish','unpublish']),target:z.string().min(1).max(64)},
+      annotations:{readOnlyHint:false,openWorldHint:false,destructiveHint:false}, auth:{scopes:['ocliv:write']}
+    }, async ({action,target},extra)=>{
+      try {
+        const subject = authorize(extra.http?.authInfo,subjects,'ocliv:write');
+        return done({ok:true,...approvals.request({subject,action,target})});
+      }
+      catch(e) {return failed(e);}
+    })
+    .registerTool({
+      name:'list-approvals', title:'List pending approvals',
+      description:'List pending write approvals (metadata only, never codes) for operator hygiene.',
+      annotations:readOnly, auth:{scopes:['ocliv:read']}
+    }, async (_,extra)=>{
+      try { authorize(extra.http?.authInfo,subjects); return done({ok:true,pending:approvals.list()}); }
+      catch(e) {return failed(e);}
+    })
     .registerTool({
       name:'get-ocliv-status', title:'Get Ocliv status',
       description:'Read actual Ocliv relay reachability and durable publication states; never guesses tunnel liveness.',
@@ -82,27 +103,29 @@ export const app = new Skybridge({
     })
     .registerTool({
       name:'publish-service', title:'Publish an allowlisted local service',
-      description:'Start (or reattach to) the supervised local publisher for an operator-allowlisted service. Requires the exact confirmation `PUBLISH <name>`, the ocliv:write scope, and OCLIV_WRITE_ENABLED=true. Only allowlisted loopback targets; no arbitrary commands, paths, or URLs.',
-      inputSchema:{serviceName:z.string().min(1).max(48),confirmation:z.string().min(1).max(64)},
+      description:'Start (or reattach to) the supervised local publisher for an operator-allowlisted service. Requires a single-use human approval (approvalId + code from request-approval) bound to this exact service, the ocliv:write scope, and OCLIV_WRITE_ENABLED=true. Only allowlisted loopback targets; no arbitrary commands, paths, or URLs.',
+      inputSchema:{serviceName:z.string().min(1).max(48),approvalId:z.string().min(1).max(128),approvalCode:z.string().min(1).max(128)},
       annotations:{readOnlyHint:false,openWorldHint:false,destructiveHint:false}, auth:{scopes:['ocliv:write']}
-    }, async ({serviceName,confirmation},extra)=>{
+    }, async ({serviceName,approvalId,approvalCode},extra)=>{
       try {
-        authorize(extra.http?.authInfo,subjects,'ocliv:write');
+        const subject = authorize(extra.http?.authInfo,subjects,'ocliv:write');
         if (!publisher) return done({ok:false,code:'WRITE_DISABLED',message:'Publishing is disabled (OCLIV_WRITE_ENABLED is not true)'});
-        return done({ok:true,...await publisher.publish(serviceName,confirmation)});
+        approvals.redeem({subject,action:'publish',target:serviceName,approvalId,code:approvalCode});
+        return done({ok:true,...await publisher.publish(serviceName,`PUBLISH ${serviceName}`)});
       }
       catch(e) {return failed(e);}
     })
     .registerTool({
       name:'unpublish-service', title:'Unpublish one publication',
-      description:'Stop the supervised local publisher (if it owns the route) and revoke exactly one publication via the signed native adapter. Confirmation must equal the exact publication ID. Requires ocliv:write and OCLIV_WRITE_ENABLED=true.',
-      inputSchema:{publicationId:z.string().min(3).max(64),confirmation:z.string().min(3).max(64)},
+      description:'Stop the supervised local publisher (if it owns the route) and revoke exactly one publication via the signed native adapter. Requires a single-use human approval (approvalId + code from request-approval) bound to this exact publication ID. Requires ocliv:write and OCLIV_WRITE_ENABLED=true.',
+      inputSchema:{publicationId:z.string().min(3).max(64),approvalId:z.string().min(1).max(128),approvalCode:z.string().min(1).max(128)},
       annotations:{readOnlyHint:false,openWorldHint:false,destructiveHint:true}, auth:{scopes:['ocliv:write']}
-    }, async ({publicationId,confirmation},extra)=>{
+    }, async ({publicationId,approvalId,approvalCode},extra)=>{
       try {
-        authorize(extra.http?.authInfo,subjects,'ocliv:write');
+        const subject = authorize(extra.http?.authInfo,subjects,'ocliv:write');
         if (!publisher) return done({ok:false,code:'WRITE_DISABLED',message:'Unpublishing is disabled (OCLIV_WRITE_ENABLED is not true)'});
-        return done({ok:true,...await publisher.unpublish(publicationId,confirmation,{revoker:(id)=>client.unpublish(id)})});
+        approvals.redeem({subject,action:'unpublish',target:publicationId,approvalId,code:approvalCode});
+        return done({ok:true,...await publisher.unpublish(publicationId,publicationId,{revoker:(id)=>client.unpublish(id)})});
       }
       catch(e) {return failed(e);}
     })

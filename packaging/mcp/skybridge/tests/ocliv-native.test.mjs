@@ -187,11 +187,12 @@ function verifyFetch({ tokenTools = null } = {}) {
       const body = JSON.parse(opts.body);
       const authed = (opts.headers.authorization || '') === 'Bearer good-token';
       if (!authed) return new Response('unauthorized', { status: 401 });
+      if (body.method === 'notifications/initialized') return new Response('', { status: 202 });
       if (tokenTools === 'ok' && body.method === 'initialize') {
-        return json({ jsonrpc: '2.0', id: 1, result: { protocolVersion: '2026-07-28', capabilities: {}, serverInfo: {} } });
+        return json({ jsonrpc: '2.0', id: body.id, result: { protocolVersion: '2026-07-28', capabilities: {}, serverInfo: {} } });
       }
       if (tokenTools === 'ok' && body.method === 'tools/list') {
-        return json({ jsonrpc: '2.0', id: 1, result: { tools: [{ name: 'ping' }] } });
+        return json({ jsonrpc: '2.0', id: body.id, result: { tools: [{ name: 'ping' }] } });
       }
       return new Response('denied', { status: 403 });
     }
@@ -254,4 +255,108 @@ test('safeError preserves typed codes, redacts everything else', async () => {
   assert.deepEqual(safeError(new NativeError('UPSTREAM_AUTH', 'x')), { ok: false, code: 'UPSTREAM_AUTH', message: 'x' });
   assert.equal(safeError(new Error('boom')).code, 'INTERNAL_ERROR');
   assert.equal(safeError(new NativeError('lowercase', 'x')).code, 'INTERNAL_ERROR');
+});
+
+test('verify pins all egress to the publication host (SSRF guard)', async () => {
+  const rid = 'route-ssrf-1';
+  const rurl = `https://relay.example.org/r/${rid}/mcp`;
+  const iss = `https://relay.example.org/r/${rid}/oauth`;
+  const base = { publications: [{ route_id: rid, external_host: 'relay.example.org', profile: 'upstream-oauth', pub_name: 's', lease_id: null, created_at: '', revoked_at: null, verified_at: 't' }] };
+  const mk = (prm, asm = null) => new NativeOclivClient(loadNativeConfig(keyEnv()), async (url) => {
+    if (url === 'https://relay.example.org/v1/agent/mcp-routes') return json(base);
+    if (asm && url.includes('/.well-known/oauth-authorization-server/')) return json(asm);
+    if (url.startsWith('https://relay.example.org/.well-known/')) return json(prm);
+    if (asm && url.startsWith('https://relay.example.org/')) return json(asm);
+    throw new Error('off-host fetch attempted: ' + url);
+  });
+  const goodAsm = { issuer: iss, authorization_endpoint: iss + '/authorize', token_endpoint: iss + '/token', registration_endpoint: iss + '/register', code_challenge_methods_supported: ['S256'] };
+  // Evil issuer host: must fail before any off-host fetch.
+  const evil = await mk({ resource: rurl, authorization_servers: ['https://evil.test/oauth'] }).verifyPublication(rid);
+  assert.equal(evil.verified, false);
+  assert.equal(evil.code, 'ISSUER_HOST_MISMATCH');
+  // Endpoint escaping issuer scope.
+  const asmOff = { ...goodAsm, token_endpoint: 'https://relay.example.org/other/token' };
+  const off = await mk({ resource: rurl, authorization_servers: [iss] }, asmOff).verifyPublication(rid);
+  assert.equal(off.verified, false);
+  assert.equal(off.code, 'AS_ENDPOINT');
+  // Oversized discovery document rejected.
+  const big = new NativeOclivClient(loadNativeConfig(keyEnv()), async (url) => {
+    if (url === 'https://relay.example.org/v1/agent/mcp-routes') return json(base);
+    return new Response('x'.repeat(70000), { status: 200, headers: { 'content-type': 'application/json' } });
+  });
+  const bigOut = await big.verifyPublication('route-ssrf-1');
+  assert.equal(bigOut.verified, false);
+  assert.equal(bigOut.code, 'DISCOVERY_TOO_LARGE');
+});
+
+test('public URL uses the publication external_host, never the control host', async () => {
+  const mk = (host) => new NativeOclivClient(loadNativeConfig(keyEnv()), async (url) => {
+    if (url === 'https://control.example.org/v1/agent/mcp-routes') {
+      return json({ publications: [{ route_id: 'route-ext-1', external_host: host, profile: 'p', pub_name: 'x', lease_id: null, created_at: '', revoked_at: null, verified_at: 't' }] });
+    }
+    throw new Error('unexpected');
+  });
+  const cfg = loadNativeConfig({ ...keyEnv(), OCLIV_RELAY_URL: 'https://control.example.org' });
+  const c = new NativeOclivClient(cfg, mk('mcp.example.org').fetch);
+  const pubs = await c.list();
+  assert.equal(pubs[0].publicUrl, 'https://mcp.example.org/r/route-ext-1/mcp');
+  const bad = new NativeOclivClient(cfg, mk('evil host/../x').fetch);
+  await assert.rejects(bad.list(), { code: 'UPSTREAM_CONTRACT' });
+});
+
+test('verify rejects registration without client_id and bad id echo', async () => {
+  const base = { publications: [{ route_id: 'route-strict-1', external_host: 'relay.example.org', profile: 'upstream-oauth', pub_name: 's', lease_id: null, created_at: '', revoked_at: null, verified_at: 't' }] };
+  const rurl = 'https://relay.example.org/r/route-strict-1/mcp';
+  const iss = 'https://relay.example.org/r/route-strict-1/oauth';
+  const prm = { resource: rurl, authorization_servers: [iss] };
+  const asm = { issuer: iss, authorization_endpoint: iss + '/authorize', token_endpoint: iss + '/token', registration_endpoint: iss + '/register', code_challenge_methods_supported: ['S256'] };
+  const mk = (regBody) => new NativeOclivClient(loadNativeConfig(keyEnv()), async (url, opts = {}) => {
+    if (url === 'https://relay.example.org/v1/agent/mcp-routes') return json(base);
+    if (url.includes('/.well-known/oauth-authorization-server/')) return json(asm);
+    if (url.startsWith('https://relay.example.org/.well-known/')) return json(prm);
+    if (url === iss + '/register') return json(regBody);
+    throw new Error('unexpected: ' + url);
+  });
+  const noCid = await mk({ status: 'ok' }).verifyPublication('route-strict-1');
+  assert.equal(noCid.code, 'REGISTER_CONTRACT');
+  // Wrong id echo on initialize.
+  const wrongId = new NativeOclivClient(loadNativeConfig(keyEnv()), async (url, opts = {}) => {
+    if (url === 'https://relay.example.org/v1/agent/mcp-routes') return json(base);
+    if (url.includes('/.well-known/oauth-authorization-server/')) return json(asm);
+    if (url.startsWith('https://relay.example.org/.well-known/')) return json(prm);
+    if (url === iss + '/register') return json({ client_id: 'cid-1' });
+    if (url === rurl) {
+      if (!opts.headers.authorization) return new Response('unauthorized', { status: 401 });
+      const body = JSON.parse(opts.body);
+      if (body.method === 'notifications/initialized') return new Response('', { status: 202 });
+      return json({ jsonrpc: '2.0', id: 999, result: {} });
+    }
+    throw new Error('unexpected: ' + url);
+  });
+  const badEcho = await wrongId.verifyPublication('route-strict-1', { verifyToken: 't' });
+  assert.equal(badEcho.code, 'MCP_CONTRACT');
+});
+
+test('approvals bind subject/action/target, single-use, expiring', async () => {
+  const { Approvals } = await import('../src/core/approvals.mjs');
+  let t = 1000;
+  const a = new Approvals({ ttlMs: 60000, now: () => t });
+  // Wrong subject / action / target / code all fail (fresh grant each:
+  // redeem consumes on first attempt by design).
+  const fresh = () => a.request({ subject: 'op-1', action: 'publish', target: 'lab' });
+  const g = fresh();
+  assert.ok(g.approvalId && g.code);
+  assert.throws(() => a.redeem({ subject: 'op-2', action: 'publish', target: 'lab', approvalId: fresh().approvalId, code: g.code }), { code: 'APPROVAL_SUBJECT' });
+  assert.throws(() => a.redeem({ subject: 'op-1', action: 'unpublish', target: 'lab', approvalId: fresh().approvalId, code: g.code }), { code: 'APPROVAL_BINDING' });
+  assert.throws(() => a.redeem({ subject: 'op-1', action: 'publish', target: 'lab', approvalId: fresh().approvalId, code: 'wrong' }), { code: 'APPROVAL_CODE' });
+  // Success consumes: replay fails.
+  assert.deepEqual(a.redeem({ subject: 'op-1', action: 'publish', target: 'lab', approvalId: g.approvalId, code: g.code }), { approved: true, action: 'publish', target: 'lab' });
+  assert.throws(() => a.redeem({ subject: 'op-1', action: 'publish', target: 'lab', approvalId: g.approvalId, code: g.code }), { code: 'APPROVAL_INVALID' });
+  // Expiry fails.
+  const g2 = a.request({ subject: 'op-1', action: 'unpublish', target: 'route-1' });
+  t += 61000;
+  assert.throws(() => a.redeem({ subject: 'op-1', action: 'unpublish', target: 'route-1', approvalId: g2.approvalId, code: g2.code }), { code: 'APPROVAL_EXPIRED' });
+  // Listing never exposes codes.
+  a.request({ subject: 'op-1', action: 'publish', target: 'lab' });
+  assert.equal(JSON.stringify(a.list()).includes(g.code), false);
 });

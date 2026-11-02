@@ -94,10 +94,45 @@ export function wellKnown(resourceUrl, suffix) {
   return `${u.origin}${suffix}${u.pathname}`;
 }
 
-function cleanPublication(p, relayHost) {
+/** SSRF pinning for verification egress: every verification request must
+ * stay on the publication's own HTTPS origin. The endpoint's metadata
+ * may name an issuer and endpoints, but never a different host — a
+ * malicious or compromised MCP server cannot turn verify into a scanner
+ * or credential-forwarder for third parties. */
+export function pinVerificationHost(publicUrl, candidate, what) {
+  let base, target;
+  try { base = new URL(publicUrl); target = new URL(candidate); } catch {
+    throw new NativeError('AS_ENDPOINT', `Unparseable verification URL for ${what}`);
+  }
+  if (target.protocol !== 'https:' || target.host !== base.host) {
+    throw new NativeError('ISSUER_HOST_MISMATCH', `Verification URL for ${what} leaves the publication host`);
+  }
+  return target.toString();
+}
+
+/** Bounded metadata read: reject oversized discovery documents before
+ * parsing (64 KiB cap, checked via header when present and after read). */
+export async function readCappedJson(response, what, cap = 65536) {
+  const announced = Number(response.headers?.get?.('content-length'));
+  if (Number.isFinite(announced) && announced > cap) {
+    throw new NativeError('DISCOVERY_TOO_LARGE', `${what} exceeds size bound`);
+  }
+  const text = await response.text();
+  if (text.length > cap) throw new NativeError('DISCOVERY_TOO_LARGE', `${what} exceeds size bound`);
+  try { return JSON.parse(text); } catch { throw new NativeError('DISCOVERY_MALFORMED', `${what} is not JSON`); }
+}
+
+function cleanPublication(p) {
   if (!p || typeof p !== 'object') throw new NativeError('UPSTREAM_CONTRACT', 'Invalid publication record from relay');
   const id = p.route_id;
   if (typeof id !== 'string' || !ROUTE_ID.test(id)) throw new NativeError('UPSTREAM_CONTRACT', 'Invalid route_id from relay');
+  // The publication's own external_host is authoritative for the public
+  // URL: the relay control hostname and the MCP ingress hostname may
+  // differ (--mcp-host). Never substitute the control host.
+  const host = p.external_host;
+  if (typeof host !== 'string' || !/^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/.test(host)) {
+    throw new NativeError('UPSTREAM_CONTRACT', 'Invalid external_host from relay');
+  }
   let state = 'active';
   if (p.revoked_at != null) state = 'revoked';
   else if (p.verified_at == null) state = 'pending';
@@ -106,7 +141,7 @@ function cleanPublication(p, relayHost) {
     label: typeof p.pub_name === 'string' ? p.pub_name.slice(0, 120) : '',
     profile: typeof p.profile === 'string' ? p.profile.slice(0, 48) : 'unknown',
     state, // durable publication state, NOT tunnel liveness
-    publicUrl: `https://${relayHost}/r/${id}/mcp`,
+    publicUrl: `https://${host}/r/${id}/mcp`,
     leaseId: typeof p.lease_id === 'string' ? p.lease_id : null,
   };
 }
@@ -122,7 +157,6 @@ export function assertMgmtPath(path) {
 
 export class NativeOclivClient {
   constructor(config, fetchImpl = fetch) { this.c = config; this.fetch = fetchImpl; }
-  relayHost() { return new URL(this.c.relay).hostname; }
 
   async request(method, path) {
     assertMgmtPath(path);
@@ -148,8 +182,7 @@ export class NativeOclivClient {
   async list() {
     const body = await this.request('GET', '/v1/agent/mcp-routes');
     if (!body || !Array.isArray(body.publications)) throw new NativeError('UPSTREAM_CONTRACT', 'Expected {publications:[...]} from relay');
-    const host = this.relayHost();
-    return body.publications.map((p) => cleanPublication(p, host));
+    return body.publications.map((p) => cleanPublication(p));
   }
 
   /** Get one publication by exact route ID (filter of the owned list). */
@@ -198,39 +231,55 @@ export class NativeOclivClient {
     try {
       const r = await this.fetch(metaUrl, { redirect: 'manual', signal: AbortSignal.timeout(8000) });
       if (!r.ok) return fail('DISCOVERY_HTTP', `Resource metadata answered HTTP ${r.status}`);
-      prm = await r.json();
-    } catch { return fail('DISCOVERY_UNREACHABLE', 'Resource metadata unreachable'); }
+      prm = await readCappedJson(r, 'Resource metadata');
+    } catch (e) {
+      if (e instanceof NativeError) return fail(e.code, e.message);
+      return fail('DISCOVERY_UNREACHABLE', 'Resource metadata unreachable');
+    }
     if (!prm || prm.resource !== pub.publicUrl) return fail('RESOURCE_MISMATCH', 'Upstream advertises a different resource than the published route');
     if (!Array.isArray(prm.authorization_servers) || prm.authorization_servers.length !== 1 || typeof prm.authorization_servers[0] !== 'string') {
       return fail('ISSUER_MISSING', 'Resource metadata names no usable authorization server');
     }
-    const issuer = prm.authorization_servers[0];
+    const issuerRaw = prm.authorization_servers[0];
+    let issuer;
+    try { issuer = pinVerificationHost(pub.publicUrl, issuerRaw, 'issuer'); } catch (e) { return fail(e.code || 'ISSUER_HOST_MISMATCH', e.message); }
     let asm;
     try {
       const r = await this.fetch(wellKnown(issuer, '/.well-known/oauth-authorization-server'), { redirect: 'manual', signal: AbortSignal.timeout(8000) });
       if (!r.ok) return fail('AS_HTTP', `AS metadata answered HTTP ${r.status}`);
-      asm = await r.json();
-    } catch { return fail('AS_UNREACHABLE', 'Authorization-server metadata unreachable'); }
+      asm = await readCappedJson(r, 'AS metadata');
+    } catch (e) {
+      if (e instanceof NativeError) return fail(e.code, e.message);
+      return fail('AS_UNREACHABLE', 'Authorization-server metadata unreachable');
+    }
     if (!asm || asm.issuer !== issuer) return fail('ISSUER_MISMATCH', 'AS metadata issuer does not match the advertised server');
     if (!Array.isArray(asm.code_challenge_methods_supported) || !asm.code_challenge_methods_supported.includes('S256')) {
       return fail('PKCE_UNSUPPORTED', 'AS metadata does not advertise S256');
     }
     for (const ep of ['authorization_endpoint', 'token_endpoint', 'registration_endpoint']) {
-      if (typeof asm[ep] !== 'string' || !asm[ep].startsWith('https://')) return fail('AS_ENDPOINT', `AS metadata endpoint missing: ${ep}`);
+      if (typeof asm[ep] !== 'string') return fail('AS_ENDPOINT', `AS metadata endpoint missing: ${ep}`);
+      try { asm[ep] = pinVerificationHost(pub.publicUrl, asm[ep], ep); } catch (e) { return fail(e.code || 'AS_ENDPOINT', e.message); }
+      if (!asm[ep].startsWith(issuer)) return fail('AS_ENDPOINT', `AS metadata endpoint outside issuer scope: ${ep}`);
     }
-    // Dynamic registration proves the token endpoint lives.
+    // Dynamic registration must succeed with a usable client_id: a live
+    // token endpoint that cannot register this verifier proves nothing.
     let clientId = null;
     try {
       const r = await this.fetch(asm.registration_endpoint, {
         method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(8000),
         headers: { 'content-type': 'application/json', accept: 'application/json' },
-        body: JSON.stringify({ redirect_uris: [`${issuer}/../local-verify-callback`], grant_types: ['authorization_code'] }),
+        body: JSON.stringify({ redirect_uris: [`${issuer}/local-verify`], grant_types: ['authorization_code'] }),
       });
-      // Any redirect_uri the lab server rejects still proves liveness;
-      // only hard failures (unreachable/5xx) fail the check.
-      if (r.status >= 500) return fail('REGISTER_HTTP', `Registration endpoint answered HTTP ${r.status}`);
-      try { clientId = (await r.json()).client_id || null; } catch { clientId = null; }
-    } catch { return fail('REGISTER_UNREACHABLE', 'Registration endpoint unreachable'); }
+      if (r.status !== 200 && r.status !== 201) return fail('REGISTER_HTTP', `Registration endpoint answered HTTP ${r.status} (want 200/201)`);
+      const reg = await readCappedJson(r, 'Registration response');
+      if (!reg || typeof reg.client_id !== 'string' || !reg.client_id) {
+        return fail('REGISTER_CONTRACT', 'Registration did not return a client_id');
+      }
+      clientId = reg.client_id;
+    } catch (e) {
+      if (e instanceof NativeError) return fail(e.code, e.message);
+      return fail('REGISTER_UNREACHABLE', 'Registration endpoint unreachable');
+    }
     // Unauthenticated tools/list must 401: no anonymous execution.
     try {
       const r = await this.fetch(pub.publicUrl, {
@@ -247,25 +296,44 @@ export class NativeOclivClient {
         issuer, authorizeUrl: asm.authorization_endpoint, registeredClient: clientId,
       };
     }
-    // Authenticated proof with a provisioned token.
-    const call = async (method, params) => {
+    // Authenticated proof with a provisioned token: initialize →
+    // notifications/initialized → tools/list, each JSON-RPC-validated
+    // (exact id echo, result XOR error, correct envelope version).
+    const post = async (body, useToken) => {
+      const headers = { 'content-type': 'application/json', accept: 'application/json' };
+      if (useToken) headers.authorization = `Bearer ${verifyToken}`;
       const r = await this.fetch(pub.publicUrl, {
-        method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(8000),
-        headers: { 'content-type': 'application/json', accept: 'application/json', authorization: `Bearer ${verifyToken}` },
-        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+        method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(8000), headers,
+        body: JSON.stringify(body),
       });
-      if (r.status !== 200) throw new NativeError('MCP_DENIED', `Authenticated ${method} answered HTTP ${r.status}`);
-      return r.json();
+      return r;
+    };
+    const checkRpc = (doc, id, method) => {
+      if (!doc || typeof doc !== 'object' || doc.jsonrpc !== '2.0' || doc.id !== id) {
+        throw new NativeError('MCP_CONTRACT', `${method}: bad JSON-RPC envelope (id echo/version)`);
+      }
+      const hasResult = doc.result !== undefined, hasError = doc.error !== undefined;
+      if (hasResult === hasError) throw new NativeError('MCP_CONTRACT', `${method}: result/error exclusivity violated`);
+      if (hasError) throw new NativeError('MCP_TOOL_ERROR', `${method}: upstream error ${JSON.stringify(doc.error).slice(0, 200)}`);
+      return doc.result;
     };
     try {
-      const init = await call('initialize', { protocolVersion: '2026-07-28', capabilities: {}, clientInfo: { name: 'ocliv-verify', version: '1' } });
-      if (!init || !init.result || typeof init.result.protocolVersion !== 'string') {
-        return fail('MCP_CONTRACT', 'initialize did not negotiate a protocol version');
+      const rInit = await post({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2026-07-28', capabilities: {}, clientInfo: { name: 'ocliv-verify', version: '1' } } }, true);
+      if (rInit.status !== 200) throw new NativeError('MCP_DENIED', `Authenticated initialize answered HTTP ${rInit.status}`);
+      const initRes = checkRpc(await readCappedJson(rInit, 'initialize response'), 1, 'initialize');
+      if (!initRes || typeof initRes.protocolVersion !== 'string') {
+        throw new NativeError('MCP_CONTRACT', 'initialize did not negotiate a protocol version');
       }
-      const list = await call('tools/list', {});
-      const tools = list && list.result && Array.isArray(list.result.tools) ? list.result.tools : null;
-      if (!tools) return fail('MCP_CONTRACT', 'tools/list returned no tool array');
-      return { id, publicUrl: pub.publicUrl, verified: true, protocolVersion: init.result.protocolVersion, tools: tools.map((t) => t.name) };
+      const rNot = await post({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} }, true);
+      if (![200, 202, 204].includes(rNot.status)) {
+        throw new NativeError('MCP_CONTRACT', `notifications/initialized answered HTTP ${rNot.status} (want 200/202/204)`);
+      }
+      const rList = await post({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }, true);
+      if (rList.status !== 200) throw new NativeError('MCP_DENIED', `Authenticated tools/list answered HTTP ${rList.status}`);
+      const listRes = checkRpc(await readCappedJson(rList, 'tools/list response'), 2, 'tools/list');
+      const tools = listRes && Array.isArray(listRes.tools) ? listRes.tools : null;
+      if (!tools) throw new NativeError('MCP_CONTRACT', 'tools/list returned no tool array');
+      return { id, publicUrl: pub.publicUrl, verified: true, protocolVersion: initRes.protocolVersion, tools: tools.map((t) => t.name) };
     } catch (e) {
       if (e instanceof NativeError) return fail(e.code, e.message);
       return fail('MCP_UNREACHABLE', 'Authenticated tool call failed');

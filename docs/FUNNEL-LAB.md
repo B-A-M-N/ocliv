@@ -75,7 +75,11 @@ HOME=$PWD/pubhome setsid -f ./ocliv mcp publish \
 Full scripted check: resource metadata → AS metadata → register →
 consent GET → approve POST → token → `tools/call ping` with the JWT
 (expect `pong:ocliv-oauth-lab-1`); negatives: no/bad bearer 401,
-http redirect_uri 400, plain PKCE 400.
+http redirect_uri 400, plain PKCE 400. Lab scope note: request
+`mcp:tools` (bare `mcp` is rejected by the fixture); register requires an
+https redirect_uri. Stale `leases/*.json` pointing at a terminal lease
+breaks `mcp publish` resume — move it aside and republish fresh (stable
+route IDs are retained).
 
 Release plugin ZIP with the live route URL is built per-publication
 via `packaging/mcp/build-plugin.sh --release` (never commit a

@@ -121,25 +121,44 @@ export class PublisherController extends EventEmitter {
     }
     const rec = { child, routeUrl: null, startedAt: this.now(), log: [], exited: false, exitCode: null, exitedAt: null };
     this.children.set(name, rec);
-    const watch = (chunk) => {
-      for (const line of String(chunk).split('\n')) {
-        if (rec.log.push(line) > 200) rec.log.shift();
-        const m = line.match(ROUTE_URL);
-        if (m && !rec.routeUrl) { rec.routeUrl = m[0]; this.emit('route', { name, routeUrl: rec.routeUrl }); }
-      }
+    // Line-buffer each stream: chunks can split or merge lines; only
+    // complete lines are scanned so a route URL split across two writes
+    // is still observed exactly once.
+    const scan = (line) => {
+      if (rec.log.push(line) > 200) rec.log.shift();
+      const m = line.match(ROUTE_URL);
+      if (m && !rec.routeUrl) { rec.routeUrl = m[0]; this.emit('route', { name, routeUrl: rec.routeUrl }); }
     };
-    child.stdout.on('data', watch);
-    child.stderr.on('data', watch);
+    const buffers = new Map();
+    const watch = (stream) => (chunk) => {
+      const acc = (buffers.get(stream) ?? '') + String(chunk);
+      const parts = acc.split('\n');
+      buffers.set(stream, parts.pop());
+      for (const line of parts) scan(line);
+    };
+    child.stdout.on('data', watch('out'));
+    child.stderr.on('data', watch('err'));
     child.on('error', (err) => { rec.exited = true; rec.exitCode = -1; rec.exitedAt = this.now(); rec.log.push(`spawn error: ${err.message}`); });
     child.on('exit', (code) => { rec.exited = true; rec.exitCode = code; rec.exitedAt = this.now(); });
+    const cleanup = () => {
+      // Never leave an unsupervised child behind on failure: terminate
+      // and drop the record so a later publish starts clean.
+      this.children.delete(name);
+      try { child.kill('SIGTERM'); } catch { /* already gone */ }
+      setTimeout(() => { try { if (!rec.exited) child.kill('SIGKILL'); } catch { /* already gone */ } }, 2000).unref?.();
+    };
     const deadline = this.now() + readyTimeoutMs;
     for (;;) {
       if (rec.routeUrl) return { name, routeUrl: rec.routeUrl, resumed: false };
       if (rec.exited) {
+        cleanup();
         throw new PublisherError('PUBLISH_FAILED',
           `Publisher exited before reporting a route (code ${rec.exitCode}): ${rec.log.slice(-5).join(' | ').slice(0, 500)}`);
       }
-      if (this.now() >= deadline) throw new PublisherError('PUBLISH_TIMEOUT', 'Publisher did not report a route URL in time');
+      if (this.now() >= deadline) {
+        cleanup();
+        throw new PublisherError('PUBLISH_TIMEOUT', 'Publisher did not report a route URL in time; child terminated');
+      }
       await new Promise((r) => setTimeout(r, 250));
     }
   }

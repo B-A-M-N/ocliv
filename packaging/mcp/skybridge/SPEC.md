@@ -17,8 +17,13 @@ The assistant can turn an instruction such as "show my published MCP servers and
 - `list-publications` (read-only; `list-publications.tsx` view)
 - `get-publication` (read-only, exact route ID)
 - `verify-publication` (read-only, public network contact)
-- publish/unpublish tools: REMOVED from this build — publishing needs a
-  live publisher lifecycle and unpublish awaits a live approval test
+- `request-approval` / `list-approvals` (single-use human-approval grants; metadata only in listings, never codes)
+- `publish-service` / `unpublish-service` (require redeemed approval + OCLIV_WRITE_ENABLED=true; disabled by default)
+- Approval trust note: the code is returned in the tool result, which the
+  model can read — so the gate is operator visibility in the chat transcript
+  (human sees each request and can stop it) plus single-use action binding,
+  scope gating, allowlist, and default-off writes. It is an audit/consent
+  trail, not out-of-band human consent.
 
 ## Security / authority boundaries
 1. MCP caller → OAuth JWT with issuer, audience, scopes, **operator subject allowlist**. No anonymous management tools.

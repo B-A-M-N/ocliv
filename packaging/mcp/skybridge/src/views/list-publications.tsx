@@ -37,6 +37,6 @@ export default function ListPublications() {
       }}>Verify MCP</button>
     </div>)}
     {message && <p role="status">{message}</p>}
-    <p className="metric">Publish and unpublish are disabled in this build; publication lifecycle stays on the local publisher.</p>
+    <p className="metric">Publish/unpublish require a single-use human approval (request-approval tool) plus OCLIV_WRITE_ENABLED=true; the local publisher owns the lifecycle.</p>
   </section>;
 }

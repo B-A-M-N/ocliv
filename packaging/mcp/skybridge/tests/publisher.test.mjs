@@ -110,3 +110,35 @@ test('unpublish without revoker stops but reports UNKNOWN, never success', async
   assert.equal(out.revoked, 'UNKNOWN');
   await assert.rejects(c.unpublish('route-abc-9', 'wrong-confirm'), { code: 'CONFIRMATION_REQUIRED' });
 });
+
+test('fragmented output across chunks still yields the route URL once', async (t) => {
+  const c = new PublisherController(cfg(), { spawnImpl: fakeSpawnFactory(t) });
+  const p = c.publish('lab', 'PUBLISH lab', { readyTimeoutMs: 5000 });
+  await new Promise((r) => setTimeout(r, 20));
+  const rec = c.children.get('lab');
+  rec.child.stderr.emit('data', 'https://edge.exa');
+  rec.child.stderr.emit('data', 'mple/r/route-frag-1');
+  rec.child.stderr.emit('data', '/mcp\ntail\n');
+  const out = await p;
+  assert.equal(out.routeUrl, 'https://edge.example/r/route-frag-1/mcp');
+});
+
+test('timeout terminates the child and clears the record', async (t) => {
+  const c = new PublisherController(cfg(), { spawnImpl: fakeSpawnFactory(t) });
+  const started = Date.now();
+  await assert.rejects(c.publish('lab', 'PUBLISH lab', { readyTimeoutMs: 300 }), { code: 'PUBLISH_TIMEOUT' });
+  assert.ok(Date.now() - started < 5000);
+  assert.equal(c.children.has('lab'), false, 'failed publish must not retain a record');
+});
+
+test('early exit terminates the child and clears the record', async (t) => {
+  const c = new PublisherController(cfg(), { spawnImpl: fakeSpawnFactory(t) });
+  const p = c.publish('lab', 'PUBLISH lab', { readyTimeoutMs: 5000 });
+  await new Promise((r) => setTimeout(r, 20));
+  const rec = c.children.get('lab');
+  const child = rec.child;
+  rec.child.emit('exit', 3);
+  await assert.rejects(p, { code: 'PUBLISH_FAILED' });
+  assert.equal(c.children.has('lab'), false);
+  assert.equal(child.killed, 'SIGTERM');
+});
