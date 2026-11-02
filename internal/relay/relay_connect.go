@@ -225,8 +225,10 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	ls, attached, aerr := s.allocateOrResume(tenant, keyID, intent)
 	if aerr != nil {
 		// Distinct close codes so the agent can tell terminal denials
-		// (stop, F09) from retryable conflicts (back off and retry):
-		// 4401 terminal, 4409 conflict, 4429 quota.
+		// (stop, F09) from retryable conflicts (back off and retry) and
+		// replacement-permitted expiry (drop the stale local record and
+		// reconnect once for a fresh lease, P0-4): 4401 terminal, 4409
+		// conflict, 4410 expired-replaceable, 4429 quota.
 		closeCode := 4401
 		denyCode := "denied"
 		var ae *apperr.Error
@@ -235,6 +237,8 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 			switch ae.Code {
 			case apperr.CodeConflict:
 				closeCode = 4409
+			case apperr.CodeExpired:
+				closeCode = 4410
 			case apperr.CodeQuotaLease:
 				closeCode = 4429
 			}

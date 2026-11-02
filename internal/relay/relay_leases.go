@@ -20,10 +20,12 @@ import (
 
 // allocateOrResume creates a new lease or resumes a valid one (F04, F05).
 // Resume requires same key ownership, live window, non-revoked status, and
-// compatible version. A revoked, expired, or conflicting resume is terminal:
-// it never silently mints a replacement lease (AS-047). Only an unknown
-// lease id falls through to a new separately authorized lease; the old URL
-// is never hijacked.
+// compatible version. A revoked or closed resume is terminal: it never
+// silently mints a replacement lease (AS-047). An expired resume is also
+// terminal server-side, but carries a replacement-permitted denial so the
+// same valid identity may drop its stale record and reconnect for a fresh
+// lease. Only an unknown lease id falls through to a new separately
+// authorized lease; the old URL is never hijacked.
 func (s *Server) allocateOrResume(tenantID, keyID string, intent LeaseIntent) (*lease.Lease, attachedMsg, error) {
 	// Operator identity gate (P0-A): a revoked key or suspended tenant
 	// can neither resume nor allocate, closing the reconnect path that
@@ -132,8 +134,16 @@ func (s *Server) resumeLease(tenantID, keyID string, intent LeaseIntent) (*lease
 	if state == string(lease.StateRevoked) {
 		return nil, apperr.E(apperr.CodeRevoked, "lease revoked", nil)
 	}
-	if state == string(lease.StateExpired) || state == string(lease.StateClosed) {
-		return nil, apperr.E(apperr.CodeExpired, "lease no longer valid", nil)
+	// Expired and closed leases are both terminal, but they authorize
+	// different recovery: an expired lease (TTL lapse, downtime) may be
+	// replaced by the same identity holding a valid key, while a closed
+	// lease was intentionally terminated and must never be silently
+	// renewed. The agent tells them apart by error code (P0-4).
+	if state == string(lease.StateExpired) {
+		return nil, apperr.E(apperr.CodeExpired, "lease expired", nil)
+	}
+	if state == string(lease.StateClosed) {
+		return nil, apperr.E(apperr.CodeClosed, "lease closed", nil)
 	}
 	// TTL expiry is terminal: a lease past expires_at never resumes (V1).
 	// The row is marked EXPIRED so traffic and status agree (F01). An
@@ -238,7 +248,7 @@ func (s *Server) resumeDenyReason(leaseID string) *apperr.Error {
 	case string(lease.StateRevoked):
 		return apperr.E(apperr.CodeRevoked, "lease revoked", nil)
 	case string(lease.StateClosed):
-		return apperr.E(apperr.CodeExpired, "lease closed", nil)
+		return apperr.E(apperr.CodeClosed, "lease closed", nil)
 	case string(lease.StateExpired):
 		return apperr.E(apperr.CodeExpired, "lease expired", nil)
 	default:

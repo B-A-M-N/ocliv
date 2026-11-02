@@ -75,6 +75,23 @@ func (rn *Runner) saveLease(att Attached) error {
 	})
 }
 
+// dropStaleLease removes one local lease record after the relay
+// authoritatively denies its resume as expired (4410). The relay's
+// denial is the status check, so no local expiry inference is trusted
+// (F12); removal is idempotent and a failure simply leaves the record
+// for the next attempt to re-evaluate. It is only ever called for the
+// expired code path — revoked/closed records are never dropped here.
+func (rn *Runner) dropStaleLease(leaseID string) {
+	if rn.Cfg.DataDir == "" || leaseID == "" {
+		return
+	}
+	store, err := config.OpenLeaseStore(rn.Cfg.DataDir)
+	if err != nil {
+		return
+	}
+	_ = store.Remove(leaseID)
+}
+
 // atomicWriteFile replaces path via temp file and rename in the same
 // directory (same filesystem), with restricted permissions from
 // creation, file fsync before rename, and directory fsync after.

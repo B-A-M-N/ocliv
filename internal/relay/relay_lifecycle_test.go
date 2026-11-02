@@ -7,6 +7,7 @@ package relay
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"ocliv/internal/apperr"
 	"ocliv/internal/lease"
 	"ocliv/internal/limits"
 	"ocliv/internal/store"
@@ -248,6 +250,31 @@ func TestUnconfirmedNewLeaseRefused(t *testing.T) {
 	}
 	if got := err.Error(); !strings.Contains(got, "local readiness not confirmed") {
 		t.Fatalf("unexpected error %q", got)
+	}
+}
+
+// TestExpiredClosedResumeCodes (P0-4): an expired lease denies resume
+// with CodeExpired (the agent may replace it under the same valid
+// identity, signalled by close code 4410), while a closed lease denies
+// with CodeClosed (terminal, 4401). Pre-fix, both collapsed to
+// CodeExpired, so the agent could not tell a lapsed lease from an
+// intentionally terminated one.
+func TestExpiredClosedResumeCodes(t *testing.T) {
+	s, db := newLifecycleServer(t)
+	enrollTestKey(t, db.SQL(), "key-test", "tenant-test")
+	insertLeaseRow(t, db, "lse-exp-1", "EXPIRED", 1, nil)
+	insertLeaseRow(t, db, "lse-cls-1", "CLOSED", 1, nil)
+	intent := func(id string) LeaseIntent {
+		return LeaseIntent{Port: 3000, Ready: true, Version: "1", LeaseID: id}
+	}
+	_, _, err := s.allocateOrResume("tenant-test", "key-test", intent("lse-exp-1"))
+	var ae *apperr.Error
+	if !errors.As(err, &ae) || ae.Code != apperr.CodeExpired {
+		t.Fatalf("expired resume: want CodeExpired got %v", err)
+	}
+	_, _, err = s.allocateOrResume("tenant-test", "key-test", intent("lse-cls-1"))
+	if !errors.As(err, &ae) || ae.Code != apperr.CodeClosed {
+		t.Fatalf("closed resume: want CodeClosed got %v", err)
 	}
 }
 

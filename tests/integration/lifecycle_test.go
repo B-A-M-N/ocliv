@@ -152,6 +152,45 @@ func TestClosedResumeIsTerminal(t *testing.T) {
 	}
 }
 
+// TestExpiredLeaseAutoReplaced (P0-4): downtime beyond the TTL must not
+// strand the publisher. Restarting with a stale local record must drop
+// it after the relay's authoritative expired denial (4410) and attach a
+// replacement lease — no manual lease-file surgery, no re-enrollment of
+// a still-valid key. Pre-fix, the resume was denied as terminal and the
+// CLI advised re-enrollment despite the valid key.
+func TestExpiredLeaseAutoReplaced(t *testing.T) {
+	app := startLocalApp(t)
+	defer app.srv.Close()
+	h := newHarness(t)
+	defer h.db.Close()
+	defer h.relaySrv.Close()
+	h.startAgentOpts(t, app.Port, config.Agent{TTLSeconds: 2})
+	staleID := h.attached.LeaseID
+	if staleID == "" {
+		t.Fatal("no lease attached")
+	}
+
+	// Let the TTL lapse while the agent stays connected.
+	time.Sleep(3 * time.Second)
+
+	// Restart reusing the same data dir (stale record present), exactly
+	// the post-crash shape: the runner must recover by itself.
+	h.restartAgent(t, app.Port)
+	if h.attached.LeaseID == "" {
+		t.Fatal("restarted agent did not attach")
+	}
+	if h.attached.LeaseID == staleID {
+		t.Fatalf("restarted agent resumed the expired lease %q", staleID)
+	}
+	store, err := config.OpenLeaseStore(h.agentDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.Load(staleID); ok {
+		t.Fatalf("stale lease record %q was not dropped after 4410 denial", staleID)
+	}
+}
+
 // TestBootReconciliation (V3): a relay restart must move the orphaned ACTIVE
 // row to RECONNECTING (never leave it ACTIVE with no session) and the same
 // agent must resume the same hostname with a fenced generation.

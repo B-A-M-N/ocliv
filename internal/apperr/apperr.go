@@ -40,6 +40,7 @@ const (
 	CodeStaleGen      Code = "stale_generation"
 	CodeRevoked       Code = "revoked"
 	CodeExpired       Code = "expired"
+	CodeClosed        Code = "closed"
 	CodeConflict      Code = "conflict"
 	CodeStoreFault    Code = "store_unavailable"
 	CodeCancelled     Code = "cancelled"
@@ -73,7 +74,7 @@ func ExitFor(code Code) int {
 		return ExitCLIValidation
 	case CodeLocalUnreach, CodeUpstreamDial:
 		return ExitLocalTarget
-	case CodeEnrollAuth, CodeVisitorAuth, CodeVisitorForbid, CodeRevoked, CodeStaleGen:
+	case CodeEnrollAuth, CodeVisitorAuth, CodeVisitorForbid, CodeRevoked, CodeClosed, CodeStaleGen:
 		return ExitAuth
 	case CodeRelayUnreach, CodeTLSVerify, CodeAgentOffline:
 		return ExitRelayTLS
