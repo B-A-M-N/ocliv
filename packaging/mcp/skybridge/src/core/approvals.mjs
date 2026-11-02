@@ -3,19 +3,20 @@
  * approval: any tool caller can supply it. Approvals fix that by binding
  * each grant to the authenticated operator subject, the exact action and
  * target, and a short expiry — consumed atomically, never replayable —
- * AND by delivering the code out-of-band: the code is emitted to the
- * server operator console, never returned in a tool result. A model that
- * only sees tool results can propose an action but can never complete its
- * own approval; the human reads the code off-console and provides it for
- * exactly that action.
+ * AND by delivering the code out-of-band: the code is never returned in
+ * a tool result. A model that only sees tool results can propose an
+ * action but can never complete its own approval; the human provides the
+ * code for exactly that action through a channel the model cannot read.
  *
  * Flow: model calls request-approval (proposes action+target) → the tool
- * result carries only the approval ID (see publicReceipt); the approval
- * code is printed to the OPERATOR CONSOLE → human reads it and provides
- * it back for exactly that action → redeem validates subject/action/
- * target/expiry/code and consumes the grant in the same synchronous
- * block. A code authorizes one bound action only; guessing is infeasible
- * (128-bit) and replays fail closed.
+ * result carries only the approval ID (see publicReceipt); the server
+ * logs metadata only by default (see grantNotice) → the human obtains
+ * the code via an operator-private channel and provides it back for
+ * exactly that action → redeem validates subject/action/target/
+ * expiry/code and consumes the grant in the same synchronous block. A
+ * code authorizes one bound action only; guessing is infeasible
+ * (128-bit) and replays fail closed. Until an operator-private channel
+ * is provisioned, keep writes disabled.
  */
 import { randomBytes } from 'node:crypto';
 
@@ -49,11 +50,22 @@ export class Approvals {
 
   /** Tool-safe receipt: everything the model may see. The code is
    * deliberately absent — returning it in-band would let the requester
-   * complete its own approval. Emit the full grant (with code) to the
-   * operator console instead. */
+   * complete its own approval. */
   publicReceipt(grant) {
     const { code: _dropped, ...receipt } = grant;
     return receipt;
+  }
+
+  /** Operator-console notice for a new grant. The code is included ONLY
+   * when revealCode is true, which the server enables solely via explicit
+   * operator opt-in (OCLIV_APPROVAL_CONSOLE=true) on a console only the
+   * operator can read. Default output carries metadata only, so general
+   * process logs never become a standing approval-code feed. */
+  grantNotice(grant, { revealCode = false } = {}) {
+    const base = `action=${grant.action} target=${grant.target} subject=${grant.subject} approvalId=${grant.approvalId} expires=${new Date(grant.expiresAt).toISOString()}`;
+    return revealCode
+      ? `[ocliv-approval] ${base} code=${grant.code} (operator-private console only; never forward this code to a tool caller)`
+      : `[ocliv-approval] ${base} code withheld from logs (set OCLIV_APPROVAL_CONSOLE=true on an operator-private console to display it)`;
   }
 
   /** Validate and atomically consume a grant. Any mismatch — subject,

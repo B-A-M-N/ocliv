@@ -57,3 +57,13 @@ test('list exposes metadata only, never codes', () => {
   assert.equal(pending.length, 1);
   assert.ok(!('code' in pending[0]));
 });
+
+test('grantNotice withholds code by default, reveals only on opt-in', () => {
+  const a = new Approvals({ now: () => 0 });
+  const g = a.request({ subject: SUB, action: 'publish', target: 'lab' });
+  const quiet = a.grantNotice(g);
+  assert.ok(!quiet.includes(g.code));
+  assert.ok(quiet.includes(g.approvalId));
+  const loud = a.grantNotice(g, { revealCode: true });
+  assert.ok(loud.includes(g.code));
+});

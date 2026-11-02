@@ -122,6 +122,27 @@ export function checkTrustedIssuer(publicUrl, issuerRaw, trustedIssuers = []) {
   throw new NativeError('ISSUER_UNTRUSTED', 'Authorization server is not allowlisted (set OCLIV_TRUSTED_ISSUERS)');
 }
 
+/** Issuer-scoped endpoint check. String-prefix matching alone is unsafe
+ * (https://login.example.com.evil.invalid startswith the trusted issuer
+ * but is a different host), so parse and require the exact same origin
+ * first. The legacy within-issuer path scope is preserved on top: an
+ * endpoint on the same host but outside the issuer path is still
+ * rejected. */
+export function assertIssuerScoped(issuerUrl, endpointRaw, ep) {
+  let endpoint;
+  try { endpoint = new URL(endpointRaw); } catch {
+    throw new NativeError('AS_ENDPOINT', `AS metadata endpoint unparseable: ${ep}`);
+  }
+  if (endpoint.protocol !== 'https:') throw new NativeError('AS_ENDPOINT', `AS metadata endpoint not https: ${ep}`);
+  if (endpoint.origin !== new URL(issuerUrl).origin) {
+    throw new NativeError('AS_ENDPOINT', `AS metadata endpoint outside issuer origin: ${ep}`);
+  }
+  if (!endpoint.toString().startsWith(issuerUrl)) {
+    throw new NativeError('AS_ENDPOINT', `AS metadata endpoint outside issuer scope: ${ep}`);
+  }
+  return endpoint.toString();
+}
+
 /** Bounded metadata read: reject oversized discovery documents before
  * parsing (64 KiB cap, checked via header when present and after read). */
 export async function readCappedJson(response, what, cap = 65536) {
@@ -270,41 +291,18 @@ export class NativeOclivClient {
     }
     for (const ep of ['authorization_endpoint', 'token_endpoint']) {
       if (typeof asm[ep] !== 'string') return fail('AS_ENDPOINT', `AS metadata endpoint missing: ${ep}`);
-      let u;
-      try { u = new URL(asm[ep]); } catch { return fail('AS_ENDPOINT', `AS metadata endpoint unparseable: ${ep}`); }
-      if (u.protocol !== 'https:' || !asm[ep].startsWith(issuer)) {
-        return fail('AS_ENDPOINT', `AS metadata endpoint outside issuer scope: ${ep}`);
-      }
+      try { asm[ep] = assertIssuerScoped(issuer, asm[ep], ep); } catch (e) { return fail(e.code || 'AS_ENDPOINT', e.message); }
     }
-    // Dynamic registration is onboarding, not health: attempt it only when
-    // the AS advertises a registration endpoint, and never fail verification
-    // for its absence. Registration here must never become a per-check
-    // client factory — at most one attempt per verify run.
-    let clientId = null;
+    // Dynamic registration is onboarding, not health: verify is strictly
+    // read-only and never POSTs to the registration endpoint (a per-check
+    // DCR would mint a new OAuth client on every run). Validate that an
+    // advertised endpoint is issuer-scoped, then stop: actual registration
+    // belongs to an explicit onboarding workflow with a provisioned token.
     let dcrAdvertised = false;
     if (typeof asm.registration_endpoint === 'string') {
       dcrAdvertised = true;
-      let regUrl;
-      try { regUrl = new URL(asm.registration_endpoint); } catch { return fail('AS_ENDPOINT', 'AS metadata endpoint unparseable: registration_endpoint'); }
-      if (regUrl.protocol !== 'https:' || !asm.registration_endpoint.startsWith(issuer)) {
-        return fail('AS_ENDPOINT', 'AS metadata endpoint outside issuer scope: registration_endpoint');
-      }
-      try {
-        const r = await this.fetch(asm.registration_endpoint, {
-          method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(8000),
-          headers: { 'content-type': 'application/json', accept: 'application/json' },
-          body: JSON.stringify({ redirect_uris: [`${issuer}/local-verify`], grant_types: ['authorization_code'] }),
-        });
-        if (r.status !== 200 && r.status !== 201) return fail('REGISTER_HTTP', `Registration endpoint answered HTTP ${r.status} (want 200/201)`);
-        const reg = await readCappedJson(r, 'Registration response');
-        if (!reg || typeof reg.client_id !== 'string' || !reg.client_id) {
-          return fail('REGISTER_CONTRACT', 'Registration did not return a client_id');
-        }
-        clientId = reg.client_id;
-      } catch (e) {
-        if (e instanceof NativeError) return fail(e.code, e.message);
-        return fail('REGISTER_UNREACHABLE', 'Registration endpoint unreachable');
-      }
+      try { asm.registration_endpoint = assertIssuerScoped(issuer, asm.registration_endpoint, 'registration_endpoint'); }
+      catch (e) { return fail(e.code || 'AS_ENDPOINT', e.message); }
     }
     // Unauthenticated tools/list must 401: no anonymous execution.
     try {
@@ -319,9 +317,9 @@ export class NativeOclivClient {
       return {
         id, publicUrl: pub.publicUrl, verified: false, code: 'OAUTH_REQUIRED',
         message: dcrAdvertised
-          ? 'Discovery + registration verified; user consent + token still required (no access token provisioned)'
+          ? 'Discovery verified (registration endpoint advertised but not exercised); user consent + token still required (no access token provisioned)'
           : 'Discovery verified (no registration endpoint advertised); user consent + token still required (no access token provisioned)',
-        issuer, authorizeUrl: asm.authorization_endpoint, registeredClient: clientId,
+        issuer, authorizeUrl: asm.authorization_endpoint, registeredClient: null,
       };
     }
     // Authenticated proof with a provisioned token: initialize →

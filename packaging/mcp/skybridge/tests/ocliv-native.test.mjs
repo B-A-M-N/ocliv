@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   NativeError, loadNativeConfig, deriveKeyID, publicKeyFromSeed,
-  signMgmt, NativeOclivClient,
+  signMgmt, NativeOclivClient, assertIssuerScoped,
 } from '../src/core/ocliv-native.mjs';
 
 // Fixed 32-byte seed so signatures are reproducible (test-only).
@@ -189,7 +189,7 @@ function verifyFetch({ tokenTools = null } = {}) {
     if (url === 'https://relay.example.org/v1/agent/mcp-routes') return json(PUBS);
     if (url === 'https://relay.example.org/.well-known/oauth-protected-resource/r/route-abc-123/mcp') return json(PRM);
     if (url === 'https://relay.example.org/.well-known/oauth-authorization-server/r/route-abc-123/oauth') return json(ASM);
-    if (url === ISS + '/register' && opts.method === 'POST') return json({ client_id: 'cid-1' });
+    if (url === ISS + '/register' && opts.method === 'POST') throw new Error('DCR must not run during verify: ' + url);
     if (url === PUBURL && opts.method === 'POST') {
       const body = JSON.parse(opts.body);
       const authed = (opts.headers.authorization || '') === 'Bearer good-token';
@@ -213,7 +213,7 @@ test('verify without token stops at OAUTH_REQUIRED (never verified)', async () =
   assert.equal(out.verified, false);
   assert.equal(out.code, 'OAUTH_REQUIRED');
   assert.ok(out.authorizeUrl.endsWith('/authorize'));
-  assert.equal(out.registeredClient, 'cid-1');
+  assert.equal(out.registeredClient, null);
 });
 
 test('verify with valid token proves initialize + tools/list', async () => {
@@ -296,6 +296,17 @@ test('verify pins all egress to the publication host (SSRF guard)', async () => 
   assert.equal(bigOut.code, 'DISCOVERY_TOO_LARGE');
 });
 
+test('hostname-prefix endpoints rejected (exact origin compare)', () => {
+  const iss = 'https://login.example.com/';
+  assert.equal(assertIssuerScoped(iss, 'https://login.example.com/oauth/token', 'token_endpoint'), 'https://login.example.com/oauth/token');
+  for (const evil of [
+    'https://login.example.com.evil.invalid/token',
+    'https://login.example.com:8443@evil.invalid/token',
+    'http://login.example.com/token',
+    'not-a-url',
+  ]) assert.throws(() => assertIssuerScoped(iss, evil, 'token_endpoint'), { code: 'AS_ENDPOINT' });
+});
+
 test('allowlisted different-host issuer verifies without same-host pin', async () => {
   const rid = 'route-ext-iss';
   const rurl = `https://relay.example.org/r/${rid}/mcp`;
@@ -314,7 +325,7 @@ test('allowlisted different-host issuer verifies without same-host pin', async (
         return json({ issuer: iss, authorization_endpoint: iss + 'authorize', token_endpoint: iss + 'oauth/token',
           registration_endpoint: iss + 'register', code_challenge_methods_supported: ['S256'] });
       }
-      if (url === iss + 'register' && opts.method === 'POST') return json({ client_id: 'ext-cid' });
+      if (url === iss + 'register' && opts.method === 'POST') throw new Error('DCR must not run during verify: ' + url);
       if (url === rurl && opts.method === 'POST') return new Response('unauthorized', { status: 401 });
       throw new Error('off-host fetch attempted: ' + url);
     });
@@ -322,7 +333,7 @@ test('allowlisted different-host issuer verifies without same-host pin', async (
   assert.equal(out.verified, false);
   assert.equal(out.code, 'OAUTH_REQUIRED');
   assert.equal(out.issuer, iss);
-  assert.equal(out.registeredClient, 'ext-cid');
+  assert.equal(out.registeredClient, null);
 });
 
 test('verification without advertised DCR skips registration', async () => {
@@ -359,27 +370,35 @@ test('public URL uses the publication external_host, never the control host', as
   await assert.rejects(bad.list(), { code: 'UPSTREAM_CONTRACT' });
 });
 
-test('verify rejects registration without client_id and bad id echo', async () => {
+test('verify never touches the registration endpoint, rejects bad id echo', async () => {
   const base = { publications: [{ route_id: 'route-strict-1', external_host: 'relay.example.org', profile: 'upstream-oauth', pub_name: 's', lease_id: null, created_at: '', revoked_at: null, verified_at: 't' }] };
   const rurl = 'https://relay.example.org/r/route-strict-1/mcp';
   const iss = 'https://relay.example.org/r/route-strict-1/oauth';
   const prm = { resource: rurl, authorization_servers: [iss] };
   const asm = { issuer: iss, authorization_endpoint: iss + '/authorize', token_endpoint: iss + '/token', registration_endpoint: iss + '/register', code_challenge_methods_supported: ['S256'] };
-  const mk = (regBody) => new NativeOclivClient(loadNativeConfig(keyEnv()), async (url, opts = {}) => {
+  const noDcr = async (url, opts = {}) => {
     if (url === 'https://relay.example.org/v1/agent/mcp-routes') return json(base);
     if (url.includes('/.well-known/oauth-authorization-server/')) return json(asm);
     if (url.startsWith('https://relay.example.org/.well-known/')) return json(prm);
-    if (url === iss + '/register') return json(regBody);
+    if (url === iss + '/register') throw new Error('DCR must not run during verify: ' + url);
+    if (url === rurl) {
+      if (!opts.headers.authorization) return new Response('unauthorized', { status: 401 });
+      const body = JSON.parse(opts.body);
+      if (body.method === 'notifications/initialized') return new Response('', { status: 202 });
+      return json({ jsonrpc: '2.0', id: 999, result: {} });
+    }
     throw new Error('unexpected: ' + url);
-  });
-  const noCid = await mk({ status: 'ok' }).verifyPublication('route-strict-1');
-  assert.equal(noCid.code, 'REGISTER_CONTRACT');
+  };
+  // No token: discovery passes, registration never attempted.
+  const noTok = await new NativeOclivClient(loadNativeConfig(keyEnv()), noDcr).verifyPublication('route-strict-1');
+  assert.equal(noTok.code, 'OAUTH_REQUIRED');
+  assert.equal(noTok.registeredClient, null);
   // Wrong id echo on initialize.
   const wrongId = new NativeOclivClient(loadNativeConfig(keyEnv()), async (url, opts = {}) => {
     if (url === 'https://relay.example.org/v1/agent/mcp-routes') return json(base);
     if (url.includes('/.well-known/oauth-authorization-server/')) return json(asm);
     if (url.startsWith('https://relay.example.org/.well-known/')) return json(prm);
-    if (url === iss + '/register') return json({ client_id: 'cid-1' });
+    if (url === iss + '/register') throw new Error('DCR must not run during verify: ' + url);
     if (url === rurl) {
       if (!opts.headers.authorization) return new Response('unauthorized', { status: 401 });
       const body = JSON.parse(opts.body);

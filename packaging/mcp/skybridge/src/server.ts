@@ -40,23 +40,28 @@ export const app = new Skybridge({
     // Write tools stay fully disabled unless the operator explicitly opts
     // in AND the publisher-side controller config validates. Default off.
     const writeEnabled = (process.env.OCLIV_WRITE_ENABLED ?? 'false').trim() === 'true';
+    // Approval codes are never returned in tool results and never logged
+    // by default. Display on the server console requires explicit opt-in
+    // on a console only the operator can read; otherwise only metadata
+    // is logged and writes cannot be completed. Default off.
+    const approvalConsole = (process.env.OCLIV_APPROVAL_CONSOLE ?? 'false').trim() === 'true';
     let publisher: PublisherController | null = null;
     if (writeEnabled) publisher = new PublisherController(loadPublisherConfig());
-    return { subjects, verifyToken, client:new NativeOclivClient(nativeConfig), publisher, approvals:new Approvals() };
+    return { subjects, verifyToken, client:new NativeOclivClient(nativeConfig), publisher, approvals:new Approvals(), approvalConsole };
   },
   oauth: customProvider({issuer, audience, baseUrl:serverUrl, scopes:['ocliv:read','ocliv:write'], requiredScopes:['ocliv:read']}),
-  handler:(server, {subjects, verifyToken, client, publisher, approvals}) => server
+  handler:(server, {subjects, verifyToken, client, publisher, approvals, approvalConsole}) => server
     .registerTool({
       name:'request-approval', title:'Request a write approval',
-      description:'Propose a publish/unpublish for human approval. Returns an approval ID only — the single-use code is printed to the server OPERATOR CONSOLE, never to this tool result. The human reads the code off-console and provides it back for exactly that action. A model that only sees tool results cannot complete its own approval.',
+      description:'Propose a publish/unpublish for human approval. Returns an approval ID only — the single-use code is never in this tool result and never in general logs. The human provides the code back for exactly that action through an operator-private channel. A model that only sees tool results cannot complete its own approval. Until that channel is provisioned, keep writes disabled.',
       inputSchema:{action:z.enum(['publish','unpublish']),target:z.string().min(1).max(64)},
       annotations:{readOnlyHint:false,openWorldHint:false,destructiveHint:false}, auth:{scopes:['ocliv:write']}
     }, async ({action,target},extra)=>{
       try {
         const subject = authorize(extra.http?.authInfo,subjects,'ocliv:write');
         const grant = approvals.request({subject,action,target});
-        console.error(`[ocliv-approval] action=${action} target=${target} subject=${subject} approvalId=${grant.approvalId} code=${grant.code} expires=${new Date(grant.expiresAt).toISOString()} (human reads this code off-console; it is never returned to tool callers)`);
-        return done({ok:true,...approvals.publicReceipt(grant), codeChannel:'operator-console'});
+        console.error(approvals.grantNotice(grant, { revealCode: approvalConsole }));
+        return done({ok:true,...approvals.publicReceipt(grant), codeChannel: approvalConsole ? 'operator-console' : 'withheld'});
       }
       catch(e) {return failed(e);}
     })
@@ -105,7 +110,7 @@ export const app = new Skybridge({
     })
     .registerTool({
       name:'publish-service', title:'Publish an allowlisted local service',
-      description:'Start (or reattach to) the supervised local publisher for an operator-allowlisted service. Requires a single-use human approval (approvalId from request-approval plus the code printed to the operator console) bound to this exact service, the ocliv:write scope, and OCLIV_WRITE_ENABLED=true. Only allowlisted loopback targets; no arbitrary commands, paths, or URLs.',
+      description:'Start (or reattach to) the supervised local publisher for an operator-allowlisted service. Requires a single-use human approval (approvalId from request-approval plus the code from the operator-private channel) bound to this exact service, the ocliv:write scope, and OCLIV_WRITE_ENABLED=true. Only allowlisted loopback targets; no arbitrary commands, paths, or URLs.',
       inputSchema:{serviceName:z.string().min(1).max(48),approvalId:z.string().min(1).max(128),approvalCode:z.string().min(1).max(128)},
       annotations:{readOnlyHint:false,openWorldHint:false,destructiveHint:false}, auth:{scopes:['ocliv:write']}
     }, async ({serviceName,approvalId,approvalCode},extra)=>{
@@ -119,7 +124,7 @@ export const app = new Skybridge({
     })
     .registerTool({
       name:'unpublish-service', title:'Unpublish one publication',
-      description:'Stop the supervised local publisher (if it owns the route) and revoke exactly one publication via the signed native adapter. Requires a single-use human approval (approvalId from request-approval plus the code printed to the operator console) bound to this exact publication ID. Requires ocliv:write and OCLIV_WRITE_ENABLED=true.',
+      description:'Stop the supervised local publisher (if it owns the route) and revoke exactly one publication via the signed native adapter. Requires a single-use human approval (approvalId from request-approval plus the code from the operator-private channel) bound to this exact publication ID. Requires ocliv:write and OCLIV_WRITE_ENABLED=true.',
       inputSchema:{publicationId:z.string().min(3).max(64),approvalId:z.string().min(1).max(128),approvalCode:z.string().min(1).max(128)},
       annotations:{readOnlyHint:false,openWorldHint:false,destructiveHint:true}, auth:{scopes:['ocliv:write']}
     }, async ({publicationId,approvalId,approvalCode},extra)=>{
