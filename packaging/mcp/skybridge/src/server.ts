@@ -1,6 +1,7 @@
 import { Skybridge, customProvider } from 'skybridge/server';
 import { z } from 'zod';
-import { loadConfig, authorize, OclivClient, safeError } from './core/ocliv.mjs';
+import { authorize, safeError } from './core/ocliv.mjs';
+import { loadNativeConfig, NativeOclivClient } from './core/ocliv-native.mjs';
 
 const issuer = process.env.OCLIV_OAUTH_ISSUER;
 const audience = process.env.OCLIV_OAUTH_AUDIENCE;
@@ -9,59 +10,69 @@ const serverUrl = process.env.SERVER_URL;
 if (!issuer || !audience || !serverUrl || !issuer.startsWith('https://') || !serverUrl.startsWith('https://')) {
   throw new Error('OCLIV_OAUTH_ISSUER, OCLIV_OAUTH_AUDIENCE and HTTPS SERVER_URL required');
 }
+// Publisher-side identity for Ocliv signed management. The agent key
+// never leaves this host; remote callers authenticate via the Skybridge
+// OAuth provider above and are additionally subject-gated per tool.
+const nativeConfig = loadNativeConfig();
 const readOnly = { readOnlyHint:true, openWorldHint:false, destructiveHint:false };
-const publishHints = { readOnlyHint:false, openWorldHint:true, destructiveHint:false };
-const unpublishHints = { readOnlyHint:false, openWorldHint:true, destructiveHint:true };
+
+// Handlers must return { content, structuredContent }: content is the
+// human-readable verdict, structuredContent the typed result.
+const done = (structuredContent: unknown) => ({
+  content: JSON.stringify(structuredContent),
+  structuredContent: structuredContent as Record<string, unknown>,
+});
+const failed = (e: unknown) => {
+  const s = safeError(e);
+  return { content: `error ${s.code}: ${s.message}`, structuredContent: s };
+};
 
 export const app = new Skybridge({
-  name:'ocliv-mcp', title:'Ocliv MCP Hosting', version:'0.1.0',
-  description:'Authenticated management and verification of Ocliv-hosted MCP endpoints.',
-  setup:() => { const config = loadConfig(); return {config, client:new OclivClient(config)}; },
+  name:'ocliv-mcp', title:'Ocliv MCP Hosting', version:'0.2.0',
+  description:'Authenticated management and verification of Ocliv-hosted MCP endpoints via the Ocliv-native signed management protocol.',
+  setup:() => {
+    const subjects = new Set(
+      (process.env.OCLIV_ALLOWED_SUBJECTS ?? '').split(',').map((s) => s.trim()).filter(Boolean));
+    if (subjects.size === 0) throw new Error('OCLIV_ALLOWED_SUBJECTS required: at least one operator subject');
+    const verifyToken = (process.env.OCLIV_VERIFY_TOKEN ?? '').trim() || null;
+    return { subjects, verifyToken, client:new NativeOclivClient(nativeConfig) };
+  },
   oauth: customProvider({issuer, audience, baseUrl:serverUrl, scopes:['ocliv:read','ocliv:write'], requiredScopes:['ocliv:read']}),
-  handler:(server, {config, client}) => server
+  handler:(server, {subjects, verifyToken, client}) => server
     .registerTool({
       name:'get-ocliv-status', title:'Get Ocliv status',
-      description:'Read actual Ocliv management health; never guess whether a tunnel is operational.',
+      description:'Read actual Ocliv relay reachability and durable publication states; never guesses tunnel liveness.',
       annotations:readOnly, auth:{scopes:['ocliv:read']}
     }, async (_, extra)=>{
-      try { authorize(extra.http?.authInfo,config.subjects); return {structuredContent:{ok:true,...await client.status()}}; }
-      catch(e) {return {isError:true,structuredContent:safeError(e)};}
+      try { authorize(extra.http?.authInfo,subjects); return done({ok:true,...await client.status()}); }
+      catch(e) {return failed(e);}
     })
     .registerTool({
       name:'list-publications', title:'List Ocliv publications',
-      description:'List real Ocliv-published MCP endpoints with their current status and a verification view.',
+      description:'List real Ocliv-published MCP endpoints owned by this publisher key, with durable publication state and a verification view.',
       annotations:readOnly, auth:{scopes:['ocliv:read']},
       view:{component:'list-publications',description:'Published Ocliv MCP endpoints'}
     }, async (_,extra)=>{
-      try { authorize(extra.http?.authInfo,config.subjects); return {structuredContent:{ok:true,...await client.list()}}; }
-      catch(e) {return {isError:true,structuredContent:safeError(e)};}
+      try { authorize(extra.http?.authInfo,subjects); return done({ok:true,publications:await client.list()}); }
+      catch(e) {return failed(e);}
     })
     .registerTool({
-      name:'publish-mcp', title:'Publish an MCP service with Ocliv',
-      description:'Publish a previously enrolled Ocliv service ID as an AUTHENTICATED MCP endpoint only. Must obtain explicit operator approval and confirm=PUBLISH. Does not register arbitrary URLs or create infrastructure.',
-      inputSchema:{serviceId:z.string().min(1).max(128),label:z.string().max(120).optional(),confirm:z.literal('PUBLISH')},
-      annotations:publishHints, auth:{scopes:['ocliv:write']}
-    }, async (input,extra)=>{
-      try { authorize(extra.http?.authInfo,config.subjects,'ocliv:write'); return {structuredContent:{ok:true,...await client.publish(input)}}; }
-      catch(e) {return {isError:true,structuredContent:safeError(e)};}
-    })
-    .registerTool({
-      name:'unpublish-mcp', title:'Unpublish an Ocliv MCP endpoint',
-      description:'Destructive operation. Ask operator to confirm exact publication ID and supply matching confirmPublicationId; no automatic unpublishing.',
-      inputSchema:{publicationId:z.string().min(1).max(128),confirmPublicationId:z.string().min(1).max(128)},
-      annotations:unpublishHints, auth:{scopes:['ocliv:write']}
-    }, async(input,extra)=>{
-      try {authorize(extra.http?.authInfo,config.subjects,'ocliv:write'); return {structuredContent:{ok:true,...await client.unpublish(input)}};}
-      catch(e){return {isError:true,structuredContent:safeError(e)};}
+      name:'get-publication', title:'Get one Ocliv publication',
+      description:'Identify a single owned publication by exact route ID.',
+      inputSchema:{publicationId:z.string().min(3).max(64)},
+      annotations:readOnly, auth:{scopes:['ocliv:read']}
+    }, async ({publicationId},extra)=>{
+      try { authorize(extra.http?.authInfo,subjects); return done({ok:true,publication:await client.get(publicationId)}); }
+      catch(e) {return failed(e);}
     })
     .registerTool({
       name:'verify-publication', title:'Verify published MCP endpoint',
-      description:'Perform actual initialize and tools/list MCP protocol requests against a published Ocliv endpoint restricted to explicitly allowed public hostnames.',
-      inputSchema:{publicationId:z.string().min(1).max(128)},
+      description:'Verify a published endpoint with the real OAuth discovery + registration handshake and, when a server-side token is provisioned, an authenticated initialize/tools/list. Without a token reports OAUTH_REQUIRED, never verified.',
+      inputSchema:{publicationId:z.string().min(3).max(64)},
       annotations:{...readOnly,openWorldHint:true}, auth:{scopes:['ocliv:read']}
-    }, async({publicationId},extra)=>{
-      try {authorize(extra.http?.authInfo,config.subjects); return {structuredContent:{ok:true,...await client.verify(publicationId)}};}
-      catch(e){return {isError:true,structuredContent:safeError(e)};}
+    }, async ({publicationId},extra)=>{
+      try { authorize(extra.http?.authInfo,subjects); return done({ok:true,...await client.verifyPublication(publicationId,{verifyToken:verifyToken ?? undefined})}); }
+      catch(e) {return failed(e);}
     })
 });
 export type AppType = typeof app;

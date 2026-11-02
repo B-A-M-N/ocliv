@@ -15,42 +15,48 @@ The assistant can turn an instruction such as "show my published MCP servers and
 ## Skybridge tools and view
 - `get-ocliv-status` (read-only)
 - `list-publications` (read-only; `list-publications.tsx` view)
-- `publish-mcp` (mutating, open-world; authenticated-only access)
-- `unpublish-mcp` (destructive, open-world)
+- `get-publication` (read-only, exact route ID)
 - `verify-publication` (read-only, public network contact)
+- publish/unpublish tools: REMOVED from this build — publishing needs a
+  live publisher lifecycle and unpublish awaits a live approval test
 
 ## Security / authority boundaries
 1. MCP caller → OAuth JWT with issuer, audience, scopes, **operator subject allowlist**. No anonymous management tools.
-2. MCP handler → trusted Ocliv management API, via static HTTPS origin + explicit exact API paths + server-only management bearer secret.
+2. MCP handler — Ocliv signed management API (`ocliv-mgmt-v1` Ed25519 over the bare relay origin + exact paths) via the publisher-side agent key, which never leaves this host. No static management Bearer token exists.
 3. Management response → normalized publication records; discard unknown fields, credentials, internal addresses.
 4. Published MCP probe → exact public hostname allowlist, HTTPS only, no redirects, separate optional probe bearer. Never send management credential to a public endpoint.
 5. No arbitrary shell execution, local process access, remote PTY, or coupling to Kontrol, devdesktop, or Lovable.
 6. Writes disabled by default; enable only after contract/staging verification. Fail closed on missing configuration, unknown JSON contracts, network failure, failed OAuth, or missing explicit confirmation.
 
-## Ocliv control API contract (REQUIRES REAL VERIFICATION)
-The Ocliv control plane API could not be read during this build. No endpoint route is invented or assumed correct: each method's path must be set from the deployed Ocliv management API.
+## Ocliv control API contract (VERIFIED against the real relay)
+Management is Ocliv's signed Ed25519 protocol (`ocliv-mgmt-v1`), not the
+earlier assumed Bearer/JSON control API. The native adapter
+(`src/core/ocliv-native.mjs`) signs every call with the publisher's
+enrolled agent key (`OCLIV_AGENT_KEY_FILE`, `key-`-prefixed key ID) and
+maps relay responses to typed records. Live-verified against a real
+relay through the public Funnel edge (2026-11-02).
 
 | Operation | HTTP method | Required response |
 |---|---|---|
-| Status | GET configured path | `{ "status": "healthy" }` (actual status may differ) |
-| List | GET configured path | `{ "publications": [{ "id": "...", "status": "...", "publicUrl": "https://...", "serviceId": "...", "label": "..." }] }` |
-| Get | GET configured path with `{id}` | Single publication object |
-| Publish | POST configured path | `{ "publication": { "id": "...", ... } }` |
-| Unpublish | DELETE configured path with `{id}` | `{ "deleted": true }` or `{ "success": true }` |
+| Status | local composition (relay reachability + list) | `{ relay, relayReachable, publications: {active,pending,revoked}, listError }` — never tunnel liveness |
+| List | `GET /v1/agent/mcp-routes` (signed) | `{ publications: [{ route_id, external_host, profile, pub_name, lease_id, created_at, revoked_at, verified_at }] }` → `{ id, label, profile, state, publicUrl, leaseId }` |
+| Get | filter of owned list by exact route ID | Single typed publication; `NOT_FOUND` otherwise |
+| Verify | public OAuth+MCP handshake (no relay key used) | discovery + DCR + 401-on-anonymous required; with `OCLIV_VERIFY_TOKEN`, authenticated initialize + tools/list; without a token, `OAUTH_REQUIRED`, never verified |
+| Unpublish | `DELETE /v1/agent/mcp-routes/{id}` (signed, one-time nonce) | `{ status: "deleted" }` + re-list must not contain the id (`UNCONFIRMED` otherwise) |
 
-Publish input: `{ "serviceId": "...", "label": "...", "kind": "mcp", "access": "authenticated" }`.
-
-This is an **adapter contract**, not a claim that the current Ocliv daemon implements these routes or payloads. Integration must adapt to real Ocliv responses, with contract tests, before any live write is authorized.
+Publication `state` is durable publication state only
+(`active` = verified binding, `pending` = unverified, `revoked` =
+tombstoned). There is deliberately no publish operation: publishing
+needs a live local publisher lifecycle, not a management call.
 
 ## Hard release gates
-- [x] Management adapter, boundary rules, pure Node tests
-- [x] Skybridge 2.1.0 server/view source assembled
-- [ ] Skybridge dependency installation with Node >=24, TypeScript compilation and build
-- [ ] OAuth provider configured, verified issuer/audience/scope, unauthorized MCP request returns 401
-- [ ] Confirm actual Ocliv management API endpoints and payload contracts; live read-only smoke test
-- [ ] Verify live publish/unpublish in an isolated staging service after operator approval
-- [ ] Verify published endpoint initialize/initialized/tools/list with real auth
-- [ ] Deploy to Alpic with server-only secrets; inspect logs and `/mcp` and playground
+- [x] Native signed management adapter, boundary rules, 27 Node tests green
+- [x] TypeScript compilation (`tsc --noEmit` clean) and `skybridge build` (server)
+- [x] Live read-only smoke test: signed list/status/verify against the real relay + public OAuth handshake with real JWT (`verified:true`)
+- [ ] React view bundle (`skybridge/vite` subpath missing from installed skybridge 2.1.0 — scaffold/SDK skew, view optional)
+- [ ] OAuth provider configured for the hosted app, unauthorized MCP request returns 401
+- [ ] Live unpublish approval test in an isolated staging service (adapter implemented + unit-tested, never run live)
+- [ ] Deploy with server-only secrets; inspect logs and `/mcp` and playground
 - [ ] Register the deployed URL in ChatGPT, contingent on workspace support
 
 Do not claim READY or DEPLOYED unless every applicable gate is proven.
