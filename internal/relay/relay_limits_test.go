@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"path/filepath"
 	"testing"
 	"time"
@@ -121,6 +124,60 @@ func TestPreAuthQuotasIndependentBehindEdge(t *testing.T) {
 	// Client B is unaffected.
 	if !s.checkPreAuth(w, visitor("198.51.100.9"), "challenge") {
 		t.Fatal("client B denied by client A's usage")
+	}
+}
+
+// An isolated edge enforcing the Caddy contract (overwrite
+// X-Forwarded-For with the downstream peer, strip X-Forwarded-Host)
+// fronts the relay: rotating visitor-spoofed XFF values must not mint
+// new quota, and a smuggled X-Forwarded-Host must not affect routing
+// (Task C). Live funnel result 2026-11-02: 130 rotating spoofs through
+// the public funnel shared one admission bucket (120x401 then 10x429).
+func TestIsolatedEdgeContractOverwritesForwardedIdentity(t *testing.T) {
+	s, _ := newLimitServer(t)
+	s.preAuth = limits.NewThrottle(1, time.Minute)
+	backend := httptest.NewServer(s.Handler())
+	defer backend.Close()
+	target, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edge := &httputil.ReverseProxy{Director: func(r *http.Request) {
+		r.URL.Scheme = target.Scheme
+		r.URL.Host = target.Host
+		peer, _, _ := net.SplitHostPort(r.RemoteAddr)
+		r.Header.Set("X-Forwarded-For", peer) // overwrite, never append
+		r.Header.Del("X-Forwarded-Host")      // strip smuggled host
+		r.Header.Set("X-Forwarded-Proto", "https")
+	}}
+	front := httptest.NewServer(edge)
+	defer front.Close()
+	hit := func(xff, xfh string) int {
+		body := bytes.NewReader([]byte(`{"key_id":"nope"}`))
+		req, err := http.NewRequest(http.MethodPost, front.URL+"/v1/agent/challenge", body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = "relay.example.test"
+		if xff != "" {
+			req.Header.Set("X-Forwarded-For", xff)
+		}
+		if xfh != "" {
+			req.Header.Set("X-Forwarded-Host", xfh)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := hit("10.9.9.9", "evil.example"); code == http.StatusTooManyRequests {
+		t.Fatal("first edge request denied")
+	}
+	// Different spoofed identity, same edge peer: shares the bucket.
+	if code := hit("10.9.9.10", ""); code != http.StatusTooManyRequests {
+		t.Fatalf("rotated spoof escaped the edge bucket: %d", code)
 	}
 }
 
