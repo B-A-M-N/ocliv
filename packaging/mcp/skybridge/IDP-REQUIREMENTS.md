@@ -37,40 +37,51 @@ and adding one would weaken the boundary the server exists to enforce.
 
 ## $0 candidates (verified against primary docs via direct fetch, 2026-11-02)
 
-- **Logto Cloud free tier — PRIMARY.** Verified in docs:
-  - Free plan exists (billing page: upgrade triggers only past quota).
-    Use a production Free tenant, not a dev tenant (dev tenants delete
-    user accounts after 90 days; production Free/Pro/Enterprise persist).
-  - API resources are RFC 8707 indicators with free-form permissions
-    (e.g. `read`/`write`); mint literally `ocliv:read`, `ocliv:write` as
-    one API resource whose identifier = Skybridge public URL. Audience
-    restriction matches checklist item 3 exactly.
-  - "Dynamic app (CIMD)" is built for MCP: OAuth clients connect with no
-    pre-registration; client uses a public HTTPS URL as `client_id`
-    (IETF draft CIMD). No DCR endpoint needed on either side.
-  - Quotas (3 free API resources — we need 1; 50K tokens) dwarf this
-    deployment's usage. Confirm exact MAU/token numbers in console.
-  - Still to verify at runtime (needs the account): PKCE S256 enforcement
-    (OAuth 2.1 standard; expected) and refresh-token issuance.
-- **ZITADEL Cloud free tier — FALLBACK.** Verified: $0, 25k DAU/mo, custom
-  domain. Gaps: no DCR page in docs (likely console/API app creation only),
-  and scopes are `urn:zitadel:*` namespaced roles — free-form `ocliv:read`
-  minting is unproven and likely needs a scope-mapping code change.
-- **Auth0 free tier — FALLBACK.** RS256 + custom API scopes/audience via
-  API config fit, but open RFC 7591 DCR is absent: needs a pre-registered
-  client, viable only if ChatGPT's form accepts static client ID/secret.
+- **Auth0 Free — PRIMARY.** All checklist items verified in Auth0 docs:
+  - $0, no card, 25k MAU. Custom API scopes per API verified; pricing
+    implies baseline API limits on Free ("higher API limits" is the paid
+    uplift) — our user auth-code flow uses zero M2M tokens.
+  - RFC 8707 `resource` supported via the "Resource Parameter Compatibility
+    Profile" tenant toggle (+ "Include Issuer in Authorization Responses"
+    toggle), Dashboard → Settings → Advanced. `resource` then defines the
+    token audience; API identifiers must be absolute URIs — our MCP route
+    URL qualifies verbatim. Standard `/authorize` flow + refresh grant.
+  - DCR for MCP: dedicated guide, tenant toggle (default off), DCR-created
+    apps get per-API "Default Permissions for Third-Party Applications"
+    (baseline APIs + scopes — this is where `ocliv:read`/`ocliv:write`
+    are granted). No plan gate documented on the DCR toggle (only the
+    ACL hardening is Enterprise-only); confirm in console.
+  - RS256 default + `jwks_uri` discovery are Auth0-standard mechanics;
+    verify live against the tenant discovery doc after signup.
+  - `sub` (`auth0|<id>`) is stable per user for `OCLIV_ALLOWED_SUBJECTS`.
+- **Logto Cloud free tier — RULED OUT.** Per operator correction, Free
+  lacks API resources and third-party OAuth apps — the exact two features
+  this integration needs. (Docs research had wrongly attributed Pro
+  allowances to Free.)
+- **ZITADEL Cloud free tier — FALLBACK.** Verified: $0, 25k DAU/mo. Gaps:
+  no DCR page in docs, scopes are `urn:zitadel:*`-namespaced roles —
+  free-form `ocliv:read` minting unproven, likely needs a code change.
 - Ruled out: Google/Microsoft consumer (no custom scopes, no DCR),
-  any password/static-token scheme, the lab fixture, self-hosted IdPs
-  (new heavyweight components against the $0/simplicity mandate).
+  any password/static-token scheme, the lab fixture, self-hosted IdPs.
 
 ## Minimal operator actions (pick one issuer)
 
-1. Sign up free tier; create tenant/project.
-2. Create API/resource with identifier = future Skybridge public URL;
-   define scopes `ocliv:read`, `ocliv:write`; grant the operator both.
-3. Confirm discovery URL + `jwks_uri` + (DCR endpoint XOR static client).
-4. Hand back: issuer URL, audience, subject (`sub`), client ID/secret if
-   static. Never paste tokens into chat; values go to server env only.
+1. Sign up at auth0.com (Free, no card). Create tenant (region near you).
+2. Dashboard → Applications → APIs → Create API. Identifier = the exact
+   future Skybridge public route URL (I supply it after first publish;
+   MUST be an absolute URI). Name `ocliv-mgmt`.
+3. In the API → Permissions tab, add `ocliv:read` and `ocliv:write`.
+4. Same API → Settings → Default Permissions for Third-Party
+   Applications: Authorized for User-Delegated Access, select both scopes.
+5. Dashboard → Settings → Advanced: enable DCR toggle,
+   "Resource Parameter Compatibility Profile", and
+   "Include Issuer in Authorization Responses". Save.
+6. Create your user (User Management → Users), note your `user_id`
+   (`auth0|…`) for `OCLIV_ALLOWED_SUBJECTS`.
+7. Hand back: tenant domain, API identifier (= audience), your `sub`.
+   If the DCR toggle is plan-gated in console, stop and tell me —
+   fallback is a pre-registered Native app with exact ChatGPT callback
+   URLs in its allowlist (standard feature, still $0).
 
 ## Then the publisher host does alone (no further operator steps)
 
