@@ -143,15 +143,72 @@ export function assertIssuerScoped(issuerUrl, endpointRaw, ep) {
   return endpoint.toString();
 }
 
-/** Bounded metadata read: reject oversized discovery documents before
- * parsing (64 KiB cap, checked via header when present and after read). */
-export async function readCappedJson(response, what, cap = 65536) {
+/** Decode a JWT payload without verifying: binding check only. The
+ * upstream resource server enforces the signature; the verifier only
+ * decides whether this credential may be presented for a given
+ * resource. Returns the payload object, or null when the token is not
+ * a well-formed JWT. */
+export function decodeJwtPayload(token) {
+  if (typeof token !== 'string') return null;
+  const parts = token.split('.');
+  if (parts.length !== 3 || !parts[1]) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    return payload && typeof payload === 'object' ? payload : null;
+  } catch { return null; }
+}
+
+/** A verification credential is usable for exactly one publication: a
+ * JWT whose aud names this publication's public resource URL (string
+ * or array membership). Anything else — opaque token, foreign aud,
+ * malformed JWT — means no resource-bound credential is available for
+ * this publication and no authenticated request may be made with it. */
+export function tokenBoundToResource(token, resourceUrl) {
+  const payload = decodeJwtPayload(token);
+  if (!payload) return false;
+  if (typeof payload.aud === 'string') return payload.aud === resourceUrl;
+  if (Array.isArray(payload.aud)) return payload.aud.includes(resourceUrl);
+  return false;
+}
+
+/** Streaming size bound: bytes are accumulated only up to cap+1, then
+ * the stream is cancelled — an over-cap chunked body is never fully
+ * buffered. Stalled streams are bounded by the fetch-level
+ * AbortSignal.timeout at each call site, which rejects the read. */
+export async function readCappedBody(response, what, cap = 65536, code = 'DISCOVERY_TOO_LARGE') {
   const announced = Number(response.headers?.get?.('content-length'));
   if (Number.isFinite(announced) && announced > cap) {
-    throw new NativeError('DISCOVERY_TOO_LARGE', `${what} exceeds size bound`);
+    throw new NativeError(code, `${what} exceeds size bound`);
   }
-  const text = await response.text();
-  if (text.length > cap) throw new NativeError('DISCOVERY_TOO_LARGE', `${what} exceeds size bound`);
+  if (!response.body || typeof response.body.getReader !== 'function') {
+    const text = await response.text();
+    if (text.length > cap) throw new NativeError(code, `${what} exceeds size bound`);
+    return text;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > cap) {
+      try { await reader.cancel(); } catch { /* best effort: the cap already held */ }
+      throw new NativeError(code, `${what} exceeds size bound`);
+    }
+    chunks.push(value);
+  }
+  const buf = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { buf.set(c, off); off += c.byteLength; }
+  return new TextDecoder().decode(buf);
+}
+
+/** Bounded metadata read: reject oversized discovery documents before
+ * parsing (64 KiB cap, checked via header when present and while
+ * streaming when absent). */
+export async function readCappedJson(response, what, cap = 65536) {
+  const text = await readCappedBody(response, what, cap);
   try { return JSON.parse(text); } catch { throw new NativeError('DISCOVERY_MALFORMED', `${what} is not JSON`); }
 }
 
@@ -212,7 +269,7 @@ export class NativeOclivClient {
     if (response.status >= 300 && response.status < 400) throw new NativeError('UPSTREAM_REDIRECT', 'Relay redirected unexpectedly');
     if (response.status === 401 || response.status === 403) throw new NativeError('UPSTREAM_AUTH', 'Relay rejected the agent key (revoked, suspended, or unknown)');
     if (!response.ok) throw new NativeError('UPSTREAM_FAILURE', `Relay management returned HTTP ${response.status}`);
-    const text = await response.text();
+    const text = await readCappedBody(response, 'Relay management response', 262144, 'UPSTREAM_CONTRACT');
     try { return JSON.parse(text); } catch { throw new NativeError('UPSTREAM_CONTRACT', 'Expected JSON from relay management'); }
   }
 
@@ -255,10 +312,14 @@ export class NativeOclivClient {
    *  2. authorization-server metadata: issuer match, S256 advertised;
    *  3. dynamic client registration (proves the token endpoint lives);
    *  4. unauthenticated tools/list must 401 (never anonymous);
-   *  5. with a provisioned access token (OCLIV_VERIFY_TOKEN): initialize
-   *     + tools/list must succeed.
-   * Without a token the result is discovery-verified with user-consent
-   * still required — reported as OAUTH_REQUIRED, never as verified.
+   *  5. with a provisioned access token (OCLIV_VERIFY_TOKEN) whose aud
+   *     names this publication's public URL: initialize + tools/list
+   *     must succeed.
+   * Without a token — or with one not bound to this publication's
+   * resource — the result is discovery-verified with user-consent
+   * still required — reported as OAUTH_REQUIRED, never as verified,
+   * and no authenticated request is made (an unbound credential is
+   * never forwarded to a foreign upstream).
    * NOTE: there is deliberately no publish() here. Publishing needs a
    * live local publisher lifecycle, not a management call. */
   async verifyPublication(id, { verifyToken } = {}) {
@@ -318,12 +379,14 @@ export class NativeOclivClient {
       });
       if (r.status !== 401) return fail('AUTH_BYPASS', `Unauthenticated tools/list answered HTTP ${r.status} (want 401)`);
     } catch { return fail('MCP_UNREACHABLE', 'Tool endpoint unreachable'); }
-    if (!verifyToken) {
+    if (!verifyToken || !tokenBoundToResource(verifyToken, pub.publicUrl)) {
       return {
         id, publicUrl: pub.publicUrl, verified: false, code: 'OAUTH_REQUIRED',
-        message: dcrAdvertised
-          ? 'Discovery verified (registration endpoint advertised but not exercised); user consent + token still required (no access token provisioned)'
-          : 'Discovery verified (no registration endpoint advertised); user consent + token still required (no access token provisioned)',
+        message: !verifyToken
+          ? (dcrAdvertised
+            ? 'Discovery verified (registration endpoint advertised but not exercised); user consent + token still required (no access token provisioned)'
+            : 'Discovery verified (no registration endpoint advertised); user consent + token still required (no access token provisioned)')
+          : 'Provisioned credential is not bound to this publication resource (aud mismatch); no authenticated probe made',
         issuer, authorizeUrl: asm.authorization_endpoint, registeredClient: null,
       };
     }

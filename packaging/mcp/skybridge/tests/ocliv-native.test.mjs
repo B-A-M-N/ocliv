@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   NativeError, loadNativeConfig, deriveKeyID, publicKeyFromSeed,
-  signMgmt, NativeOclivClient, assertIssuerScoped,
+  signMgmt, NativeOclivClient, assertIssuerScoped, readCappedJson, readCappedBody,
 } from '../src/core/ocliv-native.mjs';
 
 // Fixed 32-byte seed so signatures are reproducible (test-only).
@@ -184,6 +184,12 @@ const ISS = 'https://relay.example.org/r/route-abc-123/oauth';
 const PRM = { resource: PUBURL, authorization_servers: [ISS] };
 const ASM = { issuer: ISS, authorization_endpoint: ISS + '/authorize', token_endpoint: ISS + '/token', registration_endpoint: ISS + '/register', code_challenge_methods_supported: ['S256'] };
 
+// Test-only unsigned JWTs: the client checks aud binding, never the
+// signature (the stub upstream decides acceptance by exact value).
+const b64u = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+const boundToken = (aud) => `${b64u({ alg: 'none', typ: 'JWT' })}.${b64u({ aud, scope: 'mcp:verify' })}.test-sig`;
+const GOOD_TOKEN = boundToken(PUBURL);
+
 function verifyFetch({ tokenTools = null } = {}) {
   return async (url, opts = {}) => {
     if (url === 'https://relay.example.org/v1/agent/mcp-routes') return json(PUBS);
@@ -192,7 +198,7 @@ function verifyFetch({ tokenTools = null } = {}) {
     if (url === ISS + '/register' && opts.method === 'POST') throw new Error('DCR must not run during verify: ' + url);
     if (url === PUBURL && opts.method === 'POST') {
       const body = JSON.parse(opts.body);
-      const authed = (opts.headers.authorization || '') === 'Bearer good-token';
+      const authed = (opts.headers.authorization || '') === 'Bearer ' + GOOD_TOKEN;
       if (!authed) return new Response('unauthorized', { status: 401 });
       if (body.method === 'notifications/initialized') return new Response('', { status: 202 });
       if (tokenTools === 'ok' && body.method === 'initialize') {
@@ -218,7 +224,7 @@ test('verify without token stops at OAUTH_REQUIRED (never verified)', async () =
 
 test('verify with valid token proves initialize + tools/list', async () => {
   const client = new NativeOclivClient(loadNativeConfig(keyEnv()), verifyFetch({ tokenTools: 'ok' }));
-  const out = await client.verifyPublication('route-abc-123', { verifyToken: 'good-token' });
+  const out = await client.verifyPublication('route-abc-123', { verifyToken: GOOD_TOKEN });
   assert.equal(out.verified, true);
   assert.equal(out.protocolVersion, '2026-07-28');
   assert.deepEqual(out.tools, ['ping']);
@@ -226,9 +232,93 @@ test('verify with valid token proves initialize + tools/list', async () => {
 
 test('verify denies anonymous execution and bad tokens', async () => {
   const client = new NativeOclivClient(loadNativeConfig(keyEnv()), verifyFetch());
-  const out = await client.verifyPublication('route-abc-123', { verifyToken: 'bad-token' });
+  const out = await client.verifyPublication('route-abc-123', { verifyToken: GOOD_TOKEN + 'tampered' });
   assert.equal(out.verified, false);
   assert.equal(out.code, 'MCP_DENIED');
+});
+
+test('verify never sends an unbound credential upstream (opaque token)', async () => {
+  const sent = [];
+  const client = new NativeOclivClient(loadNativeConfig(keyEnv()), async (url, opts = {}) => {
+    sent.push({ url, auth: opts.headers?.authorization ?? null, method: opts.method });
+    return verifyFetch()(url, opts);
+  });
+  const out = await client.verifyPublication('route-abc-123', { verifyToken: 'opaque-foreign-token' });
+  assert.equal(out.verified, false);
+  assert.equal(out.code, 'OAUTH_REQUIRED');
+  assert.ok(sent.every((s) => s.auth == null), 'opaque credential must never be sent upstream');
+});
+
+test('verify never sends publication A credential to publication B', async () => {
+  const BURL = 'https://relay.example.org/r/route-def-456/mcp';
+  const BISS = 'https://relay.example.org/r/route-def-456/oauth';
+  const pubs = { publications: [
+    { route_id: 'route-abc-123', external_host: 'relay.example.org', profile: 'upstream-oauth', pub_name: 'a', lease_id: 'lse-1', created_at: '', revoked_at: null, verified_at: 't' },
+    { route_id: 'route-def-456', external_host: 'relay.example.org', profile: 'upstream-oauth', pub_name: 'b', lease_id: 'lse-2', created_at: '', revoked_at: null, verified_at: 't' },
+  ] };
+  const sent = [];
+  const fetch = async (url, opts = {}) => {
+    sent.push({ url, auth: opts.headers?.authorization ?? null, method: opts.method });
+    if (url === 'https://relay.example.org/v1/agent/mcp-routes') return json(pubs);
+    if (url === 'https://relay.example.org/.well-known/oauth-protected-resource/r/route-def-456/mcp') {
+      return json({ resource: BURL, authorization_servers: [BISS] });
+    }
+    if (url === 'https://relay.example.org/.well-known/oauth-authorization-server/r/route-def-456/oauth') {
+      return json({ issuer: BISS, authorization_endpoint: BISS + '/authorize', token_endpoint: BISS + '/token', code_challenge_methods_supported: ['S256'] });
+    }
+    if (url === BURL && opts.method === 'POST') return new Response('unauthorized', { status: 401 });
+    return verifyFetch()(url, opts);
+  };
+  const client = new NativeOclivClient(loadNativeConfig(keyEnv()), fetch);
+  // Token bound to A must not be presented to B.
+  const outB = await client.verifyPublication('route-def-456', { verifyToken: GOOD_TOKEN });
+  assert.equal(outB.verified, false);
+  assert.equal(outB.code, 'OAUTH_REQUIRED');
+  assert.ok(sent.filter((s) => s.url === BURL && s.auth).length === 0, "A's credential must never reach B");
+  // Same token still verifies A (bound correctly).
+  const outA = await client.verifyPublication('route-abc-123', { verifyToken: GOOD_TOKEN });
+  assert.equal(outA.code, 'MCP_DENIED'); // stub has no tokenTools:'ok' here; binding passed, upstream refused
+});
+
+test('oversized chunked body aborts before full buffering', async () => {
+  let pulls = 0, cancelled = false;
+  const big = new ReadableStream({
+    pull(c) {
+      pulls++;
+      if (pulls <= 3) c.enqueue(new Uint8Array(40 * 1024));
+      else c.close();
+    },
+    cancel() { cancelled = true; },
+  });
+  const res = new Response(big); // no Content-Length: unbounded without a streaming cap
+  await assert.rejects(readCappedJson(res, 'probe', 65536), { code: 'DISCOVERY_TOO_LARGE' });
+  assert.ok(cancelled, 'over-cap stream must be cancelled, not drained');
+  assert.ok(pulls <= 2, `must stop early (pulls=${pulls}), not consume the stream`);
+});
+
+test('announced over-cap length rejects without reading the body', async () => {
+  let pulls = 0;
+  const s = new ReadableStream({
+    start(c) { c.enqueue(new Uint8Array(10)); c.close(); },
+    pull() { pulls++; },
+  });
+  const res = new Response(s, { headers: { 'content-length': '1000000' } });
+  await assert.rejects(readCappedJson(res, 'probe', 65536), { code: 'DISCOVERY_TOO_LARGE' });
+  assert.equal(pulls, 0);
+});
+
+test('absent length with small body parses, split UTF-8 decodes intact', async () => {
+  const euro = new TextEncoder().encode('€ok'); // E2 82 AC split across chunks
+  const s = new ReadableStream({
+    start(c) { c.enqueue(euro.subarray(0, 1)); c.enqueue(euro.subarray(1)); c.close(); },
+  });
+  assert.equal(await readCappedBody(new Response(s), 'probe', 65536), '€ok');
+  assert.deepEqual(await readCappedJson(new Response('{"a":1}'), 'probe', 65536), { a: 1 });
+});
+
+test('oversized signed management response fails closed as contract error', async () => {
+  const client = new NativeOclivClient(loadNativeConfig(keyEnv()), async () => new Response('x'.repeat(300000)));
+  await assert.rejects(client.list(), { code: 'UPSTREAM_CONTRACT' });
 });
 
 test('verify fails closed on resource mismatch and missing issuer', async () => {
@@ -407,7 +497,7 @@ test('verify never touches the registration endpoint, rejects bad id echo', asyn
     }
     throw new Error('unexpected: ' + url);
   });
-  const badEcho = await wrongId.verifyPublication('route-strict-1', { verifyToken: 't' });
+  const badEcho = await wrongId.verifyPublication('route-strict-1', { verifyToken: boundToken(rurl) });
   assert.equal(badEcho.code, 'MCP_CONTRACT');
 });
 
