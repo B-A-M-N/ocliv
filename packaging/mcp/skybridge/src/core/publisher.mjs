@@ -10,7 +10,8 @@
  * revocation as UNKNOWN — never as success.
  */
 import { spawn } from 'node:child_process';
-import { constants as fsConstants, accessSync } from 'node:fs';
+import { constants as fsConstants, accessSync, readFileSync, writeFileSync, renameSync, unlinkSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 
 export class PublisherError extends Error {
@@ -67,21 +68,131 @@ export function loadPublisherConfig(env = process.env) {
 }
 
 const ROUTE_URL = /https:\/\/\S+\/r\/[A-Za-z0-9_-]{3,64}\/mcp/;
+const ROUTE_ID = /\/r\/([A-Za-z0-9_-]{3,64})\/mcp/;
+const STATE_FILE = '.ocliv-publisher-state.json';
+
+/** Route id embedded in a route URL, or null. */
+export function routeIdOf(routeUrl) {
+  const m = typeof routeUrl === 'string' && routeUrl.match(ROUTE_ID);
+  return m ? m[1] : null;
+}
 
 export class PublisherController extends EventEmitter {
-  constructor(config, { spawnImpl = spawn, now = Date.now } = {}) {
+  constructor(config, { spawnImpl = spawn, now = Date.now, fetchImpl = fetch } = {}) {
     super();
     this.c = config;
     this.spawnImpl = spawnImpl;
     this.now = now;
+    this.fetchImpl = fetchImpl;
     this.children = new Map(); // name -> { child, routeUrl, startedAt, log: [], exited }
   }
 
+  /** Readiness probe: an unauthenticated tools/list must be denied with
+   * 401 — that proves ingress → relay → publisher forwarding is alive,
+   * rather than trusting a URL the child printed. Any other outcome
+   * (refused, wrong status, timeout) means the route is not serving. */
+  async probeRoute(routeUrl, { timeoutMs = 10000 } = {}) {
+    let r;
+    try {
+      r = await this.fetchImpl(routeUrl, {
+        method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(timeoutMs),
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+      });
+    } catch (e) {
+      throw new PublisherError('PUBLISH_UNHEALTHY', `Route not reachable for readiness probe: ${e?.message ?? e}`);
+    }
+    if (r.status !== 401) {
+      throw new PublisherError('PUBLISH_UNHEALTHY', `Readiness probe answered HTTP ${r.status} (want 401 auth challenge)`);
+    }
+    return true;
+  }
+
+  statePath() { return join(this.c.home, STATE_FILE); }
+
+  /** Durable route record: survives management-server restarts so a fresh
+   * controller can re-adopt known routes instead of reporting amnesia.
+   * Atomic write (temp + rename); best-effort — a lost record degrades
+   * to ADOPTED-unknown, never to a false success. */
+  persistState() {
+    try {
+      mkdirSync(this.c.home, { recursive: true });
+      const records = {};
+      for (const [name, rec] of this.children) {
+        // Keep exited records too: the route may still exist on the relay
+        // and reconcile must report ADOPTED (re-publish reattaches).
+        if (rec.routeUrl) records[name] = { routeUrl: rec.routeUrl, startedAt: rec.startedAt, exited: rec.exited, exitCode: rec.exitCode };
+      }
+      const tmp = this.statePath() + '.tmp';
+      writeFileSync(tmp, JSON.stringify(records));
+      renameSync(tmp, this.statePath());
+    } catch { /* degraded: memory state remains authoritative */ }
+  }
+
+  loadPersisted() {
+    try {
+      const raw = JSON.parse(readFileSync(this.statePath(), 'utf8'));
+      if (!raw || typeof raw !== 'object') return {};
+      const out = {};
+      for (const [name, r] of Object.entries(raw)) {
+        if (this.c.registry.has(name) && typeof r?.routeUrl === 'string' && routeIdOf(r.routeUrl)) {
+          out[name] = { routeUrl: r.routeUrl, startedAt: r.startedAt ?? null };
+        }
+      }
+      return out;
+    } catch { return {}; }
+  }
+
+  clearPersisted(name) {
+    try {
+      const all = this.loadPersisted();
+      if (!(name in all)) return;
+      delete all[name];
+      const tmp = this.statePath() + '.tmp';
+      writeFileSync(tmp, JSON.stringify(all));
+      renameSync(tmp, this.statePath());
+    } catch { /* degraded */ }
+  }
+
+  /** Reconcile live children + persisted records against the authoritative
+   * relay publication list (elements carry at least { id|route_id, state }
+   * where state is 'active', 'pending', 'revoked', ...). Never invents a
+   * success: routes the relay no longer lists are ORPHANED, persisted
+   * routes without a live child are ADOPTED (need re-publish), and only
+   * a live child whose route the relay confirms is ACTIVE.
+   * @param {Array<object>} authoritative
+   */
+  reconcile(authoritative = []) {
+    const known = new Map(); // routeId -> state
+    for (const p of authoritative) {
+      const id = p?.id ?? p?.route_id;
+      if (typeof id === 'string') known.set(id, p.state ?? 'unknown');
+    }
+    const persisted = this.loadPersisted();
+    return [...this.c.registry.values()].map((s) => {
+      const live = this.children.get(s.name);
+      const liveId = live && !live.exited && live.routeUrl ? routeIdOf(live.routeUrl) : null;
+      const saved = persisted[s.name]?.routeUrl ?? null;
+      const routeUrl = live?.routeUrl ?? saved;
+      const rid = liveId ?? routeIdOf(saved);
+      let routeState = 'NONE';
+      if (rid) {
+        if (liveId && known.get(liveId) === 'active') routeState = 'ACTIVE';
+        else if (liveId && known.has(liveId)) routeState = 'ORPHANED';
+        else if (liveId) routeState = 'UNCONFIRMED';
+        else routeState = 'ADOPTED';
+      }
+      return { name: s.name, supervised: !!liveId, routeUrl, routeState };
+    });
+  }
+
   listServices() {
+    const states = new Map(this.reconcile([]).map((r) => [r.name, r]));
     return [...this.c.registry.values()].map((s) => ({
       name: s.name,
       supervised: this.children.has(s.name),
       routeUrl: this.children.get(s.name)?.routeUrl ?? null,
+      routeState: states.get(s.name)?.routeState ?? 'NONE',
     }));
   }
 
@@ -89,20 +200,26 @@ export class PublisherController extends EventEmitter {
     const svc = this.c.registry.get(name);
     if (!svc) throw new PublisherError('UNKNOWN_SERVICE', `No allowlisted service: ${name}`);
     const live = this.children.get(name);
+    const persisted = this.loadPersisted()[name]?.routeUrl ?? null;
+    const routeUrl = live?.routeUrl ?? persisted;
+    const supervised = !!live && !live.exited;
     return {
       name,
       localUrl: svc.localUrl,
-      supervised: !!live && !live.exited,
-      routeUrl: live?.routeUrl ?? null,
+      supervised,
+      routeUrl,
+      routeState: !routeUrl ? 'NONE' : supervised ? 'ACTIVE-UNCONFIRMED' : 'ADOPTED',
       lastExit: live?.exited ? { code: live.exitCode, at: live.exitedAt } : null,
     };
   }
 
   /** Start (or reattach to) the supervised publisher for an allowlisted
    * service. Requires the exact confirmation `PUBLISH <name>`. Resolves
-   * with { routeUrl } once the CLI reports readiness; the child keeps
-   * running under supervision afterwards. */
-  async publish(name, confirmation, { readyTimeoutMs = 90000 } = {}) {
+   * with { routeUrl } once the CLI reports a route AND the readiness
+   * probe confirms the route serves (401 challenge); the child keeps
+   * running under supervision afterwards. Pass { probe: false } only
+   * when the caller performs its own equivalent health verification. */
+  async publish(name, confirmation, { readyTimeoutMs = 90000, probe = true } = {}) {
     const svc = this.c.registry.get(name);
     if (!svc) throw new PublisherError('UNKNOWN_SERVICE', `No allowlisted service: ${name}`);
     if (confirmation !== `PUBLISH ${name}`) throw new PublisherError('CONFIRMATION_REQUIRED', 'Publish requires the exact confirmation `PUBLISH <name>`');
@@ -127,7 +244,7 @@ export class PublisherController extends EventEmitter {
     const scan = (line) => {
       if (rec.log.push(line) > 200) rec.log.shift();
       const m = line.match(ROUTE_URL);
-      if (m && !rec.routeUrl) { rec.routeUrl = m[0]; this.emit('route', { name, routeUrl: rec.routeUrl }); }
+      if (m && !rec.routeUrl) { rec.routeUrl = m[0]; this.persistState(); this.emit('route', { name, routeUrl: rec.routeUrl }); }
     };
     const buffers = new Map();
     const watch = (stream) => (chunk) => {
@@ -138,18 +255,33 @@ export class PublisherController extends EventEmitter {
     };
     child.stdout.on('data', watch('out'));
     child.stderr.on('data', watch('err'));
-    child.on('error', (err) => { rec.exited = true; rec.exitCode = -1; rec.exitedAt = this.now(); rec.log.push(`spawn error: ${err.message}`); });
-    child.on('exit', (code) => { rec.exited = true; rec.exitCode = code; rec.exitedAt = this.now(); });
+    child.on('error', (err) => { rec.exited = true; rec.exitCode = -1; rec.exitedAt = this.now(); rec.log.push(`spawn error: ${err.message}`); this.persistState(); });
+    child.on('exit', (code) => { rec.exited = true; rec.exitCode = code; rec.exitedAt = this.now(); this.persistState(); });
     const cleanup = () => {
       // Never leave an unsupervised child behind on failure: terminate
       // and drop the record so a later publish starts clean.
       this.children.delete(name);
+      this.persistState();
       try { child.kill('SIGTERM'); } catch { /* already gone */ }
       setTimeout(() => { try { if (!rec.exited) child.kill('SIGKILL'); } catch { /* already gone */ } }, 2000).unref?.();
     };
     const deadline = this.now() + readyTimeoutMs;
+    let probed = false;
     for (;;) {
-      if (rec.routeUrl) return { name, routeUrl: rec.routeUrl, resumed: false };
+      if (rec.routeUrl && (!probe || probed)) return { name, routeUrl: rec.routeUrl, resumed: false, probed: probe };
+      if (rec.routeUrl && probe && !probed) {
+        try {
+          await this.probeRoute(rec.routeUrl);
+          probed = true;
+        } catch (e) {
+          if (e.code === 'PUBLISH_UNHEALTHY' && this.now() < deadline && !rec.exited) {
+            await new Promise((r) => setTimeout(r, 1000)); // route may still be registering; retry until deadline
+            continue;
+          }
+          cleanup();
+          throw e;
+        }
+      }
       if (rec.exited) {
         cleanup();
         throw new PublisherError('PUBLISH_FAILED',
@@ -186,6 +318,11 @@ export class PublisherController extends EventEmitter {
     }
     if (!revoker) return { id: publicationId, stopped, revoked: 'UNKNOWN', message: 'Local publisher stopped (if running); route revocation not confirmed — no signed revoker configured' };
     const result = await revoker(publicationId);
-    return { id: publicationId, stopped, revoked: result?.deleted ? 'REVOKED' : 'UNCONFIRMED', detail: result ?? null };
+    const out = { id: publicationId, stopped, revoked: result?.deleted ? 'REVOKED' : 'UNCONFIRMED', detail: result ?? null };
+    // Drop the durable record only on confirmed revocation; otherwise the
+    // route may still exist remotely and reconcile must report ADOPTED.
+    if (out.revoked === 'REVOKED' && stopped) this.clearPersisted(stopped);
+    else this.persistState();
+    return out;
   }
 }
