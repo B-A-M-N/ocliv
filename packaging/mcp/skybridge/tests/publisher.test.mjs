@@ -67,7 +67,7 @@ test('publish single-flights; resumes when route known', async () => {
   await assert.rejects(c.publish('lab', 'PUBLISH lab', { readyTimeoutMs: 500 }), { code: 'IN_PROGRESS' });
   c.children.get('lab').child.stderr.emit('data', 'https://edge.example/r/route-abc-9/mcp\n');
   await p;
-  const resumed = await c.publish('lab', 'PUBLISH lab');
+  const resumed = await c.publish('lab', 'PUBLISH lab', { probe: false });
   assert.equal(resumed.resumed, true);
 });
 
@@ -165,11 +165,15 @@ test('reconcile reports ACTIVE only for relay-confirmed live routes', async (t) 
   const c = await publishRoute(t, url);
   const active = c.reconcile([{ route_id: 'route-live-1', state: 'active' }]);
   assert.deepEqual(active, [{ name: 'lab', supervised: true, routeUrl: url, routeState: 'ACTIVE' }]);
-  const orphaned = c.reconcile([{ route_id: 'route-live-1', state: 'revoked' }]);
-  assert.equal(orphaned[0].routeState, 'ORPHANED');
-  const unknown = c.reconcile([]);
+  const revoked = c.reconcile([{ route_id: 'route-live-1', state: 'revoked' }]);
+  assert.equal(revoked[0].routeState, 'REVOKED');
+  const gone = c.reconcile([{ route_id: 'route-other-9', state: 'active' }]);
+  assert.equal(gone[0].routeState, 'ORPHANED');
+  const empty = c.reconcile([]);
+  assert.equal(empty[0].routeState, 'ORPHANED');
+  assert.equal(empty[0].supervised, true);
+  const unknown = c.reconcile(null);
   assert.equal(unknown[0].routeState, 'UNCONFIRMED');
-  assert.equal(unknown[0].supervised, true);
 });
 
 test('fresh controller adopts persisted routes after restart', async (t) => {
@@ -222,6 +226,64 @@ test('publish probes route health before reporting success', async (t) => {
   assert.equal(out.routeUrl, url);
   assert.equal(out.probed, true);
   assert.deepEqual(seen, [url]);
+});
+
+test('saved route with no live child follows the relay answer, never the URL', async (t) => {
+  const url = 'https://edge.example/r/route-live-1/mcp';
+  await publishRoute(t, url);
+  const c2 = new PublisherController(cfg(), { spawnImpl: fakeSpawnFactory(t) });
+  assert.equal(c2.children.size, 0);
+  assert.equal(c2.reconcile([{ route_id: 'route-live-1', state: 'active' }])[0].routeState, 'ADOPTED');
+  assert.equal(c2.reconcile([{ route_id: 'route-live-1', state: 'revoked' }])[0].routeState, 'REVOKED');
+  assert.equal(c2.reconcile([{ route_id: 'route-other-9', state: 'active' }])[0].routeState, 'ORPHANED');
+  assert.equal(c2.reconcile([])[0].routeState, 'ORPHANED');
+});
+
+test('reattach re-probes: healthy resumes, stale republishes fresh', async (t) => {
+  try { unlinkSync('/tmp/ocliv-pub-test/.ocliv-publisher-state.json'); } catch { /* fresh */ }
+  let probes = 0;
+  let spawns = 0;
+  const c = new PublisherController(cfg(), {
+    spawnImpl: (...a) => { spawns++; return fakeSpawnFactory(t)(...a); },
+    fetchImpl: async () => { probes++; return { status: 401 }; },
+  });
+  const first = c.publish('lab', 'PUBLISH lab', { readyTimeoutMs: 5000 });
+  await new Promise((r) => setTimeout(r, 20));
+  c.children.get('lab').child.stderr.emit('data', 'https://edge.example/r/route-live-1/mcp\n');
+  await first;
+  // Healthy reattach: probe passes, same URL, no new spawn.
+  const again = await c.publish('lab', 'PUBLISH lab', { readyTimeoutMs: 5000 });
+  assert.equal(again.resumed, true);
+  assert.equal(again.routeUrl, 'https://edge.example/r/route-live-1/mcp');
+  assert.equal(spawns, 1);
+  // Stale reattach: probe now fails, old child retired, fresh publish wins.
+  c.fetchImpl = async () => ({ status: 404 });
+  const p2 = c.publish('lab', 'PUBLISH lab', { readyTimeoutMs: 5000 });
+  await new Promise((r) => setTimeout(r, 20));
+  const rec = c.children.get('lab');
+  assert.ok(rec, 'fresh publish started after stale reattach retired');
+  rec.child.stderr.emit('data', 'https://edge.example/r/route-live-2/mcp\n');
+  // Fresh route also 404s under the stubbed fetch... restore health first.
+  c.fetchImpl = async () => ({ status: 401 });
+  const out = await p2;
+  assert.equal(out.resumed, false);
+  assert.equal(out.probed, true);
+  assert.equal(spawns, 2);
+});
+
+test('unpublish after restart clears in-memory and persisted records', async (t) => {
+  const url = 'https://edge.example/r/route-live-1/mcp';
+  await publishRoute(t, url);
+  const c2 = new PublisherController(cfg(), { spawnImpl: fakeSpawnFactory(t) });
+  assert.equal(c2.children.size, 0);
+  assert.ok(c2.loadPersisted().lab, 'restart: persisted record present');
+  const out = await c2.unpublish('route-live-1', 'route-live-1', { revoker: async (id) => ({ id, deleted: true }) });
+  assert.equal(out.revoked, 'REVOKED');
+  assert.equal(out.stopped, null);
+  assert.deepEqual(c2.loadPersisted(), {}, 'confirmed revocation clears persisted record with no live child');
+  // Repeated call: revoker says already gone → UNCONFIRMED, nothing invented.
+  const twice = await c2.unpublish('route-live-1', 'route-live-1', { revoker: async (id) => ({ id, deleted: false }) });
+  assert.equal(twice.revoked, 'UNCONFIRMED');
 });
 
 test('publish fails closed when the route does not serve', async (t) => {

@@ -132,7 +132,8 @@ export const app = new Skybridge({
         const subject = authorize(extra.http?.authInfo,subjects,'ocliv:write');
         if (!publisher) return done({ok:false,code:'WRITE_DISABLED',message:'Unpublishing is disabled (OCLIV_WRITE_ENABLED is not true)'});
         approvals.redeem({subject,action:'unpublish',target:publicationId,approvalId,code:approvalCode});
-        return done({ok:true,...await publisher.unpublish(publicationId,publicationId,{revoker:(id)=>client.unpublish(id)})});
+        const result = await publisher.unpublish(publicationId,publicationId,{revoker:(id)=>client.unpublish(id)});
+        return done({ok:result.revoked==='REVOKED',...result});
       }
       catch(e) {return failed(e);}
     })

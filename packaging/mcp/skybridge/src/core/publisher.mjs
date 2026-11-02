@@ -157,37 +157,50 @@ export class PublisherController extends EventEmitter {
   /** Reconcile live children + persisted records against the authoritative
    * relay publication list (elements carry at least { id|route_id, state }
    * where state is 'active', 'pending', 'revoked', ...). Never invents a
-   * success: routes the relay no longer lists are ORPHANED, persisted
-   * routes without a live child are ADOPTED (need re-publish), and only
-   * a live child whose route the relay confirms is ACTIVE.
-   * @param {Array<object>} authoritative
+   * success: only a live child whose route the relay confirms is ACTIVE;
+   * a route the relay lists as revoked is REVOKED; listed-but-not-usable
+   * or absent from a real relay answer is ORPHANED. A route saved locally
+   * with no live child is ADOPTED (needs re-publish) only when the relay
+   * still lists it as usable — never from a saved URL alone.
+   * @param {Array<object>|null} authoritative null = no relay data (lenient
+   * labels); an array (even empty) = the relay's answer (strict labels).
    */
-  reconcile(authoritative = []) {
+  reconcile(authoritative = null) {
+    const strict = Array.isArray(authoritative);
     const known = new Map(); // routeId -> state
-    for (const p of authoritative) {
-      const id = p?.id ?? p?.route_id;
-      if (typeof id === 'string') known.set(id, p.state ?? 'unknown');
+    if (strict) {
+      for (const p of authoritative) {
+        const id = p?.id ?? p?.route_id;
+        if (typeof id === 'string') known.set(id, p.state ?? 'unknown');
+      }
     }
+    const usable = (st) => st === 'active' || st === 'pending';
     const persisted = this.loadPersisted();
     return [...this.c.registry.values()].map((s) => {
       const live = this.children.get(s.name);
       const liveId = live && !live.exited && live.routeUrl ? routeIdOf(live.routeUrl) : null;
       const saved = persisted[s.name]?.routeUrl ?? null;
+      const savedId = routeIdOf(saved);
       const routeUrl = live?.routeUrl ?? saved;
-      const rid = liveId ?? routeIdOf(saved);
       let routeState = 'NONE';
-      if (rid) {
-        if (liveId && known.get(liveId) === 'active') routeState = 'ACTIVE';
-        else if (liveId && known.has(liveId)) routeState = 'ORPHANED';
-        else if (liveId) routeState = 'UNCONFIRMED';
-        else routeState = 'ADOPTED';
+      if (liveId) {
+        if (known.get(liveId) === 'active') routeState = 'ACTIVE';
+        else if (!strict) routeState = 'UNCONFIRMED';
+        else if (known.get(liveId) === 'revoked') routeState = 'REVOKED';
+        else routeState = 'ORPHANED';
+      } else if (savedId) {
+        if (!strict) routeState = 'ADOPTED';
+        else if (usable(known.get(savedId))) routeState = 'ADOPTED';
+        else if (known.get(savedId) === 'revoked') routeState = 'REVOKED';
+        else routeState = 'ORPHANED';
       }
       return { name: s.name, supervised: !!liveId, routeUrl, routeState };
     });
   }
 
   listServices() {
-    const states = new Map(this.reconcile([]).map((r) => [r.name, r]));
+    // No relay data in this view: lenient labels, never confirmed states.
+    const states = new Map(this.reconcile(null).map((r) => [r.name, r]));
     return [...this.c.registry.values()].map((s) => ({
       name: s.name,
       supervised: this.children.has(s.name),
@@ -226,7 +239,24 @@ export class PublisherController extends EventEmitter {
     const existing = this.children.get(name);
     if (existing && !existing.exited) {
       if (!existing.routeUrl) throw new PublisherError('IN_PROGRESS', 'Publication already attaching; wait for its route URL');
-      return { name, routeUrl: existing.routeUrl, resumed: true };
+      // Reattachment is not success: the route may have lapsed (expired
+      // lease, revoked publication) since it was first observed. Re-probe
+      // before claiming health; on failure retire the stale child and
+      // fall through to a fresh publish below.
+      if (probe) {
+        try {
+          await this.probeRoute(existing.routeUrl);
+        } catch {
+          this.children.delete(name);
+          try { existing.child.kill('SIGTERM'); } catch { /* already gone */ }
+          this.persistState();
+        }
+      }
+      const stillThere = this.children.get(name);
+      if (stillThere && !stillThere.exited && stillThere.routeUrl) {
+        return { name, routeUrl: stillThere.routeUrl, resumed: true, probed: probe };
+      }
+      // Stale attachment retired; continue to fresh publish.
     }
     const args = ['mcp', 'publish', '--local', svc.localUrl, '--auth', 'upstream-oauth', '--name', name];
     if (svc.resourceFile) args.push('--resource-file', svc.resourceFile);
@@ -319,10 +349,23 @@ export class PublisherController extends EventEmitter {
     if (!revoker) return { id: publicationId, stopped, revoked: 'UNKNOWN', message: 'Local publisher stopped (if running); route revocation not confirmed — no signed revoker configured' };
     const result = await revoker(publicationId);
     const out = { id: publicationId, stopped, revoked: result?.deleted ? 'REVOKED' : 'UNCONFIRMED', detail: result ?? null };
-    // Drop the durable record only on confirmed revocation; otherwise the
-    // route may still exist remotely and reconcile must report ADOPTED.
-    if (out.revoked === 'REVOKED' && stopped) this.clearPersisted(stopped);
-    else this.persistState();
+    // Owner = supervised child if any, else any persisted record for the
+    // route (e.g. revoked after a management-server restart with no live
+    // child). On confirmed revocation drop ALL ownership traces —
+    // in-memory and persisted — so no later persistState() resurrects
+    // stale information. Keep records when the outcome is unknown.
+    const owner = stopped ?? [...this.c.registry.values()].find((s) => {
+      const saved = this.loadPersisted()[s.name]?.routeUrl;
+      return saved && saved.includes(`/r/${publicationId}/`);
+    })?.name ?? null;
+    if (out.revoked === 'REVOKED') {
+      for (const [name, rec] of this.children) {
+        if (rec.routeUrl && rec.routeUrl.includes(`/r/${publicationId}/`)) this.children.delete(name);
+      }
+      if (owner) this.clearPersisted(owner);
+    } else {
+      this.persistState();
+    }
     return out;
   }
 }
