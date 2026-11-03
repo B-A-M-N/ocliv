@@ -204,3 +204,14 @@ with its reason instead of silently dropping it.
 - P2-I README + everyday-first help: FIXED — truthful quickstart, capability matrix, BLOCKED/NOT VERIFIED labels where true.
 - P2-J shared-relay readiness (`docs/SHARED-RELAY.md`): recorded as BLOCKED — operating requirements + client contract specified; no operated relay, no anonymous free-for-all.
 - Broad gates at `804f21a`: build + vet + `go test ./internal/...` green, full integration suite green (211s), race on relay/agent/cli/config/setup green. Soak, clean-host install, public ChatGPT registration: NOT VERIFIED (operator-gated).
+
+### 2026-11-03 chaos engineering Stage 5, local scope (`143b9af` → `2ff2ad9`)
+
+- E5 nonce persistence across restart: VERIFIED NON-ISSUE (INSERT OR IGNORE + 5-min skew; no code change).
+- E2 failed-validation restore (`setup.installManagedFile`): FIXED — loud error, backup preserved; red→green proven.
+- E1 concurrent refresh overlap, E3 unwritable-rollback, C1 compound chain, C2 stale-timestamp replay, C3 16-way route convergence: PASS (C3 `relay_chaos_routes_test.go`, race-clean).
+- D1–D3 local DNS/TLS/enrollment faults: PASS; D4/D5 live LAN impostor via 10.9.66.20: PASS (zero hits); D6 dynv6 error shapes: PARTIAL (401 auth-first; 200-with-error shape unobservable without valid token).
+- P7 doctor/status honesty, P8 unit validation, P9 planner dry-run honesty: PASS. R1 health-listener Serve logging: FIXED.
+- F1 bounded fuzz (`lease` + `proxy`, ~16.8M execs): PASS, zero crashes.
+- A2 unbounded `audit_events` growth: DEFERRED P2 residual (needs retention policy; monitor data-dir size).
+- Soak, scaled pressure, cross-machine partition/TLS-SNI, public edge, provider OAuth, dynv6 zone claim: NOT EXECUTED/BLOCKED (operator-gated). Full matrix: `docs/qualification/CHAOS-BATCH.md`.
