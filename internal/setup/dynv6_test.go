@@ -56,6 +56,24 @@ func TestDynv6UpdateRequiresToken(t *testing.T) {
 	}
 }
 
+func TestDynv6TransportErrorHidesToken(t *testing.T) {
+	// A refused connection surfaces as *url.Error whose message
+	// embeds the request URL — including the token query. The
+	// returned error must never carry it.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := UpdateDynv6(ctx, "http://127.0.0.1:1", "bamnlabs.dynv6.net", "SECRETTOKEN", "203.0.113.9", "")
+	if err == nil {
+		t.Fatal("refused connection treated as success")
+	}
+	if strings.Contains(err.Error(), "SECRETTOKEN") {
+		t.Fatalf("token leaked into transport error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "bamnlabs.dynv6.net") {
+		t.Fatalf("sanitized error lost the zone context: %v", err)
+	}
+}
+
 func TestDynv6UpdateErrorHidesToken(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)

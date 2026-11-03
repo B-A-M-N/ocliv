@@ -35,6 +35,16 @@ func validDynv6Zone(zone string) bool {
 	return label[0] != '-' && label[len(label)-1] != '-'
 }
 
+// sanitizeDynv6Error removes credential material from a transport
+// error while keeping the actionable failure category.
+func sanitizeDynv6Error(err error, token string) string {
+	msg := err.Error()
+	if token != "" {
+		msg = strings.ReplaceAll(msg, token, "***")
+	}
+	return msg
+}
+
 // UpdateDynv6 sets the zone's A/AAAA records via the provider update
 // API. Empty ipv4/ipv6 keeps the current record; "auto" lets the
 // provider use the observed client address. baseURL is the endpoint
@@ -64,7 +74,11 @@ func UpdateDynv6(ctx context.Context, baseURL, zone, token, ipv4, ipv6 string) e
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("dynv6 update for %q failed: %v", zone, err)
+		// Transport errors (*url.Error) embed the request URL,
+		// including the token query. Redact before returning so
+		// the token never reaches CLI output or logs; the
+		// failure category (timeout/refused/DNS/TLS) is preserved.
+		return fmt.Errorf("dynv6 update for %q failed: %s", zone, sanitizeDynv6Error(err, token))
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
