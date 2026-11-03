@@ -138,6 +138,16 @@ func (s *LeaseStore) Save(rec LeaseRecord) error {
 	}
 	p, _ := s.path(rec.LeaseID)
 	return s.withLock(func() error {
+		// No live Save can hold a .tmp-* while this lock is held, so
+		// anything matching is debris from a crashed save: remove it
+		// before it accumulates across restarts (P1-G).
+		if ents, err := os.ReadDir(s.dir); err == nil {
+			for _, e := range ents {
+				if !e.IsDir() && strings.HasPrefix(e.Name(), ".tmp-") {
+					_ = os.Remove(filepath.Join(s.dir, e.Name()))
+				}
+			}
+		}
 		tmp, err := os.CreateTemp(s.dir, ".tmp-*")
 		if err != nil {
 			return err

@@ -175,3 +175,40 @@ func TestFindResumeProbeContractMismatch(t *testing.T) {
 		t.Fatal("changed expected status resumed the old lease")
 	}
 }
+
+// A SIGKILL between temp-file creation and rename leaves an orphaned
+// .tmp-* file. The next Save must sweep it: crash debris must never
+// accumulate in the data dir, and the sweep must not touch live records.
+func TestLeaseStoreSweepsCrashedTmp(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenLeaseStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keep := LeaseRecord{LeaseID: "lse-keep", Hostname: "k.t", Port: 3000, RelayURL: "https://r1.test", KeyID: "key-1"}
+	if err := s.Save(keep); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate crash debris: orphan tmp + a torn (truncated) record file.
+	if err := os.WriteFile(filepath.Join(dir, ".tmp-orphan"), []byte(`{"LeaseID":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(LeaseRecord{LeaseID: "lse-new", Hostname: "n.t", Port: 3001, RelayURL: "https://r1.test", KeyID: "key-1"}); err != nil {
+		t.Fatal(err)
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		if len(e.Name()) > 5 && e.Name()[:5] == ".tmp-" {
+			t.Fatalf("orphaned tmp file survived Save: %q", e.Name())
+		}
+	}
+	if _, ok := s.Load("lse-keep"); !ok {
+		t.Fatal("sweep removed a live record")
+	}
+	if _, ok := s.Load("lse-new"); !ok {
+		t.Fatal("new record missing after sweep")
+	}
+}
