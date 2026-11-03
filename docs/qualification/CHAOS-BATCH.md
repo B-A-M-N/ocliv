@@ -84,6 +84,26 @@ covered by `TestStartHealthListenerBindAndShutdown`; the abnormal-death
 path has no deterministic unit seam without structural churn and is
 inspection-verified (`fe98c69`).
 
+## Residual finding A2 — unbounded audit_events growth (P2, not implemented)
+
+Mechanism confirmed by source: `store.DB.Audit` INSERTs on every
+denial/edge event (rate-limit denials, no-route, auth failures,
+revocations) and no code path ever DELETEs or prunes `audit_events`.
+Growth is throttled by the pre-auth/admission rate limiters but never
+reclaimed — months of probing fill disk and bloat backups.
+No global janitor exists (sweeps are per-session/nonce-local).
+
+Deliberately NOT fixed here: pruning security evidence needs an
+operator-visible retention policy (age/count bound preserving recent
+incident evidence), plus a janitor lifecycle — beyond a minimal fix.
+Recommended: age-bounded DELETE in a single explicit sweep point with
+a regression test seeding old/new rows. Until then: monitor relay
+data-dir size; recovery is manual prune + VACUUM.
+
+Adjacent check: never-reading SSE visitors hold a stream by design,
+but converge via lease TTL + the 5s revocation sweep
+(`supervise`), so no unbounded-hold defect.
+
 ## NOT EXECUTED (needs operator/second machine)
 
 Soak, scaled resource pressure, cross-machine partition/TLS-SNI chaos,
