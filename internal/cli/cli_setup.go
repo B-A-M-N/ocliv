@@ -57,6 +57,7 @@ func cmdSetup(argv []string) int {
 	compartment := ""
 	zone := ""
 	confirmCreate := false
+	refreshDNS := false
 	echoV4, echoV6 := defaultEchoV4, defaultEchoV6
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
@@ -70,6 +71,8 @@ func cmdSetup(argv []string) int {
 			jsonOut = true
 		case a == "--dry-run":
 			dryRun = true
+		case a == "--refresh-dns":
+			refreshDNS = true
 		case strings.HasPrefix(a, "--hostname="):
 			hostname = strings.TrimPrefix(a, "--hostname=")
 		case a == "--hostname" && i+1 < len(argv):
@@ -144,6 +147,13 @@ func cmdSetup(argv []string) int {
 		return apperr.ExitOK
 	}
 	printSetupReport(d)
+	if refreshDNS {
+		if hostname == "" {
+			fmt.Fprintln(os.Stderr, "--refresh-dns needs --hostname ZONE.dynv6.net")
+			return apperr.ExitCLIValidation
+		}
+		return runSetupRefreshDNS(ctx, hostname, tokenFile, echoV4, echoV6)
+	}
 	if check || !auto {
 		return apperr.ExitOK
 	}
@@ -164,28 +174,60 @@ func cmdSetup(argv []string) int {
 // update additionally renders the single-host deployment, verifies the
 // name resolves to the observed egress, and persists relay_url for
 // `ocliv 3000` / `mcp publish`; nothing is activated yet.
-func runSetupDNS(ctx context.Context, d setup.Detection, hostname, tokenFile, acmeEmail, outDir, dataDir string, dryRun bool) int {
+// runSetupRefreshDNS performs one check-and-update DNS cycle without
+// touching Caddy, systemd, or enrollment: suitable for cron or a
+// systemd timer between full `setup --auto` runs. The relay keeps
+// serving throughout; only the DNS record changes.
+func runSetupRefreshDNS(ctx context.Context, hostname, tokenFile, echoV4, echoV6 string) int {
+	token, code := readDynv6Token(tokenFile, hostname)
+	if code != apperr.ExitOK {
+		return code
+	}
+	changed, err := setup.RefreshDynDNS(ctx, dynv6Endpoint(), hostname, token, echoV4, echoV6)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return apperr.ExitRelayTLS
+	}
+	if changed {
+		fmt.Printf("dns refreshed for %s (address changed)\n", hostname)
+	} else {
+		fmt.Printf("dns already current for %s; no update sent\n", hostname)
+	}
+	return apperr.ExitOK
+}
+
+// readDynv6Token resolves the provider credential from DYNV6_TOKEN or
+// an owner-only --token-file. The token never comes from argv.
+func readDynv6Token(tokenFile, hostname string) (string, int) {
 	token := strings.TrimSpace(os.Getenv("DYNV6_TOKEN"))
 	if tokenFile != "" {
 		fi, err := os.Stat(tokenFile)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: cannot read --token-file: %v\n", err)
-			return apperr.ExitCLIValidation
+			return "", apperr.ExitCLIValidation
 		}
 		if fi.Mode().Perm()&0o077 != 0 {
 			fmt.Fprintf(os.Stderr, "error: token file %q is group/other-readable (want 0600); fix permissions first\n", tokenFile)
-			return apperr.ExitCLIValidation
+			return "", apperr.ExitCLIValidation
 		}
 		raw, err := os.ReadFile(tokenFile)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: cannot read --token-file: %v\n", err)
-			return apperr.ExitCLIValidation
+			return "", apperr.ExitCLIValidation
 		}
 		token = strings.TrimSpace(string(raw))
 	}
 	if token == "" {
 		fmt.Fprintf(os.Stderr, "dynv6 HTTP token needed for %q: create one at https://dynv6.com/keys (HTTP token for the zone), then export DYNV6_TOKEN or pass --token-file PATH (0600)\n", hostname)
-		return apperr.ExitAuth
+		return "", apperr.ExitAuth
+	}
+	return token, apperr.ExitOK
+}
+
+func runSetupDNS(ctx context.Context, d setup.Detection, hostname, tokenFile, acmeEmail, outDir, dataDir string, dryRun bool) int {
+	token, code := readDynv6Token(tokenFile, hostname)
+	if code != apperr.ExitOK {
+		return code
 	}
 	endpoint := dynv6Endpoint()
 	fmt.Printf("dns update: %s -> v4=%s v6=%s (token from %s, redacted)\n",

@@ -16,6 +16,7 @@ import (
 
 	"ocliv/internal/apperr"
 	"ocliv/internal/relay"
+	"ocliv/internal/setup"
 	"ocliv/internal/store"
 )
 
@@ -385,6 +386,80 @@ func TestSetupRejectsUnknownProvider(t *testing.T) {
 
 func TestSetupRejectsUnknownFlag(t *testing.T) {
 	if code := cmdSetup([]string{"--bogus"}); code != apperr.ExitCLIValidation {
+		t.Fatalf("exit=%d, want %d", code, apperr.ExitCLIValidation)
+	}
+}
+
+// Slice 5 acceptance: --refresh-dns runs one refresh cycle without
+// touching Caddy/systemd/enrollment. Stubs echo + DNS + update.
+func TestSetupRefreshDNSChanged(t *testing.T) {
+	v4 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("203.0.113.9"))
+	}))
+	defer v4.Close()
+	updateHits := 0
+	upd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		updateHits++
+		w.Write([]byte("addresses updated"))
+	}))
+	defer upd.Close()
+	t.Setenv("OCLIV_DYNV6_ENDPOINT", upd.URL)
+	t.Setenv("DYNV6_TOKEN", "refresh-token")
+	oldLookup := setup.LookupHost
+	setup.LookupHost = func(ctx context.Context, host string) ([]string, error) {
+		return []string{"198.51.100.9"}, nil
+	}
+	defer func() { setup.LookupHost = oldLookup }()
+	code := 0
+	out := captureOutput(t, func() {
+		code = cmdSetup([]string{"--refresh-dns", "--hostname", "h.dynv6.net", "--echo-v4", v4.URL})
+	})
+	if code != apperr.ExitOK {
+		t.Fatalf("exit=%d, want %d (out=%q)", code, apperr.ExitOK, out)
+	}
+	if updateHits != 1 {
+		t.Fatalf("update hits=%d, want 1", updateHits)
+	}
+	if !strings.Contains(out, "address changed") {
+		t.Fatalf("output missing change notice: %q", out)
+	}
+}
+
+func TestSetupRefreshDNSNoChange(t *testing.T) {
+	v4 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("203.0.113.9"))
+	}))
+	defer v4.Close()
+	updateHits := 0
+	upd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		updateHits++
+		w.Write([]byte("addresses updated"))
+	}))
+	defer upd.Close()
+	t.Setenv("OCLIV_DYNV6_ENDPOINT", upd.URL)
+	t.Setenv("DYNV6_TOKEN", "refresh-token")
+	oldLookup := setup.LookupHost
+	setup.LookupHost = func(ctx context.Context, host string) ([]string, error) {
+		return []string{"203.0.113.9"}, nil
+	}
+	defer func() { setup.LookupHost = oldLookup }()
+	code := 0
+	out := captureOutput(t, func() {
+		code = cmdSetup([]string{"--refresh-dns", "--hostname", "h.dynv6.net", "--echo-v4", v4.URL})
+	})
+	if code != apperr.ExitOK {
+		t.Fatalf("exit=%d, want %d (out=%q)", code, apperr.ExitOK, out)
+	}
+	if updateHits != 0 {
+		t.Fatalf("update hits=%d, want 0", updateHits)
+	}
+	if !strings.Contains(out, "already current") {
+		t.Fatalf("output missing no-change notice: %q", out)
+	}
+}
+
+func TestSetupRefreshDNSNeedsHostname(t *testing.T) {
+	if code := cmdSetup([]string{"--refresh-dns"}); code != apperr.ExitCLIValidation {
 		t.Fatalf("exit=%d, want %d", code, apperr.ExitCLIValidation)
 	}
 }
