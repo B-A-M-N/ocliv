@@ -241,7 +241,11 @@ func startHealthListener(addr string, h http.Handler) (*http.Server, error) {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {
-		_ = srv.Serve(ln)
+		// Abnormal listener death must be visible in the journal;
+		// graceful Shutdown reports ErrServerClosed and stays quiet.
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			fmt.Fprintln(os.Stderr, "health listener error: "+err.Error())
+		}
 	}()
 	return srv, nil
 }
