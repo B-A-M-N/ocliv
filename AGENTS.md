@@ -190,3 +190,17 @@ with its reason instead of silently dropping it.
 - Skybridge ChatGPT/Auth0 live-integration claim: UNVERIFIED (no dated redacted evidence on file) — README/SPEC downgraded accordingly; public OAuth/MCP handshake half re-verified live 2026-11-02 (PRM 200, pong, anon/revoked 401s).
 - Metis public integration (HTTP+OAuth upstream, publish/revoke through public route): BLOCKED on Metis owner — loopback expose legs pass (`TestOclivLoopbackExposeServesMetisTools`, `TestOclivLoopbackRemoteMessageChain`), `--stdio` prohibition preserved.
 - Gate 4 ChatGPT registration, clean-host install, permanent ingress, soak: NOT VERIFIED (operator-gated, unchanged).
+
+### 2026-11-03 product-rereview remediation round (`abdda2e` → `804f21a`)
+
+- P0-A wildcard DNS proof + ACTION_REQUIRED + persist-only-on-success (`cli_setup.go`): FIXED — fresh `<label>.t.<domain>` verification, manual-record instruction on miss, exit codes distinguish completed/action-required/failed, relay URL persists only after gates pass.
+- P0-B dynv6 token sanitization (`setup/dynv6.go`): FIXED — failing-first transport-error regression, token never in errors/output/logs, categories preserved.
+- P0-C preserve deployments (`setup/bootstrap.go`): FIXED — unmanaged-Caddy refusal, staged install with marker, rollback on later-step failure, injected-failure tests.
+- P1-D backoff reset (`agent/agent.go`): FIXED — reset after healthy session, escalation preserved, 2x stability runs.
+- P1-E dynamic DNS refresh (`setup/refresh.go`, `--refresh-dns`): FIXED — change-only updates, no relay restart, change/no-change CLI tests.
+- P1-F named status states (`cli_status.go`, `doctor` already verified/unverified): FIXED — RELAY DISCONNECTED / AUTH REQUIRED / RECONNECTING / ROUTE OFFLINE with Next actions in human + JSON; attachment never claimed as public reachability.
+- P1-G durability (`config/leases.go`): FIXED the one found gap — crashed-save `.tmp-*` sweep with failing-first regression; rest of the gate list (restart, revoke races, restore rollback, leak bounds) VERIFIED NON-ISSUE against existing suites (`lifecycle`, `revoke`, `relay_backup`, `exchange_adversarial`).
+- P2-H `ocliv mcp PORT` alias (`cli_mcp.go`): FIXED — thin rewrite to existing publish with `--auth upstream-oauth` pinned; parser-level regression test.
+- P2-I README + everyday-first help: FIXED — truthful quickstart, capability matrix, BLOCKED/NOT VERIFIED labels where true.
+- P2-J shared-relay readiness (`docs/SHARED-RELAY.md`): recorded as BLOCKED — operating requirements + client contract specified; no operated relay, no anonymous free-for-all.
+- Broad gates at `804f21a`: build + vet + `go test ./internal/...` green, full integration suite green (211s), race on relay/agent/cli/config/setup green. Soak, clean-host install, public ChatGPT registration: NOT VERIFIED (operator-gated).
