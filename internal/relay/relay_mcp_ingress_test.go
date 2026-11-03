@@ -617,6 +617,7 @@ func TestMCPRouteOAuthPathParsing(t *testing.T) {
 		{"/r/abc123/oauth/authorize", "abc123", "/oauth/authorize", true},
 		{"/r/abc123/oauth/token", "abc123", "/oauth/token", true},
 		{"/r/abc123/oauth/register", "abc123", "/oauth/register", true},
+		{"/r/abc123/oauth/revoke", "abc123", "/oauth/revoke", true},
 		{"/r/ABC-9_x/oauth/token", "ABC-9_x", "/oauth/token", true},
 		{"/r/abc123/oauth/admin", "", "", false},    // not allowlisted
 		{"/r/abc123/oauth/", "", "", false},         // empty endpoint
@@ -730,7 +731,7 @@ func TestSharedHostOAuthFullHandler(t *testing.T) {
 	if err := createMCPRoute(db, "public.example.org", "route-oh", "lse-oh", "upstream-oauth"); err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range []string{"/r/route-oh/oauth/authorize", "/r/route-oh/oauth/token", "/r/route-oh/oauth/register", "/.well-known/oauth-authorization-server/r/route-oh/oauth"} {
+	for _, p := range []string{"/r/route-oh/oauth/authorize", "/r/route-oh/oauth/token", "/r/route-oh/oauth/register", "/r/route-oh/oauth/revoke", "/.well-known/oauth-authorization-server/r/route-oh/oauth"} {
 		// The dispatch harness serves exactly one stream: fresh
 		// harness and session per shape.
 		h := newDispatchHarness(t)

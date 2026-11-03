@@ -56,7 +56,7 @@ port instead). Runtime state in /tmp only; repo tree untouched otherwise.
 | 3 | Strict-discovery publish | PASS | `✓ MCP route ready (auth: upstream-oauth)` + `✓ OAuth discovery verified`; route `https://pop-os.tail8d285a.ts.net/r/E2CI3j6ZIqS1yVqpsMdYNw/mcp` (oauth-lab fixture, read-only ping) |
 | 4 | Unauthenticated tool use | PASS (denied) | no-bearer → 401, tampered-signature → 401 |
 | 5 | Full OAuth + authorized call | PASS | DCR → PKCE authorize → token → `tools/list` 200, `tools/call ping` 200 (`pong:ocliv-oauth-lab-1`) |
-| 6 | Upstream revoke via route | FAIL (gap) | `POST /r/<id>/oauth/revoke` → 421; allowlist in `internal/relay/relay_mcp_ingress.go:198-202` covers authorize/token/register only. Tokens stay valid to 900s expiry; relay-side unpublish/lease-revoke remains the kill switch. Fix: add `/oauth/revoke` to the allowlist + regression test. |
+| 6 | Upstream revoke via route | FIXED + live-verified | `POST /r/<id>/oauth/revoke` → 421; allowlist in `internal/relay/relay_mcp_ingress.go:198-202` covers authorize/token/register only. Tokens stay valid to 900s expiry; relay-side unpublish/lease-revoke remains the kill switch. Fix landed + live-verified: `/oauth/revoke` added to `mcpOAuthEndpoints` with parse + dispatch regression tests; live `POST /r/<id>/oauth/revoke` → 200, revoked-token `tools/call` → 401. Relay restart for deploy preserved the stable route (publisher reconnected, same URL). |
 
 Note: `publish --auth fixture-anonymous` correctly refused (fail-closed);
 upstream-oauth with the no-auth smoke fixture correctly failed discovery

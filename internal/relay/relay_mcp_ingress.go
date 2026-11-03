@@ -186,8 +186,8 @@ const mcpASWellKnownPrefix = "/.well-known/oauth-authorization-server/r/"
 const mcpASWellKnownUpstreamPath = "/.well-known/oauth-authorization-server"
 
 // mcpOAuthRoutePrefix scopes the OAuth protocol endpoints (authorize,
-// token, registration) to one admitted route. The endpoint names are an
-// exact allowlist, not a path prefix open to extension.
+// token, registration, revocation) to one admitted route. The endpoint
+// names are an exact allowlist, not a path prefix open to extension.
 const mcpOAuthRoutePrefix = "/oauth/"
 
 // mcpOAuthUpstreamPrefix is the server-root form the route-scoped OAuth
@@ -200,6 +200,7 @@ var mcpOAuthEndpoints = map[string]bool{
 	"/oauth/authorize": true,
 	"/oauth/token":     true,
 	"/oauth/register":  true,
+	"/oauth/revoke":    true,
 }
 
 // parseMCPRouteMetadataPath matches escaped request paths of the exact
@@ -233,7 +234,7 @@ func parseRouteRest(rest string, allowSlash bool) (string, bool) {
 
 // parseMCPRouteOAuthPath matches escaped request paths of the exact shape
 // /r/<route-id>/oauth/<endpoint> where endpoint is one of authorize,
-// token, or register. It returns the route ID and the server-root
+// token, register, or revoke. It returns the route ID and the server-root
 // upstream path. Anything else under /oauth/ fails closed.
 func parseMCPRouteOAuthPath(escapedPath string) (string, string, bool) {
 	rest, ok := strings.CutPrefix(escapedPath, routePathPrefix)
