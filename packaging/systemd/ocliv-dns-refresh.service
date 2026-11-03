@@ -1,0 +1,26 @@
+[Unit]
+Description=Ocliv dynamic DNS refresh (dynv6, DNS-only)
+Documentation=file:/usr/share/doc/ocliv/SETUP.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ocliv
+Group=ocliv
+# Explicit opt-in: without this env file the service fails instead of
+# guessing. OCLIV_DNS_HOST is the zone the relay serves.
+EnvironmentFile=/etc/ocliv/dns-refresh.env
+# Credential comes from a restricted file (0600, owned by ocliv),
+# never from the process command line.
+ExecStart=/usr/local/bin/ocliv setup --refresh-dns --hostname=${OCLIV_DNS_HOST} --token-file=/etc/ocliv/dynv6.token
+# DNS-only: never touches Caddy or the relay. One attempt per trigger;
+# the timer re-triggers on its schedule.
+TimeoutStartSec=90
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# Failures surface in the journal; the exit status is the CLI's.
+StandardOutput=journal
+StandardError=journal

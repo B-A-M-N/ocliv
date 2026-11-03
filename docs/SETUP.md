@@ -64,9 +64,38 @@ recovery decisions (below).
 | `enrollment failed: relay unreachable` | Caddy/relay not serving | `systemctl status ocliv-relay`, `caddy validate`, `ocliv relay doctor` |
 | ACME issuance fails | Port 80/443 blocked or DNS wrong | Verify inbound with the curl probe; port 80 is required for issuance |
 | Caddy config replaced badly | Failed validate | Setup restores `/etc/caddy/Caddyfile.ocliv-bak` automatically |
-| IP address changed (dynv6) | DHCP/PPPoE renewal | Re-run `setup --auto --hostname ...` (DNS-only update, no re-provisioning) |
+| IP address changed (dynv6) | DHCP/PPPoE renewal | `ocliv setup --refresh-dns --hostname ZONE` (DNS-only, no re-provisioning), or enable the refresh timer below |
 | Relay down after reboot | Service not enabled | `systemctl enable --now ocliv-relay`; certificates renew automatically via Caddy |
 | Key compromised | — | `ocliv relay revoke-key --key-id ...` on the relay host, then `ocliv logout` + re-enroll |
+
+## Unattended DNS refresh (optional, relay operators only)
+
+Home IPs change. Instead of re-running full setup, a timer can run
+the DNS-only refresh every 15 minutes:
+
+```sh
+# 1. Restricted credential: readable only by the service user.
+install -o ocliv -g ocliv -m 0600 /dev/null /etc/ocliv/dynv6.token
+# paste the dynv6 HTTP token into that file (no trailing newline needed)
+
+# 2. Explicit opt-in: without this env file the service fails closed.
+printf 'OCLIV_DNS_HOST=bamnlabs.dynv6.net\n' | sudo tee /etc/ocliv/dns-refresh.env
+sudo chmod 600 /etc/ocliv/dns-refresh.env
+
+# 3. Install the units (shipped in packaging/systemd, inert by default)
+#    and enable the TIMER, not the service.
+sudo cp packaging/systemd/ocliv-dns-refresh.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ocliv-dns-refresh.timer
+
+# 4. Observe: journalctl -u ocliv-dns-refresh.service
+```
+
+Properties: repeated runs are idempotent (update only on real address
+change); a run that overruns its slot delays the next instead of
+overlapping; neither Caddy nor the relay restarts on a DNS-only
+change; failures go to the journal with a nonzero exit. The ordinary
+`ocliv 3000` / `ocliv mcp 3000` client never needs systemd.
 
 ## Simulated vs live qualification
 
