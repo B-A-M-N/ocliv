@@ -104,6 +104,14 @@ Adjacent check: never-reading SSE visitors hold a stream by design,
 but converge via lease TTL + the 5s revocation sweep
 (`supervise`), so no unbounded-hold defect.
 
+## P9 — setup planner honesty probe (live dry-run)
+
+`ocliv setup --auto --dry-run` against the real network correctly
+classified this host (`nat-ipv4-needs-forward`, CGNAT false, direct
+false, inbound UNKNOWN), refused to claim provisionability, demanded
+port-forwarding plus external verification, and required the dynv6
+token via env/file — never inline. Exit 4, no state written. PASS.
+
 ## NOT EXECUTED (needs operator/second machine)
 
 Soak, scaled resource pressure, cross-machine partition/TLS-SNI chaos,
