@@ -224,3 +224,11 @@ with its reason instead of silently dropping it.
 - Upstream revoke unreachable via path route (allowlist authorize/token/register only): FIXED — `/oauth/revoke` added to `mcpOAuthEndpoints` (`relay_mcp_ingress.go`) with parse + dispatch red→green regression tests; live: revoke → 200, revoked call → 401; relay restart preserved stable route. Full gates green (internal ×3 incl. one unattributed transient FAIL, integration 242s, race relay/agent/cli/mcp).
 - `publish --auth fixture-anonymous` refusal, upstream-oauth-without-OAuth discovery failure: VERIFIED NON-ISSUE (correct fail-closed behavior, observed live).
 - Gate 4 ChatGPT registration, funnel teardown decision, permanent ingress (dynv6/Caddy/router): BLOCKED/NOT VERIFIED (operator-gated).
+
+### SAPRE baseline (`597af82`, live funnel lab)
+
+- Publisher reconnect loop in `publish.log`: VERIFIED NON-ISSUE — 4 reconnects + generation-2 re-attach all coincide with the relay redeploy; stable since, route enforcing (401).
+- Live edge latency (20-sample, no-bearer `tools/list`): public funnel med 252ms (80–426ms) vs relay-direct med 9ms (5–13ms). No anomaly; tail consistent with shared funnel transit. Operating envelope anchor, not an SLO.
+- Whole-repo `go vet ./...` + `gofmt`: clean.
+- Earlier single transient internal FAIL (1 of 5 full runs, unattributed): UNREPRODUCED — 4 consecutive 18/18 green runs since; carried as flake watch, not a defect.
+- Live stack untouched by test runs (fixtures are repo-tracked, runtime state in /tmp only).
