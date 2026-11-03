@@ -70,6 +70,14 @@ added deliberately: the unit's stated philosophy is fail-loud, and the
 timer only runs when the operator enables it. Consistent with E1 (the
 timer's `OnUnitActiveSec` also prevents overlap by construction).
 
+| R1 | Abnormal health-listener death | `startHealthListener` | FIXED |
+R1: runtime `Serve` errors were discarded (`_ =`), so a dead
+loopback monitor was invisible until the next external probe. Now
+logged to stderr; graceful shutdown stays quiet. Liveness was already
+covered by `TestStartHealthListenerBindAndShutdown`; the abnormal-death
+path has no deterministic unit seam without structural churn and is
+inspection-verified (`fe98c69`).
+
 ## NOT EXECUTED (needs operator/second machine)
 
 Soak, scaled resource pressure, cross-machine partition/TLS-SNI chaos,
