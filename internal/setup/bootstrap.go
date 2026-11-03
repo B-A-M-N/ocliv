@@ -5,7 +5,23 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 )
+
+// ManagedMarker tags files ocliv setup owns. An existing destination
+// without the marker is treated as unrelated (possibly another
+// application's config) and is never overwritten automatically.
+const ManagedMarker = "# managed by ocliv setup"
+
+// runCaddyValidate and runDaemonReload are indirection points so
+// install/rollback behavior is testable without a live Caddy or
+// systemd.
+var runCaddyValidate = func(dst string) error {
+	return runCmd("caddy", "validate", "--config", dst, "--adapter", "caddyfile")
+}
+var runDaemonReload = func() error {
+	return runCmd("systemctl", "daemon-reload")
+}
 
 // Step is one bootstrap action. Auto steps run inside `setup --auto`
 // (root only); manual steps print the exact command for the operator.
@@ -74,51 +90,92 @@ func runCmd(name string, args ...string) error {
 	return nil
 }
 
-// InstallCaddyfile backs up any existing edge config, installs the
-// rendered one, and validates it. A failed validation restores the
-// backup so a bad render can never leave Caddy unstartable.
+// InstallCaddyfile installs the rendered edge config with ownership
+// checks and rollback (see installManagedFile).
 func InstallCaddyfile(deployDir string) error {
-	src := filepath.Join(deployDir, "Caddyfile")
-	dst := "/etc/caddy/Caddyfile"
-	bak := dst + ".ocliv-bak"
-	if _, err := os.Stat(dst); err == nil {
-		raw, err := os.ReadFile(dst)
-		if err != nil {
-			return err
-		}
-		if err := os.WriteFile(bak, raw, 0o644); err != nil {
-			return err
-		}
-	}
-	raw, err := os.ReadFile(src)
+	return InstallCaddyfileTo(deployDir, "/etc/caddy/Caddyfile")
+}
+
+// InstallCaddyfileTo is InstallCaddyfile with an explicit
+// destination so install/rollback behavior is testable without
+// touching /etc.
+func InstallCaddyfileTo(deployDir, dst string) error {
+	raw, err := os.ReadFile(filepath.Join(deployDir, "Caddyfile"))
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(dst, raw, 0o644); err != nil {
-		return err
-	}
-	if err := runCmd("caddy", "validate", "--config", dst, "--adapter", "caddyfile"); err != nil {
-		if _, statErr := os.Stat(bak); statErr == nil {
-			_ = runCmd("cp", bak, dst)
-		}
-		return err
-	}
-	return nil
+	return installManagedFile(dst, raw, func(dst string) error {
+		return runCaddyValidate(dst)
+	})
 }
 
 // InstallUnit places the rendered systemd unit and reloads the
 // manager. It starts nothing.
 func InstallUnit(deployDir string) error {
-	src := filepath.Join(deployDir, "ocliv-relay.service")
-	dst := "/etc/systemd/system/ocliv-relay.service"
-	raw, err := os.ReadFile(src)
+	return InstallUnitTo(deployDir, "/etc/systemd/system/ocliv-relay.service")
+}
+
+// InstallUnitTo is InstallUnit with an explicit destination so
+// install/rollback behavior is testable without touching /etc.
+func InstallUnitTo(deployDir, dst string) error {
+	raw, err := os.ReadFile(filepath.Join(deployDir, "ocliv-relay.service"))
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(dst, raw, 0o644); err != nil {
+	if err := installManagedFile(dst, raw, func(string) error {
+		return runDaemonReload()
+	}); err != nil {
 		return err
 	}
-	return runCmd("systemctl", "daemon-reload")
+	return nil
+}
+
+// installManagedFile stages a candidate config with clear ownership:
+// an existing file without the ocliv marker is refused (it may
+// belong to another application); a managed file is backed up, the
+// candidate is written, and validation failure restores the backup.
+// The backup remains until CleanInstallBackup runs after the whole
+// operation succeeds, so a later step failure can still roll back.
+func installManagedFile(dst string, candidate []byte, validate func(string) error) error {
+	if prev, err := os.ReadFile(dst); err == nil {
+		if !strings.Contains(string(prev), ManagedMarker) {
+			return fmt.Errorf("refusing to overwrite unmanaged %s (no %q marker): back it up, move it aside, or adopt it by adding the marker line, then re-run", dst, ManagedMarker)
+		}
+		if err := os.WriteFile(dst+".ocliv-bak", prev, 0o644); err != nil {
+			return fmt.Errorf("backing up %s: %w", dst, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("reading %s: %w", dst, err)
+	}
+	if err := os.WriteFile(dst, candidate, 0o644); err != nil {
+		return fmt.Errorf("installing %s: %w", dst, err)
+	}
+	if err := validate(dst); err != nil {
+		if prev, rerr := os.ReadFile(dst + ".ocliv-bak"); rerr == nil {
+			_ = os.WriteFile(dst, prev, 0o644)
+			_ = os.Remove(dst + ".ocliv-bak")
+		} else {
+			_ = os.Remove(dst)
+		}
+		return fmt.Errorf("validation failed, previous config restored: %w", err)
+	}
+	return nil
+}
+
+// RollbackInstalled restores the pre-install backup of one managed
+// file after a later provisioning step fails. Best effort by design:
+// it reports nothing when there is nothing to restore.
+func RollbackInstalled(dst string) {
+	if prev, err := os.ReadFile(dst + ".ocliv-bak"); err == nil {
+		_ = os.WriteFile(dst, prev, 0o644)
+		_ = os.Remove(dst + ".ocliv-bak")
+	}
+}
+
+// CleanInstallBackup drops a consumed backup after the whole
+// operation succeeds. Backups are never left behind a good install.
+func CleanInstallBackup(dst string) {
+	_ = os.Remove(dst + ".ocliv-bak")
 }
 
 // StartRelay enables and starts the relay, then reports the active

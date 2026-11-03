@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"ocliv/internal/apperr"
+	"ocliv/internal/setup"
 	edgecaddy "ocliv/packaging/caddy"
 	edgesystemd "ocliv/packaging/systemd"
 )
@@ -350,8 +351,12 @@ func buildInitFiles(cfg initConfig) map[string]string {
 	caddy = strings.ReplaceAll(caddy, "{$OCLIV_ACME_EMAIL}", cfg.acmeEmail)
 	caddy = strings.ReplaceAll(caddy, "{$OCLIV_DNS_PROVIDER}", cfg.dnsProvider)
 	caddy = strings.ReplaceAll(caddy, "{$OCLIV_DNS_ENV}", cfg.dnsEnv)
-	files["Caddyfile"] = caddy
-	files["ocliv-relay.service"] = edgesystemd.RelayUnit()
+	// Ownership marker: setup refuses to overwrite a destination file
+	// without it, so a re-run never silently clobbers another
+	// application's config. Validation checks below are
+	// substring-based and unaffected by this leading comment line.
+	files["Caddyfile"] = setup.ManagedMarker + " (Caddyfile)\n" + caddy
+	files["ocliv-relay.service"] = setup.ManagedMarker + " (systemd unit)\n" + edgesystemd.RelayUnit()
 	var dns strings.Builder
 	if cfg.edge == "single-host" {
 		fmt.Fprintf(&dns, "%s      A     <relay IPv4>\n", host)

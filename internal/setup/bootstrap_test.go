@@ -7,6 +7,10 @@ package setup
 // of a doomed provisioning run.
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -57,6 +61,82 @@ func TestPlanRootWithCaddyIsAllAuto(t *testing.T) {
 		if !s.Auto {
 			t.Errorf("root+caddy step %q not auto", s.Title)
 		}
+	}
+}
+
+func TestInstallRefusesUnmanagedCaddyfile(t *testing.T) {
+	dir := t.TempDir()
+	deploy := t.TempDir()
+	if err := os.WriteFile(filepath.Join(deploy, "Caddyfile"), []byte("tls internal\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "Caddyfile")
+	unrelated := "# corporate reverse proxy\nreverse_proxy 127.0.0.1:9000\n"
+	if err := os.WriteFile(dst, []byte(unrelated), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldValidate := runCaddyValidate
+	runCaddyValidate = func(string) error { return nil }
+	defer func() { runCaddyValidate = oldValidate }()
+	if err := InstallCaddyfileTo(deploy, dst); err == nil {
+		t.Fatal("unmanaged Caddyfile overwritten without refusal")
+	} else if !strings.Contains(err.Error(), "unmanaged") {
+		t.Fatalf("refusal must name the hazard, got: %v", err)
+	}
+	raw, _ := os.ReadFile(dst)
+	if string(raw) != unrelated {
+		t.Fatalf("unmanaged Caddyfile modified:\n%s", raw)
+	}
+	if _, err := os.Stat(dst + ".ocliv-bak"); !os.IsNotExist(err) {
+		t.Fatal("backup created for a refused install")
+	}
+}
+
+func TestInstallRestoresBackupOnInvalid(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "Caddyfile"), []byte("tls internal\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "installed-Caddyfile")
+	old := ManagedMarker + "\nold config\n"
+	if err := os.WriteFile(dst, []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldValidate := runCaddyValidate
+	runCaddyValidate = func(string) error { return errors.New("caddy: boom") }
+	defer func() { runCaddyValidate = oldValidate }()
+	if err := InstallCaddyfileTo(dir, dst); err == nil {
+		t.Fatal("invalid Caddyfile accepted")
+	}
+	raw, _ := os.ReadFile(dst)
+	if string(raw) != old {
+		t.Fatalf("previous working config not restored:\n%s", raw)
+	}
+}
+
+func TestInstallRollbackRestoresWorkingConfig(t *testing.T) {
+	dir := t.TempDir()
+	deploy := t.TempDir()
+	dst := filepath.Join(dir, "ocliv-relay.service")
+	old := ManagedMarker + "\n[Unit]\n"
+	if err := os.WriteFile(dst, []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(deploy, "ocliv-relay.service"), []byte("[Unit]\nnew\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldReload := runDaemonReload
+	runDaemonReload = func() error { return nil }
+	defer func() { runDaemonReload = oldReload }()
+	if err := InstallUnitTo(deploy, dst); err != nil {
+		t.Fatalf("valid unit refused: %v", err)
+	}
+	// A later step (e.g. StartRelay) fails: the whole operation must
+	// roll back to the previously working configuration.
+	RollbackInstalled(dst)
+	raw, _ := os.ReadFile(dst)
+	if string(raw) != old {
+		t.Fatalf("rollback lost the working config:\n%s", raw)
 	}
 }
 

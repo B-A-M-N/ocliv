@@ -26,6 +26,14 @@ import (
 	"ocliv/internal/store"
 )
 
+// setupManagedDestinations are the system files bootstrap may
+// replace; every completed step failure rolls them back to the
+// pre-install backups, and success cleans the backups up.
+var setupManagedDestinations = []string{
+	"/etc/caddy/Caddyfile",
+	"/etc/systemd/system/ocliv-relay.service",
+}
+
 // Default echo endpoints observe the egress address per family. They
 // are diagnostics-only (best effort, 8s each inside the 30s budget),
 // receive no credentials, and can be overridden or disabled with empty
@@ -381,6 +389,12 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir string) (
 		if err != nil {
 			fmt.Printf("FAILED: %v\n", err)
 			fmt.Printf("manual recovery: %s\n  %s\n", s.Title, s.Manual)
+			// A later step failed after earlier steps replaced
+			// system files: roll back to the pre-install
+			// configuration instead of leaving a half-install.
+			for _, dst := range setupManagedDestinations {
+				setup.RollbackInstalled(dst)
+			}
 			return apperr.ExitInternal, false
 		}
 		fmt.Printf("done\n")
@@ -394,6 +408,9 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir string) (
 	if !allAuto {
 		fmt.Printf("ACTION REQUIRED: %d step(s) need the operator (see manual commands above); re-run after completing them\n", len(steps))
 		return apperr.ExitRelayTLS, false
+	}
+	for _, dst := range setupManagedDestinations {
+		setup.CleanInstallBackup(dst)
 	}
 	fmt.Printf("verify externally: from another network, curl -v https://%s/v1/agent/challenge (no -k)\n", hostname)
 	return apperr.ExitOK, true
