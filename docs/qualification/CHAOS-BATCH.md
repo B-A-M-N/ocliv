@@ -20,6 +20,7 @@ no credential or infrastructure changes. Tree clean at commit.
 | D4 | Cleartext via hosts-DNS to live LAN impostor (10.9.66.20) | enrollment | PASS |
 | D5 | HTTPS via hosts-DNS to live LAN impostor (10.9.66.20) | enrollment | PASS |
 | D6 | Live dynv6 error shapes (bogus token) | `setup.UpdateDynv6` | PARTIAL |
+| F1 | Bounded fuzz campaign (4 targets, ~270s) | `lease`, `proxy` parsers | PASS |
 
 Evidence: `internal/relay/relay_chaos_nonce_test.go`,
 `internal/setup/bootstrap_chaos_test.go`,
@@ -111,6 +112,11 @@ classified this host (`nat-ipv4-needs-forward`, CGNAT false, direct
 false, inbound UNKNOWN), refused to claim provisionability, demanded
 port-forwarding plus external verification, and required the dynv6
 token via env/file — never inline. Exit 4, no state written. PASS.
+
+F1: `FuzzLeaseTransition` (6.2M execs/75s), `FuzzLeaseFenceMonotonic`
+(4.7M/60s), `FuzzCheckRequestSyntax` (3.2M/75s),
+`FuzzCheckUpgradeSyntax` (2.6M/60s) — ~16.8M execs, zero crashes,
+tree clean (interesting inputs stayed in build cache).
 
 ## NOT EXECUTED (needs operator/second machine)
 
