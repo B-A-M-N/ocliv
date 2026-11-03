@@ -118,6 +118,14 @@ tailscale funnel reset
 The funnel hostname doubles as control authority and MCP host; the
 relay keeps them separated by exact host plus strict path split.
 
+Lab relay readiness (loopback-only, 2026-11-03 live VERIFIED): the internal
+health mux (`127.0.0.1:18080`, never public) serves `/health/live` ("ok") and
+`/health/ready`, where ready evaluates `ReadyForSessions()`
+(`internal/relay/relay.go:76` — SQLite pool-conn PingContext(2s) + admission-key
+capacity under `limits.MaxThrottleKeys`). A 200 ready is a genuine prerequisite
+probe, not process-alive theater — but it still proves nothing about public
+reachability; external proof stays with `mcp doctor` + public probes.
+
 ## Exit codes
 
 `0` ok (also clean shutdown) · `2` CLI validation · `3` local target
@@ -232,3 +240,48 @@ with its reason instead of silently dropping it.
 - Whole-repo `go vet ./...` + `gofmt`: clean.
 - Earlier single transient internal FAIL (1 of 5 full runs, unattributed): UNREPRODUCED — 4 consecutive 18/18 green runs since; carried as flake watch, not a defect.
 - Live stack untouched by test runs (fixtures are repo-tracked, runtime state in /tmp only).
+- `mcp doctor --name` unreachable-`FindByName` bug (prior audit): FIXED in current tree — `selectDoctorLeaseID` (`cli_mcp_publish.go:889`) resolves explicit → name → latest with fail-closed mismatch; regression tests `TestSelectDoctorLeaseIDOrder/AmbiguousName` green on `6114ba0`.
+- Supply chain (SAPRE): VERIFIED — `go mod verify` clean, `govulncheck ./...` no vulnerabilities, 4 direct deps (websocket, yamux, x/term, modernc sqlite); no lockfile drift (`go.mod` pinned, `go.sum` present).
+- README claim-vs-reality (SAPRE §6): VERIFIED — `mcp PORT` alias pins upstream-oauth via `mcpPortAliasArgs` (`cli_mcp.go:72`, regression green); five everyday commands listed first in `usage()`; token only via `DYNV6_TOKEN`/`--token-file`, never argv (`cli_setup.go:171` + `dynv6.go` redaction). No theater found in spot check.
+
+### SAPRE security note — stale lab credential store
+
+- `live/relay-data/ocliv.db` (Oct 31, stale lab run): holds 1 agent key + 1 enrollment code, mode 644 inside a 700 dir, gitignored, no process attached (`fuser` empty). Exposure: VERIFIED NON-ISSUE (700 parent, gitignored, codes long expired). Hygiene: file itself is not 0600 because `lockDownFiles` only runs on `store.Open` and nothing has opened it since Oct 31 — ACCEPTED RISK, left untouched. If this directory is ever copied elsewhere, re-lock or drop the DB first.
+
+### SAPRE §7–§8 cross-domain checks (2026-11-03, live funnel lab)
+
+- Readiness probe honesty (SAPRE §7): VERIFIED — `/health/live` + `/health/ready` on loopback-only 18080; ready evaluates `ReadyForSessions()` (`relay.go:76`: SQLite pool-conn PingContext(2s) + preAuth/throttle/MCP admission-key capacity). Live 200 on both. Genuine prerequisite probe, not process-alive theater; proves nothing about public reachability.
+- MCP admission vs availability (SAPRE §8): VERIFIED — P1-10 throttle is pre-stream in `serveProxied` (`relay_public.go:384`), per-(trusted-edge-IP, lease), separate `MCPAdmissionRejects` counter; non-MCP traffic unaffected by construction. No contention tradeoff found.
+- Dispatch-time generation fencing / P1-5 (SAPRE §3): FIXED in current tree — `serveProxied` recheck (`relay_public.go:436`) requires pointer identity + generation match via `admittedSessionCurrent` (`:365-369`), not mere liveness. Regressions `TestAdmittedSessionCurrent`, `TestDispatchReplacementBeforeCheckRejected`, `TestDispatchReplacementInCheckWriteWindowBindsStaleGeneration` in `relay_public_test.go`.
+- Saturation behavior (SAPRE §5): VERIFIED predictable-rejection — live 130-rotating-spoof probe recorded 120x401 then 10x429 from one shared bucket (Task C above): abuse degrades to 429, unrelated leases unaffected by per-(source,lease) scoping. No unbounded accumulation observed.
+- Route-ID secrecy (SAPRE §2): VERIFIED NON-ISSUE by design + live proof — route IDs are non-secret routing identifiers; knowledge of the URL buys nothing without the OAuth/visitor credential (live: no-bearer/tampered-bearer → 401, zero upstream execution). No secret material in route metadata.
+- Audit-vs-availability (SAPRE §8): VERIFIED — `DB.Audit` (`store.go:309`) discards its Exec error (`_, _ =`), so a dead/full SQLite can lose a log row but can never convert a denial into an allow or crash the path; the 429/401 still returns. Observability degrades open, admission stays fail-closed. First-bottleneck hypothesis for future >8-worker load tests: one audit write per denied request (bounded since A2 by 90-day prune).
+- Live edge re-verified 2026-11-03 (SAPRE §10): public funnel route still 401s a no-bearer `tools/list` after all ledger work; no drift, no exposure introduced by read-only analysis.
+- Publish-mode refusals P0-1/P0-2 (SAPRE §2/§6): VERIFIED in code + tests — `--stdio` unconditionally rejected (`cli_mcp_publish.go:293`, stdio bridge can't enforce auth), `--auth fixture-anonymous` rejected for publish (`:300`, local-only `mcp serve` only), both before any remote mutation. Regressions in `cli_mcp_publish_test.go:183+` (auth×stdio matrix + invalid combos `:202-204`).
+- Gate standing (SAPRE §10): full `go test ./internal/...` 18/18 green, `go test -race ./internal/cli/` clean, and full integration suite green (243s) — all WITH the post-gate `--help` fix in tree (`cli_relay.go` + new test file are the only Go drift from `6114ba0`). Govulncheck stands (no dependency change).
+- Replay protection P1-07 (SAPRE §2/§3): VERIFIED mechanism — `nonceCache.consume` (`relay_nonce.go:57`) delete-on-read under mutex = single-use; missing/already-consumed nonce reports false. Restart-bounded by 5-min skew (chaos E5 VERIFIED NON-ISSUE).
+- Graceful shutdown (SAPRE §7): VERIFIED — `signal.NotifyContext` (Interrupt+SIGTERM) owns relay shutdown (`cli_relay.go:363`), `httpSrv.Shutdown` + `healthSrv.Shutdown` (`:381-382`), exits `ExitCleanShutdown` (`:388`). No abrupt-drop path in the serve command.
+
+### SAPRE production readiness gate (2026-11-03, scope: lab + temporary funnel edge)
+
+| # | Gate | Disposition | Basis |
+|---|------|-------------|-------|
+| 1 | Architectural integrity | VERIFIED | Decomposition preserved (leases/sessions/registry/ingress/authority/access/http); ownership contracts explicit; zero Go drift from gated HEAD; no god objects added (this pass adds no code). |
+| 2 | Security | PARTIAL | Lab + funnel-lab verified: 401s, generation fencing, publish refusals, revocation, single-use nonces, secret hygiene. Permanent ingress + provider OAuth BLOCKED (operator). |
+| 3 | Concurrency correctness | VERIFIED at tested scope | P1-5 fencing + regressions, C3 16-way, race suites green; >8-worker pressure NOT VERIFIED. |
+| 4 | Performance | PARTIAL | Envelope measured, no SLO defined: soak avg ~56ms, funnel med 252ms / relay 9ms (20-sample, tail 80–426ms transit). |
+| 5 | Capacity and saturation | PARTIAL | 8-worker soak + predictable 429 under abuse; >8 workers UNTESTED. |
+| 6 | Integration completeness | PARTIAL | Composed funnel smoke PASS (OAuth DCR→tools/call→revoke); ChatGPT registration BLOCKED (operator workspace). |
+| 7 | Operational readiness | PARTIAL | Health/readiness/shutdown/backup-code verified; clean-host install, restore drill, permanent ingress NOT VERIFIED (operator-gated). |
+| 8 | Critical invariant preservation | VERIFIED | All recorded gates stand; tree shows docs-only drift. |
+| 9 | Recovery and convergence | VERIFIED at tested scope | Stage 6 matrix (restart/resume/revoke/restore-code); compound failures untested. |
+| 10 | Regression stability | VERIFIED with watch | Gates green; one unattributed transient FAIL carried as flake watch, 4+ consecutive greens since. |
+
+**Overall: NOT READY for production; CONDITIONALLY READY for lab + temporary-funnel operation.** No unresolved critical defect is locally actionable — every remaining gap is operator-gated (dynv6 token/Caddy install/router, ChatGPT registration, funnel teardown decision) or explicitly out-of-scope scale testing. No code changes were needed or made in this pass; §9 remediation outcome = nothing to fix, all findings FIXED-in-tree or VERIFIED.
+
+### Post-gate fix — `issue-enroll --help` minted a code (P3, self-found 2026-11-03)
+
+- Defect: `cmdIssueEnroll` ignored `-h`/`--help`, opened/created the store, and printed a live enrollment code. Found by running `ocliv relay issue-enroll --help` against the repo cwd: created gitignored `./ocliv-relay-data/ocliv.db` + printed code. No live store touched (live relay uses `/tmp/ocliv-funnel-lab/data`); stray db removed, so the exposed code is unredeemable.
+- Fix: `-h`/`--help` prints usage to stderr and exits `ExitCLIValidation` before store open (`cli_relay.go:477-484`). No other relay leaf changed (none has a help convention; widening that is out of scope).
+- Proof: new `cli_relay_enroll_test.go` asserts non-zero exit + no db created for both flags — FAILs on unfixed code (exit 0), PASSes fixed. `gofmt`/`go vet` clean, full `internal/cli` package green; then full `go test ./internal/...` re-run green (18/18) WITH the fix in tree, `gofmt -l` + `git diff --check` clean. Uncommitted, like the rest of this pass.
+- CLI surface completeness (SAPRE §6): VERIFIED — `ocliv mcp` dispatches expose/manage/publish/serve/doctor/list/unpublish + numeric-port alias (`cli_mcp.go:36-67`, alias `mcpPortAliasArgs :69`), every advertised subcommand maps to a real handler; expose-vs-publish is the local-only-vs-public security boundary, not a dead path. M12 closed toolset (`manageTools :34`: status/share/revoke only, no exec).

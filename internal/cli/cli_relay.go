@@ -478,6 +478,10 @@ func cmdIssueEnroll(argv []string) int {
 	_, dataDir, _ := relayFlags(argv)
 	var tenant string
 	for _, a := range argv {
+		if a == "--help" || a == "-h" {
+			fmt.Fprintln(os.Stderr, "usage: ocliv relay issue-enroll [--data DIR] [--tenant=NAME]")
+			return apperr.ExitCLIValidation
+		}
 		if strings.HasPrefix(a, "--tenant=") {
 			tenant = strings.TrimPrefix(a, "--tenant=")
 		}
