@@ -133,7 +133,13 @@ func TestInstallRollbackRestoresWorkingConfig(t *testing.T) {
 	}
 	// A later step (e.g. StartRelay) fails: the whole operation must
 	// roll back to the previously working configuration.
-	RollbackInstalled(dst)
+	restored, err := RollbackInstalled(dst)
+	if err != nil {
+		t.Fatalf("rollback reported failure: %v", err)
+	}
+	if !restored {
+		t.Fatal("rollback reported nothing to restore after a real install")
+	}
 	raw, _ := os.ReadFile(dst)
 	if string(raw) != old {
 		t.Fatalf("rollback lost the working config:\n%s", raw)
@@ -150,5 +156,38 @@ func TestPlanRootWithoutCaddyStopsAtInstall(t *testing.T) {
 	}
 	if reason == "" {
 		t.Error("missing re-run guidance after Caddy install")
+	}
+}
+
+// Task 3: a destination that did not exist before installation must be
+// removed again when a later step fails — otherwise the rollback
+// leaves a half-installed edge config behind.
+func TestInstallRollbackRemovesNewlyCreatedFile(t *testing.T) {
+	deploy := t.TempDir()
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "Caddyfile")
+	if err := os.WriteFile(filepath.Join(deploy, "Caddyfile"), []byte("new config\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldValidate := runCaddyValidate
+	runCaddyValidate = func(string) error { return nil }
+	defer func() { runCaddyValidate = oldValidate }()
+	if err := InstallCaddyfileTo(deploy, dst); err != nil {
+		t.Fatalf("valid install refused: %v", err)
+	}
+	// A later step (e.g. relay start) fails: the newly created file
+	// must be undone, not left as the live configuration.
+	restored, err := RollbackInstalled(dst)
+	if err != nil {
+		t.Fatalf("rollback reported failure: %v", err)
+	}
+	if !restored {
+		t.Fatal("rollback reported nothing to restore after a real install")
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatalf("newly created managed file survived rollback: %s", dst)
+	}
+	if _, err := os.Stat(dst + ".ocliv-new"); !os.IsNotExist(err) {
+		t.Fatalf("rollback left the install journal behind: %s.ocliv-new", dst)
 	}
 }

@@ -424,8 +424,27 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir string) (
 			// A later step failed after earlier steps replaced
 			// system files: roll back to the pre-install
 			// configuration instead of leaving a half-install.
+			// Newly created files are removed entirely; rollback
+			// failures are reported, never silently ignored.
+			rollbackFailed := false
+			restoredAny := false
 			for _, dst := range setupManagedDestinations {
-				setup.RollbackInstalled(dst)
+				restored, rerr := setup.RollbackInstalled(dst)
+				if rerr != nil {
+					fmt.Printf("rollback FAILED for %s: %v\n", dst, rerr)
+					rollbackFailed = true
+				}
+				restoredAny = restoredAny || restored
+			}
+			if rollbackFailed {
+				fmt.Printf("manual recovery: inspect backups (*.ocliv-bak) and journal (*.ocliv-new) beside the destinations above, restore by hand, then re-run\n")
+			} else if restoredAny {
+				// The unit install reloads the manager at install
+				// time; re-read the restored files so the daemon
+				// does not keep the rolled-back config in memory.
+				if rerr := setup.ReloadServiceManager(); rerr != nil {
+					fmt.Printf("warning: service-manager reload after rollback failed: %v\n", rerr)
+				}
 			}
 			return apperr.ExitInternal, false
 		}
