@@ -70,7 +70,13 @@ added deliberately: the unit's stated philosophy is fail-loud, and the
 timer only runs when the operator enables it. Consistent with E1 (the
 timer's `OnUnitActiveSec` also prevents overlap by construction).
 
+| C3 | 16-way concurrent route create | route admission loop | PASS |
 | R1 | Abnormal health-listener death | `startHealthListener` | FIXED |
+
+C3: 16 simultaneous signed creates for the same logical publication
+all returned 200 with the identical route_id; exactly one DB row.
+The INSERT...SELECT/ON CONFLICT convergence claim is now proven
+(`relay_chaos_routes_test.go`, race-clean).
 R1: runtime `Serve` errors were discarded (`_ =`), so a dead
 loopback monitor was invisible until the next external probe. Now
 logged to stderr; graceful shutdown stays quiet. Liveness was already
