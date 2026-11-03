@@ -189,8 +189,9 @@ func TestLeaseStoreSweepsCrashedTmp(t *testing.T) {
 	if err := s.Save(keep); err != nil {
 		t.Fatal(err)
 	}
-	// Simulate crash debris: orphan tmp + a torn (truncated) record file.
-	if err := os.WriteFile(filepath.Join(dir, ".tmp-orphan"), []byte(`{"LeaseID":`), 0o600); err != nil {
+	// Simulate crash debris: an orphan tmp file in the store dir, as a
+	// SIGKILL between temp creation and rename would leave behind.
+	if err := os.WriteFile(filepath.Join(dir, LeaseStoreDir, ".tmp-orphan"), []byte(`{"LeaseID":`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Save(LeaseRecord{LeaseID: "lse-new", Hostname: "n.t", Port: 3001, RelayURL: "https://r1.test", KeyID: "key-1"}); err != nil {
