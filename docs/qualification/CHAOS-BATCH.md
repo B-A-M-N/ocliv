@@ -133,3 +133,35 @@ tree clean (interesting inputs stayed in build cache).
 
 Soak, scaled resource pressure, cross-machine partition/TLS-SNI chaos,
 public-edge faults, provider OAuth, dynv6 zone claim (browser signup).
+
+## Stage 6 — Recovery & Convergence (`678a3a9`)
+
+Remediation matrix (only Stage-5 findings needing correction; PASS
+findings required no change and their suites re-ran green post-fix):
+
+| Finding | Root cause | Correction | Recovery / convergence | Evidence | Disposition |
+|---------|-----------|------------|------------------------|----------|-------------|
+| A2 audit growth | No prune path; denials INSERT unbounded | 90-day `AuditRetention`, schemaV6 time index, `PruneAuditEvents` in `reconcileBoot` (fail-closed) | Boot converges to bounded audit state; idempotent repeatable sweep; revocation authority untouched (leases/agent_keys) | 2 red→green tests; `internal/...`, `-race` store/relay, integration green | VERIFIED |
+| E2 restore-fail | Fixed in Stage 5 (loud error, backup kept) | No new change | Replay of original E2/C1/E3 chaos tests passes on corrected impl | `TestInstallValidationFailureWithFailedRestoreIsLoud`, `TestInstallFailRestoreFailThenOperatorRollbackRecovers`, `TestRollbackInstalledReportsUnwritableDestination` PASS | VERIFIED |
+| D6 dynv6 200-shape | Needs valid token to observe | None (operator-gated) | n/a | 401 auth-first observed live | BLOCKED |
+
+Recovery-safety properties of the A2 correction: prune is a single
+idempotent DELETE (safe under repetition/interruption — a crash
+mid-sweep just leaves rows for the next boot); it runs after the
+critical lease transitions in `reconcileBoot`, so it cannot mask
+lifecycle recovery; prune failure refuses startup per the existing
+fail-closed boot contract rather than serving on unknown durable
+state. Schema v5→v6 migration proven by the legacy-DB store tests
+(`TestMigrateLegacy*`, full `internal/store` green).
+
+Invalidated-by-change reruns: store, relay, full `internal/...`,
+`-race` store/relay, `tests/integration` (218s) — all green at
+`678a3a9`. No prior PASS result was silently carried: E2/C1/E3
+replayed explicitly above.
+
+Residual risks: boot-only pruning leaves a months-long no-restart
+relay growing audit rows (bounded by rate limiters; restarts on
+upgrade/reboot converge it); D6 200-shape unobservable without a valid
+token; soak/partition/public-edge/provider-OAuth still NOT EXECUTED —
+operator-gated. Next: final Reliability Qualification against this
+revision once operator-gated items are authorized.
