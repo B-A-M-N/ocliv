@@ -40,3 +40,24 @@ fixture `127.0.0.1:18765` (throwaway stdlib MCP, bearer `g3-test-token`, /tmp on
 Needs a workspace permitting custom MCP servers. Nothing in code stands in
 the way; the URL to register comes from a fresh `mcp publish` of the real
 MCP server. `mcp doctor` reports `EXTERNAL_UNVERIFIED` by design until then.
+
+## Addendum — 2026-11-03 replication (direct-relay funnel, no Caddy)
+
+Topology: public client → `https://pop-os.tail8d285a.ts.net:443`
+(Funnel, managed TLS) → relay `127.0.0.1:18082` directly
+(`--relay-host/--mcp-host pop-os.tail8d285a.ts.net`, `--domain ocliv.test`).
+No Caddy in this run (funnel repoint needs root; relay got the backend
+port instead). Runtime state in /tmp only; repo tree untouched otherwise.
+
+| # | Check | Result | Evidence |
+|---|-------|--------|----------|
+| 1 | Valid public TLS, no `-k` | PASS | curl default trust; challenge POST → 401 relay-origin |
+| 2 | Authority denial | PASS | `/` → 421; bogus enroll code → 401, unconsumed |
+| 3 | Strict-discovery publish | PASS | `✓ MCP route ready (auth: upstream-oauth)` + `✓ OAuth discovery verified`; route `https://pop-os.tail8d285a.ts.net/r/E2CI3j6ZIqS1yVqpsMdYNw/mcp` (oauth-lab fixture, read-only ping) |
+| 4 | Unauthenticated tool use | PASS (denied) | no-bearer → 401, tampered-signature → 401 |
+| 5 | Full OAuth + authorized call | PASS | DCR → PKCE authorize → token → `tools/list` 200, `tools/call ping` 200 (`pong:ocliv-oauth-lab-1`) |
+| 6 | Upstream revoke via route | FAIL (gap) | `POST /r/<id>/oauth/revoke` → 421; allowlist in `internal/relay/relay_mcp_ingress.go:198-202` covers authorize/token/register only. Tokens stay valid to 900s expiry; relay-side unpublish/lease-revoke remains the kill switch. Fix: add `/oauth/revoke` to the allowlist + regression test. |
+
+Note: `publish --auth fixture-anonymous` correctly refused (fail-closed);
+upstream-oauth with the no-auth smoke fixture correctly failed discovery
+before this run switched to the OAuth lab fixture.
