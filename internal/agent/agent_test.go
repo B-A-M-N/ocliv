@@ -431,6 +431,38 @@ func TestRunnerReprobesCustomPath(t *testing.T) {
 // fail the handshake permanently: signing an intent under an unknown
 // version would produce an attachment the relay cannot honor, and
 // retrying cannot help (distribution row: version/protocol reporting).
+func TestReconnectDelayEscalatesThenResets(t *testing.T) {
+	var rs reconnectState
+	inRange := func(d, low, high time.Duration) bool { return d >= low && d <= high }
+	// Sustained outage follows the established curve: 250ms doubling
+	// plus up-to-20% jitter, capped at 30s.
+	want := []time.Duration{
+		300 * time.Millisecond, 600 * time.Millisecond,
+		1200 * time.Millisecond, 2400 * time.Millisecond,
+		4800 * time.Millisecond, 9600 * time.Millisecond,
+		19200 * time.Millisecond, 30 * time.Second, 30 * time.Second,
+	}
+	for i, top := range want {
+		rs.noteResult(false)
+		if d := rs.delay(); !inRange(d, top/2, top) {
+			t.Fatalf("failure %d: delay %v outside [%v,%v]", i+1, d, top/2, top)
+		}
+	}
+	// Recovery: one demonstrably healthy session resets the streak,
+	// so the next disconnect retries promptly instead of at max delay.
+	rs.noteResult(true)
+	if d := rs.delay(); !inRange(d, 125*time.Millisecond, 300*time.Millisecond) {
+		t.Fatalf("after healthy session: delay %v, want ~250ms not 30s", d)
+	}
+	// Two fast failures afterwards re-escalate from the reset base:
+	// no free pass for repeated instant failures.
+	rs.noteResult(false)
+	rs.noteResult(false)
+	if d := rs.delay(); !inRange(d, 250*time.Millisecond, 600*time.Millisecond) {
+		t.Fatalf("short-session streak: delay %v, want ~500ms", d)
+	}
+}
+
 func TestChallengeVersionMismatchIsPermanent(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","origin":"https://relay.example.test","version":"ocliv/9"}`))

@@ -132,15 +132,56 @@ func ProbeLocalPath(target, path string, wantStatus int, timeout time.Duration) 
 	return nil
 }
 
+const (
+	baseBackoff = 250 * time.Millisecond
+	maxBackoff  = 30 * time.Second
+	// healthySessionWindow is how long an attachment must survive to
+	// prove the path is healthy. A session that lived this long
+	// resets the reconnect streak; anything shorter counts as a
+	// continued outage. Without a reset, a tunnel that ran fine for
+	// hours would still retry at max delay after its next blip.
+	healthySessionWindow = 60 * time.Second
+)
+
+// reconnectState owns the consecutive-failure streak behind Run's
+// bounded backoff. It escalates base*2^n (plus up-to-20% jitter) and
+// only resets on a demonstrably healthy session — never on a fast
+// failure, and never silently.
+type reconnectState struct {
+	failures int
+}
+
+func (s *reconnectState) noteResult(healthy bool) {
+	if healthy {
+		s.failures = 0
+		return
+	}
+	s.failures++
+}
+
+func (s *reconnectState) delay() time.Duration {
+	d := baseBackoff << min(max(s.failures-1, 0), 10)
+	if d > maxBackoff || d <= 0 {
+		d = maxBackoff
+	}
+	// Cap after jitter, exactly like the historical loop: the wait
+	// never exceeds maxBackoff even at the cap.
+	wait := d + time.Duration(float64(d)*0.2*rand01())
+	if wait > maxBackoff {
+		wait = maxBackoff
+	}
+	return wait
+}
+
 // Run connects, serves, and reconnects until ctx ends. Permanent credential
 // or protocol failures stop retries and require corrective action (F09).
 func (rn *Runner) Run(ctx context.Context) error {
 	// Release the shared loopback pool at true shutdown; reconnects
 	// reuse it.
 	defer rn.closeIdleLocalConns()
-	backoff := 250 * time.Millisecond
-	const maxBackoff = 30 * time.Second
+	var rs reconnectState
 	for {
+		sessionStart := time.Now()
 		err := rn.once(ctx)
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -151,20 +192,16 @@ func (rn *Runner) Run(ctx context.Context) error {
 		if rn.OnState != nil {
 			rn.OnState("RECONNECTING")
 		}
+		// A session that survived the healthy window proves the
+		// path works: reset the streak so the next disconnect
+		// retries promptly. Short blips keep escalating.
+		rs.noteResult(time.Since(sessionStart) >= healthySessionWindow)
 		// Bounded exponential backoff with jitter (F09).
-		jitter := time.Duration(float64(backoff) * 0.2 * rand01())
-		wait := backoff + jitter
-		if wait > maxBackoff {
-			wait = maxBackoff
-		}
+		wait := rs.delay()
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(wait):
-		}
-		backoff *= 2
-		if backoff > maxBackoff {
-			backoff = maxBackoff
 		}
 	}
 }
