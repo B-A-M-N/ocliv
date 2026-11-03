@@ -39,6 +39,17 @@ unprotected public tool endpoint is never created implicitly.)
    server advertises exactly that resource. Without the handoff the
    server must already be configured with the stable public URL,
    otherwise strict discovery fails closed.
+   The local probe runs BEFORE that handoff is written, so a
+   file-bound upstream is still unbound at probe time and answers
+   `503 resource not configured`. The probe reads that as
+   authenticating presence (the server is alive and will enforce OAuth
+   once bound), never as a usable session and never as tool
+   functionality: only the strict discovery proof above can admit the
+   publication. The 503 counts only when its body carries the
+   `resource not configured` signal — a bare `503` from an overloaded
+   or unhealthy upstream is not an unbound handoff and still fails the
+   local-target gate, so publication never proceeds for a broken
+   upstream.
 4. Point the MCP client at that URL with your OAuth issuer/audience/
    scopes. The relay forwards `Authorization` byte-identical for your
    upstream server to validate; Ocliv visitor credentials are neither
