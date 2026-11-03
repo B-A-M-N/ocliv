@@ -41,6 +41,24 @@ curl -v https://lab.dynv6.net/v1/agent/challenge
 
 `sudo -E` preserves DYNV6_TOKEN for the root install steps.
 
+## Certificate strategy (read before operating)
+
+Two edges, two issuance models — do not confuse them:
+
+- **Tunnel edge (default, `Caddyfile.tunnel`).** On-demand
+  per-hostname certificates, each new `*.t.<domain>` tunnel hostname
+  getting its own cert after the relay's ask guard approves the
+  request. Ask guard tested; issuance itself is unverified against
+  public ACME (see qualification table below).
+- **Wildcard edge (`Caddyfile`, `--edge wildcard`).** One DNS-01
+  wildcard certificate covering all tunnel hostnames. Needs a Caddy
+  DNS-provider plugin and credentials (`--dns-provider/--dns-env`);
+  `relay init --check` rejects a file with the dns line commented out.
+
+Neither is free of limits: per-hostname issuance is bounded by public
+rate limits, wildcard issuance by DNS-plugin availability. Pick one
+edge per relay; the MCP single-host path needs no wildcard at all.
+
 ## What setup does and does not do
 
 Done automatically: egress/path detection, dynv6 A/AAAA sync, tunnel

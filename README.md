@@ -16,7 +16,9 @@ ocliv 3000
 # -> https://<id>.t.example.net  (protected by default)
 
 ocliv mcp 3000 --name mytools
-# -> https://<relay-host>/r/mytools/mcp  (OAuth enforced, never silent public)
+# -> https://<relay-host>/r/<route-id>/mcp  (OAuth enforced, never silent public)
+# --name keeps YOUR publication identity across restarts; the route ID
+# itself is opaque. Run `ocliv mcp list` for the exact public URL.
 ```
 
 Useful while running it:
