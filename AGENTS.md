@@ -217,3 +217,10 @@ with its reason instead of silently dropping it.
 - bamnlabs.dynv6.net apex claim: DONE by operator (resolves to 71.201.182.175); `relay` subdomain deferred (apex suffices for single-host edge).
 - Bounded soak: PASS (Stage 6, operator-authorized) — `TestSoakBoundedTraffic` SOAK_SECS=300: 42,837 ok, 0 fail, avg ~56ms, goroutine growth +6; mid-run restart resumes same lease. Incidental C08 proof (cookie-POST without Origin 403s).
 - Scaled pressure beyond 8 workers, cross-machine partition/TLS-SNI, public edge, provider OAuth: NOT EXECUTED/BLOCKED (operator-gated). Full matrix: `docs/qualification/CHAOS-BATCH.md`.
+
+### 2026-11-03 Stage 6 funnel smoke + revoke fix (`05a3237` → `16ad2c1`)
+
+- Funnel lab edge (direct relay on funnel backend port, no Caddy): FIXED + live-verified — enroll → attach → strict-discovery publish → full OAuth DCR/PKCE/token → `tools/list` + `tools/call` (`pong:ocliv-oauth-lab-1`) over `https://pop-os.tail8d285a.ts.net/r/E2CI3j6ZIqS1yVqpsMdYNw/mcp`; no-bearer/tampered 401s. Evidence: `docs/qualification/GATE3-PUBLIC-FUNNEL.md` addendum.
+- Upstream revoke unreachable via path route (allowlist authorize/token/register only): FIXED — `/oauth/revoke` added to `mcpOAuthEndpoints` (`relay_mcp_ingress.go`) with parse + dispatch red→green regression tests; live: revoke → 200, revoked call → 401; relay restart preserved stable route. Full gates green (internal ×3 incl. one unattributed transient FAIL, integration 242s, race relay/agent/cli/mcp).
+- `publish --auth fixture-anonymous` refusal, upstream-oauth-without-OAuth discovery failure: VERIFIED NON-ISSUE (correct fail-closed behavior, observed live).
+- Gate 4 ChatGPT registration, funnel teardown decision, permanent ingress (dynv6/Caddy/router): BLOCKED/NOT VERIFIED (operator-gated).
