@@ -213,5 +213,5 @@ with its reason instead of silently dropping it.
 - D1–D3 local DNS/TLS/enrollment faults: PASS; D4/D5 live LAN impostor via 10.9.66.20: PASS (zero hits); D6 dynv6 error shapes: PARTIAL (401 auth-first; 200-with-error shape unobservable without valid token).
 - P7 doctor/status honesty, P8 unit validation, P9 planner dry-run honesty: PASS. R1 health-listener Serve logging: FIXED.
 - F1 bounded fuzz (`lease` + `proxy`, ~16.8M execs): PASS, zero crashes.
-- A2 unbounded `audit_events` growth: DEFERRED P2 residual (needs retention policy; monitor data-dir size).
+- A2 unbounded `audit_events` growth: FIXED (Stage 6) — 90-day `store.AuditRetention`, schemaV6 time index, `PruneAuditEvents` in `reconcileBoot` (fail-closed); red→green regression tests; full gates green.
 - Soak, scaled pressure, cross-machine partition/TLS-SNI, public edge, provider OAuth, dynv6 zone claim: NOT EXECUTED/BLOCKED (operator-gated). Full matrix: `docs/qualification/CHAOS-BATCH.md`.

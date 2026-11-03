@@ -451,6 +451,15 @@ func (s *Server) reconcileBoot() error {
 		lease.StateReconnecting, now.Add(lease.ReconnectGrace).Format(time.RFC3339Nano), lease.StateActive); err != nil {
 		return apperr.E(apperr.CodeStoreFault, "reconciling active leases", err)
 	}
+	// Bound audit evidence (Stage 6, chaos finding A2): every denied
+	// request writes an audit row, so prune rows older than the
+	// documented retention window. Revocation authority lives in
+	// leases/agent_keys, not audit rows, so pruning cannot resurrect
+	// access. Like every other persistence failure here, a prune error
+	// refuses startup rather than serving on unknown durable state.
+	if _, err := s.db.PruneAuditEvents(now); err != nil {
+		return apperr.E(apperr.CodeStoreFault, "pruning audit events", err)
+	}
 	// Re-arm in-memory expiry for every row still waiting on a resume.
 	rows, err := s.db.SQL().Query(
 		`SELECT id, reconnect_until FROM leases WHERE status=?`, lease.StateReconnecting)

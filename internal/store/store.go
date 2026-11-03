@@ -123,6 +123,13 @@ UPDATE mcp_publications SET verified_at = created_at WHERE verified_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_mcp_publications_lease ON mcp_publications(lease_id);
 `
 
+// schemaV6 indexes audit event time for the retention sweep (Stage 6,
+// chaos finding A2). No rows are deleted by the migration itself; the
+// relay prunes rows older than AuditRetention at boot.
+const schemaV6 = `
+CREATE INDEX IF NOT EXISTS idx_audit_events_time ON audit_events(time);
+`
+
 // applyMigration runs one versioned migration body and its version
 // stamp in a single transaction: a failure anywhere rolls back the
 // body, so a version is never recorded for half-applied work (P1-2).
@@ -147,7 +154,7 @@ func applyMigration(sqldb *sql.DB, version int, body string) error {
 }
 
 // currentSchema is the newest version Open must reach.
-const currentSchema = 5
+const currentSchema = 6
 
 // DB wraps the SQLite handle.
 type DB struct {
@@ -252,6 +259,7 @@ func Open(path string) (*DB, error) {
 		{3, schemaV3},
 		{4, schemaV4},
 		{5, schemaV5},
+		{6, schemaV6},
 	}
 	for _, m := range migrations {
 		var v int
@@ -302,4 +310,31 @@ func (d *DB) Audit(actor, tenantID, leaseID, category, result, detail string) {
 	_, _ = d.sql.Exec(
 		`INSERT INTO audit_events(time, actor, tenant_id, lease_id, category, result, detail) VALUES(?,?,?,?,?,?,?)`,
 		utcNow(), actor, tenantID, leaseID, category, result, detail)
+}
+
+// AuditRetention is the operator-visible audit evidence window (Stage 6,
+// chaos finding A2): every denied request writes an audit row and no
+// code path reclaimed them, so months of probing filled the disk and
+// bloated backups. Rows older than this are pruned at relay boot
+// (reconcileBoot). 90 days preserves recent incident evidence while
+// bounding growth; revocation state itself lives in leases/agent_keys
+// (revoked_at), so pruning audit rows can never resurrect authority.
+const AuditRetention = 90 * 24 * time.Hour
+
+// PruneAuditEvents deletes audit rows older than AuditRetention relative
+// to now and returns the deleted count. Times are RFC3339Nano UTC, so
+// lexicographic comparison orders them. The DELETE is idempotent and
+// single-statement: safe to repeat, and a failure only skips pruning,
+// never blocks serving.
+func (d *DB) PruneAuditEvents(now time.Time) (int64, error) {
+	cutoff := now.UTC().Add(-AuditRetention).Format(time.RFC3339Nano)
+	res, err := d.sql.Exec(`DELETE FROM audit_events WHERE time < ?`, cutoff)
+	if err != nil {
+		return 0, apperr.E(apperr.CodeStoreFault, "pruning audit events", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, apperr.E(apperr.CodeStoreFault, "pruning audit events", err)
+	}
+	return n, nil
 }

@@ -137,6 +137,18 @@ The restored image takes effect at the next relay start; a running
 relay keeps its pre-restore handle until restart. Writes between
 restore and restart are lost — stop first, restore, start.
 
+## Audit retention (H04, Stage 6/A2)
+
+Every denied request writes an `audit_events` row. The relay prunes
+rows older than 90 days (`store.AuditRetention`) at boot, so months of
+probing cannot fill the data dir or bloat backups. Recent incident
+evidence is preserved; revocation authority lives in
+leases/agent_keys (`revoked_at`), never in audit rows, so pruning
+cannot resurrect access. If the data dir still grows faster than
+expected, inspect `audit_events` for an ongoing probe flood (check the
+pre-auth rate-limiter counters first) — do not delete the database.
+Manual prune plus `VACUUM` reclaims space after an incident.
+
 Do not represent single-node operation as highly available (H09).
 
 ## Public single-host deployment (production ingress)

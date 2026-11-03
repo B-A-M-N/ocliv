@@ -1,6 +1,8 @@
 # Chaos Engineering — Executed Batch Report (Stage 5)
 
-Revision: `24fe3e8` (extends `143b9af`, `50f2d8e`).
+Revision: `98b7660` (extends `24fe3e8`, `143b9af`, `50f2d8e`, plus
+`fd58cf8`, `721a47a`, `fe98c69`/`727b7fb`, `8e288c4`, `b6dda49`,
+`34f095d`, `2ff2ad9`).
 Scope: local-only fault injection. No live services touched, no pushes,
 no credential or infrastructure changes. Tree clean at commit.
 
@@ -85,7 +87,7 @@ covered by `TestStartHealthListenerBindAndShutdown`; the abnormal-death
 path has no deterministic unit seam without structural churn and is
 inspection-verified (`fe98c69`).
 
-## Residual finding A2 — unbounded audit_events growth (P2, not implemented)
+## Finding A2 — unbounded audit_events growth: FIXED (Stage 6)
 
 Mechanism confirmed by source: `store.DB.Audit` INSERTs on every
 denial/edge event (rate-limit denials, no-route, auth failures,
@@ -94,12 +96,21 @@ Growth is throttled by the pre-auth/admission rate limiters but never
 reclaimed — months of probing fill disk and bloat backups.
 No global janitor exists (sweeps are per-session/nonce-local).
 
-Deliberately NOT fixed here: pruning security evidence needs an
-operator-visible retention policy (age/count bound preserving recent
-incident evidence), plus a janitor lifecycle — beyond a minimal fix.
-Recommended: age-bounded DELETE in a single explicit sweep point with
-a regression test seeding old/new rows. Until then: monitor relay
-data-dir size; recovery is manual prune + VACUUM.
+Fix: operator-visible 90-day retention (`store.AuditRetention`,
+documented in `docs/OPERATOR.md` under "Audit retention").
+`DB.PruneAuditEvents` (idempotent single-statement DELETE, schemaV6
+index on `audit_events(time)`) runs in `reconcileBoot`, fail-closed
+like every other boot persistence step. Authority-safe: revocation
+state lives in leases/agent_keys (`revoked_at`), never in audit rows —
+verified `relay_backup.go` never SELECTs `audit_events` for restore
+validation, so pruning cannot resurrect access.
+
+Red→green: `TestPruneAuditEventsKeepsRecentEvidence`
+(`internal/store/store_audit_retention_test.go`) and
+`TestReconcileBootPrunesStaleAuditEvents`
+(`internal/relay/relay_audit_retention_test.go`); `go vet` red
+(undefined method) before, green after. Full `internal/...`,
+`-race` on store/relay, and integration suite green post-fix.
 
 Adjacent check: never-reading SSE visitors hold a stream by design,
 but converge via lease TTL + the 5s revocation sweep
