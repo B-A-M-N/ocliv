@@ -2,11 +2,14 @@ package setup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -35,14 +38,64 @@ func validDynv6Zone(zone string) bool {
 	return label[0] != '-' && label[len(label)-1] != '-'
 }
 
-// sanitizeDynv6Error removes credential material from a transport
-// error while keeping the actionable failure category.
-func sanitizeDynv6Error(err error, token string) string {
-	msg := err.Error()
-	if token != "" {
-		msg = strings.ReplaceAll(msg, token, "***")
+// tokenForms lists every representation url.Values encoding can give
+// the token on the wire: raw, QueryEscape (+/space/=), and the %20
+// space variant a server echo may use instead of +.
+func tokenForms(token string) []string {
+	if token == "" {
+		return nil
 	}
-	return msg
+	q := url.QueryEscape(token)
+	forms := []string{token, q}
+	if strings.Contains(q, "+") {
+		forms = append(forms, strings.ReplaceAll(q, "+", "%20"))
+	}
+	return forms
+}
+
+// redactToken removes the credential in every encoded form it can
+// take. It guards provider-controlled content (response bodies);
+// our own request URLs are never embedded in errors at all.
+func redactToken(s, token string) string {
+	for _, f := range tokenForms(token) {
+		if f != "" {
+			s = strings.ReplaceAll(s, f, "***")
+		}
+	}
+	return s
+}
+
+// sanitizeDynv6Error classifies a transport failure without embedding
+// the credential-bearing request URL (*url.Error text carries it, in
+// whatever percent-encoding the query used). The returned category
+// stays actionable; the URL stays out entirely.
+func sanitizeDynv6Error(err error) string {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return "DNS resolution failure"
+	}
+	var nerr net.Error
+	if errors.As(err, &nerr) && nerr.Timeout() {
+		return "timeout"
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return "connection refused"
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "certificate"),
+		strings.Contains(msg, "tls"),
+		strings.Contains(msg, "handshake"):
+		return "TLS failure"
+	case strings.Contains(msg, "no such host"):
+		return "DNS resolution failure"
+	case strings.Contains(msg, "connection refused"):
+		return "connection refused"
+	case strings.Contains(msg, "timeout"),
+		strings.Contains(msg, "deadline exceeded"):
+		return "timeout"
+	}
+	return "transport failure"
 }
 
 // UpdateDynv6 sets the zone's A/AAAA records via the provider update
@@ -74,16 +127,13 @@ func UpdateDynv6(ctx context.Context, baseURL, zone, token, ipv4, ipv6 string) e
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		// Transport errors (*url.Error) embed the request URL,
-		// including the token query. Redact before returning so
-		// the token never reaches CLI output or logs; the
-		// failure category (timeout/refused/DNS/TLS) is preserved.
-		return fmt.Errorf("dynv6 update for %q failed: %s", zone, sanitizeDynv6Error(err, token))
+		// Transport errors (*url.Error) embed the credential-bearing
+		// request URL, so the message is classified — never quoted.
+		return fmt.Errorf("dynv6 update for %q failed: %s", zone, sanitizeDynv6Error(err))
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-	msg := strings.TrimSpace(string(body))
-	msg = strings.ReplaceAll(msg, token, "***")
+	msg := redactToken(strings.TrimSpace(string(body)), token)
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return fmt.Errorf("dynv6 update for %q refused: HTTP %d: %s", zone, resp.StatusCode, msg)
 	}

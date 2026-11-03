@@ -90,3 +90,44 @@ func TestDynv6UpdateErrorHidesToken(t *testing.T) {
 		t.Fatalf("token leaked into error: %v", err)
 	}
 }
+
+// Task 1: URL encoding changes the token's representation
+// (q.Encode percent-encodes + / = & and space), so literal-only
+// redaction leaves the encoded credential visible in *url.Error text
+// and in echoed provider bodies. Neither form may leak.
+func TestDynv6EncodedTokenNeverLeaks(t *testing.T) {
+	token := "tok+en/with=special&chars here"
+	encoded := []string{token, "tok%2Ben%2Fwith%3Dspecial%26chars+here", "tok%2Ben%2Fwith%3Dspecial%26chars%20here"}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := UpdateDynv6(ctx, "http://127.0.0.1:1", "bamnlabs.dynv6.net", token, "203.0.113.9", "")
+	if err == nil {
+		t.Fatal("refused connection treated as success")
+	}
+	for _, form := range encoded {
+		if strings.Contains(err.Error(), form) {
+			t.Fatalf("token form leaked into transport error: %q in %v", form, err)
+		}
+	}
+	if !strings.Contains(err.Error(), "bamnlabs.dynv6.net") {
+		t.Fatalf("sanitized error lost the zone context: %v", err)
+	}
+	if !strings.Contains(err.Error(), "connection refused") {
+		t.Fatalf("sanitized error lost the failure category: %v", err)
+	}
+	// Provider body echoing the encoded URL must be sanitized too.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("bad auth for token=tok%2Ben%2Fwith%3Dspecial%26chars+here"))
+	}))
+	defer srv.Close()
+	err = UpdateDynv6(ctx, srv.URL, "bamnlabs.dynv6.net", token, "203.0.113.9", "")
+	if err == nil {
+		t.Fatal("401 treated as success")
+	}
+	for _, form := range encoded {
+		if strings.Contains(err.Error(), form) {
+			t.Fatalf("token form leaked into provider error: %q in %v", form, err)
+		}
+	}
+}
