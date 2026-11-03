@@ -52,6 +52,24 @@ classification.
 `go test ./internal/...` 18/18 green; `-race` on touched packages;
 `go test ./tests/integration/` green (204s).
 
+## Control-plane honesty + unit validation
+
+| ID | Fault | Target | Outcome |
+|----|-------|--------|---------|
+| P7 | `doctor`/`status` with no enrollment | CLI truthfulness | PASS |
+| P8 | `systemd-analyze verify` on refresh units | shipped timer/service | PASS* |
+
+P7: real `ocliv doctor` run against a clean HOME reports `✗ enrollment`,
+`? unverified` states, exits 5 — no false success. `status` reports
+"no active tunnel", exit 0. The compiled-default relay probe correctly
+shows DNS failure as unverified, not verified.
+
+P8: `systemd-analyze verify` passes on syntax; the binary-missing
+warning is expected on a non-installed host. No `ConditionPathExists`
+added deliberately: the unit's stated philosophy is fail-loud, and the
+timer only runs when the operator enables it. Consistent with E1 (the
+timer's `OnUnitActiveSec` also prevents overlap by construction).
+
 ## NOT EXECUTED (needs operator/second machine)
 
 Soak, scaled resource pressure, cross-machine partition/TLS-SNI chaos,
