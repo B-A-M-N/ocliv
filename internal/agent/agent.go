@@ -62,6 +62,18 @@ type Runner struct {
 
 	mu         sync.Mutex
 	httpShared *http.Client // loopback client shared across streams (P2-1)
+	// attachedAt is stamped exactly when the relay confirms an
+	// attachment (Task 4). The health window is measured from here —
+	// never from handshake start — so a slow failed handshake cannot
+	// masquerade as a healthy session and reset the reconnect streak.
+	attachedAt time.Time
+}
+
+// sessionHealthy reports whether the last attachment survived the
+// healthy window. Zero (never attached) and short-lived attachments
+// count as continued outage, keeping backoff escalated.
+func (rn *Runner) sessionHealthy() bool {
+	return !rn.attachedAt.IsZero() && time.Since(rn.attachedAt) >= healthySessionWindow
 }
 
 // ProbeLocal verifies a responsive local HTTP service. Any HTTP status
@@ -181,7 +193,10 @@ func (rn *Runner) Run(ctx context.Context) error {
 	defer rn.closeIdleLocalConns()
 	var rs reconnectState
 	for {
-		sessionStart := time.Now()
+		// No attachment has happened yet in this iteration: a
+		// failed handshake must read as continued outage, never
+		// as health inherited from a previous session.
+		rn.attachedAt = time.Time{}
 		err := rn.once(ctx)
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -195,7 +210,7 @@ func (rn *Runner) Run(ctx context.Context) error {
 		// A session that survived the healthy window proves the
 		// path works: reset the streak so the next disconnect
 		// retries promptly. Short blips keep escalating.
-		rs.noteResult(time.Since(sessionStart) >= healthySessionWindow)
+		rs.noteResult(rn.sessionHealthy())
 		// Bounded exponential backoff with jitter (F09).
 		wait := rs.delay()
 		select {
@@ -392,6 +407,9 @@ func (rn *Runner) once(ctx context.Context) error {
 		conn.Close(websocket.StatusProtocolError, "bad attach")
 		return fmt.Errorf("bad session attach")
 	}
+	// The relay confirmed the attachment here; the health window
+	// starts now, excluding everything the handshake just cost.
+	rn.attachedAt = time.Now()
 	if err := rn.saveLease(att); err != nil {
 		conn.Close(websocket.StatusInternalError, "lease persist failed")
 		return fmt.Errorf("persisting lease state: %w", err)

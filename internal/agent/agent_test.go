@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,14 +13,18 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/hashicorp/yamux"
 
 	"ocliv/internal/config"
+	"ocliv/internal/identity"
 	"ocliv/internal/protocol"
+	"ocliv/internal/transport"
 )
 
 // TestStreamReaderSurfacesAbortAsError: transport failures, aborts, and
@@ -478,5 +484,120 @@ func TestChallengeVersionMismatchIsPermanent(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "ocliv/9") || !strings.Contains(err.Error(), protocol.Version) {
 		t.Fatalf("version error hides the mismatch: %v", err)
+	}
+}
+
+// Task 4: the health clock must start at relay-confirmed attachment,
+// never at handshake start. A slow failed handshake must not look
+// like a healthy session just because the wall clock advanced.
+func TestSessionHealthyAccounting(t *testing.T) {
+	rn := &Runner{}
+	// Never attached (slow failed handshake): unhealthy, streak grows.
+	if rn.sessionHealthy() {
+		t.Fatal("zero attachment clock reported healthy")
+	}
+	// Short-lived attachment: unhealthy, keeps escalating.
+	rn.attachedAt = time.Now()
+	if rn.sessionHealthy() {
+		t.Fatal("fresh attachment reported healthy")
+	}
+	// Sustained session past the window: healthy, resets the streak.
+	rn.attachedAt = time.Now().Add(-(healthySessionWindow + time.Second))
+	if !rn.sessionHealthy() {
+		t.Fatal("sustained attachment not reported healthy")
+	}
+	// Boundary: exactly the window counts as healthy (>=).
+	rn.attachedAt = time.Now().Add(-healthySessionWindow)
+	if !rn.sessionHealthy() {
+		t.Fatal("window-boundary attachment not reported healthy")
+	}
+	// End to end through the streak: repeated failed handshakes
+	// escalate, one sustained session resets.
+	rn.attachedAt = time.Time{}
+	var rs reconnectState
+	rs.noteResult(rn.sessionHealthy())
+	rs.noteResult(rn.sessionHealthy())
+	if d := rs.delay(); d < 250*time.Millisecond {
+		t.Fatalf("repeated failed handshakes not escalating: %v", d)
+	}
+	rn.attachedAt = time.Now().Add(-(healthySessionWindow + time.Second))
+	rs.noteResult(rn.sessionHealthy())
+	if d := rs.delay(); d > 300*time.Millisecond {
+		t.Fatalf("sustained session did not reset backoff: %v", d)
+	}
+}
+
+// Task 4: a real attach through once() must stamp the attachment
+// clock; a failed handshake must leave it zero, no matter how slow.
+func TestOnceStampsAttachmentClock(t *testing.T) {
+	nonce := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/agent/challenge":
+			_, _ = w.Write([]byte(`{"nonce":` + strconv.Quote(nonce) + `,"origin":"https://relay.test","version":"ocliv/1"}`))
+		case r.URL.Path == "/v1/agent/connect":
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer c.Close(websocket.StatusNormalClosure, "test done")
+			att, _ := json.Marshal(Attached{Type: "attached", SessionID: "s1", LeaseID: "l1", Hostname: "h.t.test", Generation: 1, AccessMode: "private", URL: "https://h.t.test"})
+			_ = transport.WriteControl(r.Context(), c, att)
+			// Keep reading so the client's close handshake
+			// completes instead of timing out.
+			for {
+				if _, _, err := c.Read(r.Context()); err != nil {
+					return
+				}
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	key, err := identity.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rn := &Runner{Key: key, KeyID: "key-test",
+		Cfg: config.Agent{RelayURL: srv.URL, DataDir: t.TempDir(), Port: 3000}}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	attached := make(chan struct{})
+	rn.OnAttach = func(Attached) {
+		close(attached)
+		cancel()
+	}
+	_ = rn.once(ctx)
+	select {
+	case <-attached:
+	default:
+		t.Fatal("fake relay never reached attach")
+	}
+	if rn.attachedAt.IsZero() {
+		t.Fatal("successful attach left the attachment clock zero")
+	}
+	if time.Since(rn.attachedAt) > 10*time.Second {
+		t.Fatalf("attachment clock not stamped at attach: %v ago", time.Since(rn.attachedAt))
+	}
+	// Failed handshake (denied challenge): clock stays zero even
+	// though wall time advanced during the attempt.
+	denied := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer denied.Close()
+	rn2 := &Runner{Key: key, KeyID: "key-test",
+		Cfg: config.Agent{RelayURL: denied.URL, DataDir: t.TempDir(), Port: 3000}}
+	before := time.Now()
+	_ = rn2.once(context.Background())
+	if time.Since(before) < 0 {
+		t.Fatal("unreachable")
+	}
+	if !rn2.attachedAt.IsZero() {
+		t.Fatal("failed handshake stamped the attachment clock")
+	}
+	if rn2.sessionHealthy() {
+		t.Fatal("failed handshake reported healthy")
 	}
 }
