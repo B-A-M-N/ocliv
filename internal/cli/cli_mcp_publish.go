@@ -369,6 +369,20 @@ func validateMCPResourceMetadata(client *http.Client, discoveryURL, expectResour
 	return nil
 }
 
+// publishLocalProbeOK is the publish local-target gate (P1): publication
+// proceeds when the probe is either fully verified (a usable MCP session)
+// or reported authenticating presence from an upstream-oauth target
+// (bearer challenge 401/403, or an unbound resource server answering 503
+// "resource not configured" before its --resource-file handoff is
+// written). Tool functionality is never claimed from a challenge; the
+// real contract is proven later by strict OAuth discovery
+// (proveRouteReady), which fails closed if the binding never materializes.
+// Anonymous fixtures must be actually verified: their profile cannot grow
+// an auth surface, so a challenge never qualifies them.
+func publishLocalProbeOK(out mcpProbeOutcome, auth string) bool {
+	return out.Verified || (out.Auth == "AUTH_REQUIRED" && auth == "upstream-oauth")
+}
+
 // mcpAccessMode maps the --auth profile to the lease access mode born
 // at allocation (P1). The strings duplicate relay constants by design:
 // the CLI submits its intent and the relay validates it authoritatively.
@@ -697,7 +711,7 @@ func runMCPPublish(argv []string, serve bool) int {
 		// presence — tool functionality is never claimed from a
 		// challenge.
 		pout := runMCPProbe(target, mcpAccessMode(cfg.auth))
-		if !pout.Verified && !(pout.Auth == "AUTH_REQUIRED" && cfg.auth == "upstream-oauth") {
+		if !publishLocalProbeOK(pout, cfg.auth) {
 			fmt.Fprintf(os.Stderr, "local MCP %s failed protocol check: %s\n", target, pout.Summary)
 			return apperr.ExitLocalTarget
 		}

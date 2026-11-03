@@ -51,6 +51,50 @@ func modernAuthFacet(anon bool) (auth, note string) {
 	return "AUTH_UNVERIFIED", "; auth unverified (answered without bearer — upstream OAuth enforcement NOT proven)"
 }
 
+// unboundHandoffSignal is the exact body a resource-file-bound MCP
+// server answers with before the publisher writes the handoff (Metis
+// `mcp serve-http` before METIS_MCP_RESOURCE_FILE exists:
+// `http.Error(w, "resource not configured", 503)`). Matching the signal
+// keeps the acceptance narrow: a 503 from an overloaded, unhealthy or
+// otherwise broken upstream is NOT an unbound handoff and must not be
+// read as authenticating presence.
+const unboundHandoffSignal = "resource not configured"
+
+// presenceVerdict renders the probe outcome for a local endpoint that
+// answers an upstream-oauth request with authenticating presence instead
+// of a usable MCP session: a bearer challenge (401/403), or a 503 whose
+// body carries the unbound-handoff signal from a resource-file-bound
+// server whose --resource-file handoff the publisher has not written yet.
+// Both prove only that the endpoint is alive and will enforce OAuth once
+// bound — never tool functionality; the real contract is proven later by
+// strict OAuth discovery (proveRouteReady), which fails closed if the
+// binding never materializes. Anonymous fixtures can never satisfy a
+// challenge or an unbound handoff, so for them a 401/403 keeps the
+// historical broken verdict and a 503 the historical unverified
+// fallthrough.
+//
+// The body is required for the 503 case: a bare 503 is ambiguous, and
+// treating every 503 as presence would wave a genuinely broken upstream
+// through the publish gate.
+func presenceVerdict(status int, body []byte, anon bool) (mcpProbeOutcome, bool) {
+	switch status {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		if anon {
+			return mcpProbeOutcome{Summary: "protocol: broken (fixture server demands auth it cannot supply)", Auth: "AUTH_REQUIRED"}, true
+		}
+		return mcpProbeOutcome{Summary: "auth: required (server demands bearer; configure the upstream OAuth client)", Auth: "AUTH_REQUIRED"}, true
+	case http.StatusServiceUnavailable:
+		if anon {
+			return mcpProbeOutcome{}, false
+		}
+		if !strings.Contains(strings.ToLower(string(body)), unboundHandoffSignal) {
+			return mcpProbeOutcome{}, false
+		}
+		return mcpProbeOutcome{Summary: "auth: required (server reports resource not configured; it binds after publish writes the --resource-file handoff)", Auth: "AUTH_REQUIRED"}, true
+	}
+	return mcpProbeOutcome{}, false
+}
+
 // runMCPProbe executes the transport → protocol → authentication stages.
 func runMCPProbe(target, mode string) mcpProbeOutcome {
 	if mode != "mcp_upstream_oauth" && mode != "mcp_anonymous_fixture" {
@@ -93,11 +137,8 @@ func runMCPProbe(target, mode string) mcpProbeOutcome {
 	const modernVersion = "2026-07-28"
 	mresp, mraw, merr := post(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`, modernVersion)
 	if merr == nil {
-		if mresp.StatusCode == http.StatusUnauthorized || mresp.StatusCode == http.StatusForbidden {
-			if anon {
-				return mcpProbeOutcome{Summary: "protocol: broken (fixture server demands auth it cannot supply)", Auth: "AUTH_REQUIRED"}
-			}
-			return mcpProbeOutcome{Summary: "auth: required (server demands bearer; configure the upstream OAuth client)", Auth: "AUTH_REQUIRED"}
+		if v, ok := presenceVerdict(mresp.StatusCode, mraw, anon); ok {
+			return v
 		}
 		if list, err := decodeJSONRPC(mresp, mraw); err == nil {
 			if _, err := validateEnvelope(list, 1); err == nil {
@@ -128,11 +169,8 @@ func runMCPProbe(target, mode string) mcpProbeOutcome {
 		}
 		return unreachable("initialize", err)
 	}
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		if anon {
-			return mcpProbeOutcome{Summary: "protocol: broken (fixture server demands auth it cannot supply)", Auth: "AUTH_REQUIRED"}
-		}
-		return mcpProbeOutcome{Summary: "auth: required (server demands bearer; configure the upstream OAuth client)", Auth: "AUTH_REQUIRED"}
+	if v, ok := presenceVerdict(resp.StatusCode, raw, anon); ok {
+		return v
 	}
 	init, err := decodeJSONRPC(resp, raw)
 	if err != nil {
@@ -162,11 +200,8 @@ func runMCPProbe(target, mode string) mcpProbeOutcome {
 	if err != nil {
 		return unreachable("tools/list", err)
 	}
-	if lresp.StatusCode == http.StatusUnauthorized || lresp.StatusCode == http.StatusForbidden {
-		if anon {
-			return mcpProbeOutcome{Summary: "protocol: broken (fixture server demands auth it cannot supply)", Auth: "AUTH_REQUIRED"}
-		}
-		return mcpProbeOutcome{Summary: "auth: required (server demands bearer; configure the upstream OAuth client)", Auth: "AUTH_REQUIRED"}
+	if v, ok := presenceVerdict(lresp.StatusCode, lraw, anon); ok {
+		return v
 	}
 	list, err := decodeJSONRPC(lresp, lraw)
 	if err != nil {
