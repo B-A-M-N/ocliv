@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"ocliv/internal/apperr"
 	"ocliv/internal/config"
 	"ocliv/internal/identity"
 )
@@ -179,5 +180,26 @@ func TestManageExposeValidation(t *testing.T) {
 	}
 	if code := cmdMCPExpose([]string{"--", "definitely-not-a-real-binary-xyz"}); code == 0 {
 		t.Fatal("expose with unresolvable command succeeded")
+	}
+}
+
+// P2-H: `ocliv mcp 3000` rewrites to the equivalent publish argv with
+// authentication pinned to upstream-oauth; non-ports stay errors.
+func TestMCPPortAliasArgs(t *testing.T) {
+	pub, ok := mcpPortAliasArgs([]string{"3000", "--name", "mytools"})
+	if !ok {
+		t.Fatal("port alias not recognized")
+	}
+	cfg, code := parseMCPPublish(pub, false)
+	if code != apperr.ExitOK {
+		t.Fatalf("alias argv rejected by publish parser: %v", pub)
+	}
+	if cfg.localURL != "http://127.0.0.1:3000/mcp" || cfg.auth != "upstream-oauth" || cfg.name != "mytools" {
+		t.Fatalf("alias misparsed: %+v", cfg)
+	}
+	for _, bad := range [][]string{nil, {}, {"bogus"}, {"0"}, {"70000"}, {"--name"}} {
+		if _, ok := mcpPortAliasArgs(bad); ok {
+			t.Fatalf("alias accepted %v", bad)
+		}
 	}
 }

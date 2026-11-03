@@ -61,20 +61,25 @@ func Run(argv []string) int {
 func usage(code int) int {
 	fmt.Print(`Ocliv — secure instant HTTPS hosting.
 
-Usage:
+Everyday:
+  ocliv PORT                  share localhost:PORT over protected HTTPS
+  ocliv mcp PORT [--name N]   publish the MCP server on localhost:PORT (OAuth enforced)
+  ocliv status [--json]       tunnel state with the next action when unhealthy
+  ocliv doctor                diagnose key, relay, local service, and DNS/TLS
+  ocliv login --relay URL --code-file PATH   enroll this machine once
+
+Advanced:
   ocliv PORT [--public] [--ipv6] [--name NAME] [--ttl 2h] [--upstream-host H] [--json] [--no-share-link] [--share-link-file PATH]
-  ocliv login --relay URL --code-file PATH
   ocliv logout
-  ocliv status [--json]
   ocliv access share|rotate|revoke [LEASE]
-  ocliv doctor
   ocliv relay init --domain DOMAIN | relay serve --domain DOMAIN [--mcp-host HOST] [--mcp-port PORT] [--relay-host HOST] | relay doctor | relay issue-enroll
   ocliv mcp expose -- COMMAND [ARGS...]
   ocliv mcp manage
   ocliv mcp publish --local URL --auth upstream-oauth|fixture-anonymous [--name N] [--ttl D] ...
   ocliv mcp serve --local URL --auth upstream-oauth|fixture-anonymous ...
   ocliv mcp doctor [--lease ID] [--name LABEL]
-  ocliv setup --auto [--json] [--hostname ZONE.dynv6.net] [--acme-email ADDR] [--token-file PATH] [--dry-run] [--data-dir DIR] [--out DIR] [--provider oracle ...] | setup --check ...
+  ocliv mcp list|unpublish ...
+  ocliv setup --auto [--json] [--hostname ZONE.dynv6.net] [--acme-email ADDR] [--token-file PATH] [--dry-run] [--data-dir DIR] [--out DIR] [--refresh-dns] [--provider oracle ...] | setup --check ...
   ocliv version
 `)
 	return code

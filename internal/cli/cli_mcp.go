@@ -54,9 +54,31 @@ func cmdMCP(argv []string) int {
 	case "unpublish":
 		return cmdMCPUnpublish(argv[1:])
 	default:
+		// `ocliv mcp 3000` is a thin alias for publishing the local MCP
+		// server on that port: same publisher, same authentication
+		// enforcement, no second implementation. Only a leading numeric
+		// port triggers the alias; anything else stays an error.
+		if pub, ok := mcpPortAliasArgs(argv); ok {
+			return cmdMCPPublish(pub)
+		}
 		fmt.Fprintf(os.Stderr, "unknown mcp command %q\n", argv[0])
 		return apperr.ExitCLIValidation
 	}
+}
+
+// mcpPortAliasArgs rewrites `mcp PORT [publish flags...]` into the
+// equivalent `mcp publish` argv. Authentication stays upstream-oauth:
+// the alias never weakens the publisher's auth boundary.
+func mcpPortAliasArgs(argv []string) ([]string, bool) {
+	if len(argv) == 0 {
+		return nil, false
+	}
+	port, err := strconv.Atoi(argv[0])
+	if err != nil || port < 1 || port > 65535 {
+		return nil, false
+	}
+	pub := []string{"--local", fmt.Sprintf("http://127.0.0.1:%d/mcp", port), "--auth", "upstream-oauth"}
+	return append(pub, argv[1:]...), true
 }
 
 // agentRelayURL resolves the enrolled relay URL with the same precedence
