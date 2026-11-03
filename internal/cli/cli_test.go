@@ -768,8 +768,32 @@ func TestRenderStatusDistinguishesRoute(t *testing.T) {
 		t.Fatalf("missing route signal assumed live: %q", out)
 	}
 	jout, _ := renderStatus(local, down, nil, true)
-	if !strings.Contains(jout, `"route"`) || !strings.Contains(jout, "down") {
+	if !strings.Contains(jout, `"route"`) || !strings.Contains(jout, "offline") {
 		t.Fatalf("json omits route state: %q", jout)
+	}
+}
+
+// P1-F: classified failures and relay states render named conditions
+// with a next action, never a bare UNKNOWN echo.
+func TestRenderStatusNamedStates(t *testing.T) {
+	local := map[string]any{"lease_id": "l1", "url": "https://h/", "access_mode": "private", "port": float64(3000)}
+	if out, _ := renderStatus(local, nil, &statusProblem{state: "RELAY DISCONNECTED", advice: "check network"}, false); !strings.Contains(out, "RELAY DISCONNECTED") || !strings.Contains(out, "Next:") {
+		t.Fatalf("disconnected not named with action: %q", out)
+	}
+	if out, _ := renderStatus(local, nil, &statusProblem{state: "AUTHENTICATION REQUIRED", advice: "run login"}, false); !strings.Contains(out, "AUTHENTICATION REQUIRED") {
+		t.Fatalf("auth required not named: %q", out)
+	}
+	recon := map[string]any{"lease_id": "l1", "status": "RECONNECTING", "route_live": false}
+	if out, _ := renderStatus(local, recon, nil, false); !strings.Contains(out, "RECONNECTING") || !strings.Contains(out, "reattach") {
+		t.Fatalf("reconnecting lacks advice: %q", out)
+	}
+	closed := map[string]any{"lease_id": "l1", "status": "EXPIRED"}
+	if out, _ := renderStatus(local, closed, nil, false); !strings.Contains(out, "ocliv PORT") {
+		t.Fatalf("expired lacks restart advice: %q", out)
+	}
+	jout, _ := renderStatus(local, nil, &statusProblem{state: "RELAY DISCONNECTED", advice: "x"}, true)
+	if !strings.Contains(jout, "RELAY DISCONNECTED") {
+		t.Fatalf("json omits classified state: %q", jout)
 	}
 }
 

@@ -3,6 +3,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -15,6 +16,29 @@ import (
 	"ocliv/internal/config"
 	"ocliv/internal/doctor"
 )
+
+// statusProblem is a classified failure to reach the authoritative
+// relay record. The state names the condition; advice names the next
+// corrective action. An unclassified error stays UNKNOWN, never a
+// stale cache echo (P1-F).
+type statusProblem struct {
+	state  string
+	advice string
+}
+
+func (e *statusProblem) Error() string { return e.state + ": " + e.advice }
+
+// relayStateAdvice maps terminal/in-transit relay lease states to the
+// operator's next action. ACTIVE needs none.
+func relayStateAdvice(state string) string {
+	switch state {
+	case "RECONNECTING":
+		return "agent is reattaching; if it stays here, check the agent's network, then run `ocliv doctor`"
+	case "CLOSED", "EXPIRED", "REVOKED":
+		return "this tunnel has ended; start a new one with `ocliv PORT`"
+	}
+	return ""
+}
 
 // renderStatus builds the status report from the cached local lease and
 // the authoritative relay record. The relay state wins whenever the query
@@ -59,7 +83,7 @@ func renderStatus(local, remote map[string]any, fetchErr error, showJSON bool) (
 			mode = m
 		}
 		if live, ok := remote["route_live"].(bool); ok {
-			route = "down (no live session)"
+			route = "offline (no live session)"
 			if live {
 				route = "live"
 				if g, ok := remote["live_generation"].(float64); ok && g >= 0 {
@@ -69,6 +93,12 @@ func renderStatus(local, remote map[string]any, fetchErr error, showJSON bool) (
 		}
 	}
 	if showJSON {
+		if !authoritative {
+			var prob *statusProblem
+			if errors.As(fetchErr, &prob) {
+				state = prob.state
+			}
+		}
 		raw, _ := json.Marshal(map[string]any{
 			"lease_id": local["lease_id"], "url": url, "access_mode": mode,
 			"port": local["port"], "status": state, "authoritative": authoritative,
@@ -84,8 +114,21 @@ func renderStatus(local, remote map[string]any, fetchErr error, showJSON bool) (
 	if authoritative {
 		fmt.Fprintf(&sb, "Status: %s (relay)\n", state)
 		fmt.Fprintf(&sb, "Route:  %s\n", route)
+		if adv := relayStateAdvice(state); adv != "" {
+			fmt.Fprintf(&sb, "Next:   %s\n", adv)
+		}
+		if route != "unknown" && !strings.HasPrefix(route, "live") {
+			fmt.Fprintf(&sb, "Next:   route is offline; check the agent and local service, then run `ocliv doctor`\n")
+		}
 	} else if fetchErr != nil {
-		fmt.Fprintf(&sb, "Status: UNKNOWN (%s)\n", fetchErr.Error())
+		var prob *statusProblem
+		if errors.As(fetchErr, &prob) {
+			fmt.Fprintf(&sb, "Status: %s\n", prob.state)
+			fmt.Fprintf(&sb, "Next:   %s\n", prob.advice)
+		} else {
+			fmt.Fprintf(&sb, "Status: UNKNOWN (%s)\n", fetchErr.Error())
+			fmt.Fprintf(&sb, "Next:   run `ocliv doctor` to isolate relay, network, and local service\n")
+		}
 	} else {
 		fmt.Fprintf(&sb, "Status: UNKNOWN\n")
 	}
@@ -157,9 +200,16 @@ func cmdStatus(argv []string) int {
 	if leaseID == "" {
 		fetchErr = fmt.Errorf("no recorded lease id")
 	} else if k, keyID, kerr := loadKey(); kerr != nil {
-		fetchErr = kerr
+		fetchErr = &statusProblem{state: "AUTHENTICATION REQUIRED", advice: "no usable agent key (" + kerr.Error() + "); run `ocliv login`"}
 	} else if code, body := mgmtCall(relayURL, k, keyID, "GET", "/v1/agent/lease/"+leaseID+"/status"); code != http.StatusOK {
-		fetchErr = fmt.Errorf("relay status %d", code)
+		switch {
+		case code == 0:
+			fetchErr = &statusProblem{state: "RELAY DISCONNECTED", advice: "relay unreachable from here; check network and relay URL, then run `ocliv doctor`"}
+		case code == http.StatusUnauthorized || code == http.StatusForbidden:
+			fetchErr = &statusProblem{state: "AUTHENTICATION REQUIRED", advice: fmt.Sprintf("relay refused these credentials (HTTP %d); re-enroll with `ocliv login`", code)}
+		default:
+			fetchErr = fmt.Errorf("relay status %d", code)
+		}
 	} else if uerr := json.Unmarshal(body, &remote); uerr != nil {
 		fetchErr = uerr
 	}
