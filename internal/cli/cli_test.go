@@ -253,6 +253,38 @@ func TestLoginRefusesOverwriteBeforeNetwork(t *testing.T) {
 	}
 }
 
+// captureOutput redirects os.Stdout and os.Stderr to pipes while fn
+// runs and returns everything written to both, in case setup-style
+// commands split human progress (stdout) from errors (stderr).
+func captureOutput(t *testing.T, fn func()) string {
+	t.Helper()
+	oldOut, oldErr := os.Stdout, os.Stderr
+	ro, wOut, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	re, wErr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout, os.Stderr = wOut, wErr
+	fn()
+	_ = wOut.Close()
+	_ = wErr.Close()
+	os.Stdout, os.Stderr = oldOut, oldErr
+	out, err := io.ReadAll(ro)
+	_ = ro.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	errOut, err := io.ReadAll(re)
+	_ = re.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out) + string(errOut)
+}
+
 // captureStdout redirects os.Stdout to a pipe while fn runs and returns
 // everything written.
 func captureStdout(t *testing.T, fn func()) string {

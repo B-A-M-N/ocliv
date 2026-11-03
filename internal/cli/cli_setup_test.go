@@ -128,13 +128,20 @@ func TestSetupRenderPersistsOnDNSMatch(t *testing.T) {
 	t.Setenv("DYNV6_TOKEN", "TESTTOKEN")
 	out := t.TempDir()
 	var code int
-	_ = captureStdout(t, func() {
+	captured := captureOutput(t, func() {
 		code = cmdSetup([]string{"--auto", "--hostname", "lab.dynv6.net",
 			"--acme-email", "ops@mailtest.invalid-test", "--out", out,
 			"--echo-v4", echo.URL, "--echo-v6", ""})
 	})
-	if code != apperr.ExitOK {
-		t.Fatalf("exit=%d", code)
+	// DNS (apex + wildcard) verifies in this fixture, so the fresh
+	// relay_url persists — but edge provisioning cannot complete
+	// without root/Caddy, so the outcome is ACTION_REQUIRED, never a
+	// success claim.
+	if code != apperr.ExitRelayTLS {
+		t.Fatalf("exit=%d, want %d (provisioning incomplete)", code, apperr.ExitRelayTLS)
+	}
+	if !strings.Contains(captured, "ACTION REQUIRED") {
+		t.Fatalf("incomplete provisioning not labeled ACTION REQUIRED in:\n%s", captured)
 	}
 	if _, err := os.Stat(filepath.Join(out, "Caddyfile")); err != nil {
 		t.Fatalf("deployment not rendered: %v", err)
@@ -145,6 +152,121 @@ func TestSetupRenderPersistsOnDNSMatch(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), `relay_url = "https://lab.dynv6.net"`) {
 		t.Fatalf("relay_url not persisted in:\n%s", raw)
+	}
+}
+
+func TestShouldPersistRelayURL(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		existing    string
+		next        string
+		provisioned bool
+		want        bool
+	}{
+		{"fresh persists", "", "https://lab.dynv6.net", false, true},
+		{"same value idempotent", "https://lab.dynv6.net", "https://lab.dynv6.net", false, true},
+		{"replacement waits for provisioning", "https://old.example", "https://lab.dynv6.net", false, false},
+		{"replacement after provisioning", "https://old.example", "https://lab.dynv6.net", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldPersistRelayURL(tc.existing, tc.next, tc.provisioned); got != tc.want {
+				t.Fatalf("shouldPersistRelayURL(%q,%q,%v)=%v, want %v",
+					tc.existing, tc.next, tc.provisioned, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSetupWildcardDNSBlocksWithoutRecord(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	oldLookup := setupLookupHost
+	setupLookupHost = func(ctx context.Context, host string) ([]string, error) {
+		// Apex resolves; the tunnel wildcard does not exist.
+		if strings.Contains(host, ".t.") {
+			return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+		}
+		return []string{"203.0.113.9"}, nil
+	}
+	defer func() { setupLookupHost = oldLookup }()
+	upd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("addresses updated"))
+	}))
+	defer upd.Close()
+	echo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("203.0.113.9\n"))
+	}))
+	defer echo.Close()
+	t.Setenv("OCLIV_DYNV6_ENDPOINT", upd.URL)
+	t.Setenv("DYNV6_TOKEN", "TESTTOKEN")
+	out := t.TempDir()
+	var code int
+	captured := captureOutput(t, func() {
+		code = cmdSetup([]string{"--auto", "--hostname", "lab.dynv6.net",
+			"--acme-email", "ops@mailtest.invalid-test", "--out", out,
+			"--echo-v4", echo.URL, "--echo-v6", ""})
+	})
+	if code != apperr.ExitRelayTLS {
+		t.Fatalf("exit=%d, want %d (wildcard unverified)", code, apperr.ExitRelayTLS)
+	}
+	if !strings.Contains(captured, "*.t.lab.dynv6.net") {
+		t.Fatalf("missing exact wildcard record instruction in:\n%s", captured)
+	}
+	if !strings.Contains(captured, "ACTION REQUIRED") {
+		t.Fatalf("blocked setup not labeled ACTION REQUIRED in:\n%s", captured)
+	}
+	raw, err := os.ReadFile(filepath.Join(home, ".config", "ocliv", "config.toml"))
+	if err == nil && strings.Contains(string(raw), "relay_url") {
+		t.Fatalf("relay_url persisted before wildcard verified:\n%s", raw)
+	}
+}
+
+func TestSetupKeepsWorkingRelayURLWhenBlocked(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("blocked-bootstrap test must not run as root (would execute live provisioning)")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfgDir := filepath.Join(home, ".config", "ocliv")
+	if err := os.MkdirAll(cfgDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.toml"), []byte("relay_url = \"https://old.example\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldLookup := setupLookupHost
+	setupLookupHost = func(ctx context.Context, host string) ([]string, error) {
+		return []string{"203.0.113.9"}, nil
+	}
+	defer func() { setupLookupHost = oldLookup }()
+	upd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("addresses updated"))
+	}))
+	defer upd.Close()
+	echo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("203.0.113.9\n"))
+	}))
+	defer echo.Close()
+	t.Setenv("OCLIV_DYNV6_ENDPOINT", upd.URL)
+	t.Setenv("DYNV6_TOKEN", "TESTTOKEN")
+	out := t.TempDir()
+	var code int
+	_ = captureStdout(t, func() {
+		code = cmdSetup([]string{"--auto", "--hostname", "lab.dynv6.net",
+			"--acme-email", "ops@mailtest.invalid-test", "--out", out,
+			"--echo-v4", echo.URL, "--echo-v6", ""})
+	})
+	// Bootstrap cannot complete here (no root and/or no Caddy), so the
+	// outcome must be ACTION_REQUIRED and the working config untouched.
+	if code != apperr.ExitRelayTLS {
+		t.Fatalf("exit=%d, want %d (provisioning incomplete)", code, apperr.ExitRelayTLS)
+	}
+	raw, err := os.ReadFile(filepath.Join(cfgDir, "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "https://old.example") {
+		t.Fatalf("working relay_url replaced on incomplete provisioning:\n%s", raw)
 	}
 }
 

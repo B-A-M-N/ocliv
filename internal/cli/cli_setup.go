@@ -8,6 +8,8 @@ package cli
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -18,6 +20,7 @@ import (
 	"time"
 
 	"ocliv/internal/apperr"
+	"ocliv/internal/config"
 	"ocliv/internal/relay"
 	"ocliv/internal/setup"
 	"ocliv/internal/store"
@@ -229,24 +232,111 @@ func runSetupRender(ctx context.Context, d setup.Detection, hostname, acmeEmail,
 			hostname, strings.Join(addrs, ","), nonEmpty(d.EgressV4), nonEmpty(d.EgressV6))
 		return apperr.ExitRelayTLS
 	}
+	// The tunnel edge also serves per-tunnel hostnames under
+	// *.t.<domain> (on-demand ACME). An apex A/AAAA update is not
+	// wildcard provisioning: prove a fresh tunnel hostname resolves
+	// here before claiming the deployment is complete.
+	if wmatched, _, werr := verifyWildcardDNS(ctx, hostname, []string{d.EgressV4, d.EgressV6}); werr != nil || !wmatched {
+		fmt.Fprintf(os.Stderr, "ACTION REQUIRED: *.t.%s does not resolve to this host here", hostname)
+		if werr != nil {
+			fmt.Fprintf(os.Stderr, " (%v)", werr)
+		}
+		fmt.Fprintf(os.Stderr, "; tunnel hostnames like <id>.t.%s would not validate.\n", hostname)
+		fmt.Fprintf(os.Stderr, "ACTION REQUIRED: create one wildcard record — *.t.%s A %s%s — then re-run `ocliv setup --auto --hostname %s --acme-email %s`\n",
+			hostname, nonEmpty(d.EgressV4), wildcardAAAASuffix(d.EgressV6), hostname, acmeEmail)
+		return apperr.ExitRelayTLS
+	}
 	_, _, cfgPath, err := agentFiles()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return apperr.ExitInternal
 	}
 	relayURL := "https://" + strings.ToLower(strings.TrimSuffix(strings.TrimSpace(hostname), "."))
-	if err := mergeRelayURL(cfgPath, relayURL); err != nil {
-		fmt.Fprintln(os.Stderr, "error: "+err.Error())
-		return apperr.ExitInternal
+	existing := readExistingRelayURL(cfgPath)
+	persisted := false
+	if shouldPersistRelayURL(existing, relayURL, false) {
+		// Fresh install or idempotent re-run: the endpoint is
+		// DNS-verified, so recording it now is safe. Replacing a
+		// *different* working URL waits for completed provisioning.
+		if err := mergeRelayURL(cfgPath, relayURL); err != nil {
+			fmt.Fprintln(os.Stderr, "error: "+err.Error())
+			return apperr.ExitInternal
+		}
+		persisted = true
+		fmt.Printf("deployment rendered to %s and relay_url persisted (%s)\n", outDir, relayURL)
+	} else {
+		fmt.Printf("deployment rendered to %s; keeping working relay_url (%s) until provisioning succeeds\n", outDir, existing)
 	}
-	fmt.Printf("deployment rendered to %s and relay_url persisted (%s)\n", outDir, relayURL)
-	return runSetupBootstrap(d, hostname, outDir, dataDir)
+	code, completed := runSetupBootstrap(d, hostname, outDir, dataDir)
+	if !persisted {
+		if code == apperr.ExitOK && completed && shouldPersistRelayURL(existing, relayURL, completed) {
+			if err := mergeRelayURL(cfgPath, relayURL); err != nil {
+				fmt.Fprintln(os.Stderr, "error: "+err.Error())
+				return apperr.ExitInternal
+			}
+			fmt.Printf("provisioning complete; relay_url now %s\n", relayURL)
+		} else {
+			fmt.Printf("provisioning incomplete; working relay_url (%s) retained\n", existing)
+		}
+	}
+	return code
+}
+
+// shouldPersistRelayURL decides whether a newly verified endpoint may
+// replace the recorded client setting. Fresh installs and idempotent
+// re-runs persist immediately; replacing a *different* working URL
+// requires completed provisioning, so a failed Caddy install or
+// enrollment can never strand the client on a dead endpoint.
+func shouldPersistRelayURL(existing, next string, provisioned bool) bool {
+	if next == "" {
+		return false
+	}
+	if existing == "" || existing == next {
+		return true
+	}
+	return provisioned
+}
+
+// readExistingRelayURL returns the recorded relay_url, or "" when the
+// agent config has none. Unreadable files fail closed to "" only for
+// missing files; other errors surface to the caller via merge errors.
+func readExistingRelayURL(cfgPath string) string {
+	vals, err := config.LoadAgentFile(cfgPath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(vals["relay_url"])
+}
+
+// verifyWildcardDNS proves the tunnel namespace resolves here: it
+// looks up a fresh random <label>.t.<domain> (never a cached real
+// lease name) and requires it to hit the observed egress. A miss
+// means the wildcard record is absent, not merely slow apex
+// propagation — the apex check already passed above.
+func verifyWildcardDNS(ctx context.Context, hostname string, want []string) (bool, []string, error) {
+	var rnd [4]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		return false, nil, err
+	}
+	probe := "ocliv-probe-" + hex.EncodeToString(rnd[:]) + ".t." + strings.ToLower(strings.TrimSuffix(strings.TrimSpace(hostname), "."))
+	return verifyDNSResolution(ctx, probe, want)
+}
+
+func wildcardAAAASuffix(v6 string) string {
+	if strings.TrimSpace(v6) == "" {
+		return ""
+	}
+	return " + AAAA " + v6
 }
 
 // runSetupBootstrap executes the viable-path edge plan. Only steps the
 // planner marks auto run, and only as root; everything else prints as
 // the exact manual command. Live executors back up before replacing.
-func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir string) int {
+// It returns the exit code plus whether provisioning actually
+// completed: manual-only plans and hard blocks report ACTION_REQUIRED
+// (ExitRelayTLS), never success, so callers never treat a printed
+// plan as a functioning tunnel.
+func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir string) (int, bool) {
 	_, caddyErr := exec.LookPath("caddy")
 	env := setup.BootstrapEnv{
 		AsRoot:       os.Geteuid() == 0,
@@ -257,11 +347,13 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir string) i
 	}
 	steps, blockReason := setup.PlanBootstrap(env)
 	if blockReason != "" && len(steps) == 0 {
-		fmt.Printf("edge provisioning blocked: %s\n", blockReason)
-		return apperr.ExitOK
+		fmt.Printf("ACTION REQUIRED: edge provisioning blocked: %s\n", blockReason)
+		return apperr.ExitRelayTLS, false
 	}
+	allAuto := true
 	for _, s := range steps {
 		if !s.Auto {
+			allAuto = false
 			fmt.Printf("manual: %s\n  %s\n", s.Title, s.Manual)
 			continue
 		}
@@ -289,17 +381,22 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir string) i
 		if err != nil {
 			fmt.Printf("FAILED: %v\n", err)
 			fmt.Printf("manual recovery: %s\n  %s\n", s.Title, s.Manual)
-			return apperr.ExitInternal
+			return apperr.ExitInternal, false
 		}
 		fmt.Printf("done\n")
 	}
 	// Single-manual-step plans (e.g. install Caddy first) block with
 	// the re-run guidance instead of claiming progress.
 	if blockReason != "" {
-		fmt.Printf("next: %s\n", blockReason)
+		fmt.Printf("ACTION REQUIRED: %s\n", blockReason)
+		return apperr.ExitRelayTLS, false
+	}
+	if !allAuto {
+		fmt.Printf("ACTION REQUIRED: %d step(s) need the operator (see manual commands above); re-run after completing them\n", len(steps))
+		return apperr.ExitRelayTLS, false
 	}
 	fmt.Printf("verify externally: from another network, curl -v https://%s/v1/agent/challenge (no -k)\n", hostname)
-	return apperr.ExitOK
+	return apperr.ExitOK, true
 }
 
 // mintSetupCode mints a one-time enrollment code against the relay's
