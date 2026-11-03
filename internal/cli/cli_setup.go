@@ -303,48 +303,38 @@ func runSetupRender(ctx context.Context, d setup.Detection, hostname, acmeEmail,
 	}
 	relayURL := "https://" + strings.ToLower(strings.TrimSuffix(strings.TrimSpace(hostname), "."))
 	existing := readExistingRelayURL(cfgPath)
-	persisted := false
-	if shouldPersistRelayURL(existing, relayURL, false) {
-		// Fresh install or idempotent re-run: the endpoint is
-		// DNS-verified, so recording it now is safe. Replacing a
-		// *different* working URL waits for completed provisioning.
+	// The rendered deployment in outDir is the *candidate* setup; the
+	// recorded relay_url is the *active* client configuration. The
+	// candidate becomes active only after provisioning succeeds —
+	// never on DNS verification alone, which proves nothing about
+	// Caddy, relay startup, or enrollment.
+	fmt.Printf("deployment rendered to %s (candidate; active relay_url unchanged: %s)\n", outDir, nonEmpty(existing))
+	code, completed := runSetupBootstrap(d, hostname, outDir, dataDir)
+	if code == apperr.ExitOK && completed && shouldPersistRelayURL(existing, relayURL, completed) {
 		if err := mergeRelayURL(cfgPath, relayURL); err != nil {
 			fmt.Fprintln(os.Stderr, "error: "+err.Error())
 			return apperr.ExitInternal
 		}
-		persisted = true
-		fmt.Printf("deployment rendered to %s and relay_url persisted (%s)\n", outDir, relayURL)
+		fmt.Printf("provisioning complete; relay_url now %s\n", relayURL)
+	} else if code == apperr.ExitOK && completed {
+		fmt.Printf("provisioning complete; relay_url unchanged\n")
 	} else {
-		fmt.Printf("deployment rendered to %s; keeping working relay_url (%s) until provisioning succeeds\n", outDir, existing)
-	}
-	code, completed := runSetupBootstrap(d, hostname, outDir, dataDir)
-	if !persisted {
-		if code == apperr.ExitOK && completed && shouldPersistRelayURL(existing, relayURL, completed) {
-			if err := mergeRelayURL(cfgPath, relayURL); err != nil {
-				fmt.Fprintln(os.Stderr, "error: "+err.Error())
-				return apperr.ExitInternal
-			}
-			fmt.Printf("provisioning complete; relay_url now %s\n", relayURL)
-		} else {
-			fmt.Printf("provisioning incomplete; working relay_url (%s) retained\n", existing)
-		}
+		fmt.Printf("provisioning incomplete; working relay_url (%s) retained — artifacts kept in %s for inspection\n", nonEmpty(existing), outDir)
 	}
 	return code
 }
 
-// shouldPersistRelayURL decides whether a newly verified endpoint may
-// replace the recorded client setting. Fresh installs and idempotent
-// re-runs persist immediately; replacing a *different* working URL
-// requires completed provisioning, so a failed Caddy install or
-// enrollment can never strand the client on a dead endpoint.
+// shouldPersistRelayURL decides whether a newly rendered endpoint may
+// replace the recorded client setting. Only completed provisioning
+// qualifies: a failed Caddy install, relay start, or enrollment must
+// never strand the client on a dead endpoint, and a fresh install
+// must not record an endpoint that was never provisioned.
 func shouldPersistRelayURL(existing, next string, provisioned bool) bool {
-	if next == "" {
-		return false
-	}
-	if existing == "" || existing == next {
-		return true
-	}
-	return provisioned
+	// existing is accepted but unused in the decision: fresh, same,
+	// and replacement URLs all persist exactly when provisioning
+	// completed. It stays a parameter so the call site documents
+	// which working configuration is being replaced.
+	return next != "" && provisioned
 }
 
 // readExistingRelayURL returns the recorded relay_url, or "" when the

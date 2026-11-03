@@ -109,7 +109,7 @@ func TestSetupMissingTokenNeedsAuth(t *testing.T) {
 	}
 }
 
-func TestSetupRenderPersistsOnDNSMatch(t *testing.T) {
+func TestSetupFreshInstallDoesNotPersistBeforeProvisioning(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	oldLookup := setupLookupHost
@@ -134,10 +134,11 @@ func TestSetupRenderPersistsOnDNSMatch(t *testing.T) {
 			"--acme-email", "ops@mailtest.invalid-test", "--out", out,
 			"--echo-v4", echo.URL, "--echo-v6", ""})
 	})
-	// DNS (apex + wildcard) verifies in this fixture, so the fresh
-	// relay_url persists — but edge provisioning cannot complete
-	// without root/Caddy, so the outcome is ACTION_REQUIRED, never a
-	// success claim.
+	// DNS (apex + wildcard) verifies in this fixture, but edge
+	// provisioning cannot complete without root/Caddy: the outcome
+	// must be ACTION_REQUIRED and the fresh install must NOT record
+	// an operational relay_url for an endpoint that was never
+	// provisioned. Rendered artifacts stay for manual inspection.
 	if code != apperr.ExitRelayTLS {
 		t.Fatalf("exit=%d, want %d (provisioning incomplete)", code, apperr.ExitRelayTLS)
 	}
@@ -148,11 +149,8 @@ func TestSetupRenderPersistsOnDNSMatch(t *testing.T) {
 		t.Fatalf("deployment not rendered: %v", err)
 	}
 	raw, err := os.ReadFile(filepath.Join(home, ".config", "ocliv", "config.toml"))
-	if err != nil {
-		t.Fatalf("agent config not written: %v", err)
-	}
-	if !strings.Contains(string(raw), `relay_url = "https://lab.dynv6.net"`) {
-		t.Fatalf("relay_url not persisted in:\n%s", raw)
+	if err == nil && strings.Contains(string(raw), "lab.dynv6.net") {
+		t.Fatalf("fresh relay_url persisted before provisioning completed:\n%s", raw)
 	}
 }
 
@@ -164,10 +162,13 @@ func TestShouldPersistRelayURL(t *testing.T) {
 		provisioned bool
 		want        bool
 	}{
-		{"fresh persists", "", "https://lab.dynv6.net", false, true},
-		{"same value idempotent", "https://lab.dynv6.net", "https://lab.dynv6.net", false, true},
+		{"fresh waits for provisioning", "", "https://lab.dynv6.net", false, false},
+		{"fresh persists after provisioning", "", "https://lab.dynv6.net", true, true},
+		{"same value waits for provisioning", "https://lab.dynv6.net", "https://lab.dynv6.net", false, false},
+		{"same value idempotent after provisioning", "https://lab.dynv6.net", "https://lab.dynv6.net", true, true},
 		{"replacement waits for provisioning", "https://old.example", "https://lab.dynv6.net", false, false},
 		{"replacement after provisioning", "https://old.example", "https://lab.dynv6.net", true, true},
+		{"empty next never persists", "https://old.example", "", true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := shouldPersistRelayURL(tc.existing, tc.next, tc.provisioned); got != tc.want {
