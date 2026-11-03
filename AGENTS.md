@@ -214,4 +214,6 @@ with its reason instead of silently dropping it.
 - P7 doctor/status honesty, P8 unit validation, P9 planner dry-run honesty: PASS. R1 health-listener Serve logging: FIXED.
 - F1 bounded fuzz (`lease` + `proxy`, ~16.8M execs): PASS, zero crashes.
 - A2 unbounded `audit_events` growth: FIXED (Stage 6) — 90-day `store.AuditRetention`, schemaV6 time index, `PruneAuditEvents` in `reconcileBoot` (fail-closed); red→green regression tests; full gates green. E2/C1/E3 chaos replayed green on corrected impl (VERIFIED); D6 dynv6 200-shape BLOCKED (needs valid token). Full Stage-6 matrix: `docs/qualification/CHAOS-BATCH.md`.
-- Soak, scaled pressure, cross-machine partition/TLS-SNI, public edge, provider OAuth, dynv6 zone claim: NOT EXECUTED/BLOCKED (operator-gated). Full matrix: `docs/qualification/CHAOS-BATCH.md`.
+- bamnlabs.dynv6.net apex claim: DONE by operator (resolves to 71.201.182.175); `relay` subdomain deferred (apex suffices for single-host edge).
+- Bounded soak: PASS (Stage 6, operator-authorized) — `TestSoakBoundedTraffic` SOAK_SECS=300: 42,837 ok, 0 fail, avg ~56ms, goroutine growth +6; mid-run restart resumes same lease. Incidental C08 proof (cookie-POST without Origin 403s).
+- Scaled pressure beyond 8 workers, cross-machine partition/TLS-SNI, public edge, provider OAuth: NOT EXECUTED/BLOCKED (operator-gated). Full matrix: `docs/qualification/CHAOS-BATCH.md`.
