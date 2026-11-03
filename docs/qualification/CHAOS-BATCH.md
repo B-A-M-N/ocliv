@@ -162,6 +162,18 @@ replayed explicitly above.
 Residual risks: boot-only pruning leaves a months-long no-restart
 relay growing audit rows (bounded by rate limiters; restarts on
 upgrade/reboot converge it); D6 200-shape unobservable without a valid
-token; soak/partition/public-edge/provider-OAuth still NOT EXECUTED —
+token; partition/public-edge/provider-OAuth still NOT EXECUTED —
 operator-gated. Next: final Reliability Qualification against this
 revision once operator-gated items are authorized.
+
+## Stage 6 — bounded soak (operator-authorized, `3eaaf66`)
+
+`TestSoakBoundedTraffic` (`tests/integration/soak_test.go`,
+SOAK_SECS=300): 8 workers, protected GET + POST-with-Origin traffic
+through a full relay+agent path; mid-run controlled pause, agent
+restart, resume on the same lease with the pre-restart cookie.
+Result: 42,837 ok, 0 fail, avg latency ~56ms, goroutine growth +6
+(20→26, bounded). Incidental C08 proof: cookie-authenticated POSTs
+without Origin 403 as required (caught as a test bug, fixed by
+attaching exact Origin). Soak item CLOSED; scaled pressure beyond
+8 workers and cross-machine partition remain operator-gated.
