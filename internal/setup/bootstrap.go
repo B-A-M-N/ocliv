@@ -162,11 +162,21 @@ func installManagedFile(dst string, candidate []byte, validate func(string) erro
 	}
 	if err := validate(dst); err != nil {
 		if prev, rerr := os.ReadFile(dst + ".ocliv-bak"); rerr == nil {
-			_ = os.WriteFile(dst, prev, 0o644)
-			_ = os.Remove(dst + ".ocliv-bak")
+			// The restore write is itself fallible (disk full,
+			// permissions, hostile post-write state). A failed
+			// restore must be loud, and the backup must survive
+			// as a recovery artifact — never silently deleted.
+			if werr := os.WriteFile(dst, prev, 0o644); werr != nil {
+				return fmt.Errorf("validation failed and previous config restore failed, backup kept at %s.ocliv-bak: %v: %w", dst, werr, err)
+			}
+			if rerr := os.Remove(dst + ".ocliv-bak"); rerr != nil {
+				return fmt.Errorf("validation failed, previous config restored but backup removal failed: %v: %w", rerr, err)
+			}
 			return fmt.Errorf("validation failed, previous config restored: %w", err)
 		}
-		_ = os.Remove(dst)
+		if rerr := os.Remove(dst); rerr != nil && !os.IsNotExist(rerr) {
+			return fmt.Errorf("validation failed and installed candidate removal failed: %v: %w", rerr, err)
+		}
 		return fmt.Errorf("validation failed, installed candidate removed (no previous config): %w", err)
 	}
 	if !existed {
