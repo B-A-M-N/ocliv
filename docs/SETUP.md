@@ -27,19 +27,25 @@ involved at any step.
 # 1. Diagnose only — changes nothing.
 ocliv setup --check
 
-# 2. Preview the DNS update (token redacted, nothing sent).
-DYNV6_TOKEN=... ocliv setup --auto --hostname lab.dynv6.net --dry-run
+# 2. Store the token in an owner-only file first (never on the
+#    command line — it would land in shell history):
+printf '%s' "$TOKEN" > ~/.dynv6-token && chmod 600 ~/.dynv6-token
+#    Preview the DNS update (token redacted, nothing sent).
+ocliv setup --auto --hostname lab.dynv6.net --token-file ~/.dynv6-token --dry-run
 
 # 3. Full bootstrap: DNS sync, tunnel-edge render, DNS verify,
 #    relay_url persist, Caddy install, systemd enable, auto-enroll.
-sudo -E DYNV6_TOKEN=... ocliv setup --auto \
-  --hostname lab.dynv6.net --acme-email you@addr
+sudo ocliv setup --auto --hostname lab.dynv6.net \
+  --acme-email you@addr --token-file ~/.dynv6-token
 
 # 4. From another network (no -k): expect relay 4xx, not TLS errors.
 curl -v https://lab.dynv6.net/v1/agent/challenge
 ```
 
-`sudo -E` preserves DYNV6_TOKEN for the root install steps.
+The token travels only via `--token-file` (0600, owned by root for
+`sudo` runs) or the `DYNV6_TOKEN` environment variable set OUTSIDE the
+invoked command (e.g. in a shell profile), never as an inline
+`TOKEN=... ocliv ...` assignment, which shell history would persist.
 
 ## Certificate strategy (read before operating)
 

@@ -392,6 +392,53 @@ func validateMCPResourceMetadata(client *http.Client, discoveryURL, expectResour
 	return nil
 }
 
+// mcpRouteASDiscoveryURL derives the RFC 8414 well-known URL for a
+// relay-minted route URL of the exact shape https://<host>/r/<route-id>/mcp.
+// The issuer for the route is https://<host>/r/<route-id>/oauth, so its
+// metadata lives at /.well-known/oauth-authorization-server/r/<route-id>/oauth.
+// Same scheme/host/path discipline as mcpRouteDiscoveryURL.
+func mcpRouteASDiscoveryURL(routeURL, routeID string) (string, error) {
+	u, err := url.Parse(routeURL)
+	if err != nil || u.Scheme != "https" || u.Host == "" {
+		return "", fmt.Errorf("route URL is not a valid https URL: %q", routeURL)
+	}
+	if u.EscapedPath() != "/r/"+routeID+"/mcp" {
+		return "", fmt.Errorf("route URL %q does not match route %q", routeURL, routeID)
+	}
+	return "https://" + u.Host + "/.well-known/oauth-authorization-server/r/" + routeID + "/oauth", nil
+}
+
+// validateMCPASMetadata fetches an RFC 8414 authorization-server metadata
+// document and requires its "issuer" to equal the route's OAuth issuer
+// exactly. Without this check a relay that admits PRM and MCP but rejects
+// AS metadata (421) passes strict discovery while OAuth cannot complete.
+// Transport failure is inconclusive (errDiscoveryUnreachable); a reachable
+// non-200 (including 421) or mismatched issuer is a hard failure.
+func validateMCPASMetadata(client *http.Client, discoveryURL, expectIssuer string) error {
+	resp, err := client.Get(discoveryURL)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errDiscoveryUnreachable, err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil {
+		return fmt.Errorf("%w: unreadable discovery body", errDiscoveryUnreachable)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("oauth authorization-server discovery answered %d (want 200 with issuer %q)", resp.StatusCode, expectIssuer)
+	}
+	var doc struct {
+		Issuer string `json:"issuer"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil || doc.Issuer == "" {
+		return fmt.Errorf("oauth authorization-server discovery is not a metadata document")
+	}
+	if doc.Issuer != expectIssuer {
+		return fmt.Errorf("upstream advertises issuer %q, published route expects %q", doc.Issuer, expectIssuer)
+	}
+	return nil
+}
+
 // publishLocalProbeOK is the publish local-target gate (P1): publication
 // proceeds when the probe is either fully verified (a usable MCP session)
 // or reported authenticating presence from an upstream-oauth target
@@ -873,7 +920,19 @@ func runMCPPublish(argv []string, serve bool) int {
 					if derr != nil {
 						return derr
 					}
-					return validateMCPResourceMetadata(dclient, durl, routeURL)
+					if err := validateMCPResourceMetadata(dclient, durl, routeURL); err != nil {
+						return err
+					}
+					// PRM alone is insufficient: a relay admitting PRM
+					// but 421ing AS metadata would pass while OAuth
+					// cannot complete. Require AS metadata 200 with
+					// the exact route issuer as well.
+					aurl, aerr := mcpRouteASDiscoveryURL(routeURL, routeID)
+					if aerr != nil {
+						return aerr
+					}
+					expectIssuer := strings.TrimSuffix(routeURL, "/mcp") + "/oauth"
+					return validateMCPASMetadata(dclient, aurl, expectIssuer)
 				},
 				func() (int, string) {
 					return activatePublishedRoute(relayURL, k, keyID, routeLeaseID, routeID)

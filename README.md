@@ -41,6 +41,8 @@ identity administration live under Advanced.
 | Reconnect backoff with reset, dynamic-DNS refresh | Implemented |
 | Backup / restore without resurrecting revoked authority | Implemented, tested |
 | Self-hosted relay on your own domain (dynv6 + Caddy) | Implemented; needs public inbound IP, DNS, root — see [docs/SETUP.md](docs/SETUP.md) |
+| Designated relay on Tailscale Funnel (`.20`, `pop-os-3.tail8d285a.ts.net`) | **QUALIFIED 2026-11-04** — full MCP OAuth E2E PASS through public HTTPS via Funnel (see [docs/qualification/QUALIFICATION.md](docs/qualification/QUALIFICATION.md), Round 47). Deployed binary sha256 `9d38bb1b2142b661fe5590584061bf696d6a1523bcaea5000d783ef5dd7e8e7a` on `.20` (`/usr/local/bin/ocliv`, PID 3350438 at qualification). |
+| Permanent public ingress on `bamnlabs.dynv6.net` (DNS + router + Caddy) | **NOT QUALIFIED** — depends on dynv6 DNS, public inbound IP/router, and production Caddy. Funnel qualification does not establish this. |
 | Shared public relay (no domain/VPS per user) | **BLOCKED — no operated relay exists yet** (see [docs/SHARED-RELAY.md](docs/SHARED-RELAY.md)) |
 | Public ChatGPT registration of an Ocliv endpoint | **NOT VERIFIED** — local protocol path works; provider-side steps unproven |
 | 24-hour soak, clean-host install proof | **NOT VERIFIED** |

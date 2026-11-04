@@ -1,10 +1,30 @@
 #!/bin/sh
 # verify-local.sh — Gate-1 style probe of a loopback MCP server.
-# Usage: MCP_TOKEN=<token> ./verify-local.sh [base-url]
+# Usage: ./verify-local.sh [--token-file PATH] [base-url]
+#   The bearer comes from --token-file (preferred, 0600), MCP_TOKEN_FILE,
+#   or MCP_TOKEN set in the environment — never from an inline
+#   `MCP_TOKEN=...` command assignment (shell history would persist it).
 # Fails closed on any mismatch; prints nothing secret.
 set -eu
-BASE="${1:-http://127.0.0.1:18766}"
-TOKEN="${MCP_TOKEN:?set MCP_TOKEN to the server's bearer token}"
+TOKEN=""
+BASE=""
+for arg in "$@"; do
+  case "$arg" in
+    --token-file=*) TOKEN_FILE="${arg#--token-file=}";;
+    --token-file) echo "--token-file needs =PATH" >&2; exit 1;;
+    *) BASE="$arg";;
+  esac
+done
+if [ -n "${TOKEN_FILE:-}" ]; then
+  TOKEN="$(cat "$TOKEN_FILE")"
+fi
+if [ -z "$TOKEN" ] && [ -n "${MCP_TOKEN_FILE:-}" ]; then
+  TOKEN="$(cat "$MCP_TOKEN_FILE")"
+fi
+if [ -z "$TOKEN" ]; then
+  TOKEN="${MCP_TOKEN:?set MCP_TOKEN, MCP_TOKEN_FILE, or --token-file=PATH to the server's bearer token}"
+fi
+BASE="${BASE:-http://127.0.0.1:18766}"
 JSON='Content-Type: application/json'
 
 fail() { echo "FAIL: $1" >&2; exit 1; }

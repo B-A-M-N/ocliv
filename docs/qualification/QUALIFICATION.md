@@ -1100,3 +1100,86 @@ Drill (container removed afterwards, zero host footprint):
 - Disposition: docs FIXED; live items remain BLOCKED on operator
   prerequisites (VPS-or-direct-host with public IP, dynv6 zone,
   OCI account, ChatGPT workspace).
+
+## Round 47 — .20 designated relay qualification via Tailscale Funnel (2026-11-04)
+
+Host roles (fixed): 10.9.66.155 pop-os = development/publisher/temporary
+Funnel test; 10.9.66.20 pop-os-3 = designated relay.  This round
+qualifies .20 only; it does not qualify permanent public ingress.
+
+- Found: .20 relay (systemd ocliv-relay, PID 3293659) ran
+  /usr/local/bin/ocliv Nov 1 14:38, sha256 5f8ebbab3b0fb754f661c5f13298d675a894936fa3060b88c52cdc1f0845dbf3,
+  which predates commit 76d48b8 (Nov 1 17:40, route-scoped OAuth ingress +
+  AS metadata).  Loopback on .20: PRM -> 404, AS -> 421,
+  /r/<id>/mcp -> 404, /r/<id>/oauth/* -> 421.  Binary contains 0
+  oauth-authorization-server / /oauth/revoke strings (vs 2/1 on current builds).
+  Cause: outdated binary, not configuration (--mcp-host/--mcp-port=443 correct,
+  Caddy funnel :18081 -> 127.0.0.1:8080 correct).  The earlier :10000 report
+  was a stale first-attempt route (2wEpl..., never activated); current
+  cmdline uses --mcp-port=443.
+- Strict-discovery gap (confirmed): cli_mcp_publish.go validated only PRM
+  (validateMCPResourceMetadata), never AS metadata, so a relay admitting
+  PRM but 421ing AS passed as "verified".  Fix (this round):
+  +mcpRouteASDiscoveryURL(), +validateMCPASMetadata() (200 + exact issuer;
+  transport = errDiscoveryUnreachable; non-200 incl. 421 = hard fail),
+  verify closure in runMCPPublish checks PRM then AS.
+  Regression: TestValidateMCPASMetadata (421 hard-fails, mismatch fails,
+  unreachable inconclusive).  Focused tests pass.
+- Replacement: built on .155 from the then-current worktree (HEAD + strict
+  fix + pre-existing pending install/init changes),
+  sha256 9d38bb1b2142b661fe5590584061bf696d6a1523bcaea5000d783ef5dd7e8e7a,
+  tested isolated (relay + cli green; throwaway relay returned 404-not-421
+  for PRM/AS/MCP/OAuth/revoke on both .155 and .20 with a copied DB).
+  Staged on .20 at ~/ocliv-lab-bin/ocliv-candidate-20261104 (not installed).
+  Pre-deploy DB backup on .20 (Docker bind-mount, no restart):
+  ~/ocliv-e2e-20-backup/ocliv.db-predeploy-20261104T2300Z.backup, integrity ok,
+  880d8391fc211ae01a1adbc1d186a85f7375e685b7222a9f56872056b125e3ca,
+  leases 19, publications 0.
+- Deployment (operator, sudo on .20, approved): backed up old binary to
+  /usr/local/bin/ocliv.bak-20261104T2300Z and env to
+  /etc/ocliv/relay.env.bak-20261104T2300Z, installed candidate to
+  /usr/local/bin/ocliv, systemctl restart ocliv-relay.
+  Verified: PID 3350438, health ok, AS loopback -> 404 (not 421).
+  Rollback: restore .bak binary + systemctl restart.
+- E2E (ONE, on .20 through https://pop-os-3.tail8d285a.ts.net, publisher on
+  .155, existing key-0bea142b... identity, no new enrollment):
+  publish --name e2e-20-qual --strict-discovery ->
+    route MCp47-XC-zH1drKOuTbA2A, "OAuth discovery verified" (PRM+AS),
+    lease lse-n1zgJNEAKdvEEtpNMPXnsA.
+  PRM -> 200, AS -> 200 (previously 421).  doctor: route live.
+  OAuth DCR -> client_id, PKCE S256, authorize txn approve -> 302 code,
+    token exchange -> 200.  PASS.
+  tools/list -> 200 [ping]; tools/call ping -> 200 pong:ocliv-oauth-lab-1;
+    no-bearer -> 401; tampered -> 401.  PASS.
+  Reconnect: SIGINT (retained offline) + republish same name ->
+    same route MCp47..., discovery verified again, lease lse-LaBmNLzuQggp8cwtTF5cGg,
+    tools still 200.  PASS.
+  Revocation: pre 200, POST /oauth/revoke -> 200, post 401.  PASS.
+  Unpublish: "MCP route removed: MCp47...", doctor no lease, public probes 404.
+  Disposable tokens/client deleted; redacted logs retained in
+  /tmp/ocliv-e2e-20/qual/ (.155).  Post-qual DB backup on .20:
+  ocliv.db-postqual-20261104T2327Z.backup, integrity ok, leases 20,
+  audit 404, publications 0, qual leases CLOSED.
+- Security cleanup: disposable lab on .155 :18810 stopped; lab secrets
+  (/tmp/ocliv-e2e-20/oauth-secret.txt, code-file.txt,
+  /tmp/ocliv-e2e-verify/oauth-secret.txt, and the same enrollment code
+  copies on .20 ~/ocliv-e2e-20/) shredded; .20 ~/ocliv-cand-test20 removed.
+  Funnel lab :18766 and existing funnel/metis routes on .155 preserved.
+  The e2e-20 agent key (key-0bea142b...) remains active-but-leaseless on .20;
+  operator may revoke with `ocliv relay revoke-key --key-id key-0bea142b8dbe449f
+  --data /var/lib/ocliv` if desired (not done by the agent - needs sudo).
+- Full gates at closeout (this tree): go build ./... ok, go vet ./... ok,
+  gofmt clean, go test ./internal/... PASS, go test ./packaging/... PASS,
+  go test -race relay/agent/config/cli/mcp PASS,
+  go test ./tests/integration/ PASS (242s, incl. new E2E qualification test).
+- Verdicts:
+  .20 relay E2E: PASS.  OAuth DCR/PKCE/tools/revocation: PASS.
+  Reconnect and cleanup: PASS.  Strict-discovery regression fix: PASS.
+  Permanent public ingress on bamnlabs.dynv6.net: NOT QUALIFIED - still
+  depends on dynv6 DNS, public inbound IP/router, and production Caddy.
+  This proves the .20 relay works through public HTTPS via Tailscale Funnel;
+  it does not establish independent production ingress on bamnlabs.dynv6.net.
+- Disposition: .20 deployment QUALIFIED (Funnel scope); permanent ingress
+  BLOCKED/NOT VERIFIED (operator DNS/router/Caddy).  Implementation frozen
+  after closeout; no further features or repeated E2E unless a real
+  defect emerges.

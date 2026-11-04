@@ -75,6 +75,55 @@ func TestValidateMCPResourceMetadata(t *testing.T) {
 	}
 }
 
+// TestValidateMCPASMetadata pins the strict-discovery AS check: a relay
+// that returns 421 for AS metadata while serving PRM 200 must fail, not
+// pass as "verified". Transport failure stays inconclusive.
+func TestValidateMCPASMetadata(t *testing.T) {
+	client := &http.Client{}
+	// Match: nil.
+	match := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"issuer":"https://public.example.org/r/abc/oauth"}`))
+	}))
+	defer match.Close()
+	if err := validateMCPASMetadata(client, match.URL+"/.well-known/oauth-authorization-server", "https://public.example.org/r/abc/oauth"); err != nil {
+		t.Fatalf("matching AS metadata rejected: %v", err)
+	}
+	// 421 (authority rejects AS while PRM passes): hard failure, never unreachable.
+	misdirected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "misdirected: visitor traffic requires a tunnel hostname", http.StatusMisdirectedRequest)
+	}))
+	defer misdirected.Close()
+	err := validateMCPASMetadata(client, misdirected.URL+"/.well-known/oauth-authorization-server", "https://public.example.org/r/abc/oauth")
+	if err == nil || errors.Is(err, errDiscoveryUnreachable) {
+		t.Fatalf("421 AS metadata = %v, want fail-closed non-unreachable error", err)
+	}
+	// Issuer mismatch: hard failure.
+	mismatch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"issuer":"https://evil.example/r/abc/oauth"}`))
+	}))
+	defer mismatch.Close()
+	if err := validateMCPASMetadata(client, mismatch.URL+"/.well-known/oauth-authorization-server", "https://public.example.org/r/abc/oauth"); err == nil || errors.Is(err, errDiscoveryUnreachable) {
+		t.Fatalf("mismatched issuer = %v, want fail-closed mismatch", err)
+	}
+	// Unreachable: inconclusive.
+	closed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	url := closed.URL
+	closed.Close()
+	if err := validateMCPASMetadata(client, url, "https://public.example.org/r/abc/oauth"); !errors.Is(err, errDiscoveryUnreachable) {
+		t.Fatalf("unreachable AS = %v, want errDiscoveryUnreachable", err)
+	}
+	// URL derivation.
+	got, err := mcpRouteASDiscoveryURL("https://public.example.org/r/abc123/mcp", "abc123")
+	if err != nil || got != "https://public.example.org/.well-known/oauth-authorization-server/r/abc123/oauth" {
+		t.Fatalf("AS derivation = (%q, %v)", got, err)
+	}
+	if _, err := mcpRouteASDiscoveryURL("http://public.example.org/r/abc123/mcp", "abc123"); err == nil {
+		t.Fatal("non-https AS derivation accepted")
+	}
+}
+
 // TestDoctorLoopbackTargetHonorsFamily: the doctor must probe the exact
 // loopback family the tunnel was started with. An IPv6-only server must
 // not be diagnosed via 127.0.0.1 (possibly a different service on the

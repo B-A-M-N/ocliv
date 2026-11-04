@@ -1,6 +1,10 @@
 #!/bin/sh
 # verify-ingress.sh — probe a published MCP route through the public edge.
-# Usage: MCP_TOKEN=<token> [MCP_CACERT=<ca-bundle>] [EXPECTED_TOOL=<name>] ./verify-ingress.sh <route-url>
+# Usage: ./verify-ingress.sh [--token-file PATH] <route-url>
+#   [MCP_CACERT=<ca-bundle>] [EXPECTED_TOOL=<name>]
+#   The bearer comes from --token-file (preferred, 0600), MCP_TOKEN_FILE,
+#   or MCP_TOKEN set in the environment — never from an inline
+#   `MCP_TOKEN=...` command assignment (shell history would persist it).
 # Route URL shape: https://<relay-host>[:port]/r/<route-id>/mcp
 # Checks: OAuth metadata resource binding, missing-token 401, invalid-token
 # 401, and a valid-token JSON-RPC call. EXPECTED_TOOL defaults to "ping";
@@ -9,8 +13,25 @@
 # system roots unless MCP_CACERT names a lab bundle (verification is
 # never disabled).
 set -eu
-ROUTE="${1:?usage: MCP_TOKEN=<token> $0 <route-url>}"
-TOKEN="${MCP_TOKEN:?set MCP_TOKEN to the upstream Bearer [REDACTED]}"
+TOKEN=""
+ROUTE=""
+for arg in "$@"; do
+  case "$arg" in
+    --token-file=*) TOKEN_FILE="${arg#--token-file=}";;
+    --token-file) echo "--token-file needs =PATH" >&2; exit 1;;
+    *) ROUTE="$arg";;
+  esac
+done
+ROUTE="${ROUTE:?usage: ./verify-ingress.sh [--token-file=PATH] <route-url>}"
+if [ -n "${TOKEN_FILE:-}" ]; then
+  TOKEN="$(cat "$TOKEN_FILE")"
+fi
+if [ -z "$TOKEN" ] && [ -n "${MCP_TOKEN_FILE:-}" ]; then
+  TOKEN="$(cat "$MCP_TOKEN_FILE")"
+fi
+if [ -z "$TOKEN" ]; then
+  TOKEN="${MCP_TOKEN:?set MCP_TOKEN, MCP_TOKEN_FILE, or --token-file=PATH to the upstream Bearer token}"
+fi
 TOOL="${EXPECTED_TOOL:-ping}"
 JSON='Content-Type: application/json'
 CURL="curl -s"

@@ -14,6 +14,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -22,6 +23,19 @@ import (
 	edgecaddy "ocliv/packaging/caddy"
 	edgesystemd "ocliv/packaging/systemd"
 )
+
+// initCaddyValidate runs a real `caddy validate` on a generated
+// Caddyfile. Indirection lets tests prove the check fires without a
+// live Caddy. checkInitDir skips it (structurally only) when no caddy
+// binary is on PATH; the bootstrap planner then blocks with an
+// explicit "install Caddy" step instead of passing.
+var initCaddyValidate = func(caddyPath string) error {
+	c := exec.Command("caddy", "validate", "--config", caddyPath, "--adapter", "caddyfile")
+	if out, err := c.CombinedOutput(); err != nil {
+		return fmt.Errorf("caddy validate: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
 
 // initFileTargets names every file init may write, for the
 // no-clobber check and operator reporting.
@@ -499,6 +513,15 @@ dnsOK:
 	}
 	if !strings.Contains(string(dns), domain) && !strings.Contains(string(dns), host) {
 		fail("dns-records.txt: names neither %q nor %q", domain, host)
+	}
+	// Real-Caddy gate: structural checks alone cannot catch a broken
+	// Caddyfile (directive typo, stray placeholder render). When a
+	// caddy binary is on PATH, `caddy validate` is authoritative —
+	// a failure fails the whole check, never a warning.
+	if _, lookErr := exec.LookPath("caddy"); lookErr == nil {
+		if err := initCaddyValidate(filepath.Join(outDir, "Caddyfile")); err != nil {
+			fail("Caddyfile: %v", err)
+		}
 	}
 	return bad
 }
