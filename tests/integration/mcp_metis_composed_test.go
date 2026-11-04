@@ -131,6 +131,15 @@ func TestMetisComposedPublicRouteRealBearerAuth(t *testing.T) {
 	if strings.Contains(string(body), "metis_") {
 		t.Errorf("wrong-audience response leaked tool names: %q", body)
 	}
+	// The 401 must come from METIS validating the bearer, not from
+	// Ocliv's relay refusing the visitor. Both answer 401, but the
+	// bodies differ: Metis answers "unauthorized", Ocliv's relay
+	// answers "visitor authorization required". Asserting the body
+	// pins WHERE enforcement happened, which is the claim this test
+	// exists to make. A relay-side rejection would still be a 401.
+	if !strings.Contains(string(body), "unauthorized") {
+		t.Errorf("wrong-audience 401 did not come from Metis: body=%q, want Metis's %q", body, "unauthorized")
+	}
 
 	// --- Negative: no bearer at all must not retrieve tools either.
 	resp = routeReq(t, h, "public.example.org", "/r/"+routeID+"/mcp", map[string]string{
@@ -144,6 +153,11 @@ func TestMetisComposedPublicRouteRealBearerAuth(t *testing.T) {
 	}
 	if strings.Contains(string(body), "metis_") {
 		t.Errorf("missing-bearer response leaked tool names: %q", body)
+	}
+	// Same discriminator as above: a relay-side refusal would also be
+	// a 401, so pin Metis as the enforcing party.
+	if !strings.Contains(string(body), "unauthorized") {
+		t.Errorf("missing-bearer 401 did not come from Metis: body=%q, want Metis's %q", body, "unauthorized")
 	}
 
 	// --- Negative (protocol contract): a valid bearer with an
