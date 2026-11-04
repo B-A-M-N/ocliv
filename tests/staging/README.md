@@ -18,3 +18,6 @@
 # reachability. Those stay NOT VERIFIED for production.
 #
 # Run order: check-edge.sh -> check-forwarding.sh -> check-recovery.sh
+#
+# Composed demo: composed/run-composed.sh (Ocliv relay -> Metis MCP, with
+# an operator-gated Locus inference leg) -- see composed/README.md.
