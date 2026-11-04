@@ -537,6 +537,82 @@ func TestMCPPublishLeaseCloseFailurePropagates(t *testing.T) {
 	}
 }
 
+// TestMCPPublishExplicitRelayBeatsEnvForTunnelAndRoute: an explicit
+// --relay must be used by BOTH halves of a publication. The env points
+// at an unresolvable relay; only an explicit --relay forwarded into the
+// agent tunnel can attach, and only an explicit --relay used for the
+// management call can register the route on the real in-process relay.
+// If either half ignored the flag, no route row would ever appear.
+func TestMCPPublishExplicitRelayBeatsEnvForTunnelAndRoute(t *testing.T) {
+	home := t.TempDir()
+	db, relayURL := publishFlowRelay(t, "mcp.example.test")
+	publishFlowEnroll(t, home, relayURL, db)
+	// Deliberately wrong relay in the environment: the explicit flag
+	// must win over it for management calls and the tunnel alike.
+	t.Setenv("OCLIV_RELAY_URL", "https://wrong-relay.invalid")
+	port, closeFixture := publishFlowFixture(t)
+	defer closeFixture()
+
+	argv := []string{"--local", fmt.Sprintf("http://127.0.0.1:%d/mcp", port),
+		"--auth", "upstream-oauth", "--relay", relayURL,
+		"--name", "relaypin", "--ttl", "30m", "--dev-allow-unverified-discovery"}
+	done := make(chan int, 1)
+	go func() { done <- runMCPPublish(argv, false) }()
+
+	deadline := time.Now().Add(25 * time.Second)
+	for routeRowCount(t, db) != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("route was never registered on the explicit --relay (tunnel targeted %q?)", relayURL)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	self, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := self.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case code := <-done:
+		if code != apperr.ExitOK {
+			t.Fatalf("shutdown exit=%d, want clean 0", code)
+		}
+	case <-time.After(45 * time.Second):
+		t.Fatal("publish did not shut down after SIGINT")
+	}
+	if st := leaseStatus(t, db, "relaypin.t.example.test"); st != "CLOSED" {
+		t.Fatalf("lease status %q, want CLOSED on the explicit relay", st)
+	}
+}
+
+// TestMCPPublishRouteFailureNamesRelay: when route registration fails,
+// the diagnostic must name the relay that was tried so an operator with
+// several relays configured knows WHICH one refused.
+func TestMCPPublishRouteFailureNamesRelay(t *testing.T) {
+	home := t.TempDir()
+	db, relayURL := publishFlowRelay(t, "") // no MCPExternalHost: registration 409s
+	publishFlowEnroll(t, home, relayURL, db)
+	port, closeFixture := publishFlowFixture(t)
+	defer closeFixture()
+
+	argv := []string{"--local", fmt.Sprintf("http://127.0.0.1:%d/mcp", port),
+		"--auth", "upstream-oauth", "--relay", relayURL,
+		"--name", "relayfail", "--ttl", "30m"}
+	var code int
+	out := captureOutput(t, func() { code = runMCPPublish(argv, false) })
+	if code != apperr.ExitAuth {
+		t.Fatalf("exit=%d, want ExitAuth (unchanged) for registration failure", code)
+	}
+	if !strings.Contains(out, "route registration failed") {
+		t.Fatalf("registration failure not reported: %q", out)
+	}
+	if !strings.Contains(out, relayURL) {
+		t.Fatalf("registration diagnostic does not name the relay %q: %q", relayURL, out)
+	}
+}
+
 // TestMCPUnpublishRemovesRouteAndClosesLease: after an orderly
 // shutdown retains the publication, `mcp unpublish --lease` deletes
 // every bound route and closes the lease, exiting clean when both

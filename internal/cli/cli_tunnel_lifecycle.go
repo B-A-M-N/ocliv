@@ -107,6 +107,12 @@ func attachJSONMap(a agent.Attached) map[string]string {
 	}
 }
 
+// tunnelFailedHint is runnerExit's generic relay-reachability action. It
+// is a constant so the named-relay variant can be derived from it
+// without changing runnerExit's contract (existing callers and tests
+// keep the same signature and exit codes).
+const tunnelFailedHint = "tunnel failed: run `ocliv doctor`"
+
 // runnerExit maps a terminal runner error to a stable exit code and a
 // corrective action. A nil error (or a shutdown-driven one) is clean;
 // definitive failures name the fix instead of hanging (P1-02).
@@ -124,8 +130,32 @@ func runnerExit(err error) (int, string) {
 		strings.Contains(msg, "permanently denied") || strings.Contains(msg, "auth"):
 		return apperr.ExitAuth, "tunnel credential rejected: run `ocliv login --relay URL --code-file PATH` to re-enroll"
 	default:
-		return apperr.ExitRelayTLS, "tunnel failed: run `ocliv doctor`"
+		return apperr.ExitRelayTLS, tunnelFailedHint
 	}
+}
+
+// tunnelFailureHint maps a terminal runner error exactly like runnerExit
+// but names the relay that was attempted in the generic reachability
+// case. With more than one relay in play (OCLIV_RELAY_URL, a
+// HOME-scoped agent config, an explicit --relay) the bare
+// "tunnel failed" line leaves the operator unable to tell WHICH relay
+// refused; exit codes and every specific hint stay unchanged.
+func tunnelFailureHint(err error, relayURL string) (int, string) {
+	code, hint := runnerExit(err)
+	if hint == tunnelFailedHint && relayURL != "" {
+		hint = fmt.Sprintf("tunnel failed for relay %s: run `ocliv doctor`", relayURL)
+	}
+	return code, hint
+}
+
+// relayNotConfirmedHint is the attach-timeout diagnostic. It names the
+// relay that never confirmed the tunnel for the same reason: the
+// operator must know where the connection was aimed.
+func relayNotConfirmedHint(relayURL string) string {
+	if relayURL == "" {
+		return "relay did not confirm the tunnel; run `ocliv doctor`"
+	}
+	return fmt.Sprintf("relay %s did not confirm the tunnel; run `ocliv doctor`", relayURL)
 }
 
 // cmdTunnel implements `ocliv PORT`: probe local, connect, print URL.
@@ -229,7 +259,7 @@ func runTunnel(ctx context.Context, ready tunnelReady) (agent.Attached, *tunnelL
 		}
 		select {
 		case err := <-runErr:
-			code, hint := runnerExit(err)
+			code, hint := tunnelFailureHint(err, ready.opts.cfg.RelayURL)
 			if hint != "" {
 				fmt.Fprintln(os.Stderr, hint)
 			}
@@ -242,7 +272,7 @@ func runTunnel(ctx context.Context, ready tunnelReady) (agent.Attached, *tunnelL
 				a, attached = ev, true
 				break
 			}
-			fmt.Fprintln(os.Stderr, "relay did not confirm the tunnel; run `ocliv doctor`")
+			fmt.Fprintln(os.Stderr, relayNotConfirmedHint(ready.opts.cfg.RelayURL))
 			return agent.Attached{}, nil, apperr.ExitRelayTLS, false
 		}
 	}
@@ -322,7 +352,7 @@ steady:
 			if ctx.Err() != nil {
 				break steady
 			}
-			code, hint := runnerExit(err)
+			code, hint := tunnelFailureHint(err, ready.opts.cfg.RelayURL)
 			if hint != "" {
 				fmt.Fprintln(os.Stderr, hint)
 			}

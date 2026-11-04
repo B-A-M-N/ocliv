@@ -432,6 +432,164 @@ func TestMCPPublishBoundedDefaultTTL(t *testing.T) {
 	}
 }
 
+// `mcp publish` / `mcp serve` accept an explicit --relay URL (both
+// `--relay URL` and `--relay=URL`); it names the relay for the relay
+// management API calls AND the tunnel.
+func TestParseMCPPublishRelayFlag(t *testing.T) {
+	// Both `--relay URL` and `--relay=URL` must parse identically, in
+	// publish and serve mode: the flag names the relay for the
+	// management API calls and the tunnel.
+	for _, tc := range []struct {
+		argv  []string
+		serve bool
+	}{
+		{[]string{"--local", "http://127.0.0.1:8765/mcp", "--auth", "upstream-oauth", "--relay", "https://relay.example.com"}, false},
+		{[]string{"--local=http://127.0.0.1:8765/mcp", "--auth=upstream-oauth", "--relay=https://relay.example.com"}, false},
+		{[]string{"--local", "http://127.0.0.1:8765/mcp", "--auth", "upstream-oauth", "--relay", "https://relay.example.com"}, true},
+		{[]string{"--local=http://127.0.0.1:8765/mcp", "--auth=upstream-oauth", "--relay=https://relay.example.com"}, true},
+	} {
+		c, code := parseMCPPublish(tc.argv, tc.serve)
+		if code != 0 {
+			t.Fatalf("serve=%v argv %q rejected: code=%d", tc.serve, tc.argv, code)
+		}
+		if c.relay != "https://relay.example.com" {
+			t.Fatalf("serve=%v argv %q dropped --relay: %+v", tc.serve, tc.argv, c)
+		}
+	}
+	// Absent --relay stays empty so ordinary precedence applies.
+	c, code := parseMCPPublish([]string{"--local=http://127.0.0.1:8765/mcp", "--auth=upstream-oauth"}, false)
+	if code != 0 || c.relay != "" {
+		t.Fatalf("absent --relay must resolve to empty: %+v code=%d", c, code)
+	}
+}
+
+// An invalid --relay is rejected before any key load, probe, tunnel, or
+// remote call, with the CLI-validation exit and a usage line that names
+// --relay so the operator can see the accepted shape.
+func TestParseMCPPublishRelayInvalid(t *testing.T) {
+	for _, raw := range []string{
+		"ftp://relay.example.com",  // not http(s)
+		"https://",                 // missing host
+		"not-a-url",                // unparseable / no scheme
+		"relay.example.com",        // scheme-less
+		"http://192.168.1.10:8080", // remote plaintext (login policy)
+	} {
+		argv := []string{"--local=http://127.0.0.1:8765/mcp", "--auth=upstream-oauth", "--relay", raw}
+		var code int
+		out := captureOutput(t, func() { _, code = parseMCPPublish(argv, false) })
+		if code != apperr.ExitCLIValidation {
+			t.Errorf("--relay %q: code=%d, want ExitCLIValidation(%d)", raw, code, apperr.ExitCLIValidation)
+		}
+		if !strings.Contains(out, "--relay") {
+			t.Errorf("--relay %q: diagnostic does not mention --relay: %q", raw, out)
+		}
+	}
+	// Missing value fails closed too.
+	var code int
+	out := captureOutput(t, func() {
+		_, code = parseMCPPublish([]string{"--local=http://127.0.0.1:8765/mcp", "--auth=upstream-oauth", "--relay"}, false)
+	})
+	if code != apperr.ExitCLIValidation || !strings.Contains(out, "--relay") {
+		t.Fatalf("missing --relay value: code=%d out=%q", code, out)
+	}
+}
+
+// `ocliv mcp PORT` rewrites to publish argv; --relay must survive the
+// rewrite and still pin upstream-oauth.
+func TestMCPPortAliasForwardsRelay(t *testing.T) {
+	pub, ok := mcpPortAliasArgs([]string{"3000", "--relay", "https://relay.example.com"})
+	if !ok {
+		t.Fatal("numeric port alias not recognized")
+	}
+	c, code := parseMCPPublish(pub, false)
+	if code != 0 {
+		t.Fatalf("alias argv %q rejected: code=%d", pub, code)
+	}
+	if c.relay != "https://relay.example.com" || c.localURL != "http://127.0.0.1:3000/mcp" || c.auth != "upstream-oauth" {
+		t.Fatalf("alias misparsed: %+v", c)
+	}
+}
+
+// Relay precedence is exactly: explicit --relay > OCLIV_RELAY_URL >
+// agent config file relay_url > built-in default.
+func TestResolveMCPRelayPrecedence(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OCLIV_RELAY_URL", "https://from-env.example.com")
+	_, _, cfgPath, err := agentFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, []byte("relay_url = https://from-file.example.com\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := resolveMCPRelay("https://explicit.example.com"); got != "https://explicit.example.com" {
+		t.Fatalf("explicit --relay lost to env/config: %q", got)
+	}
+	if got := resolveMCPRelay(""); got != "https://from-env.example.com" {
+		t.Fatalf("env did not beat config file: %q", got)
+	}
+	t.Setenv("OCLIV_RELAY_URL", "")
+	if got := resolveMCPRelay(""); got != "https://from-file.example.com" {
+		t.Fatalf("config file relay_url not used: %q", got)
+	}
+	if err := os.WriteFile(cfgPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := resolveMCPRelay(""); got != config.DefaultRelayURL {
+		t.Fatalf("built-in default not used: %q", got)
+	}
+}
+
+// The tunnel must target the same relay the management calls use: an
+// explicit --relay is forwarded into the ordinary tunnel parser (which
+// owns flag > env > file > default), not left to a second resolution.
+func TestMCPTunnelOptionsForwardsRelay(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OCLIV_RELAY_URL", "https://from-env.example.com")
+
+	opts, code := mcpTunnelOptions(8765, false, mcpPublishConfig{auth: "upstream-oauth", relay: "https://explicit.example.com"})
+	if code != 0 {
+		t.Fatalf("tunnel options rejected: code=%d", code)
+	}
+	if opts.cfg.RelayURL != "https://explicit.example.com" {
+		t.Fatalf("explicit --relay not forwarded to the tunnel: %q", opts.cfg.RelayURL)
+	}
+	// Absent --relay keeps the historical env precedence.
+	opts, code = mcpTunnelOptions(8765, false, mcpPublishConfig{auth: "upstream-oauth"})
+	if code != 0 || opts.cfg.RelayURL != "https://from-env.example.com" {
+		t.Fatalf("absent --relay must keep env precedence: %q code=%d", opts.cfg.RelayURL, code)
+	}
+}
+
+// A relay that cannot be reached must be NAMED in the generic failure
+// diagnostic; specific hints and exit codes stay unchanged.
+func TestTunnelFailureHintNamesRelay(t *testing.T) {
+	const relay = "https://other-relay.example.com"
+	code, hint := tunnelFailureHint(errTest("relay unreachable: dial tcp: connection refused"), relay)
+	if code != apperr.ExitRelayTLS {
+		t.Fatalf("exit=%d, want ExitRelayTLS(%d)", code, apperr.ExitRelayTLS)
+	}
+	if !strings.Contains(hint, relay) {
+		t.Fatalf("generic tunnel failure does not name the relay: %q", hint)
+	}
+	if !strings.Contains(hint, "ocliv doctor") {
+		t.Fatalf("corrective action lost: %q", hint)
+	}
+	// A specific hint is never rewritten.
+	if _, hint := tunnelFailureHint(errTest("agent key revoked by operator"), relay); strings.Contains(hint, relay) {
+		t.Fatalf("specific auth hint was rewritten with a relay: %q", hint)
+	}
+	// The attach timeout names the relay too.
+	if got := relayNotConfirmedHint(relay); !strings.Contains(got, relay) {
+		t.Fatalf("attach timeout does not name the relay: %q", got)
+	}
+	if got := relayNotConfirmedHint(""); got != "relay did not confirm the tunnel; run `ocliv doctor`" {
+		t.Fatalf("relay-less timeout message changed: %q", got)
+	}
+}
+
 // TestSelectDoctorLeaseIDOrder pins the resolution order: explicit
 // --lease, then named selection, then latest-lease fallback. The fixed
 // defect rejected a valid named lease whenever it was not the latest

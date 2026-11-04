@@ -84,6 +84,13 @@ type mcpPublishConfig struct {
 	// strict discovery probes it. Empty means no handoff; strict
 	// discovery then only passes if the server was preconfigured.
 	resourceFile string
+	// relay is the explicit --relay target. Empty means "not named on
+	// the command line", in which case the ordinary resolution applies
+	// (OCLIV_RELAY_URL > agent config file > built-in default). A
+	// non-empty value wins over every other source and is used for
+	// BOTH the relay management API calls and the agent tunnel, so the
+	// two halves of a publication can never target different relays.
+	relay string
 }
 
 // writeResourceBinding atomically publishes the canonical route URL to
@@ -205,7 +212,7 @@ func parseMCPPublish(argv []string, serve bool) (mcpPublishConfig, int) {
 	var rest []string
 	seenDashDash := false
 	bad := func() (mcpPublishConfig, int) {
-		fmt.Fprintln(os.Stderr, "usage: ocliv mcp publish --local URL --auth upstream-oauth [--name N] [--ttl D] [--strict-discovery] [--resource-file PATH] [--dev-allow-unverified-discovery]")
+		fmt.Fprintln(os.Stderr, "usage: ocliv mcp publish --local URL --auth upstream-oauth [--relay URL] [--name N] [--ttl D] [--strict-discovery] [--resource-file PATH] [--dev-allow-unverified-discovery]")
 		return c, apperr.ExitCLIValidation
 	}
 	for i := 0; i < len(argv); i++ {
@@ -235,6 +242,12 @@ func parseMCPPublish(argv []string, serve bool) (mcpPublishConfig, int) {
 				return bad()
 			}
 			c.name = v
+		} else if !seenDashDash && (a == "--relay" || strings.HasPrefix(a, "--relay=")) {
+			v, ok := mcpFlagValue(argv, &i, "relay")
+			if !ok {
+				return bad()
+			}
+			c.relay = v
 		} else if !seenDashDash && (a == "--ttl" || strings.HasPrefix(a, "--ttl=")) {
 			v, ok := mcpFlagValue(argv, &i, "ttl")
 			if !ok {
@@ -272,6 +285,16 @@ func parseMCPPublish(argv []string, serve bool) (mcpPublishConfig, int) {
 		}
 	}
 	c.cmd = rest
+	// An explicit --relay is validated with the same policy login and
+	// the ordinary tunnel parser use (https anywhere; http loopback
+	// only) and rejected before any key load, probe, tunnel, or remote
+	// call — an invalid target has no partial side effects.
+	if c.relay != "" {
+		if verr := config.CheckRelayTLS(c.relay); verr != nil {
+			fmt.Fprintf(os.Stderr, "invalid --relay: %v\n", verr)
+			return bad()
+		}
+	}
 	if _, ok := mcpAuthProfiles[c.auth]; !ok {
 		return bad()
 	}
@@ -448,6 +471,15 @@ func mcpTunnelOptions(port int, v6 bool, c mcpPublishConfig) (tunnelOptions, int
 	if v6 {
 		argv = append(argv, "--ipv6")
 	}
+	// Forward the explicit --relay as a tunnel flag. parseTunnelOptions
+	// already owns --relay and its precedence (flag > env > config file
+	// > default), so the tunnel target is the exact relay named for the
+	// management API calls instead of a second, possibly different
+	// resolution. Absent --relay, nothing is forwarded and the
+	// historical precedence stands unchanged.
+	if c.relay != "" {
+		argv = append(argv, "--relay="+c.relay)
+	}
 	if c.name != "" {
 		argv = append(argv, "--name="+c.name)
 	}
@@ -471,6 +503,17 @@ func mcpTunnelOptions(port int, v6 bool, c mcpPublishConfig) (tunnelOptions, int
 
 func cmdMCPPublish(argv []string) int {
 	return runMCPPublish(argv, false)
+}
+
+// resolveMCPRelay applies the publish/serve relay precedence: explicit
+// --relay > OCLIV_RELAY_URL > agent config file relay_url > built-in
+// default. agentRelayURL already implements the last three in that
+// order, so the explicit flag only has to win over all of them.
+func resolveMCPRelay(explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	return agentRelayURL()
 }
 
 func cmdMCPServe(argv []string) int {
@@ -685,7 +728,7 @@ func runMCPPublish(argv []string, serve bool) int {
 		fmt.Fprintln(os.Stderr, "not enrolled: run `ocliv login` first")
 		return apperr.ExitAuth
 	}
-	relayURL := agentRelayURL()
+	relayURL := resolveMCPRelay(cfg.relay)
 
 	// 1. Local source: validate and start before any tunnel or route, so
 	// a bad local target fails with nothing registered remotely.
@@ -752,8 +795,12 @@ func runMCPPublish(argv []string, serve bool) int {
 		rstatus, rbody := mgmtCall(relayURL, k, keyID, "POST",
 			"/v1/agent/lease/"+routeLeaseID+"/mcp-route/"+profile)
 		if rstatus != http.StatusOK {
-			fmt.Fprintf(os.Stderr, "mcp publish: route registration failed (relay status %d): %s\n",
-				rstatus, strings.TrimSpace(string(rbody)))
+			// Name the relay that was tried: with several relays in
+			// play (env override, HOME-scoped config, explicit
+			// --relay), a bare status code leaves the operator
+			// unable to tell WHICH relay answered or refused.
+			fmt.Fprintf(os.Stderr, "mcp publish: route registration failed (relay %s status %d): %s\n",
+				relayURL, rstatus, strings.TrimSpace(string(rbody)))
 			return closeTunnel(ready, a, apperr.ExitAuth)
 		}
 		var rr struct {
