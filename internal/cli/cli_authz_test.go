@@ -107,13 +107,20 @@ func TestParseMCPPublishStdioManagedOnly(t *testing.T) {
 	}
 }
 
-// approve/revoke require --client; a missing client must fail validation
-// before any store access.
+// approve/revoke require --client AND explicit --tenant/--route. An
+// ambiguous approval must never silently cover several grants.
 func TestAuthzClientRequired(t *testing.T) {
-	if code := cmdAuthzApprove([]string{"--data", t.TempDir()}); code == 0 {
+	dir := t.TempDir()
+	if code := cmdAuthzApprove([]string{"--data", dir}); code == 0 {
 		t.Error("approve without --client returned 0, want failure")
 	}
-	if code := cmdAuthzRevoke([]string{"--data", t.TempDir()}); code == 0 {
+	if code := cmdAuthzRevoke([]string{"--data", dir}); code == 0 {
 		t.Error("revoke without --client returned 0, want failure")
+	}
+	if code := cmdAuthzApprove([]string{"--data", dir, "--client", "c1"}); code == 0 {
+		t.Error("approve without --tenant/--route returned 0, want failure")
+	}
+	if code := cmdAuthzRevoke([]string{"--data", dir, "--client", "c1"}); code == 0 {
+		t.Error("revoke without --tenant/--route returned 0, want failure")
 	}
 }

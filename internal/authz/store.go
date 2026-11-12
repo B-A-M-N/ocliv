@@ -1,8 +1,11 @@
 package authz
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"sync"
@@ -34,6 +37,12 @@ type Client struct {
 }
 
 // Grant is an operator approval binding one client to one tenant + route.
+//
+// A public client_id is not a credential: anyone who learns it can start an
+// authorization flow. The approval therefore also issues a pairing secret
+// (stored only as a hash) that the client must present to obtain a code.
+// Losing the pairing secret is a full compromise of that grant, exactly as
+// losing a client secret would be.
 type Grant struct {
 	ClientID  string
 	Tenant    string
@@ -41,6 +50,23 @@ type Grant struct {
 	Status    GrantStatus
 	CreatedAt time.Time
 	UpdatedAt time.Time
+	// PairingHash is the hex SHA-256 of the pairing secret. Empty means no
+	// pairing secret has been issued, which for an ACTIVE grant is a
+	// fail-closed condition at authorize.
+	PairingHash     string
+	PairingIssuedAt time.Time
+}
+
+// AuthzAudit is one authorization-plane decision record.
+type AuthzAudit struct {
+	Time     time.Time
+	Actor    string
+	Tenant   string
+	Route    string
+	ClientID string
+	Action   string
+	Result   string
+	Detail   string
 }
 
 // Code is a single-use authorization code with its PKCE binding.
@@ -72,16 +98,35 @@ type Store interface {
 	ApproveGrant(clientID, tenant, route string) error
 	RevokeGrant(clientID, tenant, route string) error
 
+	// SetPairingSecret issues (or rotates) the pairing secret for a grant,
+	// storing only its hash. The plaintext is returned once to the operator.
+	SetPairingSecret(clientID, tenant, route, secret string) error
+	// CheckPairingSecret reports whether the secret matches the grant's
+	// stored hash, in constant time.
+	CheckPairingSecret(clientID, tenant, route, secret string) (bool, error)
+
+	// RevokeToken durably revokes one token by its jti.
+	RevokeToken(jti, clientID, tenant, route string) error
+	// IsTokenRevoked reports whether a jti is revoked. Checked at admission.
+	IsTokenRevoked(jti string) (bool, error)
+
+	// AuditAuthz records an authorization-plane decision.
+	AuditAuthz(actor, tenant, route, clientID, action, result, detail string) error
+	// ListAuthzAudit returns the most recent audit records.
+	ListAuthzAudit(limit int) ([]AuthzAudit, error)
+
 	CreateCode(c Code) error
 	ConsumeCode(code string) (*Code, error)
 }
 
 // MemStore is an in-memory Store for tests and local evaluation.
 type MemStore struct {
-	mu      sync.Mutex
-	clients map[string]*Client
-	grants  map[string]*Grant // key: clientID + "\x00" + tenant + "\x00" + route
-	codes   map[string]*Code
+	mu          sync.Mutex
+	clients     map[string]*Client
+	grants      map[string]*Grant // key: clientID + "\x00" + tenant + "\x00" + route
+	codes       map[string]*Code
+	revocations map[string]bool
+	audit       []AuthzAudit
 }
 
 // NewMemStore returns an empty in-memory store.
@@ -91,6 +136,30 @@ func NewMemStore() *MemStore {
 		grants:  map[string]*Grant{},
 		codes:   map[string]*Code{},
 	}
+}
+
+// HashSecret returns the hex SHA-256 of a secret. Only hashes are stored.
+func HashSecret(secret string) string {
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:])
+}
+
+// MintJTI returns a fresh token identifier for revocation tracking.
+func MintJTI() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("authz: jti: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+// MintPairingSecret returns a fresh pairing secret for an approved grant.
+func MintPairingSecret() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("authz: pairing secret: %w", err)
+	}
+	return "pair_" + base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
 func grantKey(clientID, tenant, route string) string {
@@ -204,6 +273,84 @@ func (m *MemStore) RevokeGrant(clientID, tenant, route string) error {
 	g.Status = GrantRevoked
 	g.UpdatedAt = time.Now()
 	return nil
+}
+
+// SetPairingSecret stores only the hash of the pairing secret.
+func (m *MemStore) SetPairingSecret(clientID, tenant, route, secret string) error {
+	if secret == "" {
+		return fmt.Errorf("authz: pairing secret is required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	g, ok := m.grants[grantKey(clientID, tenant, route)]
+	if !ok {
+		return fmt.Errorf("authz: no grant for client %q route %q", clientID, route)
+	}
+	g.PairingHash = HashSecret(secret)
+	g.PairingIssuedAt = time.Now()
+	g.UpdatedAt = time.Now()
+	return nil
+}
+
+// CheckPairingSecret compares in constant time.
+func (m *MemStore) CheckPairingSecret(clientID, tenant, route, secret string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	g, ok := m.grants[grantKey(clientID, tenant, route)]
+	if !ok {
+		return false, fmt.Errorf("authz: no grant for client %q route %q", clientID, route)
+	}
+	if g.PairingHash == "" {
+		return false, nil
+	}
+	return hmac.Equal([]byte(g.PairingHash), []byte(HashSecret(secret))), nil
+}
+
+// RevokeToken durably revokes a token by jti.
+func (m *MemStore) RevokeToken(jti, clientID, tenant, route string) error {
+	if jti == "" {
+		return fmt.Errorf("authz: token jti is required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.revocations == nil {
+		m.revocations = map[string]bool{}
+	}
+	m.revocations[jti] = true
+	return nil
+}
+
+// IsTokenRevoked reports whether a jti is revoked.
+func (m *MemStore) IsTokenRevoked(jti string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.revocations[jti], nil
+}
+
+// AuditAuthz records an authorization-plane decision.
+func (m *MemStore) AuditAuthz(actor, tenant, route, clientID, action, result, detail string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.audit = append(m.audit, AuthzAudit{
+		Time: time.Now(), Actor: actor, Tenant: tenant, Route: route,
+		ClientID: clientID, Action: action, Result: result, Detail: detail,
+	})
+	return nil
+}
+
+// ListAuthzAudit returns the most recent audit records, newest first.
+func (m *MemStore) ListAuthzAudit(limit int) ([]AuthzAudit, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]AuthzAudit, 0, len(m.audit))
+	for _, a := range m.audit {
+		out = append(out, a)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Time.After(out[j].Time) })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 // CreateCode stores a code. Codes are single-use and short-lived.

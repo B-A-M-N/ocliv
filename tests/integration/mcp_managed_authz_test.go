@@ -138,9 +138,10 @@ func routeReqBody(t *testing.T, h *harness, host, path, body string) *http.Respo
 	return resp
 }
 
-// managedAuthorize runs the authorization step and returns the code from the
-// redirect Location, or "" when no code was issued.
-func managedAuthorize(t *testing.T, h *harness, rid, clientID, verifier string) string {
+// managedAuthorize runs the authorization step with the operator's pairing
+// secret and returns the code from the redirect Location, or "" when no code
+// was issued.
+func managedAuthorize(t *testing.T, h *harness, rid, clientID, pairing, verifier string) string {
 	t.Helper()
 	challenge := base64.RawURLEncoding.EncodeToString(func() []byte {
 		sum := sha256.Sum256([]byte(verifier))
@@ -153,6 +154,9 @@ func managedAuthorize(t *testing.T, h *harness, rid, clientID, verifier string) 
 	q.Set("code_challenge", challenge)
 	q.Set("code_challenge_method", "S256")
 	q.Set("state", "xyz")
+	if pairing != "" {
+		q.Set("pairing_code", pairing)
+	}
 	req, err := http.NewRequest(http.MethodGet, h.relaySrv.URL+"/r/"+rid+"/oauth/authorize?"+q.Encode(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -215,7 +219,7 @@ func TestManagedAuthzPublicationLevelBoundary(t *testing.T) {
 	}
 
 	// Authorization before approval: no code is issued.
-	if code := managedAuthorize(t, h, rid, clientID, "verifier-1"); code != "" {
+	if code := managedAuthorize(t, h, rid, clientID, "", "verifier-1"); code != "" {
 		t.Fatalf("authorization issued code %q before approval, want none", code)
 	}
 
@@ -242,8 +246,16 @@ func TestManagedAuthzApprovedClientExecutesOnce(t *testing.T) {
 	if err := st.ApproveGrant(clientID, tenant, rid); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
+	// An approved client_id alone is not enough: without the pairing secret
+	// no authorization code is issued.
+	if code := managedAuthorize(t, h, rid, clientID, "", "verifier-2-nosecret"); code != "" {
+		t.Fatal("authorization issued a code with an approved client_id but no pairing secret")
+	}
+	if err := st.SetPairingSecret(clientID, tenant, rid, "pairing-2"); err != nil {
+		t.Fatalf("pairing secret: %v", err)
+	}
 
-	code := managedAuthorize(t, h, rid, clientID, "verifier-2")
+	code := managedAuthorize(t, h, rid, clientID, "pairing-2", "verifier-2")
 	if code == "" {
 		t.Fatal("approved client received no authorization code")
 	}
@@ -288,7 +300,10 @@ func TestManagedAuthzTokenBinding(t *testing.T) {
 	if err := st.ApproveGrant(clientID, tenant, rid); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
-	code := managedAuthorize(t, h, rid, clientID, "verifier-3")
+	if err := st.SetPairingSecret(clientID, tenant, rid, "pairing-3"); err != nil {
+		t.Fatalf("pairing secret: %v", err)
+	}
+	code := managedAuthorize(t, h, rid, clientID, "pairing-3", "verifier-3")
 	if code == "" {
 		t.Fatal("no code")
 	}
@@ -303,7 +318,7 @@ func TestManagedAuthzTokenBinding(t *testing.T) {
 	}
 
 	// A fresh code with the correct verifier works.
-	code = managedAuthorize(t, h, rid, clientID, "verifier-3")
+	code = managedAuthorize(t, h, rid, clientID, "pairing-3", "verifier-3")
 	if code == "" {
 		t.Fatal("no fresh code")
 	}
@@ -343,7 +358,10 @@ func TestManagedAuthzRevocationIsImmediate(t *testing.T) {
 	if err := st.ApproveGrant(clientID, tenant, rid); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
-	code := managedAuthorize(t, h, rid, clientID, "verifier-4")
+	if err := st.SetPairingSecret(clientID, tenant, rid, "pairing-4"); err != nil {
+		t.Fatalf("pairing secret: %v", err)
+	}
+	code := managedAuthorize(t, h, rid, clientID, "pairing-4", "verifier-4")
 	if code == "" {
 		t.Fatal("no code")
 	}
@@ -383,7 +401,10 @@ func TestManagedAuthzKeyRotation(t *testing.T) {
 	if err := st.ApproveGrant(clientID, tenant, rid); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
-	code := managedAuthorize(t, h, rid, clientID, "verifier-5")
+	if err := st.SetPairingSecret(clientID, tenant, rid, "pairing-5"); err != nil {
+		t.Fatalf("pairing secret: %v", err)
+	}
+	code := managedAuthorize(t, h, rid, clientID, "pairing-5", "verifier-5")
 	if code == "" {
 		t.Fatal("no code")
 	}
@@ -422,7 +443,10 @@ func TestManagedAuthzRepublishPreservesApproval(t *testing.T) {
 	if err := st.ApproveGrant(clientID, tenant, rid); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
-	authCode := managedAuthorize(t, h, rid, clientID, "verifier-repub")
+	if err := st.SetPairingSecret(clientID, tenant, rid, "pairing-repub"); err != nil {
+		t.Fatalf("pairing secret: %v", err)
+	}
+	authCode := managedAuthorize(t, h, rid, clientID, "pairing-repub", "verifier-repub")
 	if authCode == "" {
 		t.Fatal("no authorization code")
 	}
@@ -573,7 +597,10 @@ func TestManagedAuthzStdioAdapter(t *testing.T) {
 	if err := st.ApproveGrant(clientID, tenant, rid); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
-	authCode := managedAuthorize(t, h, rid, clientID, "verifier-stdio")
+	if err := st.SetPairingSecret(clientID, tenant, rid, "pairing-stdio"); err != nil {
+		t.Fatalf("pairing secret: %v", err)
+	}
+	authCode := managedAuthorize(t, h, rid, clientID, "pairing-stdio", "verifier-stdio")
 	if authCode == "" {
 		t.Fatal("no authorization code")
 	}
@@ -613,6 +640,97 @@ func TestManagedAuthzStdioAdapter(t *testing.T) {
 	}
 	if string(raw) != rpcBody+"\n" {
 		t.Fatalf("stdio child reply = %q, want the echoed request", raw)
+	}
+}
+
+// TestManagedAuthzOAuthTokenRevocation: the advertised RFC 7009 endpoint
+// really revokes the presented token, immediately, while unrelated clients
+// keep working. (ServeRevoke previously returned 200 without revoking.)
+func TestManagedAuthzOAuthTokenRevocation(t *testing.T) {
+	h, up, rid, _ := managedHarness(t)
+	tenant := publicationTenant(t, h, rid)
+	st := authz.NewSQLStore(h.db.SQL())
+
+	mintClient := func(name, pairing, verifier string) string {
+		t.Helper()
+		clientID := managedDCR(t, h, rid)
+		if err := st.ApproveGrant(clientID, tenant, rid); err != nil {
+			t.Fatalf("%s approve: %v", name, err)
+		}
+		if err := st.SetPairingSecret(clientID, tenant, rid, pairing); err != nil {
+			t.Fatalf("%s pairing: %v", name, err)
+		}
+		code := managedAuthorize(t, h, rid, clientID, pairing, verifier)
+		if code == "" {
+			t.Fatalf("%s: no authorization code", name)
+		}
+		status, body := managedToken(t, h, rid, clientID, code, verifier)
+		if status != http.StatusOK {
+			t.Fatalf("%s token status=%d body=%s", name, status, body)
+		}
+		var tok struct {
+			AccessToken string `json:"access_token"`
+		}
+		if err := json.Unmarshal([]byte(body), &tok); err != nil || tok.AccessToken == "" {
+			t.Fatalf("%s token reply unparseable: %v (%q)", name, err, body)
+		}
+		return tok.AccessToken
+	}
+
+	tokA := mintClient("A", "pairing-revoke-a", "verifier-revoke-a")
+	tokB := mintClient("B", "pairing-revoke-b", "verifier-revoke-b")
+
+	if c, _ := managedCall(t, h, rid, tokA); c != http.StatusOK {
+		t.Fatalf("pre-revocation A status=%d, want 200", c)
+	}
+
+	// Revoke A's token at the advertised OAuth revocation endpoint.
+	form := url.Values{}
+	form.Set("token", tokA)
+	form.Set("token_type_hint", "access_token")
+	req, err := http.NewRequest(http.MethodPost, h.relaySrv.URL+"/r/"+rid+"/oauth/revoke",
+		strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "public.example.org"
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := visitorClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("revoke status=%d, want 200", resp.StatusCode)
+	}
+
+	before := up.execs.Load()
+	if c, _ := managedCall(t, h, rid, tokA); c != http.StatusUnauthorized {
+		t.Fatalf("revoked token A status=%d, want 401", c)
+	}
+	if c, _ := managedCall(t, h, rid, tokB); c != http.StatusOK {
+		t.Fatalf("unrelated token B status=%d, want 200", c)
+	}
+	if got := up.execs.Load() - before; got != 1 {
+		t.Fatalf("post-revocation executed %d tools, want 1 (only B)", got)
+	}
+
+	// An invalid token is treated as already revoked (RFC 7009 §2.2).
+	form.Set("token", "not-a-token")
+	req2, err := http.NewRequest(http.MethodPost, h.relaySrv.URL+"/r/"+rid+"/oauth/revoke",
+		strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req2.Host = "public.example.org"
+	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp2, err := visitorClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("invalid-token revoke status=%d, want 200", resp2.StatusCode)
 	}
 }
 

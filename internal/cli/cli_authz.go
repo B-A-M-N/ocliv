@@ -181,10 +181,28 @@ func authzClientFlags(argv []string) (dataDir, client, tenant, route string, ok 
 	return dataDir, client, tenant, route, true
 }
 
-// cmdAuthzApprove approves a registered client for a tenant + route.
+// authzAudit writes an authorization-plane decision record. The actor is
+// the local operator: this CLI's authority is filesystem/DB access on the
+// relay host, NOT the enrollment key. That distinction is deliberate and
+// documented in the ADR.
+func authzAudit(st *authz.SQLStore, tenant, route, client, action, result, detail string) {
+	if err := st.AuditAuthz("operator", tenant, route, client, action, result, detail); err != nil {
+		fmt.Fprintln(os.Stderr, "warning: audit record failed: "+err.Error())
+	}
+}
+
+// cmdAuthzApprove approves a registered client for a tenant + route and
+// issues the pairing secret the client must present to obtain a code.
 func cmdAuthzApprove(argv []string) int {
 	dataDir, client, tenant, route, ok := authzClientFlags(argv)
 	if !ok {
+		return apperr.ExitCLIValidation
+	}
+	// Tenant and route must be named explicitly. Approving by client alone
+	// could silently cover several grants; ambiguity is an error, never a
+	// guess.
+	if tenant == "" || route == "" {
+		fmt.Fprintln(os.Stderr, "--tenant and --route are required: a client may have grants on several routes, and an ambiguous approval is never guessed")
 		return apperr.ExitCLIValidation
 	}
 	db, err := authzOpen(dataDir)
@@ -194,37 +212,33 @@ func cmdAuthzApprove(argv []string) int {
 	}
 	defer db.Close()
 	st := authz.NewSQLStore(db.SQL())
-	grants, err := st.ListGrants()
+	grant, gerr := st.GetGrant(client, tenant, route)
+	if gerr != nil {
+		fmt.Fprintf(os.Stderr, "no pending grant for client %s tenant=%s route=%s; the client must initiate authorization first\n", client, tenant, route)
+		return apperr.ExitCLIValidation
+	}
+	if grant.Status == authz.GrantRevoked {
+		fmt.Fprintf(os.Stderr, "client %s is revoked for tenant=%s route=%s; delete the grant first\n", client, tenant, route)
+		return apperr.ExitCLIValidation
+	}
+	if err := st.ApproveGrant(client, tenant, route); err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
+	}
+	secret, err := authz.MintPairingSecret()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return apperr.ExitInternal
 	}
-	matched := false
-	for _, g := range grants {
-		if g.ClientID != client {
-			continue
-		}
-		if tenant != "" && g.Tenant != tenant {
-			continue
-		}
-		if route != "" && g.Route != route {
-			continue
-		}
-		if g.Status == authz.GrantRevoked {
-			fmt.Fprintf(os.Stderr, "client %s is revoked for tenant=%s route=%s; delete the grant first\n", client, g.Tenant, g.Route)
-			return apperr.ExitCLIValidation
-		}
-		if err := st.ApproveGrant(g.ClientID, g.Tenant, g.Route); err != nil {
-			fmt.Fprintln(os.Stderr, "error: "+err.Error())
-			return apperr.ExitInternal
-		}
-		matched = true
-		fmt.Printf("approved client %s for tenant=%s route=%s\n", g.ClientID, g.Tenant, g.Route)
+	if err := st.SetPairingSecret(client, tenant, route, secret); err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
 	}
-	if !matched {
-		fmt.Fprintf(os.Stderr, "no pending grant for client %s (tenant=%q route=%q)\n", client, tenant, route)
-		return apperr.ExitCLIValidation
-	}
+	authzAudit(st, tenant, route, client, "approve", "ok", "grant active; pairing secret issued")
+	fmt.Printf("approved client %s for tenant=%s route=%s\n", client, tenant, route)
+	fmt.Println("Pairing secret (show once; deliver it to the client operator over a private channel):")
+	fmt.Println(secret)
+	fmt.Println("The client must present it as pairing_code on the authorization request.")
 	return apperr.ExitOK
 }
 
@@ -234,6 +248,10 @@ func cmdAuthzRevoke(argv []string) int {
 	if !ok {
 		return apperr.ExitCLIValidation
 	}
+	if tenant == "" || route == "" {
+		fmt.Fprintln(os.Stderr, "--tenant and --route are required: an ambiguous revocation is never guessed")
+		return apperr.ExitCLIValidation
+	}
 	db, err := authzOpen(dataDir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
@@ -241,33 +259,17 @@ func cmdAuthzRevoke(argv []string) int {
 	}
 	defer db.Close()
 	st := authz.NewSQLStore(db.SQL())
-	grants, err := st.ListGrants()
-	if err != nil {
+	if _, gerr := st.GetGrant(client, tenant, route); gerr != nil {
+		fmt.Fprintf(os.Stderr, "no grant for client %s tenant=%s route=%s\n", client, tenant, route)
+		return apperr.ExitCLIValidation
+	}
+	if err := st.RevokeGrant(client, tenant, route); err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return apperr.ExitInternal
 	}
-	matched := false
-	for _, g := range grants {
-		if g.ClientID != client {
-			continue
-		}
-		if tenant != "" && g.Tenant != tenant {
-			continue
-		}
-		if route != "" && g.Route != route {
-			continue
-		}
-		if err := st.RevokeGrant(g.ClientID, g.Tenant, g.Route); err != nil {
-			fmt.Fprintln(os.Stderr, "error: "+err.Error())
-			return apperr.ExitInternal
-		}
-		matched = true
-		fmt.Printf("revoked client %s for tenant=%s route=%s\n", g.ClientID, g.Tenant, g.Route)
-	}
-	if !matched {
-		fmt.Fprintf(os.Stderr, "no grant for client %s (tenant=%q route=%q)\n", client, tenant, route)
-		return apperr.ExitCLIValidation
-	}
+	authzAudit(st, tenant, route, client, "revoke", "ok", "grant revoked")
+	fmt.Printf("revoked client %s for tenant=%s route=%s\n", client, tenant, route)
+	fmt.Println("Existing tokens stop working on the next request.")
 	return apperr.ExitOK
 }
 
@@ -287,6 +289,7 @@ func cmdAuthzRotateKey(argv []string) int {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return apperr.ExitInternal
 	}
+	authzAudit(st, "", "", "", "rotate-key", "ok", "issuer key rotated (kid "+issuer.KeyID()+")")
 	fmt.Printf("rotated authorization issuer key (kid %s)\n", issuer.KeyID())
 	return apperr.ExitOK
 }

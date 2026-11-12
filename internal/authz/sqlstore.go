@@ -1,6 +1,7 @@
 package authz
 
 import (
+	"crypto/hmac"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -97,21 +98,122 @@ func (s *SQLStore) CreateGrant(g Grant) error {
 // GetGrant loads a grant.
 func (s *SQLStore) GetGrant(clientID, tenant, route string) (*Grant, error) {
 	var (
-		g         Grant
-		createdAt string
-		updatedAt string
+		g             Grant
+		status        string
+		createdAt     string
+		updatedAt     string
+		pairingHash   string
+		pairingIssued string
 	)
 	err := s.db.QueryRow(
-		`SELECT client_id, tenant_id, route_id, status, created_at, updated_at
+		`SELECT client_id, tenant_id, route_id, status, created_at, updated_at,
+		        pairing_hash, pairing_issued_at
 		 FROM authz_grants WHERE client_id=? AND tenant_id=? AND route_id=?`,
 		clientID, tenant, route).
-		Scan(&g.ClientID, &g.Tenant, &g.Route, &g.Status, &createdAt, &updatedAt)
+		Scan(&g.ClientID, &g.Tenant, &g.Route, &status, &createdAt, &updatedAt,
+			&pairingHash, &pairingIssued)
 	if err != nil {
 		return nil, fmt.Errorf("authz: get grant: %w", err)
 	}
+	g.Status = GrantStatus(status)
 	g.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
 	g.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	g.PairingHash = pairingHash
+	g.PairingIssuedAt, _ = time.Parse(time.RFC3339Nano, pairingIssued)
 	return &g, nil
+}
+
+// SetPairingSecret stores only the hash of the pairing secret.
+func (s *SQLStore) SetPairingSecret(clientID, tenant, route, secret string) error {
+	if secret == "" {
+		return fmt.Errorf("authz: pairing secret is required")
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.Exec(
+		`UPDATE authz_grants SET pairing_hash=?, pairing_issued_at=?, updated_at=?
+		 WHERE client_id=? AND tenant_id=? AND route_id=?`,
+		HashSecret(secret), now, now, clientID, tenant, route); err != nil {
+		return fmt.Errorf("authz: set pairing secret: %w", err)
+	}
+	return nil
+}
+
+// CheckPairingSecret compares the presented secret against the stored hash
+// in constant time.
+func (s *SQLStore) CheckPairingSecret(clientID, tenant, route, secret string) (bool, error) {
+	var stored string
+	err := s.db.QueryRow(
+		`SELECT pairing_hash FROM authz_grants WHERE client_id=? AND tenant_id=? AND route_id=?`,
+		clientID, tenant, route).Scan(&stored)
+	if err != nil {
+		return false, fmt.Errorf("authz: check pairing secret: %w", err)
+	}
+	if stored == "" {
+		return false, nil
+	}
+	return hmac.Equal([]byte(stored), []byte(HashSecret(secret))), nil
+}
+
+// RevokeToken durably revokes one token by its jti.
+func (s *SQLStore) RevokeToken(jti, clientID, tenant, route string) error {
+	if jti == "" {
+		return fmt.Errorf("authz: token jti is required")
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.Exec(
+		`INSERT INTO authz_revocations(jti, client_id, tenant_id, route_id, revoked_at)
+		 VALUES(?,?,?,?,?) ON CONFLICT(jti) DO NOTHING`,
+		jti, clientID, tenant, route, now); err != nil {
+		return fmt.Errorf("authz: revoke token: %w", err)
+	}
+	return nil
+}
+
+// IsTokenRevoked reports whether a jti is revoked.
+func (s *SQLStore) IsTokenRevoked(jti string) (bool, error) {
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(1) FROM authz_revocations WHERE jti=?`, jti).Scan(&n); err != nil {
+		return false, fmt.Errorf("authz: token revocation check: %w", err)
+	}
+	return n > 0, nil
+}
+
+// AuditAuthz records an authorization-plane decision.
+func (s *SQLStore) AuditAuthz(actor, tenant, route, clientID, action, result, detail string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.Exec(
+		`INSERT INTO authz_audit(time, actor, tenant_id, route_id, client_id, action, result, detail)
+		 VALUES(?,?,?,?,?,?,?,?)`,
+		now, actor, tenant, route, clientID, action, result, detail); err != nil {
+		return fmt.Errorf("authz: audit: %w", err)
+	}
+	return nil
+}
+
+// ListAuthzAudit returns the most recent audit records, newest first.
+func (s *SQLStore) ListAuthzAudit(limit int) ([]AuthzAudit, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.Query(
+		`SELECT time, actor, tenant_id, route_id, client_id, action, result, detail
+		 FROM authz_audit ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("authz: list audit: %w", err)
+	}
+	defer rows.Close()
+	var out []AuthzAudit
+	for rows.Next() {
+		var a AuthzAudit
+		var ts string
+		if err := rows.Scan(&ts, &a.Actor, &a.Tenant, &a.Route, &a.ClientID,
+			&a.Action, &a.Result, &a.Detail); err != nil {
+			return nil, fmt.Errorf("authz: scan audit: %w", err)
+		}
+		a.Time, _ = time.Parse(time.RFC3339Nano, ts)
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 // ApproveGrant sets a grant active, creating it if the client has not yet

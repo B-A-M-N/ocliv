@@ -207,7 +207,6 @@ func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "PKCE S256 required"})
 		return
 	}
-
 	grant, err := s.Store.GetGrant(clientID, s.tenant(), s.RouteID)
 	if err != nil {
 		// First contact for this route: record a pending grant. No code.
@@ -235,6 +234,18 @@ func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	case GrantPending:
 		writeJSON(w, http.StatusAccepted, map[string]any{"status": "pending_approval", "client": clientID})
+		return
+	}
+	// ACTIVE: require the operator's pairing secret. A public client_id is
+	// not a credential — without this, anyone who learns an approved
+	// client_id could start their own PKCE flow and inherit the approval.
+	pairing := q.Get("pairing_code")
+	ok, err := s.Store.CheckPairingSecret(clientID, s.tenant(), s.RouteID, pairing)
+	if err != nil || !ok {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":             "access_denied",
+			"error_description": "valid operator pairing secret required",
+		})
 		return
 	}
 
@@ -301,6 +312,11 @@ func (s *Server) ServeToken(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant", "error_description": "client is not approved for this route"})
 		return
 	}
+	jti, err := MintJTI()
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	token, err := s.Issuer.Mint(TokenClaims{
 		Issuer:   s.IssuerURL,
 		Subject:  clientID,
@@ -308,6 +324,7 @@ func (s *Server) ServeToken(w http.ResponseWriter, r *http.Request) {
 		Tenant:   s.tenant(),
 		Route:    s.RouteID,
 		Expiry:   time.Now().Add(s.tokenTTL()).Unix(),
+		ID:       jti,
 	})
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -345,10 +362,17 @@ func (s *Server) ServeRevoke(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	grant, err := s.Store.GetGrant(claims.Subject, s.tenant(), s.RouteID)
-	if err == nil && grant.Status != GrantActive {
-		// already denied at admission
+	// Durably revoke this specific token by its jti. Admission checks the
+	// revocation set on every request, so denial is immediate.
+	if claims.ID != "" {
+		if err := s.Store.RevokeToken(claims.ID, claims.Subject, s.tenant(), s.RouteID); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
+			return
+		}
 	}
+	// Revoking the client's grant is the operator's kill switch; it is
+	// deliberately NOT implied by a token revocation, so a client cannot
+	// revoke another client's approval or its own operator grant.
 	w.WriteHeader(http.StatusOK)
 }
 

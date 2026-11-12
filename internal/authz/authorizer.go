@@ -59,6 +59,17 @@ func (a *Authorizer) AuthorizeClaims(r *http.Request, routeURL, issuerURL, tenan
 	if grant.Status != GrantActive {
 		return nil, fmt.Errorf("authz: client %q is not approved (status %q)", claims.Subject, grant.Status)
 	}
+	// Token-specific revocation (RFC 7009). Checked on every request so a
+	// revoked token is denied immediately, not at its expiry.
+	if claims.ID != "" {
+		revoked, err := a.store.IsTokenRevoked(claims.ID)
+		if err != nil {
+			return nil, fmt.Errorf("authz: revocation check: %w", err)
+		}
+		if revoked {
+			return nil, fmt.Errorf("authz: token %q is revoked", claims.ID)
+		}
+	}
 	return claims, nil
 }
 

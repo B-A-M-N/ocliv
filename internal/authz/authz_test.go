@@ -333,14 +333,22 @@ func TestAuthorizePendingThenActive(t *testing.T) {
 		t.Fatal("pending authorize must not redirect")
 	}
 
-	// Approve.
+	// Approval issues the operator's pairing secret; the client must present
+	// it to obtain a code. Without it an approved client_id alone is not
+	// enough.
 	if err := s.Store.ApproveGrant(client, s.tenant(), s.RouteID); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
+	if err := s.Store.SetPairingSecret(client, s.tenant(), s.RouteID, "pair-secret"); err != nil {
+		t.Fatalf("pairing secret: %v", err)
+	}
 
-	// Second authorize: redirect with a code.
+	// Second authorize, with the pairing secret: redirect with a code.
 	w2 := httptest.NewRecorder()
-	s.ServeAuthorize(w2, r)
+	r2 := httptest.NewRequest(http.MethodGet, "/oauth/authorize?response_type=code&client_id="+client+
+		"&redirect_uri=https%3A%2F%2Fclient.example%2Fcb&code_challenge="+CodeChallengeS256("verifier")+
+		"&code_challenge_method=S256&state=xyz&pairing_code=pair-secret", nil)
+	s.ServeAuthorize(w2, r2)
 	if w2.Code != http.StatusFound {
 		t.Fatalf("active authorize: status=%d", w2.Code)
 	}

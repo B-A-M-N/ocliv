@@ -163,6 +163,25 @@ CREATE TABLE IF NOT EXISTS authz_issuer_key (
   kid TEXT NOT NULL, priv BLOB NOT NULL, created_at TEXT NOT NULL);
 `
 
+// schemaV9 closes the public-client impersonation and fake-revocation
+// findings: each grant carries a pairing secret hash (the operator's
+// out-of-band approval credential), tokens carry a revocation key, and
+// authorization-plane decisions are audited. Forward-only.
+const schemaV9 = `
+ALTER TABLE authz_grants ADD COLUMN pairing_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE authz_grants ADD COLUMN pairing_issued_at TEXT NOT NULL DEFAULT '';
+CREATE TABLE IF NOT EXISTS authz_revocations (
+  jti TEXT PRIMARY KEY, client_id TEXT NOT NULL, tenant_id TEXT NOT NULL,
+  route_id TEXT NOT NULL, revoked_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_authz_revocations_client ON authz_revocations(client_id);
+CREATE TABLE IF NOT EXISTS authz_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT NOT NULL,
+  actor TEXT NOT NULL, tenant_id TEXT NOT NULL DEFAULT '',
+  route_id TEXT NOT NULL DEFAULT '', client_id TEXT NOT NULL DEFAULT '',
+  action TEXT NOT NULL, result TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '');
+CREATE INDEX IF NOT EXISTS idx_authz_audit_time ON authz_audit(time);
+`
+
 // applyMigration runs one versioned migration body and its version
 // stamp in a single transaction: a failure anywhere rolls back the
 // body, so a version is never recorded for half-applied work (P1-2).
@@ -187,7 +206,7 @@ func applyMigration(sqldb *sql.DB, version int, body string) error {
 }
 
 // currentSchema is the newest version Open must reach.
-const currentSchema = 8
+const currentSchema = 9
 
 // DB wraps the SQLite handle.
 type DB struct {
@@ -295,6 +314,7 @@ func Open(path string) (*DB, error) {
 		{6, schemaV6},
 		{7, schemaV7},
 		{8, schemaV8},
+		{9, schemaV9},
 	}
 	for _, m := range migrations {
 		var v int
