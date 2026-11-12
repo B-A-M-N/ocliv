@@ -1,0 +1,270 @@
+# Managed Authorization — External Qualification Runbook
+
+Status: **NOT EXECUTED** — operator-gated. No result below is a claim; every
+row in the verdict table is a place for evidence, not a prediction.
+
+This runbook qualifies the relay-side authorization mode added in
+`docs/ADR-local-mcp-auth.md`: a route whose upstream has no native OAuth,
+fronted by the relay acting as the Authorization Server.
+
+It is written so an operator can execute it end to end without reading the
+implementation. Every step names its **oracle** (what output proves it) and
+its **fail-closed expectation** (what a broken build does instead).
+
+## 0. What this does and does not qualify
+
+**Does:** the complete authorization flow over real infrastructure — public
+TLS edge, route-scoped discovery, DCR, PKCE, operator approval, token
+enforcement at admission, revocation, key rotation.
+
+**Does not:** ChatGPT registration, a production IdP, per-tool
+permissioning, multi-IdP federation, or scale testing. Those stay out of
+scope by design (ADR §2).
+
+**Not a substitute for:** the local suites. `go test ./internal/...` and
+`go test ./tests/integration/` must be green before this starts; a local
+red here means the runbook was run against a broken build.
+
+## 1. Prerequisites (operator-gated)
+
+| # | Prerequisite | Why it blocks |
+|---|--------------|---------------|
+| P1 | A public hostname with DNS pointing at the edge | The token audience is the route URL; a non-public host cannot be reached by an external client |
+| P2 | A valid cert for that host (Caddy ACME or managed TLS) | `--insecure`/`InsecureSkipVerify` are refused by construction; a self-signed edge needs `--cacert` and is a weaker oracle |
+| P3 | The relay deployed with `--mcp-host` set to that exact FQDN | Without it, route creation fails closed with 409 |
+| P4 | A publisher machine that can reach the relay over WSS | The route must be bound to a live lease |
+| P5 | A local MCP server for the upstream (read-only, no private data) | Do not qualify against anything with real data |
+| P6 | Shell access to the relay host for `ocliv authz ...` | Approval is a local operator action on the relay store |
+| P7 | A throwaway MCP client (curl is sufficient) | DCR + PKCE must be driven by something other than the relay's own tests |
+
+If any prerequisite is unmet, stop. The run is **BLOCKED**, not partially
+passed.
+
+## 2. Topology
+
+```
+external client (public internet)
+  -> https://<fqdn>/                       (TLS edge: Caddy or managed TLS)
+  -> relay 127.0.0.1:<port>               (--mcp-host <fqdn>)
+       PRM  /.well-known/oauth-protected-resource/r/<id>/mcp
+       AS   /.well-known/oauth-authorization-server/r/<id>/oauth
+       OAuth /r/<id>/oauth/{authorize,token,register,revoke,jwks}
+  -> agent WSS+yamux
+  -> upstream 127.0.0.1:<local>            (local MCP server, no OAuth)
+```
+
+Managed routes require path ingress: the token audience is route-scoped, so
+the wildcard-hostname surface cannot carry them.
+
+## 3. Procedure
+
+### 3.1 Relay and route
+
+```sh
+# Relay host. Loopback only; the edge is the public listener.
+ocliv relay serve --listen 127.0.0.1:8080 --data /var/lib/ocliv \
+  --domain <domain> --mcp-host <fqdn>
+```
+
+```sh
+# Publisher host: enroll once, then publish with relay-terminated auth.
+ocliv login --relay https://<fqdn> --code-file -
+ocliv mcp publish --local http://127.0.0.1:8765/mcp \
+  --auth ocliv-managed --name managed-qual
+```
+
+**Oracle:** the publish prints `✓ route registered (managed authorization:
+the relay is the Authorization Server)` followed by the approval commands.
+**Fail-closed:** an unconfigured `--mcp-host` gives 409 at route creation;
+`--auth upstream-oauth` with a non-OAuth upstream fails strict discovery.
+
+Record the printed endpoint: `https://<fqdn>/r/<id>/mcp`.
+
+### 3.2 Discovery is route-scoped
+
+```sh
+curl -fsS https://<fqdn>/.well-known/oauth-protected-resource/r/<id>/mcp
+curl -fsS https://<fqdn>/.well-known/oauth-authorization-server/r/<id>/oauth
+```
+
+**Oracle:** PRM `resource` equals the endpoint URL exactly, and
+`authorization_servers[0]` equals `https://<fqdn>/r/<id>/oauth`. AS
+`issuer` equals that same value and each `*_endpoint` is issuer + the
+expected suffix (`/authorize`, `/token`, `/register`, `/revoke`, `/jwks`).
+**Fail-closed:** a mismatch means the advertised endpoints do not match the
+route's real paths — clients will construct wrong URLs.
+
+### 3.3 Publication-level boundary (deny by default)
+
+```sh
+# No bearer, no token: must be refused before any upstream call.
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -X POST -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+  https://<fqdn>/r/<id>/mcp
+```
+
+**Oracle:** `401`. **Fail-closed:** anything else means an unauthenticated
+fallback exists. Also confirm the upstream logged zero requests.
+
+### 3.4 Client registration and operator approval
+
+```sh
+# Register a client (RFC 7591 shape).
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  -d '{"client_name":"qual","redirect_uris":["http://127.0.0.1:59999/cb"],"token_endpoint_auth_method":"none"}' \
+  https://<fqdn>/r/<id>/oauth/register
+# -> {"client_id":"..."}
+
+# Before approval: no code is issued.
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  "https://<fqdn>/r/<id>/oauth/authorize?client_id=<cid>&redirect_uri=http%3A%2F%2F127.0.0.1%3A59999%2Fcb&response_type=code&code_challenge=<S256>&code_challenge_method=S256"
+```
+
+**Oracle:** `202` with `status: pending_approval` and **no** `Location`
+header. **Fail-closed:** a `302` with a code before approval means the
+publication boundary is not the gate.
+
+```sh
+# Relay host: the operator approves. This is the ONLY grant path.
+ocliv authz pending --data /var/lib/ocliv
+ocliv authz approve --data /var/lib/ocliv --client <cid> \
+  --tenant <tenant> --route <id>
+```
+
+**Oracle:** `approved client <cid> for tenant=<t> route=<id>`, and
+`ocliv authz list --data /var/lib/ocliv` shows `status=active` for exactly
+one row.
+
+### 3.5 Full client flow
+
+```sh
+# Authorize (capture the code from the redirect), then exchange with PKCE.
+# -> access_token
+curl -fsS -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-urlencode 'grant_type=authorization_code' \
+  --data-urlencode 'code=<code>' \
+  --data-urlencode 'client_id=<cid>' \
+  --data-urlencode 'redirect_uri=http://127.0.0.1:59999/cb' \
+  --data-urlencode 'code_verifier=<verifier>' \
+  https://<fqdn>/r/<id>/oauth/token
+```
+
+```sh
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: Bearer $TOKEN" \
+  -X POST -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+  https://<fqdn>/r/<id>/mcp
+```
+
+**Oracle:** `200` with a real `tools/list` result. **Fail-closed:** a token
+minted without an ACTIVE grant must be refused at admission.
+
+### 3.6 Negative paths
+
+Each must be `401` with **zero** upstream executions:
+
+| Case | Construction |
+|------|--------------|
+| Missing bearer | omit `Authorization` |
+| Tampered bearer | append a character to a valid token |
+| Wrong audience | present a token minted for a *different* route |
+| Replayed code | exchange the same `code` twice |
+| Wrong PKCE | exchange with a mismatched `code_verifier` |
+
+**Fail-closed:** a wrong-audience token accepted anywhere means audience
+binding is not enforced per route.
+
+### 3.7 Revocation is immediate
+
+```sh
+ocliv authz revoke --data /var/lib/ocliv --client <cid> --tenant <tenant> --route <id>
+curl ... -H "Authorization: Bearer $TOKEN" ...   # same token as 3.5
+```
+
+**Oracle:** the **next** request is `401`; not the token's expiry.
+**Fail-closed:** still `200` after revocation means revocation is
+expiry-dependent.
+
+### 3.8 Issuer key rotation
+
+```sh
+ocliv authz rotate-key --data /var/lib/ocliv
+curl ... -H "Authorization: Bearer $TOKEN" ...   # pre-rotation token
+```
+
+**Oracle:** `401` immediately, without a relay restart. **Fail-closed:**
+still `200` means the running relay kept the retired key in memory.
+
+### 3.9 Publisher restart preserves approval
+
+```sh
+# Stop the publisher, then republish the same name.
+ocliv mcp publish --local http://127.0.0.1:8765/mcp \
+  --auth ocliv-managed --name managed-qual
+# Present the SAME pre-restart token.
+```
+
+**Oracle:** the endpoint is byte-identical, the token still works, and no
+re-approval was needed. **Fail-closed:** a new route id, or a working token
+after an unapproved republish, means approval state is not bound to route
+identity.
+
+### 3.10 Incompatible mode change is refused
+
+```sh
+# Same lease, different profile: must not silently rebind.
+# (Drive this through the management API the same way publish does.)
+```
+
+**Oracle:** `409`, route unchanged, existing token still works.
+
+### 3.11 Teardown
+
+```sh
+ocliv mcp unpublish --lease <lease-id>
+tail -f <upstream access log>   # confirm zero further requests
+ocliv authz list --data /var/lib/ocliv   # confirm the grant row is gone/revoked
+```
+
+**Fail-closed:** the route must stop serving; a retained publication is
+offline (`503`) and must not forward.
+
+## 4. Verdict table (fill during the run)
+
+| # | Check | Result | Evidence |
+|---|-------|--------|----------|
+| 1 | Public TLS, no `-k` | | |
+| 2 | Route-scoped PRM/AS match the endpoint | | |
+| 3 | No-bearer denied, zero upstream hits | | |
+| 4 | Registration without approval issues no code | | |
+| 5 | Approval grants exactly one tenant+route | | |
+| 6 | DCR → PKCE → token → authorized call | | |
+| 7 | Negative paths all 401, zero executions | | |
+| 8 | Revocation immediate | | |
+| 9 | Key rotation immediate | | |
+| 10 | Republish preserves route id + approval | | |
+| 11 | Incompatible mode change refused | | |
+| 12 | Teardown stops serving | | |
+
+**Overall disposition:** PASS only if every row is PASS with recorded
+evidence. Any FAIL is a defect, not a qualification gap to be argued away.
+
+## 5. Evidence standard
+
+- Paste the actual command and its actual output; "it worked" is not
+  evidence.
+- For every denial, show both the status code **and** the upstream access
+  log proving zero executions — the counter, not the status, is the oracle.
+- Record the relay version (`ocliv version`) and the route id.
+- Redact tokens, codes, and enrollment codes. Refer to them by label.
+- A check that could not be exercised is **NOT VERIFIED**, never PASS.
+
+## 6. Known limits of this runbook
+
+- It does not prove the upstream's own behavior beyond receiving a
+  relay-minted identity header. The upstream's use of that identity is
+  out of scope (ADR §5: loopback is not isolation).
+- It does not prove a provider-issued IdP or ChatGPT registration.
+- It does not prove behavior under load; see `docs/qualification/CHAOS-BATCH.md`.
