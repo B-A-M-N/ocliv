@@ -213,11 +213,14 @@ func (s *SQLStore) ListClients() ([]Client, error) {
 	var out []Client
 	for rows.Next() {
 		var c Client
-		var uris string
-		if err := rows.Scan(&c.ID, &c.Name, &uris, &c.CreatedAt, &c.RevokedAt); err != nil {
+		var uris, createdAt string
+		if err := rows.Scan(&c.ID, &c.Name, &uris, &createdAt, &c.RevokedAt); err != nil {
 			return nil, fmt.Errorf("authz: scan client: %w", err)
 		}
 		c.RedirectURIs = splitList(uris)
+		if t, err := time.Parse(time.RFC3339Nano, createdAt); err == nil {
+			c.CreatedAt = t
+		}
 		out = append(out, c)
 	}
 	return out, rows.Err()
@@ -234,11 +237,17 @@ func (s *SQLStore) ListGrants() ([]Grant, error) {
 	var out []Grant
 	for rows.Next() {
 		var g Grant
-		var status string
-		if err := rows.Scan(&g.ClientID, &g.Tenant, &g.Route, &status, &g.CreatedAt, &g.UpdatedAt); err != nil {
+		var status, createdAt, updatedAt string
+		if err := rows.Scan(&g.ClientID, &g.Tenant, &g.Route, &status, &createdAt, &updatedAt); err != nil {
 			return nil, fmt.Errorf("authz: scan grant: %w", err)
 		}
 		g.Status = GrantStatus(status)
+		if t, err := time.Parse(time.RFC3339Nano, createdAt); err == nil {
+			g.CreatedAt = t
+		}
+		if t, err := time.Parse(time.RFC3339Nano, updatedAt); err == nil {
+			g.UpdatedAt = t
+		}
 		out = append(out, g)
 	}
 	return out, rows.Err()
@@ -256,9 +265,13 @@ func (s *SQLStore) ListCodes() ([]Code, error) {
 	var out []Code
 	for rows.Next() {
 		var c Code
+		var expiresAt string
 		if err := rows.Scan(&c.Code, &c.ClientID, &c.Tenant, &c.Route, &c.RedirectURI,
-			&c.Challenge, &c.ChallengeMethod, &c.ExpiresAt, &c.ConsumedAt); err != nil {
+			&c.Challenge, &c.ChallengeMethod, &expiresAt, &c.ConsumedAt); err != nil {
 			return nil, fmt.Errorf("authz: scan code: %w", err)
+		}
+		if t, err := time.Parse(time.RFC3339Nano, expiresAt); err == nil {
+			c.ExpiresAt = t
 		}
 		out = append(out, c)
 	}

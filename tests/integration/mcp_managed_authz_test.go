@@ -410,6 +410,79 @@ func TestManagedAuthzKeyRotation(t *testing.T) {
 	}
 }
 
+// TestManagedAuthzRepublishPreservesApproval: a publisher restart rebinds
+// the SAME route identity, so operator approvals survive it — the client's
+// existing token keeps working with no re-approval. An incompatible
+// authentication-mode change under the same stable name is refused.
+func TestManagedAuthzRepublishPreservesApproval(t *testing.T) {
+	h, up, rid, _ := managedHarness(t)
+	clientID := managedDCR(t, h, rid)
+	st := authz.NewSQLStore(h.db.SQL())
+	tenant := publicationTenant(t, h, rid)
+	if err := st.ApproveGrant(clientID, tenant, rid); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	authCode := managedAuthorize(t, h, rid, clientID, "verifier-repub")
+	if authCode == "" {
+		t.Fatal("no authorization code")
+	}
+	status, body := managedToken(t, h, rid, clientID, authCode, "verifier-repub")
+	if status != http.StatusOK {
+		t.Fatalf("token status=%d body=%s", status, body)
+	}
+	var tok struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal([]byte(body), &tok); err != nil || tok.AccessToken == "" {
+		t.Fatalf("token reply unparseable: %v (%q)", err, body)
+	}
+	if c, _ := managedCall(t, h, rid, tok.AccessToken); c != http.StatusOK {
+		t.Fatalf("pre-restart call status=%d, want 200", c)
+	}
+
+	// Publisher restart: republish under the same name/profile.
+	code, rid2, _, _ := mgmtRouteCreate(t, h, "managed-oauth")
+	if code != http.StatusOK {
+		t.Fatalf("republish status=%d", code)
+	}
+	if rid2 != rid {
+		t.Fatalf("republish minted %q, want stable %q", rid2, rid)
+	}
+
+	// Approval state is preserved: the same token still works, with no
+	// re-approval and no new grant row.
+	grants, err := st.ListGrants()
+	if err != nil {
+		t.Fatalf("list grants: %v", err)
+	}
+	n := 0
+	for _, g := range grants {
+		if g.ClientID == clientID && g.Route == rid {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("approval rows for client/route = %d, want 1 (no duplicate, none lost)", n)
+	}
+	before := up.execs.Load()
+	if c, _ := managedCall(t, h, rid, tok.AccessToken); c != http.StatusOK {
+		t.Fatalf("post-restart call status=%d, want 200", c)
+	}
+	if got := up.execs.Load() - before; got != 1 {
+		t.Fatalf("post-restart executed %d tools, want 1", got)
+	}
+
+	// An incompatible authentication-mode change under the same stable
+	// name is refused, never silently applied.
+	if code, _, _, _ := mgmtRouteCreate(t, h, "upstream-oauth"); code != http.StatusConflict {
+		t.Fatalf("mode change status=%d, want 409", code)
+	}
+	// The route is unchanged and still serving.
+	if c, _ := managedCall(t, h, rid, tok.AccessToken); c != http.StatusOK {
+		t.Fatalf("post-mode-change call status=%d, want 200", c)
+	}
+}
+
 // TestManagedAuthzDiscoveryIsRouteScoped: PRM names this route's resource and
 // this route's AS; the AS metadata advertises exactly the route's endpoints.
 func TestManagedAuthzDiscoveryIsRouteScoped(t *testing.T) {
