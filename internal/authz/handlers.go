@@ -21,6 +21,7 @@ const (
 type Server struct {
 	Issuer    *Issuer
 	Store     Store
+	Tenant    string // owning tenant; grants and tokens are scoped to it
 	RouteID   string
 	RouteURL  string // external route URL; used as the token audience
 	IssuerURL string // exact AS issuer string
@@ -29,10 +30,11 @@ type Server struct {
 }
 
 // NewServer builds a route-scoped authorization server.
-func NewServer(issuer *Issuer, store Store, routeID, routeURL, issuerURL string) *Server {
+func NewServer(issuer *Issuer, store Store, tenant, routeID, routeURL, issuerURL string) *Server {
 	return &Server{
 		Issuer:    issuer,
 		Store:     store,
+		Tenant:    tenant,
 		RouteID:   routeID,
 		RouteURL:  routeURL,
 		IssuerURL: issuerURL,
@@ -69,11 +71,11 @@ func (s *Server) AuthorizationServerMetadata() map[string]any {
 	base := s.IssuerURL
 	return map[string]any{
 		"issuer":                                base,
-		"authorization_endpoint":                base + "/oauth/authorize",
-		"token_endpoint":                        base + "/oauth/token",
-		"registration_endpoint":                 base + "/oauth/register",
-		"revocation_endpoint":                   base + "/oauth/revoke",
-		"jwks_uri":                              base + "/oauth/jwks",
+		"authorization_endpoint":                base + "/authorize",
+		"token_endpoint":                        base + "/token",
+		"registration_endpoint":                 base + "/register",
+		"revocation_endpoint":                   base + "/revoke",
+		"jwks_uri":                              base + "/jwks",
 		"response_types_supported":              []string{"code"},
 		"grant_types_supported":                 []string{"authorization_code"},
 		"code_challenge_methods_supported":      []string{"S256"},
@@ -350,13 +352,10 @@ func (s *Server) ServeRevoke(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// tenant is the tenant for this route. Phase 1 uses a fixed default; Phase 2
-// wires the publication's tenant.
+// tenant is the owning tenant of this route; grants and tokens are scoped
+// to it, and admission enforces the match.
 func (s *Server) tenant() string {
-	if s.RouteID == "" {
-		return ""
-	}
-	return "tenant-default"
+	return s.Tenant
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

@@ -100,7 +100,7 @@ func wantMode(intent LeaseIntent) (string, error) {
 		return "protected", nil
 	}
 	switch intent.AccessMode {
-	case "protected", "public", AccessModeMCPUpstreamOAuth, AccessModeMCPAnonymousFixture:
+	case "protected", "public", AccessModeMCPUpstreamOAuth, AccessModeMCPAnonymousFixture, AccessModeMCPManaged:
 		if intent.Public && intent.AccessMode != "public" {
 			return "", apperr.E(apperr.CodeCLIValidation, "public flag contradicts explicit access mode", nil)
 		}

@@ -32,18 +32,39 @@ func newAuthzManager(db *store.DB) (*authzManager, error) {
 	return &authzManager{db: db, store: st, issuer: issuer}, nil
 }
 
+// issuerNow returns the current issuer, reloading it from the store so an
+// operator key rotation (a store write) takes effect on the next request
+// rather than after a relay restart. Rotation is an explicit security
+// control, so it must not be delayed by an in-memory cache.
+func (m *authzManager) issuerNow() (*authz.Issuer, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	issuer, err := m.store.LoadIssuer()
+	if err != nil {
+		return nil, err
+	}
+	m.issuer = issuer
+	return issuer, nil
+}
+
 // serverFor returns a route-scoped authorization server. routeURL is the
 // external route URL used as the token audience; issuerURL is the exact AS
 // issuer string.
-func (m *authzManager) serverFor(routeID, routeURL, issuerURL string) *authz.Server {
-	return authz.NewServer(m.issuer, m.store, routeID, routeURL, issuerURL)
+func (m *authzManager) serverFor(tenant, routeID, routeURL, issuerURL string) (*authz.Server, error) {
+	issuer, err := m.issuerNow()
+	if err != nil {
+		return nil, err
+	}
+	return authz.NewServer(issuer, m.store, tenant, routeID, routeURL, issuerURL), nil
 }
 
 // authorizer returns the admission authorizer over the current issuer.
-func (m *authzManager) authorizer() *authz.Authorizer {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return authz.NewAuthorizer(m.issuer, m.store)
+func (m *authzManager) authorizer() (*authz.Authorizer, error) {
+	issuer, err := m.issuerNow()
+	if err != nil {
+		return nil, err
+	}
+	return authz.NewAuthorizer(issuer, m.store), nil
 }
 
 // store returns the durable store.
@@ -70,12 +91,14 @@ func routeURLFor(host string, port int, routeID string) string {
 	return fmt.Sprintf("https://%s:%d/r/%s/mcp", host, port, routeID)
 }
 
-// issuerURLFor builds the exact AS issuer string for a route.
-func issuerURLFor(host string, port int) string {
+// issuerURLFor builds the exact AS issuer string for a route. It is
+// route-scoped so the advertised endpoints match the route's real paths
+// (RFC 8414 path-inserted well-known form).
+func issuerURLFor(host string, port int, routeID string) string {
 	if port == 0 || port == 443 {
-		return fmt.Sprintf("https://%s", host)
+		return fmt.Sprintf("https://%s/r/%s/oauth", host, routeID)
 	}
-	return fmt.Sprintf("https://%s:%d", host, port)
+	return fmt.Sprintf("https://%s:%d/r/%s/oauth", host, port, routeID)
 }
 
 // isManagedAuthzPath reports whether the request path is one the relay serves
@@ -96,8 +119,13 @@ func (s *Server) serveManagedAuthz(w http.ResponseWriter, r *http.Request, t *ro
 		return
 	}
 	routeURL := routeURLFor(s.mcpHost, s.mcpPort, routeID)
-	issuerURL := issuerURLFor(s.mcpHost, s.mcpPort)
-	srv := s.authz.serverFor(routeID, routeURL, issuerURL)
+	issuerURL := issuerURLFor(s.mcpHost, s.mcpPort, routeID)
+	srv, err := s.authz.serverFor(t.TenantID, t.RouteID, routeURL, issuerURL)
+	if err != nil {
+		s.db.Audit("visitor", t.TenantID, t.LeaseID, "mcp_path", "denied", "authz issuer unavailable")
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	switch {
 	case r.URL.EscapedPath() == mcpWellKnownUpstreamPath:
 		writeManagedJSON(w, srv.ProtectedResourceMetadata())
@@ -125,8 +153,12 @@ func (s *Server) authorizeManaged(r *http.Request, tenant, routeID string) (stri
 		return "", fmt.Errorf("relay: no authz manager")
 	}
 	routeURL := routeURLFor(s.mcpHost, s.mcpPort, routeID)
-	issuerURL := issuerURLFor(s.mcpHost, s.mcpPort)
-	claims, err := s.authz.authorizer().AuthorizeClaims(r, routeURL, issuerURL, tenant, routeID)
+	issuerURL := issuerURLFor(s.mcpHost, s.mcpPort, routeID)
+	authorizer, err := s.authz.authorizer()
+	if err != nil {
+		return "", err
+	}
+	claims, err := authorizer.AuthorizeClaims(r, routeURL, issuerURL, tenant, routeID)
 	if err != nil {
 		return "", err
 	}

@@ -216,6 +216,7 @@ var mcpOAuthEndpoints = map[string]bool{
 	"/oauth/token":     true,
 	"/oauth/register":  true,
 	"/oauth/revoke":    true,
+	"/oauth/jwks":      true,
 }
 
 // parseMCPRouteMetadataPath matches escaped request paths of the exact

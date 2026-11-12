@@ -21,7 +21,7 @@ func newFixture(t *testing.T) (*Server, *Authorizer) {
 		t.Fatalf("issuer: %v", err)
 	}
 	store := NewMemStore()
-	s := NewServer(issuer, store, "r-sec", "https://relay.test/r/r-sec/mcp", "https://relay.test")
+	s := NewServer(issuer, store, "tenant-test", "r-sec", "https://relay.test/r/r-sec/mcp", "https://relay.test")
 	s.CodeTTL = 5 * time.Minute
 	s.TokenTTL = 1 * time.Hour
 	return s, NewAuthorizer(issuer, store)

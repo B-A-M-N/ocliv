@@ -293,8 +293,11 @@ func (s *Server) serveMCPRouteMutation(w http.ResponseWriter, r *http.Request, t
 		// silently re-authorize existing streams. Start the tunnel
 		// with the matching mode instead.
 		targetMode := AccessModeMCPUpstreamOAuth
-		if profile == IngressMCPAnonymousFixture {
+		switch profile {
+		case IngressMCPAnonymousFixture:
 			targetMode = AccessModeMCPAnonymousFixture
+		case IngressMCPManaged:
+			targetMode = AccessModeMCPManaged
 		}
 		if mode != targetMode {
 			http.Error(w, "lease mode "+mode+" does not support MCP routes; start the tunnel with the matching --auth mode", http.StatusConflict)
@@ -389,12 +392,20 @@ func (s *Server) serveMCPRouteMutation(w http.ResponseWriter, r *http.Request, t
 			// until the publisher completes discovery verification
 			// and activation. The metadata path stays reachable so
 			// that verification can complete.
+			// Managed routes have no upstream OAuth to verify: the relay
+			// is the Authorization Server, so the publication is active as
+			// soon as it is created. Every other profile stays pending
+			// until the publisher proves upstream discovery and activates.
+			var verifiedAt any
+			if profile == IngressMCPManaged {
+				verifiedAt = now
+			}
 			_, err = s.db.SQL().Exec(
 				`INSERT INTO mcp_publications(route_id, tenant_id, owner_key_id, external_host, profile, pub_name, target_path, lease_id, created_at, updated_at, verified_at)
-				 SELECT ?,?,?,?,?,?,?,?, ?,?, NULL WHERE EXISTS(SELECT 1 FROM leases WHERE id=? AND status='ACTIVE')
+				 SELECT ?,?,?,?,?,?,?,?, ?,?, ? WHERE EXISTS(SELECT 1 FROM leases WHERE id=? AND status='ACTIVE')
 				 ON CONFLICT(tenant_id, owner_key_id, external_host, profile, pub_name) DO NOTHING`,
 				minted, tenant, keyID, s.mcpHost, rest, label, "/mcp", leaseID,
-				now, now, leaseID)
+				now, now, verifiedAt, leaseID)
 			if err != nil {
 				http.Error(w, "internal error", http.StatusInternalServerError)
 				return
