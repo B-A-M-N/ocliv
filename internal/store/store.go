@@ -130,6 +130,14 @@ const schemaV6 = `
 CREATE INDEX IF NOT EXISTS idx_audit_events_time ON audit_events(time);
 `
 
+// schemaV7 attributes audit events to the authenticated key that caused
+// them (post-qualification hardening). Existing rows keep the empty
+// default; management-plane denials are queryable by key without parsing
+// free text. No rows are deleted.
+const schemaV7 = `
+ALTER TABLE audit_events ADD COLUMN key_id TEXT NOT NULL DEFAULT '';
+`
+
 // applyMigration runs one versioned migration body and its version
 // stamp in a single transaction: a failure anywhere rolls back the
 // body, so a version is never recorded for half-applied work (P1-2).
@@ -154,7 +162,7 @@ func applyMigration(sqldb *sql.DB, version int, body string) error {
 }
 
 // currentSchema is the newest version Open must reach.
-const currentSchema = 6
+const currentSchema = 7
 
 // DB wraps the SQLite handle.
 type DB struct {
@@ -260,6 +268,7 @@ func Open(path string) (*DB, error) {
 		{4, schemaV4},
 		{5, schemaV5},
 		{6, schemaV6},
+		{7, schemaV7},
 	}
 	for _, m := range migrations {
 		var v int
@@ -310,6 +319,16 @@ func (d *DB) Audit(actor, tenantID, leaseID, category, result, detail string) {
 	_, _ = d.sql.Exec(
 		`INSERT INTO audit_events(time, actor, tenant_id, lease_id, category, result, detail) VALUES(?,?,?,?,?,?,?)`,
 		utcNow(), actor, tenantID, leaseID, category, result, detail)
+}
+
+// AuditKey is Audit with the authenticated key identifier recorded in its
+// own column (schemaV7). Use it for key-scoped management-plane events so
+// a denied attempt can be attributed without parsing the detail string.
+// keyID must be the already-authenticated key identifier, never a secret.
+func (d *DB) AuditKey(actor, tenantID, keyID, leaseID, category, result, detail string) {
+	_, _ = d.sql.Exec(
+		`INSERT INTO audit_events(time, actor, tenant_id, key_id, lease_id, category, result, detail) VALUES(?,?,?,?,?,?,?,?)`,
+		utcNow(), actor, tenantID, keyID, leaseID, category, result, detail)
 }
 
 // AuditRetention is the operator-visible audit evidence window (Stage 6,

@@ -749,3 +749,59 @@ func TestMCPUnpublishByPublicationIDIsolatesSiblings(t *testing.T) {
 		}
 	}
 }
+
+// TestMCPUnpublishPublicationIDNotFoundIsNonzero: a 404 from the relay
+// (nonexistent route, or a route owned by another key) must not report
+// success. The CLI exits ExitAuth; a confirmed 200 delete still exits 0;
+// a repeat delete of the now-gone route is nonzero again.
+func TestMCPUnpublishPublicationIDNotFoundIsNonzero(t *testing.T) {
+	home := t.TempDir()
+	db, relayURL := publishFlowRelay(t, "mcp.example.test")
+	publishFlowEnroll(t, home, relayURL, db)
+	port, closeFixture := publishFlowFixture(t)
+	defer closeFixture()
+
+	argv := []string{"--local", fmt.Sprintf("http://127.0.0.1:%d/mcp", port),
+		"--auth", "upstream-oauth", "--name", "notfound", "--ttl", "30m",
+		"--dev-allow-unverified-discovery"}
+	done := make(chan int, 1)
+	go func() { done <- runMCPPublish(argv, false) }()
+	deadline := time.Now().Add(25 * time.Second)
+	for routeRowCount(t, db) != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("route was never registered")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	self, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := self.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(45 * time.Second):
+		t.Fatal("publish did not shut down after SIGINT")
+	}
+
+	// A route this key does not own (nonexistent) must be nonzero.
+	if code := cmdMCPUnpublish([]string{"--publication-id", "zzz-not-a-route"}); code != apperr.ExitAuth {
+		t.Fatalf("unpublish unknown route exit=%d, want %d", code, apperr.ExitAuth)
+	}
+
+	// The owned publication still deletes cleanly.
+	var routeID string
+	if err := db.SQL().QueryRow(`SELECT route_id FROM mcp_publications LIMIT 1`).Scan(&routeID); err != nil {
+		t.Fatal(err)
+	}
+	if code := cmdMCPUnpublish([]string{"--publication-id", routeID}); code != apperr.ExitOK {
+		t.Fatalf("unpublish owned route exit=%d, want 0", code)
+	}
+
+	// A second delete of the now-gone route is nonzero (404).
+	if code := cmdMCPUnpublish([]string{"--publication-id", routeID}); code != apperr.ExitAuth {
+		t.Fatalf("repeat unpublish exit=%d, want %d", code, apperr.ExitAuth)
+	}
+}

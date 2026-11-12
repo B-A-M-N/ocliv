@@ -422,6 +422,63 @@ func TestOpenAppliesSchema(t *testing.T) {
 	}
 }
 
+// TestOpenMigratesAuditEventsToV7: a pre-V7 database's audit rows survive
+// the key_id addition with the empty default, and new key-scoped events are
+// attributable by key without parsing the detail string.
+func TestOpenMigratesAuditEventsToV7(t *testing.T) {
+	path := t.TempDir() + "/legacy-audit.db"
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(schemaV1); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO schema_version(v, applied_at) VALUES(1, ?)`, utcNow()); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(
+		`INSERT INTO audit_events(time, actor, tenant_id, lease_id, category, result, detail)
+		 VALUES(?,?,?,?,?,?,?)`,
+		utcNow(), "agent", "t1", "", "legacy-op", "ok", "pre-v7 row"); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("open migrated db: %v", err)
+	}
+	defer db.Close()
+
+	// The V6→V7 migration added the column without dropping the old row.
+	var keyID string
+	if err := db.SQL().QueryRow(
+		`SELECT key_id FROM audit_events WHERE category='legacy-op'`).Scan(&keyID); err != nil {
+		t.Fatalf("legacy audit row lost or key_id missing: %v", err)
+	}
+	if keyID != "" {
+		t.Fatalf("legacy row key_id=%q want empty default", keyID)
+	}
+
+	// Key-scoped events record the authenticated key identifier.
+	db.AuditKey("agent", "t1", "key-abc", "", "mcp-route-delete", "denied",
+		"route r1 not found or not owned by this key")
+	var gotKey, gotTenant, gotResult string
+	if err := db.SQL().QueryRow(
+		`SELECT key_id, tenant_id, result FROM audit_events WHERE category='mcp-route-delete'`).Scan(&gotKey, &gotTenant, &gotResult); err != nil {
+		t.Fatal(err)
+	}
+	if gotKey != "key-abc" || gotTenant != "t1" || gotResult != "denied" {
+		t.Fatalf("key-scoped audit row key=%q tenant=%q result=%q", gotKey, gotTenant, gotResult)
+	}
+}
+
 // Orphan credentials must be rejected: a token or session referencing a
 // nonexistent lease fails the foreign key instead of lingering as an
 // unroutable authorization (qualification P1).

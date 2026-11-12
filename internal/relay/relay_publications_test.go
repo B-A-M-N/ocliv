@@ -158,6 +158,95 @@ func TestKeyPublicationsCrossKeyDenied(t *testing.T) {
 	}
 }
 
+// TestKeyPublicationDeleteAudit: successful and denied deletes each emit
+// exactly one attributed audit row (schemaV7 key_id); denied attempts
+// mutate nothing; the audit names the route and carries no secret material.
+func TestKeyPublicationDeleteAudit(t *testing.T) {
+	s, db := newMCPServer(t)
+	privA := enrollTestKey(t, db.SQL(), "key-a", "tenant-test")
+	privB := enrollTestKey(t, db.SQL(), "key-b", "tenant-test")
+	if _, err := db.SQL().Exec(
+		`INSERT INTO leases(id, tenant_id, agent_key_id, hostname, label, port, access_mode, generation, status, created_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		"lse-a", "tenant-test", "key-a", "alpha.t.example.test", "alpha", 3000,
+		AccessModeMCPUpstreamOAuth, 1, lease.StateActive,
+		"2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	r1 := publishRoute(t, s, privA, "key-a", "lse-a", "upstream-oauth")
+
+	countAudit := func(keyID, result string) int {
+		var n int
+		if err := db.SQL().QueryRow(
+			`SELECT COUNT(*) FROM audit_events WHERE category='mcp-route-delete' AND key_id=? AND result=?`,
+			keyID, result).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	routeRows := func() int {
+		var n int
+		if err := db.SQL().QueryRow(`SELECT COUNT(*) FROM mcp_publications WHERE route_id=?`, r1).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	// 1. Cross-key denied delete: 404, no mutation, one denied audit row.
+	if code, _ := deleteKeyPublication(t, s, privB, "key-b", r1); code != http.StatusNotFound {
+		t.Fatalf("cross-key delete: status=%d want 404", code)
+	}
+	if n := routeRows(); n != 1 {
+		t.Fatalf("cross-key denied delete mutated the publication: rows=%d want 1", n)
+	}
+	if n := countAudit("key-b", "denied"); n != 1 {
+		t.Fatalf("cross-key denied audit rows=%d want 1", n)
+	}
+
+	// 2. Successful owner delete: 200, route gone, one ok audit row.
+	if code, _ := deleteKeyPublication(t, s, privA, "key-a", r1); code != http.StatusOK {
+		t.Fatalf("owner delete: status=%d want 200", code)
+	}
+	if n := routeRows(); n != 0 {
+		t.Fatalf("route rows after delete=%d want 0", n)
+	}
+	if n := countAudit("key-a", "ok"); n != 1 {
+		t.Fatalf("ok audit rows=%d want 1", n)
+	}
+
+	// 3. Repeat delete of the now-gone route: 404, still gone, one denied row.
+	if code, _ := deleteKeyPublication(t, s, privA, "key-a", r1); code != http.StatusNotFound {
+		t.Fatalf("repeat delete: status=%d want 404", code)
+	}
+	if n := routeRows(); n != 0 {
+		t.Fatalf("repeat delete resurrected rows=%d want 0", n)
+	}
+	if n := countAudit("key-a", "denied"); n != 1 {
+		t.Fatalf("repeat denied audit rows=%d want 1", n)
+	}
+
+	// 4. The denied row carries actor, tenant, a timestamp, the route id,
+	// and no ownership disclosure or secret material.
+	var actor, tenant, detail, ts string
+	if err := db.SQL().QueryRow(
+		`SELECT actor, tenant_id, detail, time FROM audit_events
+		 WHERE category='mcp-route-delete' AND key_id='key-b' AND result='denied'`).Scan(&actor, &tenant, &detail, &ts); err != nil {
+		t.Fatal(err)
+	}
+	if actor != "agent" || tenant != "tenant-test" {
+		t.Fatalf("audit actor=%q tenant=%q want agent/tenant-test", actor, tenant)
+	}
+	if ts == "" {
+		t.Fatal("audit row has no timestamp")
+	}
+	if !strings.Contains(detail, r1) {
+		t.Fatalf("audit detail %q does not name the route", detail)
+	}
+	if strings.Contains(detail, "owner") || strings.Contains(detail, "key-") {
+		t.Fatalf("audit detail %q leaks ownership or a key identifier", detail)
+	}
+}
+
 // TestKeyPublicationsRevokedKeyDenied: after operator revocation the key's
 // management plane (list and delete) is denied at the identity gate,
 // before any row is touched.

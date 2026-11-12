@@ -703,14 +703,23 @@ func cmdMCPUnpublish(argv []string) int {
 			return apperr.ExitCLIValidation
 		}
 		dstatus, dbody := mgmtCall(relayURL, k, keyID, "DELETE", "/v1/agent/mcp-routes/"+routeID)
-		// 404 is the desired end state (already gone), not a failure.
-		if dstatus != http.StatusOK && dstatus != http.StatusNotFound {
+		switch dstatus {
+		case http.StatusOK:
+			fmt.Printf("✓ MCP publication removed: %s\n", routeID)
+			return apperr.ExitOK
+		case http.StatusNotFound:
+			// The relay deliberately does not disclose whether the route
+			// exists but belongs to another key, so a 404 is ambiguous
+			// between "already gone" and "not owned". Report that
+			// honestly with a distinct nonzero exit: a 404 is NOT a
+			// confirmed deletion and must never print success.
+			fmt.Fprintf(os.Stderr, "mcp unpublish: publication %s not found or not owned by this key (the relay does not disclose ownership)\n", routeID)
+			return apperr.ExitAuth
+		default:
 			fmt.Fprintf(os.Stderr, "mcp unpublish: route %s delete reported status %d (%s)\n",
 				routeID, dstatus, shortDetail(string(dbody)))
 			return apperr.ExitInternal
 		}
-		fmt.Printf("✓ MCP publication removed: %s\n", routeID)
-		return apperr.ExitOK
 	}
 	dir, _, _, _ := agentFiles()
 	leaseID, msg, code := selectDoctorLeaseID(dir, name, leaseID)

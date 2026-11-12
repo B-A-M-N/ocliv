@@ -113,14 +113,24 @@ func (s *Server) handleAgentPublications(w http.ResponseWriter, r *http.Request)
 		`DELETE FROM mcp_publications WHERE route_id=? AND tenant_id=? AND owner_key_id=?`,
 		routeID, tenant, keyID)
 	if err != nil {
+		s.db.AuditKey("agent", tenant, keyID, "", "mcp-route-delete", "error",
+			"route "+routeID+" delete failed")
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
+		// No row matched this (route, tenant, key) triple. The relay
+		// deliberately does not disclose whether the route exists under
+		// another owner, so "already gone" and "not owned" share the
+		// same non-committal 404. The audit row records the authenticated
+		// key and the denied outcome for incident review without leaking
+		// publication existence to the caller.
+		s.db.AuditKey("agent", tenant, keyID, "", "mcp-route-delete", "denied",
+			"route "+routeID+" not found or not owned by this key")
 		http.Error(w, "unknown route", http.StatusNotFound)
 		return
 	}
-	s.db.Audit("agent", tenant, "", "mcp-route-delete", "ok", "route "+routeID+" removed")
+	s.db.AuditKey("agent", tenant, keyID, "", "mcp-route-delete", "ok", "route "+routeID+" removed")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
