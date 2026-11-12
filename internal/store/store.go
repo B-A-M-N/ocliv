@@ -202,7 +202,6 @@ CREATE INDEX IF NOT EXISTS idx_authz_consent_expires ON authz_consent(expires_at
 const schemaV11 = `
 ALTER TABLE authz_grants ADD COLUMN pairing_expires_at TEXT NOT NULL DEFAULT '';
 ALTER TABLE authz_grants ADD COLUMN pairing_consumed_at TEXT;
-ALTER TABLE authz_grants ADD COLUMN consented_at TEXT;
 ALTER TABLE authz_consent ADD COLUMN resource TEXT NOT NULL DEFAULT '';
 ALTER TABLE authz_clients ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE authz_clients ADD COLUMN route_id TEXT NOT NULL DEFAULT '';
