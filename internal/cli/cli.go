@@ -49,6 +49,8 @@ func Run(argv []string) int {
 		return cmdAccess(argv[1:])
 	case "mcp":
 		return cmdMCP(argv[1:])
+	case "authz":
+		return cmdAuthz(argv[1:])
 	default:
 		if strings.HasPrefix(argv[0], "-") {
 			fmt.Fprintf(os.Stderr, "unknown flag %q; see `ocliv help`\n", argv[0])

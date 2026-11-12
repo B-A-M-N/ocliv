@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -199,6 +200,76 @@ func (s *SQLStore) ConsumeCode(code string) (*Code, error) {
 	c.ConsumedAt = &now
 	c.ExpiresAt = exp
 	return &c, nil
+}
+
+// ListClients returns every registered client, newest first.
+func (s *SQLStore) ListClients() ([]Client, error) {
+	rows, err := s.db.Query(
+		`SELECT id, name, redirect_uris, created_at, revoked_at FROM authz_clients ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("authz: list clients: %w", err)
+	}
+	defer rows.Close()
+	var out []Client
+	for rows.Next() {
+		var c Client
+		var uris string
+		if err := rows.Scan(&c.ID, &c.Name, &uris, &c.CreatedAt, &c.RevokedAt); err != nil {
+			return nil, fmt.Errorf("authz: scan client: %w", err)
+		}
+		c.RedirectURIs = splitList(uris)
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ListGrants returns every grant, newest first.
+func (s *SQLStore) ListGrants() ([]Grant, error) {
+	rows, err := s.db.Query(
+		`SELECT client_id, tenant_id, route_id, status, created_at, updated_at FROM authz_grants ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("authz: list grants: %w", err)
+	}
+	defer rows.Close()
+	var out []Grant
+	for rows.Next() {
+		var g Grant
+		var status string
+		if err := rows.Scan(&g.ClientID, &g.Tenant, &g.Route, &status, &g.CreatedAt, &g.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("authz: scan grant: %w", err)
+		}
+		g.Status = GrantStatus(status)
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+// ListCodes returns unconsumed authorization codes pending operator action.
+func (s *SQLStore) ListCodes() ([]Code, error) {
+	rows, err := s.db.Query(
+		`SELECT code, client_id, tenant, route, redirect_uri, challenge, challenge_method, expires_at, consumed_at
+		 FROM authz_codes WHERE consumed_at IS NULL ORDER BY expires_at ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("authz: list codes: %w", err)
+	}
+	defer rows.Close()
+	var out []Code
+	for rows.Next() {
+		var c Code
+		if err := rows.Scan(&c.Code, &c.ClientID, &c.Tenant, &c.Route, &c.RedirectURI,
+			&c.Challenge, &c.ChallengeMethod, &c.ExpiresAt, &c.ConsumedAt); err != nil {
+			return nil, fmt.Errorf("authz: scan code: %w", err)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func splitList(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, ",")
 }
 
 // LoadIssuer loads the relay's issuer key, creating it on first use.

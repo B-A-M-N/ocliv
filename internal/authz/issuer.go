@@ -57,6 +57,9 @@ type Issuer struct {
 	method jwt.SigningMethod
 }
 
+// KeyID returns the issuer's key identifier (the JWT "kid").
+func (i *Issuer) KeyID() string { return i.kid }
+
 // NewIssuer generates a fresh Ed25519 issuer key.
 func NewIssuer() (*Issuer, error) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)

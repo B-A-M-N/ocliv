@@ -51,6 +51,7 @@ import (
 var mcpAuthProfiles = map[string]string{
 	"upstream-oauth":    "upstream-oauth",
 	"fixture-anonymous": "fixture-anonymous",
+	"ocliv-managed":     "managed-oauth",
 }
 
 // mcpPublishConfig is the single typed publish/serve configuration
@@ -212,7 +213,7 @@ func parseMCPPublish(argv []string, serve bool) (mcpPublishConfig, int) {
 	var rest []string
 	seenDashDash := false
 	bad := func() (mcpPublishConfig, int) {
-		fmt.Fprintln(os.Stderr, "usage: ocliv mcp publish --local URL --auth upstream-oauth [--relay URL] [--name N] [--ttl D] [--strict-discovery] [--resource-file PATH] [--dev-allow-unverified-discovery]")
+		fmt.Fprintln(os.Stderr, "usage: ocliv mcp publish --local URL --auth upstream-oauth|ocliv-managed [--relay URL] [--name N] [--ttl D] [--strict-discovery] [--resource-file PATH] [--dev-allow-unverified-discovery]")
 		return c, apperr.ExitCLIValidation
 	}
 	for i := 0; i < len(argv); i++ {
@@ -324,6 +325,24 @@ func parseMCPPublish(argv []string, serve bool) (mcpPublishConfig, int) {
 	if !serve && c.auth == "fixture-anonymous" {
 		fmt.Fprintln(os.Stderr, "mcp publish --auth fixture-anonymous is disabled: anonymous fixtures cannot be published; use `mcp serve --auth fixture-anonymous` for local-only fixtures or publish --auth upstream-oauth")
 		return c, apperr.ExitCLIValidation
+	}
+	// Managed authorization is relay-terminated: there is no upstream OAuth
+	// discovery to constrain, no resource binding to hand off, and no
+	// dev relaxation to grant. Accepting those flags would silently imply an
+	// upstream that does not exist, so they are rejected.
+	if c.auth == "ocliv-managed" {
+		if c.strictDiscovery {
+			fmt.Fprintln(os.Stderr, "mcp publish --auth ocliv-managed takes no --strict-discovery: the relay is the Authorization Server, not an upstream")
+			return c, apperr.ExitCLIValidation
+		}
+		if c.devAllowUnverified {
+			fmt.Fprintln(os.Stderr, "mcp publish --auth ocliv-managed takes no --dev-allow-unverified-discovery: there is no upstream discovery to verify")
+			return c, apperr.ExitCLIValidation
+		}
+		if c.resourceFile != "" {
+			fmt.Fprintln(os.Stderr, "mcp publish --auth ocliv-managed takes no --resource-file: there is no upstream resource binding to hand off")
+			return c, apperr.ExitCLIValidation
+		}
 	}
 	// --strict-discovery only constrains route publication; serve has
 	// no route and no discovery, so the combination is rejected
@@ -459,6 +478,9 @@ func publishLocalProbeOK(out mcpProbeOutcome, auth string) bool {
 func mcpAccessMode(auth string) string {
 	if auth == "fixture-anonymous" {
 		return "mcp_anonymous_fixture"
+	}
+	if auth == "ocliv-managed" {
+		return "mcp_managed_oauth"
 	}
 	return "mcp_upstream_oauth"
 }
@@ -900,7 +922,17 @@ func runMCPPublish(argv []string, serve bool) int {
 		// route, close the lease); an unreachable endpoint is
 		// inconclusive and warns loudly instead of blocking on
 		// publisher network position.
-		if cfg.auth == "upstream-oauth" {
+		if cfg.auth == "ocliv-managed" {
+			// Managed authorization has no upstream OAuth to verify: the
+			// relay is the Authorization Server for this route, so there is
+			// no upstream discovery document to match. The route is live as
+			// soon as it is registered; access is gated by operator approval
+			// at admission, never by an unauthenticated fallback.
+			fmt.Println("✓ route registered (managed authorization: the relay is the Authorization Server)")
+			fmt.Println("  clients register via OAuth DCR, then an operator approves them:")
+			fmt.Println("    ocliv authz pending --data <relay-data>")
+			fmt.Println("    ocliv authz approve --data <relay-data> --client <id> --tenant <t> --route " + routeID)
+		} else if cfg.auth == "upstream-oauth" {
 			durl, derr := mcpRouteDiscoveryURL(routeURL, routeID)
 			if derr != nil {
 				fmt.Fprintf(os.Stderr, "mcp publish: bad route URL from relay: %v\n", derr)
