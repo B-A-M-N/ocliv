@@ -138,6 +138,31 @@ const schemaV7 = `
 ALTER TABLE audit_events ADD COLUMN key_id TEXT NOT NULL DEFAULT '';
 `
 
+// schemaV8 adds the managed-authorization state (Phase 2): dynamically
+// registered clients, per-tenant/per-route grants, single-use authorization
+// codes, and the relay's issuer key. Forward-only; the issuer key makes this
+// database a secret (it already holds enrollment verifiers).
+const schemaV8 = `
+CREATE TABLE IF NOT EXISTS authz_clients (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
+  redirect_uris TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL, revoked_at TEXT);
+CREATE TABLE IF NOT EXISTS authz_grants (
+  client_id TEXT NOT NULL, tenant_id TEXT NOT NULL, route_id TEXT NOT NULL,
+  status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  PRIMARY KEY (client_id, tenant_id, route_id));
+CREATE INDEX IF NOT EXISTS idx_authz_grants_route ON authz_grants(tenant_id, route_id);
+CREATE TABLE IF NOT EXISTS authz_codes (
+  code TEXT PRIMARY KEY, client_id TEXT NOT NULL, tenant_id TEXT NOT NULL,
+  route_id TEXT NOT NULL, redirect_uri TEXT NOT NULL,
+  challenge TEXT NOT NULL, challenge_method TEXT NOT NULL,
+  expires_at TEXT NOT NULL, consumed_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_authz_codes_expires ON authz_codes(expires_at);
+CREATE TABLE IF NOT EXISTS authz_issuer_key (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  kid TEXT NOT NULL, priv BLOB NOT NULL, created_at TEXT NOT NULL);
+`
+
 // applyMigration runs one versioned migration body and its version
 // stamp in a single transaction: a failure anywhere rolls back the
 // body, so a version is never recorded for half-applied work (P1-2).
@@ -162,7 +187,7 @@ func applyMigration(sqldb *sql.DB, version int, body string) error {
 }
 
 // currentSchema is the newest version Open must reach.
-const currentSchema = 7
+const currentSchema = 8
 
 // DB wraps the SQLite handle.
 type DB struct {
@@ -269,6 +294,7 @@ func Open(path string) (*DB, error) {
 		{5, schemaV5},
 		{6, schemaV6},
 		{7, schemaV7},
+		{8, schemaV8},
 	}
 	for _, m := range migrations {
 		var v int

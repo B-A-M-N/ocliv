@@ -24,11 +24,15 @@
 package relay
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"ocliv/internal/apperr"
@@ -61,7 +65,52 @@ func BackupState(db *store.DB, destPath string) error {
 		_ = os.Remove(tmp)
 		return apperr.E(apperr.CodeStoreFault, "installing backup file", err)
 	}
+	// Tamper-evident sidecar: a byte flipped anywhere in the snapshot
+	// (including a free page, which PRAGMA integrity_check does not cover)
+	// is detected on validation.
+	if err := writeChecksum(destPath); err != nil {
+		return err
+	}
 	dirSync(filepath.Dir(destPath))
+	return nil
+}
+
+// checksumPath is the sidecar path for a backup's SHA-256.
+func checksumPath(backupPath string) string { return backupPath + ".sha256" }
+
+// writeChecksum records the SHA-256 of the backup file next to it.
+func writeChecksum(backupPath string) error {
+	raw, err := os.ReadFile(backupPath)
+	if err != nil {
+		return apperr.E(apperr.CodeStoreFault, "reading backup for checksum", err)
+	}
+	sum := sha256.Sum256(raw)
+	if err := os.WriteFile(checksumPath(backupPath), []byte(hex.EncodeToString(sum[:])+"\n"), 0o600); err != nil {
+		return apperr.E(apperr.CodeStoreFault, "writing backup checksum", err)
+	}
+	return nil
+}
+
+// verifyChecksum checks the sidecar checksum when one exists. A missing
+// sidecar is accepted for backups written before checksums existed; their
+// integrity is still checked by SQLite.
+func verifyChecksum(backupPath string) error {
+	rawSum, err := os.ReadFile(checksumPath(backupPath))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return apperr.E(apperr.CodeStoreFault, "reading backup checksum", err)
+	}
+	raw, err := os.ReadFile(backupPath)
+	if err != nil {
+		return apperr.E(apperr.CodeStoreFault, "reading backup for checksum", err)
+	}
+	sum := sha256.Sum256(raw)
+	want := strings.TrimSpace(string(rawSum))
+	if want == "" || !hmac.Equal([]byte(hex.EncodeToString(sum[:])), []byte(want)) {
+		return apperr.E(apperr.CodeStoreFault, "backup checksum mismatch (file modified after backup)", nil)
+	}
 	return nil
 }
 
@@ -310,6 +359,9 @@ func rollbackDiff(live, backup *revocationSet) []string {
 // closed, older ones migrate forward in the copy only), and require a
 // clean integrity_check.
 func ValidateBackup(backupPath string) error {
+	if err := verifyChecksum(backupPath); err != nil {
+		return err
+	}
 	fi, err := os.Stat(backupPath)
 	if err != nil || fi.IsDir() {
 		return apperr.E(apperr.CodeCLIValidation, "backup file not readable", err)

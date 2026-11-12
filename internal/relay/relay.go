@@ -135,6 +135,7 @@ type Server struct {
 	mcpAdmission *limits.Throttle // P1-10: per-(source,lease) cap on MCP-profile forwarding
 	budgets      *limits.Registry
 	mux          *http.ServeMux
+	authz        *authzManager // managed-route authorization (relay_authz.go only)
 	// dispatchHold is a test-only barrier run between the dispatch-time
 	// session recheck and the request-head write (P2-1). It lets a test
 	// deterministically land a replacement in that window to prove the
@@ -179,6 +180,13 @@ func New(o Options) (*Server, error) {
 	}
 	if s.log == nil {
 		s.log = noopLog{}
+	}
+	if o.DB != nil {
+		m, err := newAuthzManager(o.DB)
+		if err != nil {
+			return nil, err
+		}
+		s.authz = m
 	}
 	s.mux.HandleFunc("/v1/agent/enroll", s.handleEnroll)
 	s.mux.HandleFunc("/v1/agent/challenge", s.handleChallenge)

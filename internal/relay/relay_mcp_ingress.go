@@ -41,12 +41,17 @@ const (
 	// explicitly safe hard-coded read-only demonstration tool with no
 	// private data only. Never bind this to a real service.
 	AccessModeMCPAnonymousFixture = "mcp_anonymous_fixture"
+	// AccessModeMCPManaged: the relay is the Authorization Server for this
+	// route (internal/authz). The relay terminates OAuth, validates the
+	// bearer at admission, and injects a relay-minted upstream identity;
+	// the upstream never sees the external bearer.
+	AccessModeMCPManaged = "mcp_managed_oauth"
 )
 
 // IsMCPMode reports whether an access mode is an MCP ingress policy
 // rather than the generic protected/public contract.
 func IsMCPMode(mode string) bool {
-	return mode == AccessModeMCPUpstreamOAuth || mode == AccessModeMCPAnonymousFixture
+	return mode == AccessModeMCPUpstreamOAuth || mode == AccessModeMCPAnonymousFixture || mode == AccessModeMCPManaged
 }
 
 // mcpModeBinding enforces the exact route-profile/lease-mode pairing.
@@ -59,6 +64,8 @@ func mcpModeBinding(profile IngressProfile, mode string) bool {
 		return mode == AccessModeMCPUpstreamOAuth
 	case IngressMCPAnonymousFixture:
 		return mode == AccessModeMCPAnonymousFixture
+	case IngressMCPManaged:
+		return mode == AccessModeMCPManaged
 	default:
 		return false
 	}
@@ -79,6 +86,10 @@ const (
 	// hard-coded read-only demonstration tool with no private data.
 	// Never bind it to a real service (P0-B).
 	IngressMCPAnonymousFixture
+	// IngressMCPManaged terminates OAuth at the relay (internal/authz) for
+	// an upstream that has no native OAuth. The relay validates the bearer
+	// on every tool request and injects a relay-minted upstream identity.
+	IngressMCPManaged
 )
 
 // parseIngressProfile maps the stored profile string to its typed policy.
@@ -89,6 +100,8 @@ func parseIngressProfile(s string) (IngressProfile, bool) {
 		return IngressMCPUpstreamOAuth, true
 	case "fixture-anonymous":
 		return IngressMCPAnonymousFixture, true
+	case "managed-oauth":
+		return IngressMCPManaged, true
 	default:
 		return IngressInvalid, false
 	}
@@ -101,6 +114,8 @@ func profileString(p IngressProfile) (string, bool) {
 		return "upstream-oauth", true
 	case IngressMCPAnonymousFixture:
 		return "fixture-anonymous", true
+	case IngressMCPManaged:
+		return "managed-oauth", true
 	default:
 		return "", false
 	}
@@ -438,7 +453,7 @@ func (s *Server) admitPathRoute(r *http.Request) (*routeTarget, *Session, *http.
 // profiles, missing leases, and failed lease admission all fail closed
 // with wildcard-identical semantics (404 unknown/expired, 503 inactive).
 func (s *Server) resolveMCPRouteID(routeID string) (*routeTarget, *Session, IngressProfile, int) {
-	var rowHost, profileStr string
+	var rowHost, rowTenant, profileStr string
 	// NULL-safe: revoked tombstones detached by lease reclaim carry a
 	// NULL active binding (P0-B); revocation is decided before the
 	// binding is dereferenced. verified_at NULL means the publication
@@ -446,8 +461,8 @@ func (s *Server) resolveMCPRouteID(routeID string) (*routeTarget, *Session, Ingr
 	var leaseID sql.NullString
 	var revoked, verified *string
 	err := s.db.SQL().QueryRow(
-		`SELECT external_host, lease_id, profile, revoked_at, verified_at FROM mcp_publications WHERE route_id=?`,
-		routeID).Scan(&rowHost, &leaseID, &profileStr, &revoked, &verified)
+		`SELECT external_host, lease_id, profile, revoked_at, verified_at, tenant_id FROM mcp_publications WHERE route_id=?`,
+		routeID).Scan(&rowHost, &leaseID, &profileStr, &revoked, &verified, &rowTenant)
 	if err != nil {
 		return s.denyMCPRoute("", "unknown route id", http.StatusNotFound)
 	}
@@ -485,6 +500,8 @@ func (s *Server) resolveMCPRouteID(routeID string) (*routeTarget, *Session, Ingr
 	t.MCPProfile = profile
 	t.ViaPathRoute = true
 	t.MCPVerified = verified != nil
+	t.RouteID = routeID
+	t.TenantID = rowTenant
 	admitted, sess, code := s.admitRoutedLease(&t, state, expiresAt)
 	if code != 0 {
 		return nil, nil, IngressInvalid, code

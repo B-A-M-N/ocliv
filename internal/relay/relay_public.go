@@ -37,12 +37,19 @@ type routeTarget struct {
 	// (P0-B). Both are zero on the wildcard path.
 	MCPProfile   IngressProfile
 	ViaPathRoute bool
+	// RouteID is the path-route identifier for managed authorization
+	// (AccessModeMCPManaged). Empty on the wildcard path; managed routes
+	// require path ingress because their token audience is route-scoped.
+	RouteID string
 	// MCPVerified reports that the path-route publication completed
 	// OAuth discovery verification and explicit activation (P0-A).
 	// Unverified publications deny the tool path but still serve the
 	// public discovery document. False on the wildcard path unless
 	// proven otherwise by leaseHasPendingPublication.
 	MCPVerified bool
+	// TenantID is the publication's tenant, used by managed
+	// authorization to scope grants and tokens.
+	TenantID string
 }
 
 // leaseHasPendingPublication reports whether the lease carries at
@@ -144,6 +151,14 @@ func mcpUpstreamPathAllowed(t *routeTarget, escapedPath string) bool {
 	if profile == IngressInvalid && t.AccessMode == AccessModeMCPUpstreamOAuth {
 		profile = IngressMCPUpstreamOAuth
 	}
+	if profile == IngressInvalid && t.AccessMode == AccessModeMCPManaged {
+		profile = IngressMCPManaged
+	}
+	if profile == IngressMCPManaged {
+		// The relay serves the managed route's own OAuth and discovery
+		// documents locally, so they are allowed through admission.
+		return escapedPath == mcpASWellKnownUpstreamPath || mcpOAuthEndpoints[escapedPath]
+	}
 	if profile != IngressMCPUpstreamOAuth {
 		return false
 	}
@@ -157,6 +172,44 @@ func mcpUpstreamPathAllowed(t *routeTarget, escapedPath string) bool {
 func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request, t *routeTarget, sess *Session) {
 	if t.AccessMode == "public" {
 		s.serveProxied(w, r, t, sess, true, false)
+		return
+	}
+	// Managed authorization: the relay is the Authorization Server for this
+	// route. OAuth/metadata paths are served locally; the tool path requires
+	// a valid bearer and is forwarded with a relay-minted upstream identity.
+	// The external bearer is never forwarded upstream.
+	if t.AccessMode == AccessModeMCPManaged {
+		if t.RouteID == "" {
+			s.db.Audit("visitor", t.TenantID, t.LeaseID, "mcp_path", "denied", "managed route requires path ingress")
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if isManagedAuthzPath(r.URL.EscapedPath()) {
+			s.serveManagedAuthz(w, r, t, t.RouteID)
+			return
+		}
+		if r.URL.EscapedPath() != "/mcp" && r.URL.EscapedPath() != mcpWellKnownUpstreamPath {
+			s.db.Audit("visitor", t.TenantID, t.LeaseID, "mcp_path", "denied", "non-/mcp path on managed route")
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if r.URL.EscapedPath() == mcpWellKnownUpstreamPath {
+			// Discovery stays public so clients can find the AS.
+			s.serveManagedAuthz(w, r, t, t.RouteID)
+			return
+		}
+		client, err := s.authorizeManaged(r, t.TenantID, t.RouteID)
+		if err != nil {
+			s.db.Audit("visitor", t.TenantID, t.LeaseID, "mcp_path", "denied", "managed bearer rejected")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		// Inject the relay-minted upstream identity and strip the external
+		// bearer before forwarding.
+		r.Header.Set("X-Ocliv-Upstream-Sub", client)
+		r.Header.Set("X-Ocliv-Route", t.RouteID)
+		r.Header.Del("Authorization")
+		s.serveProxied(w, r, t, sess, false, false)
 		return
 	}
 	// Pending verification (P0-A): a publication that has not completed
