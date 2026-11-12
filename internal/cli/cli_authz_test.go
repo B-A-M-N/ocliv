@@ -72,6 +72,41 @@ func TestAuthzCommandSetClosed(t *testing.T) {
 	}
 }
 
+// stdio publication is accepted ONLY with relay-terminated managed
+// authorization: the adapter has no upstream OAuth to verify, so
+// upstream-oauth cannot be proven for it and fixture-anonymous must never
+// bound an arbitrary child.
+func TestParseMCPPublishStdioManagedOnly(t *testing.T) {
+	cfg, code := parseMCPPublish([]string{
+		"--stdio", "--auth=ocliv-managed", "--", "/bin/srv", "--flag",
+	}, false)
+	if code != 0 {
+		t.Fatalf("stdio managed publish rejected: code %d", code)
+	}
+	if !cfg.stdio || cfg.auth != "ocliv-managed" {
+		t.Fatalf("cfg = %+v, want stdio+managed", cfg)
+	}
+	if len(cfg.cmd) != 2 || cfg.cmd[0] != "/bin/srv" {
+		t.Fatalf("cfg.cmd = %v, want the operator command", cfg.cmd)
+	}
+	for _, auth := range []string{"upstream-oauth", "fixture-anonymous", ""} {
+		argv := []string{"--stdio", "--auth=" + auth, "--", "/bin/srv"}
+		if auth == "" {
+			argv = []string{"--stdio", "--", "/bin/srv"}
+		}
+		if _, code := parseMCPPublish(argv, false); code == 0 {
+			t.Errorf("stdio publish accepted with auth %q, want rejection", auth)
+		}
+	}
+	if _, code := parseMCPPublish([]string{"--stdio", "--auth=ocliv-managed"}, false); code == 0 {
+		t.Error("stdio publish without a command accepted, want rejection")
+	}
+	// serve mode has no route, so stdio serve stays rejected.
+	if _, code := parseMCPPublish([]string{"--stdio", "--auth=ocliv-managed", "--", "/bin/srv"}, true); code == 0 {
+		t.Error("stdio serve accepted, want rejection")
+	}
+}
+
 // approve/revoke require --client; a missing client must fail validation
 // before any store access.
 func TestAuthzClientRequired(t *testing.T) {

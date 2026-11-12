@@ -11,10 +11,12 @@ package cli
 //     close the lease and RETAIN the publication (offline until the
 //     next authorized republish rebinds it). Permanent removal is
 //     explicit via `mcp unpublish` (P1-A).
-//   - publish --stdio is rejected: the stdio bridge cannot enforce MCP
-//     authentication yet, so only --local (an already-listening loopback
-//     MCP server) can be published. Run a child loopback-only via
-//     `mcp expose` (never remotely reachable).
+//   - publish --stdio --auth ocliv-managed -- COMMAND [ARGS...]: run an
+//     operator-selected child through the bounded stdio adapter and
+//     publish it with relay-terminated authorization. The child is pinned
+//     by local argv; no remote client can select executables, arguments,
+//     directories, or environment. The adapter has no upstream OAuth, so
+//     upstream-oauth cannot be verified for it and is rejected.
 //   - serve: lifecycle only (tunnel, no route registration) — for
 //     wildcard-namespace use or pre-publish verification.
 //   - doctor: read-only diagnostics; never prints secrets.
@@ -29,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -43,6 +46,7 @@ import (
 	"ocliv/internal/apperr"
 	"ocliv/internal/config"
 	"ocliv/internal/identity"
+	"ocliv/internal/mcp"
 )
 
 // mcpAuthProfiles maps the operator-facing --auth values to the signed
@@ -307,16 +311,32 @@ func parseMCPPublish(argv []string, serve bool) (mcpPublishConfig, int) {
 		fmt.Fprintln(os.Stderr, "pick one of --local or --stdio")
 		return c, apperr.ExitCLIValidation
 	}
-	// Remote publication of operator-selected subprocesses is disabled
-	// (P0-1, P0-2): the stdio bridge cannot enforce upstream OAuth, and
-	// the anonymous fixture profile cannot bound an arbitrary child, so
-	// neither auth mode is safe with --stdio. This stays rejected until
-	// the P0-C bridge lands with protocol and auth enforcement. Publish
-	// an HTTP-native loopback MCP server with --local, or run a child
-	// loopback-only via `mcp expose` (never remotely reachable).
+	// stdio publication runs an operator-selected child through the bounded
+	// stdio adapter. The child is pinned by local argv only; no remote
+	// client can select executables, arguments, directories, or
+	// environment (P0-1/P0-2/M07).
+	//
+	// The adapter is a plain loopback HTTP server with no OAuth of its own,
+	// so upstream-oauth cannot be verified for it: publishing --stdio with
+	// --auth upstream-oauth would either fail strict discovery or silently
+	// mark the binding NOT VERIFIED. Only relay-terminated managed
+	// authorization is supported, because the relay is the AS and the
+	// adapter never sees the external bearer.
 	if c.stdio {
-		fmt.Fprintln(os.Stderr, "mcp publish --stdio is disabled: the stdio bridge cannot enforce MCP authentication yet; publish --local http://127.0.0.1:PORT/mcp instead")
-		return c, apperr.ExitCLIValidation
+		// serve has no route, so a published stdio child would be
+		// unreachable: the child is only meaningful behind a route.
+		if serve {
+			fmt.Fprintln(os.Stderr, "mcp serve takes no --stdio: serve has no route; use `mcp publish --stdio --auth ocliv-managed`")
+			return c, apperr.ExitCLIValidation
+		}
+		if c.auth != "ocliv-managed" {
+			fmt.Fprintln(os.Stderr, "mcp publish --stdio requires --auth ocliv-managed: the stdio adapter has no upstream OAuth to verify; the relay terminates authorization instead")
+			return c, apperr.ExitCLIValidation
+		}
+		if len(c.cmd) == 0 {
+			fmt.Fprintln(os.Stderr, "mcp publish --stdio needs a command after --")
+			return c, apperr.ExitCLIValidation
+		}
 	}
 	// Anonymous fixtures cannot be published (P0-F): the profile
 	// cannot bound an arbitrary local server, so it must never back a
@@ -810,34 +830,65 @@ func runMCPPublish(argv []string, serve bool) int {
 
 	// 1. Local source: validate and start before any tunnel or route, so
 	// a bad local target fails with nothing registered remotely.
-	// --stdio is rejected in parseMCPPublish (the stdio bridge cannot
-	// enforce MCP authentication yet), so only --local reaches here.
 	port := 0
 	v6 := false
-	{
+	if cfg.stdio {
+		// The stdio adapter is started here, before any tunnel or route,
+		// and torn down with this process. Its child was pinned by local
+		// argv in parseMCPPublish; no request content can change it.
+		a, err := mcp.New(mcp.Options{
+			Command: cfg.cmd[0],
+			Args:    cfg.cmd[1:],
+			Dir:     cfg.dir,
+			Env:     cfg.env,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "mcp publish --stdio: %v\n", err)
+			return apperr.ExitCLIValidation
+		}
+		actx, astop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		if err := a.Start(actx); err != nil {
+			fmt.Fprintf(os.Stderr, "mcp publish --stdio: %v\n", err)
+			return apperr.ExitAuth
+		}
+		defer a.Close()
+		defer astop()
+		host, pstr, err := net.SplitHostPort(a.Addr().String())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "mcp publish --stdio: adapter address: %v\n", err)
+			return apperr.ExitInternal
+		}
+		n, err := strconv.Atoi(pstr)
+		if err != nil || n <= 0 {
+			fmt.Fprintf(os.Stderr, "mcp publish --stdio: bad adapter port %q\n", pstr)
+			return apperr.ExitInternal
+		}
+		port, v6 = n, host == "::1"
+		fmt.Printf("stdio adapter: %v on http://%s:%d (loopback only)\n", cfg.cmd, host, port)
+	} else {
 		var perr error
 		port, v6, perr = parseMCPLocalURL(cfg.localURL)
 		if perr != nil {
 			fmt.Fprintf(os.Stderr, "mcp publish: %v\n", perr)
 			return apperr.ExitCLIValidation
 		}
-		target := config.LoopbackTarget(port, v6)
-		if perr := agent.ProbeLocal(target, 3*time.Second); perr != nil {
-			fmt.Fprintf(os.Stderr, "local MCP unreachable at %s: %v\n", target, perr)
-			return apperr.ExitLocalTarget
-		}
-		// The local endpoint must speak MCP before a public route is
-		// registered for it (P1). An upstream-oauth server that
-		// answers with an authentication challenge is sufficient
-		// presence — tool functionality is never claimed from a
-		// challenge.
-		pout := runMCPProbe(target, mcpAccessMode(cfg.auth))
-		if !publishLocalProbeOK(pout, cfg.auth) {
-			fmt.Fprintf(os.Stderr, "local MCP %s failed protocol check: %s\n", target, pout.Summary)
-			return apperr.ExitLocalTarget
-		}
-		fmt.Printf("local MCP: %s\n", pout.Summary)
 	}
+	target := config.LoopbackTarget(port, v6)
+	if perr := agent.ProbeLocal(target, 3*time.Second); perr != nil {
+		fmt.Fprintf(os.Stderr, "local MCP unreachable at %s: %v\n", target, perr)
+		return apperr.ExitLocalTarget
+	}
+	// The local endpoint must speak MCP before a public route is
+	// registered for it (P1). An upstream-oauth server that answers
+	// with an authentication challenge is sufficient presence — tool
+	// functionality is never claimed from a challenge. A stdio adapter
+	// is relay-terminated, so a live MCP session is required.
+	pout := runMCPProbe(target, mcpAccessMode(cfg.auth))
+	if !publishLocalProbeOK(pout, cfg.auth) {
+		fmt.Fprintf(os.Stderr, "local MCP %s failed protocol check: %s\n", target, pout.Summary)
+		return apperr.ExitLocalTarget
+	}
+	fmt.Printf("local MCP: %s\n", pout.Summary)
 
 	// 2. Tunnel in the requested mode.
 	opts, tcode := mcpTunnelOptions(port, v6, cfg)

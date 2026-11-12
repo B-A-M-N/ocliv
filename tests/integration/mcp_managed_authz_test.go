@@ -15,20 +15,24 @@ package integration
 // not status codes alone.
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 
 	"ocliv/internal/authz"
 	"ocliv/internal/config"
+	"ocliv/internal/mcp"
 )
 
 // managedUpstream is a plain local MCP server with no OAuth of its own. It
@@ -454,6 +458,88 @@ func TestManagedAuthzDiscoveryIsRouteScoped(t *testing.T) {
 	if as.AuthorizationEndpoint != wantIssuer+"/authorize" || as.TokenEndpoint != wantIssuer+"/token" ||
 		as.RegistrationEndpoint != wantIssuer+"/register" || as.JWKSURI != wantIssuer+"/jwks" {
 		t.Fatalf("AS endpoints not route-scoped: %+v", as)
+	}
+}
+
+// TestManagedAuthzStdioAdapter: a relay-terminated route backed by the
+// bounded stdio adapter. The external client completes OAuth against the
+// relay, and the child sees only the forwarded JSON-RPC message — never
+// the external bearer.
+func TestManagedAuthzStdioAdapter(t *testing.T) {
+	// cat echoes its stdin line back, so the child's reply is the request
+	// body plus a newline: a deterministic protocol round trip.
+	a, err := mcp.New(mcp.Options{Command: "cat"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	_, portStr, err := net.SplitHostPort(a.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h := newHarnessNS(t, "tenant-stdio.example.test", "relay.example.test", "public.example.org")
+	t.Cleanup(func() { h.db.Close() })
+	t.Cleanup(h.relaySrv.Close)
+	h.startAgentOpts(t, port, config.Agent{AccessMode: "mcp_managed_oauth"})
+	code, rid, _, _ := mgmtRouteCreate(t, h, "managed-oauth")
+	if code != http.StatusOK {
+		t.Fatalf("managed route create status=%d", code)
+	}
+
+	clientID := managedDCR(t, h, rid)
+	st := authz.NewSQLStore(h.db.SQL())
+	tenant := publicationTenant(t, h, rid)
+	if err := st.ApproveGrant(clientID, tenant, rid); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	authCode := managedAuthorize(t, h, rid, clientID, "verifier-stdio")
+	if authCode == "" {
+		t.Fatal("no authorization code")
+	}
+	status, body := managedToken(t, h, rid, clientID, authCode, "verifier-stdio")
+	if status != http.StatusOK {
+		t.Fatalf("token status=%d body=%s", status, body)
+	}
+	var tok struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal([]byte(body), &tok); err != nil || tok.AccessToken == "" {
+		t.Fatalf("token reply unparseable: %v (%q)", err, body)
+	}
+
+	// No bearer: denied before the child is touched.
+	if c, _ := managedCall(t, h, rid, ""); c != http.StatusUnauthorized {
+		t.Fatalf("no bearer status=%d, want 401", c)
+	}
+
+	// Authorized: the child echoes the exact JSON-RPC message.
+	const rpcBody = `{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}`
+	req, err := http.NewRequest(http.MethodPost, h.relaySrv.URL+"/r/"+rid+"/mcp", strings.NewReader(rpcBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "public.example.org"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
+	resp, err := visitorClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("authorized stdio call status=%d, want 200", resp.StatusCode)
+	}
+	if string(raw) != rpcBody+"\n" {
+		t.Fatalf("stdio child reply = %q, want the echoed request", raw)
 	}
 }
 
