@@ -70,29 +70,48 @@ Rejected alternatives (kept for the record):
 
 ## 1. Operator approval flow (R6, R8)
 
-The relay authenticates the **operator** with the identity it already trusts:
-the tenant's enrollment (tunnel) key, which the management plane authenticates
-today. OAuth **client registration is not tool access**.
+**Operator authority is local, not a key.** `ocliv authz ...` runs on the
+relay host and authorizes by **filesystem/DB access to the relay's SQLite
+store** (mode 0600, owner-only). It is not authenticated by the tenant's
+enrollment (tunnel) key, and this ADR no longer claims that it is. The
+enrollment key authenticates *agents*; authorization-plane administration is
+a separate, local, root/operator capability. Consequence: whoever can write
+the relay DB can approve clients — the DB must be protected accordingly (it
+already holds enrollment verifiers and the issuer private key).
+
+**A public client_id is not a credential.** RFC 7591 clients here are public
+(`token_endpoint_auth_method=none`), so knowing a client_id proves nothing.
+Approval therefore issues a **pairing secret** per grant, delivered
+out-of-band by the operator to the intended client operator, and the
+authorization endpoint requires it. Client registration is never access, and
+an approved client_id alone is never enough to obtain a code.
 
 ```
-1. operator: ocliv mcp publish 8765
+1. operator: ocliv mcp publish --local ... --auth ocliv-managed
    -> relay creates a managed route (mode ocliv-managed), prints endpoint
 2. client:   DCR POST /r/<id>/oauth/register  -> client_id (NO access)
 3. client:   GET /r/<id>/oauth/authorize      -> pending grant, no code issued
-4. operator: ocliv auth pending               -> lists pending clients
-   operator: ocliv auth approve <client_id>   -> grant ACTIVE (tenant-scoped)
-5. client:   GET /r/<id>/oauth/authorize      -> 302 + code (PKCE)
-6. client:   POST /r/<id>/oauth/token         -> access token (aud=route, sub=client)
-7. client:   POST /r/<id>/mcp with bearer     -> authorized at publication level
+4. operator: ocliv authz pending --data <dir>
+   operator: ocliv authz approve --data <dir> --client <id> \
+               --tenant <t> --route <id>
+   -> grant ACTIVE + pairing secret printed ONCE
+5. operator: delivers the pairing secret to the client operator privately
+6. client:   GET /r/<id>/oauth/authorize?...&pairing_code=<secret>
+   -> 302 + code (PKCE); NO code without the pairing secret
+7. client:   POST /r/<id>/oauth/token         -> access token (aud=route, sub=client)
+8. client:   POST /r/<id>/mcp with bearer     -> authorized at publication level
 ```
 
-- `ocliv auth pending|approve|revoke|list|status` are management-plane
-  commands authenticated by the operator's enrollment key and scoped to its
-  tenant.
+- `--tenant` and `--route` are **required** on approve/revoke. An ambiguous
+  approval is an error, never a guess, and multiple grants are never approved
+  in one call.
 - Approval is **per tenant + per publication + per client**. A client approved
   on route A cannot use the token on route B (audience binding).
 - The client's registered metadata (name, logo) is display-only; it never
   grants access.
+- `approve`, `revoke`, and `rotate-key` write `authz_audit` records (time,
+  actor, tenant, route, client, action, result, detail). The actor is recorded
+  as `operator` (local authority), not as an enrollment key id.
 - Deny by default: an unapproved client gets no code, no token, no tool call.
 
 ## 2. Publication-level boundary (R13)
@@ -161,9 +180,19 @@ The first implementation enforces **one boundary: the publication**.
 - **DCR (RFC 7591)**: backward-compatible — the existing `upstream-oauth` DCR
   path and its tests are unchanged; the managed mode implements the same
   `registration_endpoint` shape so existing MCP clients work unchanged.
-- **Proven libraries**: `ory/fosite` or `go-oauth2/oauth2` for the flow;
-  `golang-jwt/jwt/v5` or `lestrrat-go/jwx` for tokens/JWKS. No hand-rolled
-  crypto or token verification.
+- **Token signing/verification**: `golang-jwt/jwt/v5` (established library).
+  Ed25519 keys, `kid` in the JWKS, issuer/audience/expiry validated.
+- **The protocol flow is implemented in-tree, not delegated to an AS
+  library.** Registration, authorization, token exchange, and revocation are
+  `internal/authz/handlers.go`; PKCE (`code_challenge`/`verifier`), issuer
+  binding, audience binding, grant status, and token revocation are enforced
+  there. No OAuth cryptography is hand-rolled — signatures and key handling
+  are the JWT library's — but the *flow* is our code, and that is a residual
+  risk to be stated rather than papered over. Adopting `ory/fosite` or
+  `go-oauth2/oauth2` would remove that risk at the cost of a new dependency
+  and a large API surface for a single-route AS; **DEFERRED**, with the
+  security-critical decisions covered by independent tests
+  (`internal/authz/security_test.go`, `tests/integration/mcp_managed_authz_test.go`).
 
 ## 5. Loopback threat model (corrected)
 
@@ -241,8 +270,11 @@ The first implementation enforces **one boundary: the publication**.
    external bearer; reject owner/mode changes on republish.
 4. **`internal/cli/cli_mcp.go` / `cli_mcp_publish.go`**: `--auth
    ocliv-managed` (default for C3), `--stdio` (starts `mcp.Adapter`).
-5. **`internal/cli/cli_authz.go` (new)**: `pending|approve|revoke|list|status`
-   and `rotate-key`, authenticated by the operator's enrollment key.
+5. **`internal/cli/cli_authz.go` (new)**: `pending|list|approve|revoke|
+   rotate-key`, operating on the local relay store (local operator authority,
+   not enrollment-key auth). `approve`/`revoke` require explicit `--tenant`
+   and `--route`; `approve` issues the pairing secret; all three write
+   `authz_audit` records.
 6. **`internal/cli/cli_status.go`**: endpoint + auth mode + client/grant
    status.
 

@@ -132,15 +132,25 @@ ocliv authz approve --data /var/lib/ocliv --client <cid> \
   --tenant <tenant> --route <id>
 ```
 
-**Oracle:** `approved client <cid> for tenant=<t> route=<id>`, and
-`ocliv authz list --data /var/lib/ocliv` shows `status=active` for exactly
-one row.
+**Oracle:** `approved client <cid> ...` followed by a **pairing secret**
+printed once. `ocliv authz list --data /var/lib/ocliv` shows `status=active`
+for exactly one row.
+
+**Deliver the pairing secret to the client operator over a private channel.**
+It appears in the authorization URL, so treat it as a secret: no logs, no
+chat, no ticket.
+
+**Fail-closed:** approving without `--tenant`/`--route` is refused (an
+ambiguous approval is never guessed); approving a client with no pending
+grant is refused.
 
 ### 3.5 Full client flow
 
 ```sh
-# Authorize (capture the code from the redirect), then exchange with PKCE.
-# -> access_token
+# Authorize WITH the pairing secret (capture the code from the redirect).
+# -> 302, Location: http://127.0.0.1:59999/cb?code=...&state=xyz
+curl -sS -o /dev/null -w '%{http_code}\n' -D - \
+  "https://<fqdn>/r/<id>/oauth/authorize?client_id=<cid>&redirect_uri=http%3A%2F%2F127.0.0.1%3A59999%2Fcb&response_type=code&code_challenge=<S256>&code_challenge_method=S256&pairing_code=<secret>"
 curl -fsS -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
   --data-urlencode 'grant_type=authorization_code' \
   --data-urlencode 'code=<code>' \
@@ -163,62 +173,100 @@ minted without an ACTIVE grant must be refused at admission.
 
 ### 3.6 Negative paths
 
-Each must be `401` with **zero** upstream executions:
+Each case uses a **freshly minted token for a second, independent client**
+(so a token invalidated by an earlier section can never silently satisfy a
+later one). Every denial must show **both** the status and zero upstream
+executions.
 
-| Case | Construction |
-|------|--------------|
-| Missing bearer | omit `Authorization` |
-| Tampered bearer | append a character to a valid token |
-| Wrong audience | present a token minted for a *different* route |
-| Replayed code | exchange the same `code` twice |
-| Wrong PKCE | exchange with a mismatched `code_verifier` |
+| # | Case | Construction | Expected |
+|---|------|--------------|----------|
+| N1 | Missing bearer | omit `Authorization` | 401 |
+| N2 | Tampered bearer | append a character to a valid token | 401 |
+| N3 | Wrong audience | token minted for a *different* route | 401 |
+| N4 | Replayed code | exchange the same `code` twice | 400 `invalid_grant` |
+| N5 | Wrong PKCE | exchange with a mismatched `code_verifier` | 400 `invalid_grant` |
+| N6 | No pairing secret | authorize an approved client without `pairing_code` | 403 `access_denied`, no redirect |
+| N7 | Wrong pairing secret | authorize with a bad `pairing_code` | 403 `access_denied`, no redirect |
+
+**Status-code note.** N1–N3 and N6–N7 are authorization failures → 401/403.
+N4–N5 are **token-endpoint** errors → `400 invalid_grant` per RFC 6749 §5.2.
+Expecting 401 there would be wrong; the runbook previously did.
 
 **Fail-closed:** a wrong-audience token accepted anywhere means audience
 binding is not enforced per route.
 
-### 3.7 Revocation is immediate
+### 3.7 Revocation is immediate (OAuth token revocation, RFC 7009)
+
+Use a **dedicated client T3** with a currently valid token. Do not reuse a
+token invalidated above.
 
 ```sh
-ocliv authz revoke --data /var/lib/ocliv --client <cid> --tenant <tenant> --route <id>
-curl ... -H "Authorization: Bearer $TOKEN" ...   # same token as 3.5
+# T3: register, approve, obtain a fresh token (as in 3.4-3.5).
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: Bearer $TOK3" ... https://<fqdn>/r/<id>/mcp   # -> 200
+
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-urlencode "token=$TOK3" \
+  --data-urlencode 'token_type_hint=access_token' \
+  https://<fqdn>/r/<id>/oauth/revoke                                  # -> 200
+
+# Immediately denied, on the NEXT request — not at expiry.
+curl ... -H "Authorization: Bearer $TOK3" ...                        # -> 401
 ```
 
-**Oracle:** the **next** request is `401`; not the token's expiry.
-**Fail-closed:** still `200` after revocation means revocation is
-expiry-dependent.
+**Oracle:** 401 on the next request, zero upstream executions, and a second
+client T4's token still returns 200. An invalid token presented to
+`/oauth/revoke` must also return 200 (RFC 7009 §2.2).
+**Fail-closed:** still 200 after revocation means the endpoint is
+advertised but not implemented.
 
 ### 3.8 Issuer key rotation
 
+Start from a **currently ACTIVE grant and a valid pre-rotation token**.
+Mint a fresh token for client T5 after confirming its grant is `active`; do
+not reuse a token from an earlier section.
+
 ```sh
+# Relay host. Confirm the grant first.
+ocliv authz list --data /var/lib/ocliv          # T5 must be status=active
+# Present T5's live token once -> 200
 ocliv authz rotate-key --data /var/lib/ocliv
-curl ... -H "Authorization: Bearer $TOKEN" ...   # pre-rotation token
+# Present the SAME pre-rotation token -> must be 401 immediately.
 ```
 
-**Oracle:** `401` immediately, without a relay restart. **Fail-closed:**
-still `200` means the running relay kept the retired key in memory.
+**Oracle:** 401 on the next request, with no relay restart. **Fail-closed:**
+still 200 means the running relay kept the retired key in memory.
 
 ### 3.9 Publisher restart preserves approval
+
+Use a client T6 whose grant is ACTIVE and whose token is still valid.
 
 ```sh
 # Stop the publisher, then republish the same name.
 ocliv mcp publish --local http://127.0.0.1:8765/mcp \
   --auth ocliv-managed --name managed-qual
-# Present the SAME pre-restart token.
+# Present T6's SAME pre-restart token (no re-approval, no new pairing secret).
 ```
 
-**Oracle:** the endpoint is byte-identical, the token still works, and no
-re-approval was needed. **Fail-closed:** a new route id, or a working token
-after an unapproved republish, means approval state is not bound to route
-identity.
+**Oracle:** the endpoint is byte-identical, the token still works, and
+`ocliv authz list` still shows exactly one `active` grant for T6.
+**Fail-closed:** a new route id, or a working token after an unapproved
+republish, means approval state is not bound to route identity.
 
 ### 3.10 Incompatible mode change is refused
 
 ```sh
-# Same lease, different profile: must not silently rebind.
-# (Drive this through the management API the same way publish does.)
+# Same lease, different profile: must not silently rebind the stable URL.
+# Publish the same name with the other profile.
+ocliv mcp publish --local http://127.0.0.1:8765/mcp \
+  --auth upstream-oauth --name managed-qual
 ```
 
-**Oracle:** `409`, route unchanged, existing token still works.
+**Oracle:** route creation is refused (409) because the lease's access mode
+does not support the requested profile, the route id is unchanged, and T6's
+token still works. **Fail-closed:** a silent rebind would mean an
+authentication-mode change happened without authorization.
 
 ### 3.11 Teardown
 
@@ -239,14 +287,15 @@ offline (`503`) and must not forward.
 | 2 | Route-scoped PRM/AS match the endpoint | | |
 | 3 | No-bearer denied, zero upstream hits | | |
 | 4 | Registration without approval issues no code | | |
-| 5 | Approval grants exactly one tenant+route | | |
-| 6 | DCR → PKCE → token → authorized call | | |
-| 7 | Negative paths all 401, zero executions | | |
-| 8 | Revocation immediate | | |
-| 9 | Key rotation immediate | | |
-| 10 | Republish preserves route id + approval | | |
-| 11 | Incompatible mode change refused | | |
-| 12 | Teardown stops serving | | |
+| 5 | Approval requires explicit tenant+route; issues one pairing secret | | |
+| 6 | Approved client_id without the pairing secret gets no code (403) | | |
+| 7 | DCR → PKCE+pairing → token → authorized call | | |
+| 8 | Negative paths N1–N7 (401/403/400 as specified), zero executions | | |
+| 9 | OAuth token revocation (RFC 7009) immediate; unrelated client unaffected | | |
+| 10 | Key rotation immediate, from an ACTIVE grant + live token | | |
+| 11 | Republish preserves route id + approval, same token still valid | | |
+| 12 | Incompatible mode change refused (409) | | |
+| 13 | Teardown stops serving | | |
 
 **Overall disposition:** PASS only if every row is PASS with recorded
 evidence. Any FAIL is a defect, not a qualification gap to be argued away.
