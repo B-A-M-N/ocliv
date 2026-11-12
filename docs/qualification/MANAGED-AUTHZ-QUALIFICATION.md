@@ -333,24 +333,24 @@ offline (`503`) and must not forward.
 
 | # | Check | Result | Evidence |
 |---|-------|--------|----------|
-| 1 | Public TLS, no `-k` | | |
-| 2 | Route-scoped PRM/AS match the endpoint | | |
-| 3 | No-bearer denied, zero upstream hits | | |
-| 4 | Registration without approval issues no code | | |
-| 5 | Approval requires explicit tenant+route; issues one single-use pairing credential | | |
-| 6 | Pending approval renders a consent page whose form action is the route-scoped consent URL; no credential in the URL | | |
-| 7 | DCR → consent (form's own action) → PKCE+resource → token → authorized call | | |
-| 8 | An ACTIVE grant alone issues NO code; a completed consent transaction does | | |
-| 9 | Negative paths N1–N11 (401/403/400 as specified), zero executions | | |
-| 10 | OAuth token revocation (RFC 7009) immediate; unrelated client unaffected | | |
-| 11 | Revoked client's existing token and previously issued code both refused | | |
-| 12 | Token without a jti is refused at admission | | |
-| 13 | Key rotation immediate, from an ACTIVE grant + live token | | |
-| 14 | Republish preserves route id + approval, same token still valid | | |
-| 15 | Incompatible mode change refused (409) | | |
-| 16 | Teardown stops serving | | |
-| 17 | Cross-key reclaim of a named host refused, audited, original lease keeps serving | | |
-| 18 | Registration and pending-consent quotas enforced (429 past the caps) | | |
+| 1 | Public TLS, no `-k` | **PARTIAL** | TLS verified against a PINNED CA (`--cacert`, never `-k`): the chain, hostname and expiry are all enforced. The certificate is NOT publicly trusted (self-signed, tailnet) — a public ACME/Caddy edge is **NOT VERIFIED**. |
+| 2 | Route-scoped PRM/AS match the endpoint | **PASS** | PRM `resource` = `…/r/8tiVen6x2ckCO1jIrX5gKQ/mcp`; AS `issuer` = `…/r/8tiVen6x2ckCO1jIrX5gKQ/oauth` (both 200). |
+| 3 | No-bearer denied, zero upstream hits | **PASS** | 401, and the harmless upstream's OWN hit counter went `1→1` (+0). The upstream writes one line per MCP method it receives; the counter moved `0→1` only for an authorized call. |
+| 4 | Registration without approval issues no code | **PASS** | After DCR the authorize serves the consent page with NO redirect and NO code; approval is still required before a consent can complete. |
+| 5 | Approval requires explicit tenant+route; issues one single-use pairing credential | **PASS** | `authz approve` refuses without `--tenant`+`--route`; it prints one `pair_…` credential; a second consent with that credential → 403, and the challenge → 400 on replay. |
+| 6 | Pending approval renders a consent page whose form action is the route-scoped consent URL; no credential in the URL | **PASS** | The form action is the route-scoped `/r/<id>/oauth/consent`; the authorize response has no `Location` and no pairing material; the page carries the field NAME only. |
+| 7 | DCR → consent (form's own action) → PKCE+resource → token → authorized call | **PASS** | Full flow; the token carries a jti and `aud` = the route URL; `tools/list` returned the upstream's `ping` tool (200). |
+| 8 | An ACTIVE grant alone issues NO code; a completed consent transaction does | **PASS** | Approved-but-unconsented authorize → no redirect, no code; the consent POST → 302 + code. |
+| 9 | Negative paths N1–N11 (401/403/400 as specified), zero executions | **PARTIAL** | Exercised live: tampered/missing bearer 401, code replay 400, wrong verifier 400, foreign resource 400 `invalid_target` on BOTH endpoints, missing resource 400, approval-alone no code, replayed credential 403 — each with the upstream counter unmoved. **NOT VERIFIED:** the EXPIRED-credential case (needs the 1 h credential TTL to elapse) — covered by unit test only. |
+| 10 | OAuth token revocation (RFC 7009) immediate; unrelated client unaffected | **PASS** | revoke → 200; the revoked token → 401 on the NEXT request; an unrelated client's token still 200; an invalid token → 200 (RFC 7009 §2.2). |
+| 11 | Revoked client's existing token and previously issued code both refused | **PASS** | Existing token → 401; a NEVER-redeemed code → 400 `invalid_grant` "client is not approved for this route" (the revocation is the reason), and the code is burned fail-closed; other clients unaffected → 200. |
+| 12 | Token without a jti is refused at admission | **NOT VERIFIED (live)** | Not exercised live: forging a token needs the issuer's private key, which is not exposed by design. Covered by `TestMissingJTITokenRejected` (unit) and the managed-admission test. |
+| 13 | Key rotation immediate, from an ACTIVE grant + live token | **PASS** | The publisher restart ran FIRST (§3.8), then the rotation; a token minted fresh after the restart → 401 immediately after `authz rotate-key`, no relay restart; a token minted after the rotation → 200 with the new key. |
+| 14 | Republish preserves route id + approval, same token still valid | **PASS** | Route id unchanged (`8tiVen6x2ckCO1jIrX5gKQ`) across the publisher restart; the PRE-restart token still 200; exactly one active grant before and after. |
+| 15 | Incompatible mode change refused (409) | **PASS** | Publishing the same name with `--auth upstream-oauth` → **409** "publication exists with profile managed-oauth; delete it first to replace the profile", exit 4; the route id was unchanged and the original publisher resumed. |
+| 16 | Teardown stops serving | see the teardown evidence below | The staging stack was torn down after the run and the route stopped serving. |
+| 17 | Cross-key reclaim of a named host refused, audited, original lease keeps serving | **PASS** | A second key enrolled in the SAME tenant attempted the same named host: refused, with 7 audited `lease_reclaim`/`denied` rows ("named host held by a different agent key in this tenant"); the original lease stayed ACTIVE and the publication stayed bound to it, so the route kept serving. |
+| 18 | Registration and pending-consent quotas enforced (429 past the caps) | **NOT VERIFIED (live)** | Not exercised live: the public OAuth endpoints are rate limited to 10 requests/minute per (tenant, endpoint kind), so reaching the 200-registration / 100-pending-consent caps would take ~30 minutes of wall clock and would leave 200 junk registrations in the staging DB. Covered by `TestPendingConsentQuota` (unit). |
 
 **Overall disposition:** PASS only if every row is PASS with recorded
 evidence. Any FAIL is a defect, not a qualification gap to be argued away.

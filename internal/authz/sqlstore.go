@@ -446,6 +446,20 @@ func (s *SQLStore) ApproveGrantWithPairingSecret(clientID, tenant, route, secret
 }
 
 // RevokeGrant sets a grant revoked. It is immediate and permanent.
+// RevokeGrantsForRoute revokes every grant of one route in one statement.
+func (s *SQLStore) RevokeGrantsForRoute(tenant, route string) (int, error) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	res, err := s.db.Exec(
+		`UPDATE authz_grants SET status='revoked', updated_at=?
+		 WHERE tenant_id=? AND route_id=? AND status<>'revoked'`,
+		now, tenant, route)
+	if err != nil {
+		return 0, fmt.Errorf("authz: revoke grants for route: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
 func (s *SQLStore) RevokeGrant(clientID, tenant, route string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	res, err := s.db.Exec(

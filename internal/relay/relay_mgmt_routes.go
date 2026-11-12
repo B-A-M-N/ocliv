@@ -130,8 +130,33 @@ func (s *Server) handleAgentPublications(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "unknown route", http.StatusNotFound)
 		return
 	}
+	// The route is gone, so its approvals must die with it: an operator
+	// approval is authority over a route that no longer exists, and a
+	// later route reusing the id must not inherit it. The revocation is
+	// scoped to (tenant, route), so no other route is touched.
+	s.retireRouteApprovals(tenant, routeID)
 	s.db.AuditKey("agent", tenant, keyID, "", "mcp-route-delete", "ok", "route "+routeID+" removed")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// retireRouteApprovals revokes every operator approval of one route.
+// It is a no-op when the relay has no managed mode. A failure is audited
+// but never fails the delete: the route is already gone, so the access
+// decision is fail-closed either way.
+func (s *Server) retireRouteApprovals(tenant, routeID string) {
+	if s.authz == nil {
+		return
+	}
+	n, err := s.authz.Store().RevokeGrantsForRoute(tenant, routeID)
+	if err != nil {
+		s.db.Audit("system", tenant, "", "authz-revoke", "error",
+			"revoking approvals for route "+routeID+" failed: "+errShort(err))
+		return
+	}
+	if n > 0 {
+		s.db.Audit("system", tenant, "", "authz-revoke", "ok",
+			"revoked "+itoa(uint64(n))+" approval(s) for removed route "+routeID)
+	}
 }
 
 // serveKeyPublications lists every publication owned by one key: identity
@@ -443,6 +468,9 @@ func (s *Server) serveMCPRouteMutation(w http.ResponseWriter, r *http.Request, t
 			http.Error(w, "unknown route", http.StatusNotFound)
 			return
 		}
+		// Same reasoning as the owner-key delete: the route is gone, so
+		// its operator approvals are retired with it.
+		s.retireRouteApprovals(tenant, rest)
 		s.db.Audit("agent", tenant, leaseID, "mcp-route-delete", "ok", "route "+rest+" removed")
 		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 	default:

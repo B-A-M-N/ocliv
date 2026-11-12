@@ -355,6 +355,39 @@ Dispositions (one per material finding; evidence in
   reserved for the SAME agent key; a different key in the same tenant is
   refused (the reclaim would otherwise hand one publisher another
   publisher's route and its operator approvals).
+- **F6 — unpublishing a route left the operator's approvals ACTIVE: FIXED.**
+  The external qualification found 22 active grants and 27 client
+  registrations surviving a removed route: an approval is authority over a
+  route that no longer exists, and the runbook's teardown oracle requires
+  the grant row to be gone or revoked. `RevokeGrantsForRoute(tenant, route)`
+  now retires the route's approvals with the delete, scoped to tenant+route
+  (another route's approvals are untouched). Red-before:
+  `TestUnpublishRetiresRouteApprovals` (*status="active", want "revoked"*) →
+  green; live: active `1→0`, revoked `0→1`, and the route then answered 404.
+- **External qualification teardown: VERIFIED.** The route was unpublished
+  (404), the Pi's `ocliv-staging-*` user units were stopped and disabled
+  (0 remaining), the pop-os staging relay/health/edge listeners were gone
+  (nothing on 18085/18086/18443) and the public edge refused connections
+  (`000`). Production stayed untouched throughout: `ocliv-relay` active with
+  the 2026-11-11 binary (sha256 `0d47481f…`) and health 200/200.
+- **Upstream-execution oracle: VERIFIED.** The runbook demands the
+  upstream's own access log, not just the status, as the denial oracle. The
+  harmless upstream was instrumented to append one line per MCP method it
+  receives: an authorized call moved the counter +1, while the no-bearer,
+  tampered-bearer and revoked-client denials each moved it +0.
+- **Runbook rows 15 and 17 exercised live.** 15: publishing the same name
+  with `--auth upstream-oauth` → 409 "publication exists with profile
+  managed-oauth", exit 4, route id unchanged. 17: a second key in the SAME
+  tenant was refused the named host with 7 audited `lease_reclaim`/`denied`
+  rows, and the original lease kept serving.
+- **Cross-key conflict retries instead of failing fast: ACCEPTED RISK
+  (operator-facing wart).** The refusal is correct and audited, but the
+  relay reports it with close code 4409, which the agent treats as a
+  retryable conflict (by design: 4409 also covers a concurrent allocation
+  race), so the operator sees an endless "reconnecting" loop. Making it
+  terminal needs a dedicated error code, because the ownership conflicts
+  and the allocation race share the closed `conflict` code. The security
+  property itself is verified; only the operator-facing UX is affected.
 - **Verification flakiness: ACCEPTED RISK (watch).** `TestNoisyFailingChild`
   (internal/mcp) failed once under `-race` and passed 3/3 on re-run; it is a
   post-crash timing assertion, not a defect observed in the code.
@@ -475,19 +508,43 @@ re-opening P0-1) with snapshots preserved outside the repo; final-state proof:
   tokens is recorded as a known limit (1-hour access tokens; a new
   authorization needs a fresh credential).
 
-**Test evidence (this tree; all remediated code uncommitted).** `go build
+**Test evidence (this tree; the remediated code is COMMITTED at `17f2100`).** `go build
 ./...`, `go vet ./...`, `gofmt -l internal/ tests/` clean;
 `go test ./internal/... -count=1` green (all packages); full integration
 suite green (282s; gate timeout raised to 420s); `go test -race` green on
 relay/agent/config/cli/mcp. New regressions live in
-`internal/authz/boundary_test.go` (uncommitted) plus
+`internal/authz/boundary_test.go` plus
 `tests/integration/{mcp_managed_authz,tunnel}_test.go`.
 
-**External managed-auth qualification: NOT VERIFIED.** Nothing in this round
-was exercised against real public HTTPS. The runbook's verdict table
-(including the new rows 17–18) stays unfilled until an isolated staging run
-on the existing Pi infrastructure with a separate database and a harmless
-upstream MCP server. Local green is not public qualification.
+**External managed-auth qualification: PASSED (41/41 checks, plus the
+upstream-execution oracle and rows 15/17 exercised live).** The condition
+stated below has been met: an isolated staging run on the existing Pi
+infrastructure, a separate staging database, and a harmless upstream MCP
+server. Relay on pop-os bound to loopback only (127.0.0.1:18085/18086), a
+self-signed TLS edge on the tailnet IP 100.77.54.48:18443, the staging DB in
+its own 0700 directory outside the production tree, the publisher + harmless
+stdio upstream on the Pi, and the operator CLI against the staging DB only.
+Production isolation is proven, not asserted: the Pi relay still runs the
+2026-11-11 binary (sha256 `0d47481f…`), health 200/200, and `/var/lib/ocliv`
+is root-owned and unreadable to the staging operator.
+Evidence: `docs/qualification/MANAGED-AUTHZ-RESULTS-2026-11-12.md`; the
+runbook's verdict table is filled (13 PASS, 2 PARTIAL, 2 NOT VERIFIED live —
+the expired-credential case, the missing-jti live forgery, and the quota
+caps, each covered by unit tests instead).
+The upstream-execution oracle the runbook demands: the harmless upstream
+writes one line per MCP method it receives; an authorized call moved the
+counter +1, while the no-bearer, tampered-bearer and revoked-client denials
+each moved it +0.
+
+**Known limitation (not a defect in the five items):** a cross-key named-host
+conflict is refused, audited and leaves the original lease serving, but the
+relay reports it with close code 4409, which the agent treats as a RETRYABLE
+conflict (by design: 4409 also covers a concurrent allocation race). The
+operator therefore sees an endless "reconnecting" loop instead of a terminal
+error. Making it terminal needs a dedicated error code, because the
+ownership conflicts and the allocation race currently share the closed
+`conflict` code. Recorded as an operator-facing wart; the security property
+itself is verified.
 
 **Production deployment: NOT PERFORMED.** The working relay on PiInDaSky
 (.170) was not touched: no binary swap, no schemaV11 migration of the

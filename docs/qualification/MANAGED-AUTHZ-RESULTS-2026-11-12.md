@@ -82,6 +82,40 @@ staging relay reports `live=200 ready=200`.
 | A1 | a revoked client cannot redeem a **never-redeemed** code | 400 `invalid_grant` — *"client is not approved for this route"* (the revocation is the reason, not "already used") |
 | A2 | the rejected code is burned (fail-closed) | `consumed_at=2026-11-12T18:54:47Z` — a failed redemption is never retried, exactly like a failed PKCE exchange |
 
+### Upstream-execution oracle — the runbook's required counter
+
+The runbook's evidence standard: *"For every denial, show both the status
+code AND the upstream access log proving zero executions — the counter, not
+the status, is the oracle."*
+
+The harmless upstream was instrumented to append one line per MCP method it
+receives. The counter is the upstream's own, read over SSH after each
+request.
+
+| # | Check | Result |
+|---|---|---|
+| O1 | an AUTHORIZED call reaches the upstream (the control) | 200, counter `0→1` (**+1**) |
+| O2 | no bearer | 401, counter `1→1` (**+0**) |
+| O3 | tampered bearer | 401, counter `1→1` (**+0**) |
+| O4 | revoked client's token | 401, counter `1→1` (**+0**) |
+
+The counter moves only for an authorized call. Every denial is refused
+before the upstream is touched.
+
+### Rows 15 and 17 exercised live
+
+| Row | Check | Result |
+|---|---|---|
+| 15 | incompatible mode change refused | Publishing the same name with `--auth upstream-oauth` → **409** *"publication exists with profile managed-oauth; delete it first to replace the profile"*, exit 4; the route id was unchanged and the original publisher resumed. |
+| 17 | cross-key reclaim refused, audited, original lease keeps serving | A second key enrolled in the SAME tenant attempted the same named host: refused, with 7 audited `lease_reclaim`/`denied` rows (*"named host held by a different agent key in this tenant"*); the original lease stayed ACTIVE, the publication stayed bound to it, and the route kept serving. |
+
+### Teardown (row 16)
+
+`ocliv mcp unpublish --lease <id>` → *"✓ MCP route removed"*; the route
+then answered **404**. The whole staging stack was then stopped (the Pi's
+`ocliv-staging-*` user units, the pop-os staging relay and the edge proxy)
+and nothing was left listening on 18085/18086/18443.
+
 ### Part 2 — the ordering-sensitive pair (9/9)
 
 Run order: **publisher restart (§3.8) first, key rotation (§3.9) second**,
@@ -108,6 +142,8 @@ with the rotation token minted *fresh after* the restart.
 | F3 | the SQLStore test schema lagged the store schema (missing `tenant_id`/`route_id`/`pairing_expires_at`/`consented_at`/`resource`) | `SQL logic error: table authz_clients has no column named tenant_id` | **FIXED** — test schema brought to the v11 shape |
 | F4 | `TestMCPPortAliasArgs` demanded that `mcp publish --auth fixture-anonymous` be **accepted**, contradicting the standing invariant that an anonymous fixture can never back a public route | test failure + `mcp publish --auth fixture-anonymous is disabled: …` | **FIXED** — the test now asserts the refusal (which is itself the proof that the explicit `--auth` was preserved) and the preserved `cfg.auth` |
 | F5 | `mcp publish --auth ocliv-managed` accepted `--strict-discovery`, `--dev-allow-unverified-discovery` and `--resource-file`, which imply an upstream that does not exist | `mcp publish --auth ocliv-managed takes no --strict-discovery: the relay is the Authorization Server, not an upstream` | **FIXED** (in-tree, covered by CLI tests) |
+| F6 | unpublishing a route deleted the publication but left the operator's approvals **ACTIVE** in the authorization plane (22 active grants + 27 client registrations survived a removed route) | live: after `mcp unpublish`, `authz_grants` still had 22 `active` rows for the removed route; the runbook's teardown oracle requires the grant row to be gone or revoked | **FIXED** — `RevokeGrantsForRoute(tenant, route)` retires the route's approvals with the delete, scoped to tenant+route; red-before `TestUnpublishRetiresRouteApprovals` (*status="active", want "revoked"*) → green; live L1: active `1→0`, revoked `0→1` |
+| F7 | the staging fixture's upstream port was a lucky random pick (`mcp expose` binds `127.0.0.1:0` and has no port flag), so restarting the adapter silently broke the publisher's fixed target | live: the authorized call 502'd after an adapter restart | **FIXED (fixture)** — the publisher unit now points at the adapter's advertised port; a staging-fixture property, not a product defect |
 
 ## 5. Gates
 
@@ -124,7 +160,22 @@ with the rotation token minted *fresh after* the restart.
 green suite takes 331 s, so the gate fails on a healthy tree. Raise it to
 `-timeout 420s`.
 
-## 6. Not qualified (explicitly out of scope / operator-gated)
+## 6. Known limitations found by the run
+
+* **A cross-key named-host conflict retries instead of failing fast.** The
+  refusal itself is correct (refused, audited, the original lease keeps
+  serving — row 17), but the relay reports it with close code **4409**,
+  which the agent treats as a *retryable* conflict (by design: 4409 also
+  covers a concurrent allocation race). The operator therefore sees an
+  endless "reconnecting" loop instead of a terminal error. Making it
+  terminal needs a dedicated error code, because the ownership conflicts
+  and the allocation race currently share the closed `conflict` code.
+  Recorded as an operator-facing wart; the security property is verified.
+* **The staging upstream's port is a random pick** (`mcp expose` binds
+  `127.0.0.1:0` with no port flag), so the publisher unit must be repointed
+  whenever the adapter restarts. A fixture property, not a product defect.
+
+## 7. Not qualified (explicitly out of scope / operator-gated)
 
 * **ChatGPT registration** — the managed flow requires an operator-mediated
   consent and a single-use credential per authorization; an unattended client

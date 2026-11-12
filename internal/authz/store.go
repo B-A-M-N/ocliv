@@ -154,6 +154,12 @@ type Store interface {
 	// complete. It refuses a revoked grant.
 	ApproveGrantWithPairingSecret(clientID, tenant, route, secret string, ttl time.Duration) error
 	RevokeGrant(clientID, tenant, route string) error
+	// RevokeGrantsForRoute revokes every grant of one route in a single
+	// step and returns how many rows changed. Removing a route must
+	// retire its approvals: an approval is authority over a route that
+	// no longer exists, and leaving it active would let a later route
+	// with the same id inherit it.
+	RevokeGrantsForRoute(tenant, route string) (int, error)
 
 	// SetPairingSecret issues (or rotates) the pairing secret for a grant,
 	// storing only its hash. The plaintext is returned once to the
@@ -377,6 +383,22 @@ func (m *MemStore) ApproveGrantWithPairingSecret(clientID, tenant, route, secret
 	g.PairingConsumedAt = nil
 	g.UpdatedAt = now
 	return nil
+}
+
+// RevokeGrantsForRoute revokes every grant of one route.
+func (m *MemStore) RevokeGrantsForRoute(tenant, route string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, g := range m.grants {
+		if g.Tenant != tenant || g.Route != route || g.Status == GrantRevoked {
+			continue
+		}
+		g.Status = GrantRevoked
+		g.UpdatedAt = time.Now()
+		n++
+	}
+	return n, nil
 }
 
 // RevokeGrant flips a grant to revoked. It is immediate and permanent.
