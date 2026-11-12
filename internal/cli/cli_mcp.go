@@ -67,8 +67,12 @@ func cmdMCP(argv []string) int {
 }
 
 // mcpPortAliasArgs rewrites `mcp PORT [publish flags...]` into the
-// equivalent `mcp publish` argv. Authentication stays upstream-oauth:
-// the alias never weakens the publisher's auth boundary.
+// equivalent `mcp publish` argv. The bare alias defaults to the
+// relay-side MANAGED authorization mode: one command publishes a local
+// MCP server that has no OAuth of its own, with operator-authorized
+// clients through the consent flow. An EXPLICIT --auth value passes
+// through untouched, so the alias never weakens an explicit choice
+// (upstream-oauth passthrough stays explicit).
 func mcpPortAliasArgs(argv []string) ([]string, bool) {
 	if len(argv) == 0 {
 		return nil, false
@@ -77,7 +81,14 @@ func mcpPortAliasArgs(argv []string) ([]string, bool) {
 	if err != nil || port < 1 || port > 65535 {
 		return nil, false
 	}
-	pub := []string{"--local", fmt.Sprintf("http://127.0.0.1:%d/mcp", port), "--auth", "upstream-oauth"}
+	pub := []string{"--local", fmt.Sprintf("http://127.0.0.1:%d/mcp", port)}
+	for _, a := range argv[1:] {
+		if a == "--auth" || strings.HasPrefix(a, "--auth=") {
+			// Explicit authentication selection: nothing is injected.
+			return append(pub, argv[1:]...), true
+		}
+	}
+	pub = append(pub, "--auth", "ocliv-managed")
 	return append(pub, argv[1:]...), true
 }
 

@@ -25,11 +25,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"ocliv/internal/agent"
 	"ocliv/internal/authz"
 	"ocliv/internal/config"
 	"ocliv/internal/mcp"
@@ -144,8 +147,20 @@ func routeReqBody(t *testing.T, h *harness, host, path, body string) *http.Respo
 // OAuth authorization-code redirect with no Ocliv-specific parameters.
 // It returns the code from the redirect Location, or "" when no code was
 // issued.
+// managedVerifier normalizes a test verifier to the RFC 7636 §4.1 bounds
+// (43-128 characters). The same transformation is applied when the code
+// challenge is computed and when the verifier is presented, so the two
+// always agree.
+func managedVerifier(v string) string {
+	if len(v) >= 43 {
+		return v
+	}
+	return v + strings.Repeat("x", 43-len(v))
+}
+
 func managedAuthorize(t *testing.T, h *harness, rid, clientID, pairing, verifier string) string {
 	t.Helper()
+	verifier = managedVerifier(verifier)
 	challenge := base64.RawURLEncoding.EncodeToString(func() []byte {
 		sum := sha256.Sum256([]byte(verifier))
 		return sum[:]
@@ -221,6 +236,7 @@ func managedAuthorize(t *testing.T, h *harness, rid, clientID, pairing, verifier
 // managedToken exchanges a code for an access token.
 func managedToken(t *testing.T, h *harness, rid, clientID, code, verifier string) (int, string) {
 	t.Helper()
+	verifier = managedVerifier(verifier)
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
 	form.Set("code", code)
@@ -289,7 +305,7 @@ func TestManagedAuthzApprovedClientExecutesOnce(t *testing.T) {
 	if err := st.ApproveGrant(clientID, tenant, rid); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
-	if err := st.SetPairingSecret(clientID, tenant, rid, "pairing-2"); err != nil {
+	if err := st.SetPairingSecret(clientID, tenant, rid, "pairing-2", time.Hour); err != nil {
 		t.Fatalf("pairing secret: %v", err)
 	}
 
@@ -338,7 +354,7 @@ func TestManagedAuthzTokenBinding(t *testing.T) {
 	if err := st.ApproveGrant(clientID, tenant, rid); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
-	if err := st.SetPairingSecret(clientID, tenant, rid, "pairing-3"); err != nil {
+	if err := st.SetPairingSecret(clientID, tenant, rid, "pairing-3", time.Hour); err != nil {
 		t.Fatalf("pairing secret: %v", err)
 	}
 	code := managedAuthorize(t, h, rid, clientID, "pairing-3", "verifier-3")
@@ -355,8 +371,13 @@ func TestManagedAuthzTokenBinding(t *testing.T) {
 		t.Fatalf("replaying a burned code status=%d, want 400", status)
 	}
 
-	// A fresh code with the correct verifier works.
-	code = managedAuthorize(t, h, rid, clientID, "pairing-3", "verifier-3")
+	// A fresh code with the correct verifier works. The pairing credential
+	// is single-use: the operator must authorize this new transaction with
+	// a FRESH credential. An ACTIVE grant alone never mints a code.
+	if err := st.ApproveGrantWithPairingSecret(clientID, tenant, rid, "pairing-3b", time.Hour); err != nil {
+		t.Fatalf("fresh pairing: %v", err)
+	}
+	code = managedAuthorize(t, h, rid, clientID, "pairing-3b", "verifier-3")
 	if code == "" {
 		t.Fatal("no fresh code")
 	}
@@ -396,7 +417,7 @@ func TestManagedAuthzRevocationIsImmediate(t *testing.T) {
 	if err := st.ApproveGrant(clientID, tenant, rid); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
-	if err := st.SetPairingSecret(clientID, tenant, rid, "pairing-4"); err != nil {
+	if err := st.SetPairingSecret(clientID, tenant, rid, "pairing-4", time.Hour); err != nil {
 		t.Fatalf("pairing secret: %v", err)
 	}
 	code := managedAuthorize(t, h, rid, clientID, "pairing-4", "verifier-4")
@@ -439,7 +460,7 @@ func TestManagedAuthzKeyRotation(t *testing.T) {
 	if err := st.ApproveGrant(clientID, tenant, rid); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
-	if err := st.SetPairingSecret(clientID, tenant, rid, "pairing-5"); err != nil {
+	if err := st.SetPairingSecret(clientID, tenant, rid, "pairing-5", time.Hour); err != nil {
 		t.Fatalf("pairing secret: %v", err)
 	}
 	code := managedAuthorize(t, h, rid, clientID, "pairing-5", "verifier-5")
@@ -473,6 +494,103 @@ func TestManagedAuthzKeyRotation(t *testing.T) {
 // the SAME route identity, so operator approvals survive it — the client's
 // existing token keeps working with no re-approval. An incompatible
 // authentication-mode change under the same stable name is refused.
+// TestManagedAuthzReclaimKeepsRouteServing: a publisher RESTART reclaims
+// the named lease (new lease id, same hostname/label) and carries the live
+// publication over to it. The reclaim used to clear verified_at for every
+// profile — including managed ones that have no upstream discovery to
+// re-verify. The route then 404s and a previously valid token stops
+// working, which breaks the stable-route-identity promise.
+//
+// Failing-first: before the fix the post-reclaim call returned 404.
+func TestManagedAuthzReclaimKeepsRouteServing(t *testing.T) {
+	up := startManagedUpstream(t)
+	h := newHarnessNS(t, "tenant-mgd2.example.test", "relay.example.test", "public.example.org")
+	t.Cleanup(func() { h.db.Close() })
+	t.Cleanup(h.relaySrv.Close)
+	h.startAgentOpts(t, portOfUpstream(t, up.srv.URL),
+		config.Agent{AccessMode: "mcp_managed_oauth", Name: "mgdrebind"})
+	code, rid, _, _ := mgmtRouteCreate(t, h, "managed-oauth")
+	if code != http.StatusOK {
+		t.Fatalf("managed route create status=%d", code)
+	}
+
+	clientID := managedDCR(t, h, rid)
+	st := authz.NewSQLStore(h.db.SQL())
+	tenant := publicationTenant(t, h, rid)
+	if err := st.ApproveGrant(clientID, tenant, rid); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if err := st.SetPairingSecret(clientID, tenant, rid, "pairing-reclaim", time.Hour); err != nil {
+		t.Fatalf("pairing secret: %v", err)
+	}
+	authCode := managedAuthorize(t, h, rid, clientID, "pairing-reclaim", "verifier-reclaim")
+	if authCode == "" {
+		t.Fatal("no authorization code")
+	}
+	status, body := managedToken(t, h, rid, clientID, authCode, "verifier-reclaim")
+	if status != http.StatusOK {
+		t.Fatalf("token status=%d body=%s", status, body)
+	}
+	var tok struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal([]byte(body), &tok); err != nil || tok.AccessToken == "" {
+		t.Fatalf("token reply unparseable: %v (%q)", err, body)
+	}
+	if c, _ := managedCall(t, h, rid, tok.AccessToken); c != http.StatusOK {
+		t.Fatalf("pre-reclaim call status=%d, want 200", c)
+	}
+
+	// Publisher restart: a NEW agent image with the SAME name (so the relay
+	// reclaims the named lease) and a fresh data dir (so it does not resume).
+	dir2, err := os.MkdirTemp("", "ocliv-agent-reclaim-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	rn := &agent.Runner{
+		Cfg: config.Agent{RelayURL: h.relaySrv.URL, Port: portOfUpstream(t, up.srv.URL),
+			DataDir: dir2, Name: "mgdrebind", AccessMode: "mcp_managed_oauth"},
+		Key:                h.agentKey,
+		KeyID:              h.keyID,
+		Target:             fmt.Sprintf("127.0.0.1:%d", portOfUpstream(t, up.srv.URL)),
+		HandshakeTransport: h.handshakeTransport(),
+	}
+	attached2 := make(chan agent.Attached, 4)
+	rn.OnAttach = func(a agent.Attached) { attached2 <- a }
+	go func() { _ = rn.Run(ctx2) }()
+	var a2 agent.Attached
+	select {
+	case a2 = <-attached2:
+		if a2.LeaseID == h.attached.LeaseID {
+			t.Fatal("reclaim returned the same lease")
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("reclaiming agent did not attach")
+	}
+	h.attached = a2
+
+	// The publication keeps its route identity and its operator grants.
+	code2, rid2, _, _ := mgmtRouteCreate(t, h, "managed-oauth")
+	if code2 != http.StatusOK {
+		t.Fatalf("republish after reclaim status=%d", code2)
+	}
+	if rid2 != rid {
+		t.Fatalf("republish minted %q, want stable %q", rid2, rid)
+	}
+
+	// The managed route must still serve: no upstream discovery exists to
+	// re-verify, so the reclaim must not clear verified_at.
+	before := up.execs.Load()
+	if c, _ := managedCall(t, h, rid, tok.AccessToken); c != http.StatusOK {
+		t.Fatalf("post-reclaim call status=%d, want 200 (route must keep serving)", c)
+	}
+	if got := up.execs.Load() - before; got != 1 {
+		t.Fatalf("post-reclaim executed %d tools, want 1", got)
+	}
+}
+
 func TestManagedAuthzRepublishPreservesApproval(t *testing.T) {
 	h, up, rid, _ := managedHarness(t)
 	clientID := managedDCR(t, h, rid)
@@ -481,7 +599,7 @@ func TestManagedAuthzRepublishPreservesApproval(t *testing.T) {
 	if err := st.ApproveGrant(clientID, tenant, rid); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
-	if err := st.SetPairingSecret(clientID, tenant, rid, "pairing-repub"); err != nil {
+	if err := st.SetPairingSecret(clientID, tenant, rid, "pairing-repub", time.Hour); err != nil {
 		t.Fatalf("pairing secret: %v", err)
 	}
 	authCode := managedAuthorize(t, h, rid, clientID, "pairing-repub", "verifier-repub")
@@ -635,7 +753,7 @@ func TestManagedAuthzStdioAdapter(t *testing.T) {
 	if err := st.ApproveGrant(clientID, tenant, rid); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
-	if err := st.SetPairingSecret(clientID, tenant, rid, "pairing-stdio"); err != nil {
+	if err := st.SetPairingSecret(clientID, tenant, rid, "pairing-stdio", time.Hour); err != nil {
 		t.Fatalf("pairing secret: %v", err)
 	}
 	authCode := managedAuthorize(t, h, rid, clientID, "pairing-stdio", "verifier-stdio")
@@ -695,7 +813,7 @@ func TestManagedAuthzOAuthTokenRevocation(t *testing.T) {
 		if err := st.ApproveGrant(clientID, tenant, rid); err != nil {
 			t.Fatalf("%s approve: %v", name, err)
 		}
-		if err := st.SetPairingSecret(clientID, tenant, rid, pairing); err != nil {
+		if err := st.SetPairingSecret(clientID, tenant, rid, pairing, time.Hour); err != nil {
 			t.Fatalf("%s pairing: %v", name, err)
 		}
 		code := managedAuthorize(t, h, rid, clientID, pairing, verifier)
@@ -784,7 +902,7 @@ func TestManagedAuthzConsentPageFlow(t *testing.T) {
 	st := authz.NewSQLStore(h.db.SQL())
 
 	routeURL := "https://public.example.org/r/" + rid + "/mcp"
-	verifier := "verifier-consent"
+	verifier := managedVerifier("verifier-consent")
 	challengeSum := sha256.Sum256([]byte(verifier))
 	challenge := base64.RawURLEncoding.EncodeToString(challengeSum[:])
 	q := url.Values{}
@@ -823,9 +941,11 @@ func TestManagedAuthzConsentPageFlow(t *testing.T) {
 		t.Fatal("the pairing credential appears in the page/URL")
 	}
 
-	// The operator issues the pairing credential for the now-pending grant.
-	if err := st.SetPairingSecret(clientID, tenant, rid, "pairing-consent"); err != nil {
-		t.Fatalf("pairing secret: %v", err)
+	// The operator approves the grant AND issues the pairing credential in
+	// one step. Approval alone is not consent: the client still has to
+	// complete the consent transaction below.
+	if err := st.ApproveGrantWithPairingSecret(clientID, tenant, rid, "pairing-consent", time.Hour); err != nil {
+		t.Fatalf("approve with pairing credential: %v", err)
 	}
 
 	// 2. Complete consent by POST against the one-time challenge.
@@ -906,11 +1026,163 @@ func TestManagedAuthzConsentPageFlow(t *testing.T) {
 		t.Fatalf("consented call executed %d tools, want 1", got)
 	}
 
-	// 5. A second authorize (ACTIVE) is a plain redirect with standard params.
+	// 5. A second authorize against the ACTIVE grant is NOT a code
+	// hand-out: operator approval is durable, authorization is
+	// per-transaction. Standard parameters alone yield the consent page.
 	code2 := managedAuthorize(t, h, rid, clientID, "", "verifier-consent-2")
-	if code2 == "" {
-		t.Fatal("active grant produced no code with standard parameters only")
+	if code2 != "" {
+		t.Fatal("an ACTIVE grant alone issued a code with standard parameters only")
+	}
+	// 6. A fresh credential for the new transaction does mint a code.
+	if err := st.ApproveGrantWithPairingSecret(clientID, tenant, rid, "pairing-consent-2", time.Hour); err != nil {
+		t.Fatalf("fresh pairing: %v", err)
+	}
+	code3 := managedAuthorize(t, h, rid, clientID, "pairing-consent-2", "verifier-consent-2")
+	if code3 == "" {
+		t.Fatal("fresh credential + consent produced no code")
 	}
 }
 
-var _ = fmt.Sprintf
+// extractFormAction pulls the consent form's action attribute out of the
+// rendered page — exactly what a browser would submit to.
+func extractFormAction(t *testing.T, page string) string {
+	t.Helper()
+	i := strings.Index(page, "<form")
+	if i < 0 {
+		t.Fatalf("no form in consent page: %q", page)
+	}
+	j := strings.Index(page[i:], `action="`)
+	if j < 0 {
+		t.Fatalf("form has no action: %q", page)
+	}
+	rest := page[i+j+len(`action="`):]
+	k := strings.Index(rest, `"`)
+	if k < 0 {
+		t.Fatalf("unterminated form action: %q", rest)
+	}
+	return rest[:k]
+}
+
+// TestManagedAuthzConsentFormActionIsRouteScoped drives the consent flow
+// the way a browser does: the form's OWN action attribute is the POST
+// target, not a manually constructed URL. The old page posted to the
+// server-root /oauth/consent, which route dispatch does not serve, so a
+// real browser flow could never complete. The action must be the
+// route-scoped authorization-server URL.
+func TestManagedAuthzConsentFormActionIsRouteScoped(t *testing.T) {
+	h, up, rid, _ := managedHarness(t)
+	clientID := managedDCR(t, h, rid)
+	st := authz.NewSQLStore(h.db.SQL())
+	tenant := publicationTenant(t, h, rid)
+	if err := st.ApproveGrantWithPairingSecret(clientID, tenant, rid, "pairing-form", time.Hour); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	verifier := managedVerifier("verifier-form")
+	challenge := base64.RawURLEncoding.EncodeToString(func() []byte {
+		sum := sha256.Sum256([]byte(verifier))
+		return sum[:]
+	}())
+	routeURL := "https://public.example.org/r/" + rid + "/mcp"
+	q := url.Values{}
+	q.Set("client_id", clientID)
+	q.Set("redirect_uri", "http://127.0.0.1:59999/cb")
+	q.Set("response_type", "code")
+	q.Set("code_challenge", challenge)
+	q.Set("code_challenge_method", "S256")
+	q.Set("state", "form-state")
+	q.Set("resource", routeURL)
+	req, err := http.NewRequest(http.MethodGet, h.relaySrv.URL+"/r/"+rid+"/oauth/authorize?"+q.Encode(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "public.example.org"
+	resp, err := visitorClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("authorize status=%d, want 200 consent page", resp.StatusCode)
+	}
+
+	// The form action must be the route-scoped authorization-server URL.
+	action := extractFormAction(t, string(page))
+	wantAction := "https://public.example.org/r/" + rid + "/oauth/consent"
+	if action != wantAction {
+		t.Fatalf("consent form action=%q, want %q", action, wantAction)
+	}
+	// A server-root action (the old defect) would not be served.
+	if !strings.HasPrefix(action, "/r/"+rid+"/") && !strings.HasPrefix(action, "https://") {
+		t.Fatalf("form action is not route-scoped: %q", action)
+	}
+
+	// Browser-style completion: POST the SAME fields the form carries to
+	// the action the page itself specifies.
+	au, err := url.Parse(action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{}
+	form.Set("challenge", extractChallengeHelper(t, string(page)))
+	form.Set("client_id", clientID)
+	form.Set("redirect_uri", "http://127.0.0.1:59999/cb")
+	form.Set("code_challenge", challenge)
+	form.Set("code_challenge_method", "S256")
+	form.Set("state", "form-state")
+	form.Set("resource", routeURL)
+	form.Set("pairing_secret", "pairing-form")
+	creq, err := http.NewRequest(http.MethodPost, h.relaySrv.URL+au.Path, strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	creq.Host = "public.example.org"
+	creq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	cresp, err := visitorClient.Do(creq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cresp.Body.Close()
+	if cresp.StatusCode != http.StatusFound {
+		t.Fatalf("browser-style consent status=%d, want 302", cresp.StatusCode)
+	}
+	loc, err := url.Parse(cresp.Header.Get("Location"))
+	if err != nil || loc.Query().Get("code") == "" {
+		t.Fatalf("consent redirect=%q", cresp.Header.Get("Location"))
+	}
+
+	// The code obtained through the real form action exchanges for a
+	// working token.
+	status, body := managedToken(t, h, rid, clientID, loc.Query().Get("code"), verifier)
+	if status != http.StatusOK {
+		t.Fatalf("token status=%d body=%s", status, body)
+	}
+	var tok struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal([]byte(body), &tok); err != nil || tok.AccessToken == "" {
+		t.Fatalf("token reply unparseable: %v (%q)", err, body)
+	}
+	before := up.execs.Load()
+	if c, _ := managedCall(t, h, rid, tok.AccessToken); c != http.StatusOK {
+		t.Fatalf("call status=%d, want 200", c)
+	}
+	if got := up.execs.Load() - before; got != 1 {
+		t.Fatalf("executed %d tools, want 1", got)
+	}
+}
+
+func extractChallengeHelper(t *testing.T, page string) string {
+	t.Helper()
+	marker := `name="challenge" value="`
+	i := strings.Index(page, marker)
+	if i < 0 {
+		t.Fatalf("no consent challenge in page: %q", page)
+	}
+	rest := page[i+len(marker):]
+	j := strings.Index(rest, `"`)
+	if j < 0 {
+		t.Fatalf("unterminated challenge: %q", rest)
+	}
+	return rest[:j]
+}

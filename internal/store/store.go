@@ -193,6 +193,21 @@ CREATE TABLE IF NOT EXISTS authz_consent (
 CREATE INDEX IF NOT EXISTS idx_authz_consent_expires ON authz_consent(expires_at);
 `
 
+// schemaV11 completes the managed-authorization pairing lifecycle: the
+// pairing credential gains an enforced expiry and single-use consumption,
+// the consent challenge records the canonical resource so every field of
+// the transaction can be rebound on completion, and public dynamic client
+// registration is route-scoped so registration can be bounded per route.
+// Forward-only; legacy rows keep fail-closed defaults.
+const schemaV11 = `
+ALTER TABLE authz_grants ADD COLUMN pairing_expires_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE authz_grants ADD COLUMN pairing_consumed_at TEXT;
+ALTER TABLE authz_grants ADD COLUMN consented_at TEXT;
+ALTER TABLE authz_consent ADD COLUMN resource TEXT NOT NULL DEFAULT '';
+ALTER TABLE authz_clients ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE authz_clients ADD COLUMN route_id TEXT NOT NULL DEFAULT '';
+`
+
 // applyMigration runs one versioned migration body and its version
 // stamp in a single transaction: a failure anywhere rolls back the
 // body, so a version is never recorded for half-applied work (P1-2).
@@ -217,7 +232,7 @@ func applyMigration(sqldb *sql.DB, version int, body string) error {
 }
 
 // currentSchema is the newest version Open must reach.
-const currentSchema = 10
+const currentSchema = 11
 
 // DB wraps the SQLite handle.
 type DB struct {
@@ -327,6 +342,7 @@ func Open(path string) (*DB, error) {
 		{8, schemaV8},
 		{9, schemaV9},
 		{10, schemaV10},
+		{11, schemaV11},
 	}
 	for _, m := range migrations {
 		var v int

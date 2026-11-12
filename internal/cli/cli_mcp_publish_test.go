@@ -495,7 +495,8 @@ func TestParseMCPPublishRelayInvalid(t *testing.T) {
 }
 
 // `ocliv mcp PORT` rewrites to publish argv; --relay must survive the
-// rewrite and still pin upstream-oauth.
+// rewrite, and the bare alias defaults to the managed mode while an
+// explicit --auth passes through untouched.
 func TestMCPPortAliasForwardsRelay(t *testing.T) {
 	pub, ok := mcpPortAliasArgs([]string{"3000", "--relay", "https://relay.example.com"})
 	if !ok {
@@ -505,8 +506,21 @@ func TestMCPPortAliasForwardsRelay(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("alias argv %q rejected: code=%d", pub, code)
 	}
-	if c.relay != "https://relay.example.com" || c.localURL != "http://127.0.0.1:3000/mcp" || c.auth != "upstream-oauth" {
+	if c.relay != "https://relay.example.com" || c.localURL != "http://127.0.0.1:3000/mcp" || c.auth != "ocliv-managed" {
 		t.Fatalf("alias misparsed: %+v", c)
+	}
+
+	// An explicit --auth survives the rewrite and is not overridden.
+	pub2, ok := mcpPortAliasArgs([]string{"3000", "--relay", "https://relay.example.com", "--auth", "upstream-oauth"})
+	if !ok {
+		t.Fatal("numeric port alias not recognized")
+	}
+	c2, code := parseMCPPublish(pub2, false)
+	if code != 0 {
+		t.Fatalf("explicit-auth alias argv %q rejected: code=%d", pub2, code)
+	}
+	if c2.auth != "upstream-oauth" || c2.relay != "https://relay.example.com" {
+		t.Fatalf("explicit auth lost in the alias: %+v", c2)
 	}
 }
 

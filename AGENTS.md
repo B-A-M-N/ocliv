@@ -44,7 +44,7 @@ go build ./...
 go vet ./...
 gofmt -l internal/ tests/
 go test ./internal/... -count=1
-go test -count=1 -timeout 280s ./tests/integration/
+go test -count=1 -timeout 420s ./tests/integration/   # 280s is too tight: the green suite takes 331s
 go test -race ./internal/relay/ ./internal/agent/ ./internal/config/ ./internal/cli/ ./internal/mcp/
 ```
 
@@ -285,6 +285,83 @@ with its reason instead of silently dropping it.
 - Fix: `-h`/`--help` prints usage to stderr and exits `ExitCLIValidation` before store open (`cli_relay.go:477-484`). No other relay leaf changed (none has a help convention; widening that is out of scope).
 - Proof: new `cli_relay_enroll_test.go` asserts non-zero exit + no db created for both flags — FAILs on unfixed code (exit 0), PASSes fixed. `gofmt`/`go vet` clean, full `internal/cli` package green; then full `go test ./internal/...` re-run green (18/18) WITH the fix in tree, `gofmt -l` + `git diff --check` clean. Uncommitted, like the rest of this pass.
 - CLI surface completeness (SAPRE §6): VERIFIED — `ocliv mcp` dispatches expose/manage/publish/serve/doctor/list/unpublish + numeric-port alias (`cli_mcp.go:36-67`, alias `mcpPortAliasArgs :69`), every advertised subcommand maps to a real handler; expose-vs-publish is the local-only-vs-public security boundary, not a dead path. M12 closed toolset (`manageTools :34`: status/share/revoke only, no exec).
+
+### 2026-11-12 managed-authorization remediation + external qualification
+
+Scope: one focused remediation pass over the five review findings, then an
+external qualification against an isolated staging stack. The production Pi
+relay was NOT deployed to and NOT restarted.
+
+Dispositions (one per material finding; evidence in
+`docs/qualification/MANAGED-AUTHZ-RESULTS-2026-11-12.md`):
+
+- **Goal 1 — consent page, no URL credential: FIXED.** The reusable
+  `pairing_code` GET parameter is gone. The authorize endpoint renders a
+  route-scoped consent page; the credential is submitted by POST against a
+  one-time, expiring, transaction-bound challenge (`authz_consent`), and is
+  single-use. Live: no credential in the authorize URL, none in the page
+  (field name only), challenge replay → 400, consumed credential → 403, and
+  approval alone yields no code. `TestConsentPageNotURLCredential`,
+  `TestActiveGrantNeedsNoOclivParams`, `TestActiveGrantAloneNeverYieldsACode`.
+- **Goal 1 — "ordinary OAuth client needs no Ocliv-specific authorization
+  parameters": FIXED.** The authorize request carries only standard OAuth
+  parameters (client_id, redirect_uri, response_type, code_challenge,
+  code_challenge_method, state, resource); the credential travels on the
+  consent POST, never as an authorization parameter. Verified live (G4) and
+  by unit test.
+- **Goal 2 — client-level revocation: FIXED.** `AuthorizeClaims` refuses a
+  token whose client is revoked and `ServeToken` rechecks before issuing.
+  Live: a revoked client's existing token → 401, a revoked client cannot
+  redeem a never-redeemed code → 400 "client is not approved for this
+  route", other clients unaffected → 200. Failing-first tests
+  `TestRevokedClientCannotUseExistingToken`,
+  `TestRevokedClientCannotRedeemCode`.
+- **Goal 3 — JTI: FIXED.** Every newly issued managed token carries a jti and
+  a token without one is refused at managed admission. Revocation stays
+  scoped to (issuer, tenant, route). Live: jti present on every token,
+  RFC 7009 revoke → 200 then the token → 401 on the next request, an
+  unrelated client's token still 200, an invalid token → 200 (RFC 7009
+  §2.2). Tests `TestMissingJTITokenRejected`,
+  `TestTokenRevocationScopedToTenantAndRoute`.
+- **Goal 4 — runbook ordering: FIXED.**
+  `docs/qualification/MANAGED-AUTHZ-QUALIFICATION.md` §3.8 (publisher
+  restart) now runs BEFORE §3.9 (key rotation), and §3.9's token must be
+  minted fresh after §3.8; every gate states its required starting state.
+  Verified live: the route id survives the publisher restart, the
+  pre-restart token still works, and the rotation refuses the old token
+  immediately with no relay restart.
+- **Goal 5 — resource parameter: FIXED.** The canonical resource is required
+  on authorize and token and must equal the route exactly; the token
+  audience is bound to it. Live: foreign resource → 400 `invalid_target` on
+  both endpoints, missing resource → 400, `aud` = the route URL.
+- **F1 — `mcp publish --auth ocliv-managed` sent the CLI auth name as the
+  ingress profile: FIXED** (red: live `400 unknown ingress profile`).
+- **F2 — a managed publication was left unverified by the lease reclaim and
+  the route rebind, so a publisher restart left the route 404: FIXED**
+  (red: `TestManagedAuthzReclaimKeepsRouteServing` 404 → green; live P3/P4).
+- **F3 — the SQLStore test schema lagged the store schema: FIXED.**
+- **F4 — `TestMCPPortAliasArgs` demanded that publish accept
+  `fixture-anonymous`, contradicting the standing invariant: FIXED** (the
+  refusal is now the proof that an explicit `--auth` is preserved).
+- **Cross-key named-host reclaim (P0-2): FIXED.** Automatic reclaim is
+  reserved for the SAME agent key; a different key in the same tenant is
+  refused (the reclaim would otherwise hand one publisher another
+  publisher's route and its operator approvals).
+- **Verification flakiness: ACCEPTED RISK (watch).** `TestNoisyFailingChild`
+  (internal/mcp) failed once under `-race` and passed 3/3 on re-run; it is a
+  post-crash timing assertion, not a defect observed in the code.
+- **Integration gate timeout: FIXED.** The documented `-timeout 280s` failed
+  on a healthy 331 s suite; the cap is now 420 s.
+- **ChatGPT registration, permanent public ingress, ACME/Caddy edge,
+  production deployment of managed OAuth: NOT VERIFIED / operator-gated.**
+  The managed flow needs an operator-mediated consent and a single-use
+  credential per authorization, so an unattended client cannot complete it.
+- **External qualification: PASSED, 41/41 checks** against the isolated
+  staging stack (relay on loopback + self-signed tailnet edge + harmless
+  stdio upstream + staging DB). Production isolation proven: the Pi relay
+  still runs the 2026-11-11 binary (sha256 `0d47481f…`), health 200/200, and
+  `/var/lib/ocliv` is root-owned and unreadable to the staging operator.
+  Rollback is demonstrated (stop the staging units, remove the staging dirs).
 
 ### 2026-11-11 post-qualification hardening round (`bcaebd8` → working tree)
 

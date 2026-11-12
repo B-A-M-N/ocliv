@@ -282,7 +282,14 @@ func (s *Server) allocateEphemeral(tenantID, keyID string, intent LeaseIntent, n
 }
 
 // allocateNamed binds an owner-locked persistent subdomain (P1). A name
-// owned by another tenant is a conflict, never a takeover (D04).
+// owned by another tenant is a conflict, never a takeover (D04). A name
+// held by another AGENT KEY in the same tenant is also a conflict: the
+// reclaim path inherits the retired lease's publications and (for managed
+// routes) their operator approval state, so allowing a different key to
+// reclaim would hand one publisher another publisher's route. Automatic
+// reclaim is reserved for the SAME key that owns the hostname (the
+// publisher-restart case); a cross-key takeover requires an explicit,
+// audited ownership-transfer operation, which does not exist yet.
 func (s *Server) allocateNamed(tenantID, keyID string, intent LeaseIntent, now time.Time) (*lease.Lease, attachedMsg, error) {
 	label := strings.ToLower(intent.Name)
 	if err := lease.ValidateLabel(label); err != nil {
@@ -317,13 +324,25 @@ func (s *Server) insertLease(tenantID, keyID, label string, intent LeaseIntent, 
 		sharePrepared = true
 	}
 	var retiredID string
+	var reclaimDenied bool
 	err = withTx(s.db.SQL(), func(tx *sql.Tx) error {
 		if named != nil {
-			var owner, st, oldID string
-			err := tx.QueryRow(`SELECT tenant_id, status, id FROM leases WHERE hostname=?`, hostname).Scan(&owner, &st, &oldID)
+			var owner, ownerKey, st, oldID string
+			err := tx.QueryRow(`SELECT tenant_id, agent_key_id, status, id FROM leases WHERE hostname=?`, hostname).Scan(&owner, &ownerKey, &st, &oldID)
 			if err == nil {
 				if owner != tenantID {
 					return apperr.E(apperr.CodeConflict, "named host owned by another tenant", nil)
+				}
+				// Same tenant is not enough (P0-2): the reclaim rebinds
+				// the retired lease's publications — and for managed
+				// routes their operator approval state — to the new
+				// lease. Automatic reclaim is reserved for the SAME key
+				// that owns the hostname (the publisher-restart case).
+				// A different key must use an explicit ownership
+				// transfer, which does not exist, so it is refused here.
+				if ownerKey != keyID {
+					reclaimDenied = true
+					return apperr.E(apperr.CodeConflict, "named host is held by another agent key in this tenant", nil)
 				}
 				// Same owner: reclaim the name; old generations are fenced.
 				// The old lease id is captured so its live session and
@@ -371,9 +390,19 @@ func (s *Server) insertLease(tenantID, keyID, label string, intent LeaseIntent, 
 			// public route — but never its verification: the new
 			// upstream binding is unproven until re-verified (P0).
 			// Revoked publications keep their tombstone.
+			//
+			// EXCEPTION: a MANAGED publication has no upstream binding
+			// to prove — the relay is the Authorization Server. Clearing
+			// its verified_at would 404 the route forever, because there
+			// is no discovery verification to re-activate it. Its
+			// verification is the operator's grant, which survives the
+			// restart untouched, so it is preserved.
 			if _, err := tx.Exec(
-				`UPDATE mcp_publications SET lease_id=?, verified_at=NULL, updated_at=? WHERE lease_id=? AND revoked_at IS NULL`,
-				id, now.Format(time.RFC3339Nano), retiredID); err != nil {
+				`UPDATE mcp_publications SET lease_id=?,
+				   verified_at=CASE WHEN profile=? THEN verified_at ELSE NULL END,
+				   updated_at=?
+				 WHERE lease_id=? AND revoked_at IS NULL`,
+				id, ingressProfileManaged, now.Format(time.RFC3339Nano), retiredID); err != nil {
 				return err
 			}
 		}
@@ -385,6 +414,12 @@ func (s *Server) insertLease(tenantID, keyID, label string, intent LeaseIntent, 
 		return nil
 	})
 	if err != nil {
+		if reclaimDenied {
+			// Audited outside the transaction: the audit store shares the
+			// relay's single connection, which the transaction holds.
+			s.db.Audit("agent", tenantID, "", "lease_reclaim", "denied",
+				"named host held by a different agent key in this tenant")
+		}
 		if isUniqueConflict(err) {
 			return nil, attachedMsg{}, apperr.E(apperr.CodeConflict, "hostname already allocated", nil)
 		}
@@ -459,6 +494,17 @@ func (s *Server) reconcileBoot() error {
 	// refuses startup rather than serving on unknown durable state.
 	if _, err := s.db.PruneAuditEvents(now); err != nil {
 		return apperr.E(apperr.CodeStoreFault, "pruning audit events", err)
+	}
+	// Authorization-plane lifecycle (schemaV11): expired codes, consumed
+	// or expired consent challenges, and revocations past their retention
+	// window. Pruning cannot resurrect access — authority lives in
+	// grants and clients — and, like every other persistence failure
+	// here, a prune error refuses startup rather than serving on unknown
+	// durable state. Absent when the relay has no managed mode.
+	if s.authz != nil {
+		if err := s.authz.Store().PruneAuthzExpired(now); err != nil {
+			return apperr.E(apperr.CodeStoreFault, "pruning authorization state", err)
+		}
 	}
 	// Re-arm in-memory expiry for every row still waiting on a resume.
 	rows, err := s.db.SQL().Query(

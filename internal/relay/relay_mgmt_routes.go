@@ -352,10 +352,18 @@ func (s *Server) serveMCPRouteMutation(w http.ResponseWriter, r *http.Request, t
 					// re-proven ACTIVE and within TTL in the same
 					// statement, so a close/revoke racing the pre-check
 					// cannot bind a dead lease (P0-C).
+					//
+					// A MANAGED publication keeps its verification across the
+					// rebind: there is no upstream discovery to re-verify,
+					// so clearing verified_at would strand the route at 404.
 					oldBinding := boundLease.String
 					res, err := s.db.SQL().Exec(
-						`UPDATE mcp_publications SET lease_id=?, verified_at=NULL, updated_at=? WHERE route_id=? AND lease_id=? AND revoked_at IS NULL AND EXISTS(SELECT 1 FROM leases WHERE id=? AND status='ACTIVE' AND (expires_at IS NULL OR expires_at > ?))`,
-						leaseID, now, routeID, oldBinding, leaseID, now)
+						`UPDATE mcp_publications SET lease_id=?,
+						   verified_at=CASE WHEN profile=? THEN verified_at ELSE NULL END,
+						   updated_at=?
+						 WHERE route_id=? AND lease_id=? AND revoked_at IS NULL
+						   AND EXISTS(SELECT 1 FROM leases WHERE id=? AND status='ACTIVE' AND (expires_at IS NULL OR expires_at > ?))`,
+						leaseID, ingressProfileManaged, now, routeID, oldBinding, leaseID, now)
 					if err != nil {
 						http.Error(w, "internal error", http.StatusInternalServerError)
 						return

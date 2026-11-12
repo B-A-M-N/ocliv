@@ -12,6 +12,24 @@ import (
 	"time"
 )
 
+// Policy bounds for the managed authorization plane. They live beside the
+// store because both the durable store (pruning) and the HTTP handlers
+// (quotas) enforce them.
+const (
+	// DefaultPairingTTL bounds one pairing credential: it is single-use,
+	// and an unused one dies within this window.
+	DefaultPairingTTL = time.Hour
+	// DefaultRevocationRetention bounds how long token revocations are
+	// retained. It far exceeds any token lifetime, so pruning can never
+	// resurrect access.
+	DefaultRevocationRetention = 30 * 24 * time.Hour
+	// MaxClientsPerRoute bounds public dynamic registration per route.
+	MaxClientsPerRoute = 200
+	// MaxPendingConsentsPerRoute bounds outstanding (unconsumed,
+	// unexpired) consent challenges per route.
+	MaxPendingConsentsPerRoute = 100
+)
+
 // GrantStatus is the operator approval state of a client grant.
 type GrantStatus string
 
@@ -34,6 +52,11 @@ type Client struct {
 	RedirectURIs []string
 	CreatedAt    time.Time
 	RevokedAt    *time.Time
+	// Tenant + Route scope the registration to the route it was made
+	// through: the relay is a route-scoped Authorization Server, so a
+	// client_id minted for one route is not an identity on another.
+	Tenant string
+	Route  string
 }
 
 // Grant is an operator approval binding one client to one tenant + route.
@@ -41,8 +64,10 @@ type Client struct {
 // A public client_id is not a credential: anyone who learns it can start an
 // authorization flow. The approval therefore also issues a pairing secret
 // (stored only as a hash) that the client must present to obtain a code.
-// Losing the pairing secret is a full compromise of that grant, exactly as
-// losing a client secret would be.
+// The pairing secret is single-use and expires: each authorization
+// transaction consumes one credential, and an ACTIVE grant by itself never
+// mints a code. Losing the pairing secret is a compromise of that grant
+// until it expires or is rotated, exactly as losing a client secret would be.
 type Grant struct {
 	ClientID  string
 	Tenant    string
@@ -51,10 +76,16 @@ type Grant struct {
 	CreatedAt time.Time
 	UpdatedAt time.Time
 	// PairingHash is the hex SHA-256 of the pairing secret. Empty means no
-	// pairing secret has been issued, which for an ACTIVE grant is a
-	// fail-closed condition at authorize.
-	PairingHash     string
+	// pairing secret has been issued; consent then always fails closed.
+	PairingHash string
+	// PairingIssuedAt is when the current pairing secret was minted.
 	PairingIssuedAt time.Time
+	// PairingExpiresAt bounds the current pairing secret. Zero means no
+	// secret was ever issued.
+	PairingExpiresAt time.Time
+	// PairingConsumedAt is set once the secret has been used; a consumed
+	// secret never authorizes a second transaction.
+	PairingConsumedAt *time.Time
 }
 
 // Consent is a one-time, expiring, transaction-bound pairing challenge.
@@ -68,6 +99,7 @@ type Consent struct {
 	RedirectURI   string
 	CodeChallenge string
 	State         string
+	Resource      string
 	ExpiresAt     time.Time
 	ConsumedAt    *time.Time
 }
@@ -113,20 +145,41 @@ type Store interface {
 
 	CreateGrant(g Grant) error
 	GetGrant(clientID, tenant, route string) (*Grant, error)
+	// ApproveGrant flips a grant active. It never resurrects a revoked
+	// grant: a revocation is terminal until the grant row is deleted.
 	ApproveGrant(clientID, tenant, route string) error
+	// ApproveGrantWithPairingSecret atomically activates the grant AND
+	// issues the pairing secret: an approval that cannot persist its
+	// credential must not leave an ACTIVE grant that no consent can ever
+	// complete. It refuses a revoked grant.
+	ApproveGrantWithPairingSecret(clientID, tenant, route, secret string, ttl time.Duration) error
 	RevokeGrant(clientID, tenant, route string) error
 
 	// SetPairingSecret issues (or rotates) the pairing secret for a grant,
-	// storing only its hash. The plaintext is returned once to the operator.
-	SetPairingSecret(clientID, tenant, route, secret string) error
-	// CheckPairingSecret reports whether the secret matches the grant's
-	// stored hash, in constant time.
-	CheckPairingSecret(clientID, tenant, route, secret string) (bool, error)
+	// storing only its hash. The plaintext is returned once to the
+	// operator. ttl bounds the credential; the store stamps its expiry.
+	SetPairingSecret(clientID, tenant, route, secret string, ttl time.Duration) error
+	// ConsumePairingSecret atomically validates and burns a pairing secret:
+	// a secret authorizes exactly one consent transaction and is then
+	// dead. Expired or already-consumed secrets fail closed, and the
+	// check-and-burn happen in one step so a replay cannot race it.
+	ConsumePairingSecret(clientID, tenant, route, secret string) (bool, error)
 
 	// CreateConsent stores a one-time consent challenge.
 	CreateConsent(c Consent) error
 	// ConsumeConsent atomically marks a challenge consumed and returns it.
 	ConsumeConsent(challenge string) (*Consent, error)
+
+	// CountClients reports clients registered for a route.
+	CountClients(tenant, route string) (int, error)
+	// CountPendingConsents reports unconsumed, unexpired consent
+	// challenges for a route.
+	CountPendingConsents(tenant, route string) (int, error)
+	// PruneAuthzExpired deletes lifecycle-expired authorization rows:
+	// consumed or expired codes, consumed or expired challenges, and
+	// revocations past their retention window. Pruning can never
+	// resurrect access: authority lives in grants and clients.
+	PruneAuthzExpired(now time.Time) error
 
 	// RevokeToken durably revokes one token by its jti.
 	RevokeToken(jti, clientID, tenant, route string) error
@@ -149,7 +202,7 @@ type MemStore struct {
 	clients     map[string]*Client
 	grants      map[string]*Grant // key: clientID + "\x00" + tenant + "\x00" + route
 	codes       map[string]*Code
-	revocations map[string]bool
+	revocations map[string]time.Time // key: jti\x00tenant\x00route -> revokedAt
 	consent     map[string]*Consent
 	audit       []AuthzAudit
 }
@@ -263,9 +316,8 @@ func (m *MemStore) GetGrant(clientID, tenant, route string) (*Grant, error) {
 }
 
 // ApproveGrant flips a pending grant to active. If the client has not yet
-// initiated an authorize request for this route, the grant is created active
-// (the operator approval is the security boundary; a token still requires a
-// code exchange).
+// initiated an authorize request for this route, the grant is created active.
+// A revoked grant is never resurrected: approval is not un-revocation.
 func (m *MemStore) ApproveGrant(clientID, tenant, route string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -282,8 +334,48 @@ func (m *MemStore) ApproveGrant(clientID, tenant, route string) error {
 		}
 		return nil
 	}
+	if g.Status == GrantRevoked {
+		return fmt.Errorf("authz: grant for client %q route %q is revoked; revocation is terminal", clientID, route)
+	}
 	g.Status = GrantActive
 	g.UpdatedAt = time.Now()
+	return nil
+}
+
+// ApproveGrantWithPairingSecret atomically activates the grant and issues
+// the pairing credential. A failure at any step leaves the grant exactly as
+// it was: no ACTIVE grant without a usable credential, and no credential
+// for an unapproved grant.
+func (m *MemStore) ApproveGrantWithPairingSecret(clientID, tenant, route, secret string, ttl time.Duration) error {
+	if secret == "" {
+		return fmt.Errorf("authz: pairing secret is required")
+	}
+	if ttl <= 0 {
+		return fmt.Errorf("authz: pairing ttl must be positive")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := grantKey(clientID, tenant, route)
+	now := time.Now()
+	g, ok := m.grants[k]
+	if !ok {
+		g = &Grant{
+			ClientID: clientID,
+			Tenant:   tenant,
+			Route:    route,
+			Status:   GrantActive,
+		}
+		m.grants[k] = g
+	}
+	if g.Status == GrantRevoked {
+		return fmt.Errorf("authz: grant for client %q route %q is revoked; revocation is terminal", clientID, route)
+	}
+	g.Status = GrantActive
+	g.PairingHash = HashSecret(secret)
+	g.PairingIssuedAt = now
+	g.PairingExpiresAt = now.Add(ttl)
+	g.PairingConsumedAt = nil
+	g.UpdatedAt = now
 	return nil
 }
 
@@ -300,10 +392,15 @@ func (m *MemStore) RevokeGrant(clientID, tenant, route string) error {
 	return nil
 }
 
-// SetPairingSecret stores only the hash of the pairing secret.
-func (m *MemStore) SetPairingSecret(clientID, tenant, route, secret string) error {
+// SetPairingSecret issues (or rotates) the pairing secret for a grant,
+// storing only its hash, and stamps its expiry. Rotation clears any
+// previous consumption state so a fresh credential starts clean.
+func (m *MemStore) SetPairingSecret(clientID, tenant, route, secret string, ttl time.Duration) error {
 	if secret == "" {
 		return fmt.Errorf("authz: pairing secret is required")
+	}
+	if ttl <= 0 {
+		return fmt.Errorf("authz: pairing ttl must be positive")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -311,14 +408,19 @@ func (m *MemStore) SetPairingSecret(clientID, tenant, route, secret string) erro
 	if !ok {
 		return fmt.Errorf("authz: no grant for client %q route %q", clientID, route)
 	}
+	now := time.Now()
 	g.PairingHash = HashSecret(secret)
-	g.PairingIssuedAt = time.Now()
-	g.UpdatedAt = time.Now()
+	g.PairingIssuedAt = now
+	g.PairingExpiresAt = now.Add(ttl)
+	g.PairingConsumedAt = nil
+	g.UpdatedAt = now
 	return nil
 }
 
-// CheckPairingSecret compares in constant time.
-func (m *MemStore) CheckPairingSecret(clientID, tenant, route, secret string) (bool, error) {
+// ConsumePairingSecret validates and burns the secret in one step. A
+// missing, expired, consumed, or mismatched secret fails closed; only the
+// single correct use marks the credential consumed.
+func (m *MemStore) ConsumePairingSecret(clientID, tenant, route, secret string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	g, ok := m.grants[grantKey(clientID, tenant, route)]
@@ -328,7 +430,68 @@ func (m *MemStore) CheckPairingSecret(clientID, tenant, route, secret string) (b
 	if g.PairingHash == "" {
 		return false, nil
 	}
-	return hmac.Equal([]byte(g.PairingHash), []byte(HashSecret(secret))), nil
+	if g.PairingConsumedAt != nil {
+		return false, nil
+	}
+	if !g.PairingExpiresAt.IsZero() && time.Now().After(g.PairingExpiresAt) {
+		return false, nil
+	}
+	if !hmac.Equal([]byte(g.PairingHash), []byte(HashSecret(secret))) {
+		return false, nil
+	}
+	now := time.Now()
+	g.PairingConsumedAt = &now
+	return true, nil
+}
+
+// CountClients reports clients registered through one tenant + route.
+func (m *MemStore) CountClients(tenant, route string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, c := range m.clients {
+		if c.Tenant == tenant && c.Route == route {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// CountPendingConsents reports unconsumed, unexpired challenges for a route.
+func (m *MemStore) CountPendingConsents(tenant, route string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, c := range m.consent {
+		if c.Tenant == tenant && c.Route == route && c.ConsumedAt == nil && !c.Expired() {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// PruneAuthzExpired drops consumed/expired codes, consumed/expired
+// challenges, and revocations past DefaultRevocationRetention.
+func (m *MemStore) PruneAuthzExpired(now time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for code, c := range m.codes {
+		if c.ConsumedAt != nil || now.After(c.ExpiresAt) {
+			delete(m.codes, code)
+		}
+	}
+	for ch, c := range m.consent {
+		if c.ConsumedAt != nil || now.After(c.ExpiresAt) {
+			delete(m.consent, ch)
+		}
+	}
+	cutoff := now.Add(-DefaultRevocationRetention)
+	for key, at := range m.revocations {
+		if at.Before(cutoff) {
+			delete(m.revocations, key)
+		}
+	}
+	return nil
 }
 
 // RevokeToken durably revokes a token by jti.
@@ -339,9 +502,9 @@ func (m *MemStore) RevokeToken(jti, clientID, tenant, route string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.revocations == nil {
-		m.revocations = map[string]bool{}
+		m.revocations = map[string]time.Time{}
 	}
-	m.revocations[revocationKey(jti, tenant, route)] = true
+	m.revocations[revocationKey(jti, tenant, route)] = time.Now()
 	return nil
 }
 
@@ -349,7 +512,8 @@ func (m *MemStore) RevokeToken(jti, clientID, tenant, route string) error {
 func (m *MemStore) IsTokenRevoked(jti, tenant, route string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.revocations[revocationKey(jti, tenant, route)], nil
+	_, ok := m.revocations[revocationKey(jti, tenant, route)]
+	return ok, nil
 }
 
 func revocationKey(jti, tenant, route string) string {

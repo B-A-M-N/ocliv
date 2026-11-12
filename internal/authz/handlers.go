@@ -82,6 +82,7 @@ type consentPageData struct {
 	CodeChallenge string
 	State         string
 	Resource      string
+	ConsentURL    string
 }
 
 // renderConsent writes the operator consent screen. The pairing credential
@@ -100,7 +101,7 @@ var consentPageTemplate = template.Must(template.New("consent").Parse(`<!DOCTYPE
 <p>Client <code>{{.ClientID}}</code> is requesting access to this MCP route.</p>
 <p>Approve only if you intend to grant it. The pairing credential is the
 operator's approval; it is single-use and expires.</p>
-<form method="post" action="/oauth/consent">
+<form method="post" action="{{.ConsentURL}}">
 <input type="hidden" name="challenge" value="{{.Challenge}}">
 <input type="hidden" name="client_id" value="{{.ClientID}}">
 <input type="hidden" name="redirect_uri" value="{{.RedirectURI}}">
@@ -197,6 +198,20 @@ func (s *Server) ServeRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	// SSRF hardening: the relay never fetches client-supplied URLs. The
 	// metadata is stored for display/audit only.
+
+	// Bounded registration: public DCR writes durable rows, so a route may
+	// hold at most MaxClientsPerRoute clients. Revoked clients still count:
+	// their id reservation is permanent.
+	if n, err := s.Store.CountClients(s.tenant(), s.RouteID); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	} else if n >= MaxClientsPerRoute {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{
+			"error":             "invalid_client_metadata",
+			"error_description": "registration quota for this route is exhausted",
+		})
+		return
+	}
 	id, err := MintClientID()
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -207,6 +222,8 @@ func (s *Server) ServeRegister(w http.ResponseWriter, r *http.Request) {
 		Name:         req.ClientName,
 		RedirectURIs: append([]string(nil), req.RedirectURIs...),
 		CreatedAt:    time.Now(),
+		Tenant:       s.tenant(),
+		Route:        s.RouteID,
 	}); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_client_metadata", "error_description": err.Error()})
 		return
@@ -219,9 +236,13 @@ func (s *Server) ServeRegister(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ServeAuthorize starts the authorization code flow. A pending grant produces
-// no code; an active grant produces a single-use code; a revoked client is
-// rejected.
+// ServeAuthorize starts the authorization code flow. It NEVER issues a code
+// on its own: an ACTIVE grant is the operator's approval of the client, not
+// an authorization of this transaction. A public client_id plus redirect URI
+// is not an authentication credential — anyone can replay them — so every
+// fresh authorization renders the consent page, and only a completed consent
+// (the operator's single-use pairing credential against a one-time
+// challenge) mints a code. A revoked client is rejected outright.
 func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -265,6 +286,13 @@ func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "PKCE S256 required"})
 		return
 	}
+	// The challenge must be a well-formed S256 value (RFC 7636 §4.2: the
+	// base64url encoding of a 32-byte SHA-256 digest). Anything else is
+	// rejected here rather than stored for the token step to discover.
+	if err := ValidateCodeChallengeS256(challenge); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": err.Error()})
+		return
+	}
 	grant, err := s.Store.GetGrant(clientID, s.tenant(), s.RouteID)
 	if err != nil {
 		grant = nil
@@ -273,15 +301,15 @@ func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "access_denied", "error_description": "client revoked"})
 		return
 	}
-	// Already consented: the ordinary OAuth authorization-code flow, with no
-	// Ocliv-specific parameters.
-	if grant != nil && grant.Status == GrantActive {
-		s.issueCode(w, r, clientID, redirectURI, challenge, challengeMethod, state)
-		return
-	}
-	// Pending (or first contact): record the grant and render the consent
-	// page. The pairing credential is submitted by POST against a one-time,
-	// expiring, transaction-bound challenge — never placed in the URL.
+	// Approved AND consented: the ordinary OAuth authorization-code + PKCE
+	// flow, with no Ocliv-specific authorization parameter. The consent is
+	// the client's proof of possession of the pairing credential, recorded
+	// durably against the grant.
+	//
+	// There is deliberately no "already approved" branch. An ACTIVE grant
+	// authorizes nothing by itself: operator approval and transaction
+	// authorization are separate things (OAuth BCP guidance on client
+	// impersonation), so every authorization goes through consent.
 	if grant == nil {
 		if err := s.Store.CreateGrant(Grant{
 			ClientID:  clientID,
@@ -294,6 +322,18 @@ func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
 			return
 		}
+	}
+	// Bounded pending state: a caller who starts flows without completing
+	// them cannot fill the table. The cap is per route.
+	if n, err := s.Store.CountPendingConsents(s.tenant(), s.RouteID); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	} else if n >= MaxPendingConsentsPerRoute {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{
+			"error":             "invalid_request",
+			"error_description": "too many pending consent challenges for this route",
+		})
+		return
 	}
 	challengeID, err := MintChallenge()
 	if err != nil {
@@ -308,6 +348,7 @@ func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 		RedirectURI:   redirectURI,
 		CodeChallenge: challenge,
 		State:         state,
+		Resource:      resource,
 		ExpiresAt:     time.Now().Add(s.consentTTL()),
 	}); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -321,7 +362,16 @@ func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 		CodeChallenge: challenge,
 		State:         state,
 		Resource:      resource,
+		ConsentURL:    s.consentURL(),
 	})
+}
+
+// consentURL is the canonical, route-scoped endpoint the consent form posts
+// to: this route's AS issuer plus "/consent". A server-root path would not
+// be served by route dispatch, and a browser following the generated form
+// must land on exactly the endpoint that can complete this transaction.
+func (s *Server) consentURL() string {
+	return s.IssuerURL + "/consent"
 }
 
 // consentTTL bounds how long a pending consent challenge is valid.
@@ -333,6 +383,9 @@ func (s *Server) consentTTL() time.Duration {
 }
 
 // issueCode mints and returns an authorization code via the redirect URI.
+// The code, state, and the RFC 9207 issuer identifier are added through
+// url.Values so a redirect URI that already carries query parameters keeps
+// them: string concatenation would corrupt it.
 func (s *Server) issueCode(w http.ResponseWriter, r *http.Request, clientID, redirectURI, challenge, challengeMethod, state string) {
 	code, err := MintCode()
 	if err != nil {
@@ -352,11 +405,23 @@ func (s *Server) issueCode(w http.ResponseWriter, r *http.Request, clientID, red
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	redirect := fmt.Sprintf("%s?code=%s", redirectURI, url.QueryEscape(code))
-	if state != "" {
-		redirect += "&state=" + url.QueryEscape(state)
+	u, err := url.Parse(redirectURI)
+	if err != nil {
+		http.Error(w, "internal_request", http.StatusBadRequest)
+		return
 	}
-	w.Header().Set("Location", redirect)
+	params := u.Query()
+	params.Set("code", code)
+	if state != "" {
+		params.Set("state", state)
+	}
+	if s.IssuerURL != "" {
+		// RFC 9207: the authorization response names its issuer so a
+		// mixed-client redirect cannot be mistaken for another AS's.
+		params.Set("iss", s.IssuerURL)
+	}
+	u.RawQuery = params.Encode()
+	w.Header().Set("Location", u.String())
 	w.WriteHeader(http.StatusFound)
 }
 
@@ -393,7 +458,11 @@ func (s *Server) ServeConsent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cons.ClientID != clientID || cons.RedirectURI != redirectURI ||
-		cons.CodeChallenge != challenge || cons.State != state {
+		cons.CodeChallenge != challenge || cons.State != state ||
+		cons.Tenant != s.tenant() || cons.Route != s.RouteID ||
+		cons.Resource != resource {
+		s.Store.AuditAuthz("client", s.tenant(), s.RouteID, clientID, "consent", "denied",
+			"consent transaction mismatch")
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request",
 			"error_description": "consent transaction mismatch"})
 		return
@@ -404,14 +473,16 @@ func (s *Server) ServeConsent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	grant, err := s.Store.GetGrant(clientID, s.tenant(), s.RouteID)
-	if err != nil || grant.Status == GrantRevoked {
+	if err != nil || grant.Status != GrantActive {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "access_denied",
-			"error_description": "no pending approval for this client"})
+			"error_description": "no operator approval for this client"})
 		return
 	}
 	// The operator's pairing credential. Required: an approved client_id
-	// alone is not consent.
-	ok, err := s.Store.CheckPairingSecret(clientID, s.tenant(), s.RouteID, pairing)
+	// alone is not consent. It is single-use and expiring: consuming it
+	// burns it, so one credential authorizes exactly one consent
+	// transaction and a replay fails closed.
+	ok, err := s.Store.ConsumePairingSecret(clientID, s.tenant(), s.RouteID, pairing)
 	if err != nil || !ok {
 		writeJSON(w, http.StatusForbidden, map[string]string{
 			"error":             "access_denied",
@@ -419,8 +490,17 @@ func (s *Server) ServeConsent(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	// The completed consent transaction is the authorization itself: the
+	// operator's credential was presented and burned, the challenge was
+	// consumed, and every transaction field was rebound. Affirm the grant
+	// active and mint exactly one code.
+	s.Store.AuditAuthz("client", s.tenant(), s.RouteID, clientID, "consent", "ok",
+		"authorization completed through operator consent")
 	if err := s.Store.ApproveGrant(clientID, s.tenant(), s.RouteID); err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":             "access_denied",
+			"error_description": "operator approval unavailable",
+		})
 		return
 	}
 	s.issueCode(w, r, clientID, redirectURI, challenge, "S256", state)

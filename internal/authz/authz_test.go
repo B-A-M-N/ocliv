@@ -324,7 +324,7 @@ func TestAuthorizePendingThenActive(t *testing.T) {
 	// First authorize: pending, so a consent page, not a redirect.
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/oauth/authorize?response_type=code&client_id="+client+
-		"&redirect_uri=https%3A%2F%2Fclient.example%2Fcb&code_challenge="+CodeChallengeS256("verifier")+
+		"&redirect_uri=https%3A%2F%2Fclient.example%2Fcb&code_challenge="+CodeChallengeS256("0123456789abcdefghijklmnopqrstuvwxyzABCDEFG")+
 		"&code_challenge_method=S256&state=xyz&resource="+url.QueryEscape(s.RouteURL), nil)
 	s.ServeAuthorize(w, r)
 	if w.Code != http.StatusOK {
@@ -336,7 +336,7 @@ func TestAuthorizePendingThenActive(t *testing.T) {
 
 	// The operator approves and issues the pairing credential; consent is
 	// given by POST against the one-time challenge.
-	if err := store.SetPairingSecret(client, s.tenant(), s.RouteID, "pair-secret"); err != nil {
+	if err := store.ApproveGrantWithPairingSecret(client, s.tenant(), s.RouteID, "pair-secret", time.Hour); err != nil {
 		t.Fatalf("pairing secret: %v", err)
 	}
 	challenge := extractChallenge(t, w.Body.String())
@@ -344,7 +344,7 @@ func TestAuthorizePendingThenActive(t *testing.T) {
 	form.Set("challenge", challenge)
 	form.Set("client_id", client)
 	form.Set("redirect_uri", "https://client.example/cb")
-	form.Set("code_challenge", CodeChallengeS256("verifier"))
+	form.Set("code_challenge", CodeChallengeS256("0123456789abcdefghijklmnopqrstuvwxyzABCDEFG"))
 	form.Set("state", "xyz")
 	form.Set("resource", s.RouteURL)
 	form.Set("pairing_secret", "pair-secret")
@@ -378,7 +378,7 @@ func TestAuthorizeRejectsWrongResource(t *testing.T) {
 	client := register(t, s, "https://client.example/cb")
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/oauth/authorize?response_type=code&client_id="+client+
-		"&redirect_uri=https%3A%2F%2Fclient.example%2Fcb&code_challenge="+CodeChallengeS256("v")+
+		"&redirect_uri=https%3A%2F%2Fclient.example%2Fcb&code_challenge="+CodeChallengeS256("0123456789abcdefghijklmnopqrstuvwxyzABCDEFG")+
 		"&code_challenge_method=S256&resource=https%3A%2F%2Fother.test%2Fr%2Fx%2Fmcp", nil)
 	s.ServeAuthorize(w, r)
 	if w.Code != http.StatusBadRequest {
@@ -392,7 +392,7 @@ func TestTokenExchangeAndVerify(t *testing.T) {
 	if err := s.Store.CreateGrant(Grant{ClientID: client, Tenant: s.tenant(), Route: s.RouteID, Status: GrantActive}); err != nil {
 		t.Fatalf("grant: %v", err)
 	}
-	verifier := "verifier-string"
+	verifier := "v" + strings.Repeat("b", 42)
 	if err := s.Store.CreateCode(Code{
 		Code: "code1", ClientID: client, Tenant: s.tenant(), Route: s.RouteID,
 		RedirectURI: "https://client.example/cb", Challenge: CodeChallengeS256(verifier),

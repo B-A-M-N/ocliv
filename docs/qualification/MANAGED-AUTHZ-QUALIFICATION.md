@@ -121,11 +121,12 @@ curl -sS -o /dev/null -w '%{http_code}\n' -D - \
   "https://<fqdn>/r/<id>/oauth/authorize?client_id=<cid>&redirect_uri=http%3A%2F%2F127.0.0.1%3A59999%2Fcb&response_type=code&code_challenge=<S256>&code_challenge_method=S256&resource=https%3A%2F%2F<fqdn>%2Fr%2F<id>%2Fmcp"
 ```
 
-**Oracle:** `200` with an HTML **consent page** (a form posting to
-`/oauth/consent`). **No** `Location` header. **Fail-closed:** a `302` with
-a code before the operator consents means the publication boundary is not
-the gate. Confirm the page does **not** contain the pairing credential and
-that the credential appears nowhere in the request URL.
+**Oracle:** `200` with an HTML **consent page** whose form posts to the
+route-scoped `https://<fqdn>/r/<id>/oauth/consent` (the AS issuer for this
+route plus `/consent`). **No** `Location` header. **Fail-closed:** a `302`
+with a code before the operator consents means the publication boundary is
+not the gate. Confirm the page does **not** contain the pairing credential
+and that the credential appears nowhere in the request URL.
 
 ```sh
 # Relay host: the operator issues the pairing credential for the pending
@@ -139,7 +140,11 @@ ocliv authz approve --data /var/lib/ocliv --client <cid> \
 credential**, printed once.
 
 **Deliver the credential to the client operator over a private channel.**
-It is submitted in the consent form body, never in a URL.
+It is submitted in the consent form body, never in a URL. It is
+**single-use and expires after one hour**: it authorizes exactly one
+authorization transaction. A later authorization requires a fresh
+credential, so run `approve` again per transaction; previously issued
+tokens keep working.
 
 **Fail-closed:** approving without `--tenant`/`--route` is refused (an
 ambiguous approval is never guessed); approving a client with no pending
@@ -160,13 +165,16 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
   --data-urlencode 'pairing_secret=<credential>' \
   https://<fqdn>/r/<id>/oauth/consent
 
-# Exchange with PKCE. resource is required and must match the route.
+# Exchange with PKCE. resource is REQUIRED (MCP spec) and must match the
+# route exactly; the verifier must satisfy RFC 7636 (43-128 unreserved
+# characters). A short or malformed verifier is rejected.
 curl -fsS -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
   --data-urlencode 'grant_type=authorization_code' \
   --data-urlencode 'code=<code>' \
   --data-urlencode 'client_id=<cid>' \
   --data-urlencode 'redirect_uri=http://127.0.0.1:59999/cb' \
-  --data-urlencode 'code_verifier=<verifier>' \
+  --data-urlencode 'code_verifier=<43+ char verifier>' \
+  --data-urlencode 'resource=https://<fqdn>/r/<id>/mcp' \
   https://<fqdn>/r/<id>/oauth/token
 ```
 
@@ -195,12 +203,28 @@ executions.
 | N3 | Wrong audience | token minted for a *different* route | 401 |
 | N4 | Replayed code | exchange the same `code` twice | 400 `invalid_grant` |
 | N5 | Wrong PKCE | exchange with a mismatched `code_verifier` | 400 `invalid_grant` |
-| N6 | No pairing secret | authorize an approved client without `pairing_code` | 403 `access_denied`, no redirect |
-| N7 | Wrong pairing secret | authorize with a bad `pairing_code` | 403 `access_denied`, no redirect |
+| N6 | No pairing secret | complete the consent form with an EMPTY `pairing_secret` | 403 `access_denied`, no redirect |
+| N7 | Wrong pairing secret | complete the consent form with a bad credential | 403 `access_denied`, no redirect |
+| N8 | Approval alone | authorize an approved client with standard params only | 200 consent page, no redirect, zero upstream executions |
+| N9 | Replayed credential | re-run a completed authorization with the SAME pairing credential | 403 `access_denied` (the credential is single-use) |
+| N10 | Expired credential | complete the consent form with a credential past its 1-hour expiry | 403 `access_denied` |
+| N11 | Short PKCE verifier | token exchange with a verifier under 43 characters | 400 `invalid_grant` |
 
-**Status-code note.** N1–N3 and N6–N7 are authorization failures → 401/403.
-N4–N5 are **token-endpoint** errors → `400 invalid_grant` per RFC 6749 §5.2.
-Expecting 401 there would be wrong; the runbook previously did.
+**Consent mechanics (replaces the removed `pairing_code` GET flow).** The
+credential is NEVER an authorization-request parameter. The flow is:
+authorize (GET) → consent page with a one-time, expiring, transaction-bound
+challenge → operator approves on the relay host (`ocliv authz approve`,
+which mints ONE single-use credential per authorization) → the client
+POSTs `challenge`, `client_id`, `redirect_uri`, `code_challenge`,
+`state`, `resource`, and `pairing_secret` to the form's own action URL
+(`https://<fqdn>/r/<id>/oauth/consent`) → 302 with `code` (and `iss`).
+Each new authorization needs a fresh credential; existing tokens are
+unaffected by a consumed credential.
+
+**Status-code note.** N1–N3 and N6–N10 are authorization failures → 401/403.
+N4–N5 and N11 are **token-endpoint** errors → `400 invalid_grant` per RFC
+6749 §5.2. N8's 200 is the consent PAGE (not a code): authorization is
+per-transaction, so an approved client always passes through consent.
 
 **Fail-closed:** a wrong-audience token accepted anywhere means audience
 binding is not enforced per route.
@@ -252,6 +276,14 @@ unrevoked token minted **before** the restart. Do not reuse a token from
 `ocliv authz list` still shows exactly one `active` grant for T6.
 **Fail-closed:** a new route id, or a working token after an unapproved
 republish, means approval state is not bound to route identity.
+
+**Owner-key boundary (P0-2):** the reclaim is reserved for the SAME agent
+key that held the hostname. Publishing the same name with a DIFFERENT
+enrolled key in the same tenant must be REFUSED (conflict, no attach, the
+route keeps serving on the original lease, one denied audit row) — the
+reclaim path inherits the retired lease's publications and their operator
+approval state, so a cross-key takeover would hand one publisher another
+publisher's route.
 
 ### 3.9 Issuer key rotation
 
@@ -305,11 +337,11 @@ offline (`503`) and must not forward.
 | 2 | Route-scoped PRM/AS match the endpoint | | |
 | 3 | No-bearer denied, zero upstream hits | | |
 | 4 | Registration without approval issues no code | | |
-| 5 | Approval requires explicit tenant+route; issues one pairing credential | | |
-| 6 | Pending approval renders a consent page; no credential in the URL | | |
-| 7 | DCR → consent → PKCE+resource → token → authorized call | | |
-| 8 | Consented grant completes the standard flow with standard params only | | |
-| 9 | Negative paths N1–N7 (401/403/400 as specified), zero executions | | |
+| 5 | Approval requires explicit tenant+route; issues one single-use pairing credential | | |
+| 6 | Pending approval renders a consent page whose form action is the route-scoped consent URL; no credential in the URL | | |
+| 7 | DCR → consent (form's own action) → PKCE+resource → token → authorized call | | |
+| 8 | An ACTIVE grant alone issues NO code; a completed consent transaction does | | |
+| 9 | Negative paths N1–N11 (401/403/400 as specified), zero executions | | |
 | 10 | OAuth token revocation (RFC 7009) immediate; unrelated client unaffected | | |
 | 11 | Revoked client's existing token and previously issued code both refused | | |
 | 12 | Token without a jti is refused at admission | | |
@@ -317,6 +349,8 @@ offline (`503`) and must not forward.
 | 14 | Republish preserves route id + approval, same token still valid | | |
 | 15 | Incompatible mode change refused (409) | | |
 | 16 | Teardown stops serving | | |
+| 17 | Cross-key reclaim of a named host refused, audited, original lease keeps serving | | |
+| 18 | Registration and pending-consent quotas enforced (429 past the caps) | | |
 
 **Overall disposition:** PASS only if every row is PASS with recorded
 evidence. Any FAIL is a defect, not a qualification gap to be argued away.
@@ -333,6 +367,14 @@ evidence. Any FAIL is a defect, not a qualification gap to be argued away.
 
 ## 6. Known limits of this runbook
 
+- **No refresh tokens.** The token endpoint issues one-hour access tokens
+  only. The MCP authorization specification permits refresh tokens but does
+  not require servers to issue them, and this relay does not: when an access
+  token expires, the client must run another authorization flow — which,
+  under the per-transaction consent model, means a fresh operator pairing
+  credential (`ocliv authz approve` again). Long-lived unattended clients
+  need a re-authorization procedure; this is an operational limitation by
+  design, not a defect to argue away.
 - It does not prove the upstream's own behavior beyond receiving a
   relay-minted identity header. The upstream's use of that identity is
   out of scope (ADR §5: loopback is not isolation).

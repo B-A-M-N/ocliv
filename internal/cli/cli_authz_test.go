@@ -72,6 +72,22 @@ func TestAuthzCommandSetClosed(t *testing.T) {
 	}
 }
 
+// The ingress profile sent to the relay is the relay-facing name. For the
+// managed mode these differ, and sending the CLI name made route creation
+// fail closed with 400 "unknown ingress profile" on a live publish.
+func TestMCPIngressProfileMapping(t *testing.T) {
+	cases := map[string]string{
+		"upstream-oauth":    "upstream-oauth",
+		"fixture-anonymous": "fixture-anonymous",
+		"ocliv-managed":     "managed-oauth",
+	}
+	for auth, want := range cases {
+		if got := mcpIngressProfile(auth); got != want {
+			t.Errorf("mcpIngressProfile(%q) = %q, want %q", auth, got, want)
+		}
+	}
+}
+
 // stdio publication is accepted ONLY with relay-terminated managed
 // authorization: the adapter has no upstream OAuth to verify, so
 // upstream-oauth cannot be proven for it and fixture-anonymous must never

@@ -18,7 +18,9 @@ type SQLStore struct {
 // NewSQLStore wraps a database handle. The schemaV8 tables must exist.
 func NewSQLStore(db *sql.DB) *SQLStore { return &SQLStore{db: db} }
 
-// RegisterClient inserts a client. A duplicate id is rejected.
+// RegisterClient inserts a client. A duplicate id is rejected. The client
+// is scoped to the tenant + route it registered through: a public
+// registration is never a cross-route identity.
 func (s *SQLStore) RegisterClient(c Client) error {
 	if c.ID == "" {
 		return fmt.Errorf("authz: client id is required")
@@ -29,8 +31,8 @@ func (s *SQLStore) RegisterClient(c Client) error {
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err = s.db.Exec(
-		`INSERT INTO authz_clients(id, name, redirect_uris, created_at) VALUES(?,?,?,?)`,
-		c.ID, c.Name, string(uris), now)
+		`INSERT INTO authz_clients(id, name, redirect_uris, created_at, tenant_id, route_id) VALUES(?,?,?,?,?,?)`,
+		c.ID, c.Name, string(uris), now, c.Tenant, c.Route)
 	if err != nil {
 		return fmt.Errorf("authz: register client: %w", err)
 	}
@@ -63,6 +65,17 @@ func (s *SQLStore) GetClient(id string) (*Client, error) {
 		c.RevokedAt = &t
 	}
 	return &c, nil
+}
+
+// CountClients reports clients registered through one tenant + route.
+// Revoked clients still count: their id reservation is permanent.
+func (s *SQLStore) CountClients(tenant, route string) (int, error) {
+	var n int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(1) FROM authz_clients WHERE tenant_id=? AND route_id=?`, tenant, route).Scan(&n); err != nil {
+		return 0, fmt.Errorf("authz: count clients: %w", err)
+	}
+	return n, nil
 }
 
 // RevokeClient marks a client revoked. The row is retained so the id cannot
@@ -98,20 +111,22 @@ func (s *SQLStore) CreateGrant(g Grant) error {
 // GetGrant loads a grant.
 func (s *SQLStore) GetGrant(clientID, tenant, route string) (*Grant, error) {
 	var (
-		g             Grant
-		status        string
-		createdAt     string
-		updatedAt     string
-		pairingHash   string
-		pairingIssued string
+		g              Grant
+		status         string
+		createdAt      string
+		updatedAt      string
+		pairingHash    string
+		pairingIssued  string
+		pairingExpires string
+		pairingUsed    sql.NullString
 	)
 	err := s.db.QueryRow(
 		`SELECT client_id, tenant_id, route_id, status, created_at, updated_at,
-		        pairing_hash, pairing_issued_at
+		        pairing_hash, pairing_issued_at, pairing_expires_at, pairing_consumed_at
 		 FROM authz_grants WHERE client_id=? AND tenant_id=? AND route_id=?`,
 		clientID, tenant, route).
 		Scan(&g.ClientID, &g.Tenant, &g.Route, &status, &createdAt, &updatedAt,
-			&pairingHash, &pairingIssued)
+			&pairingHash, &pairingIssued, &pairingExpires, &pairingUsed)
 	if err != nil {
 		return nil, fmt.Errorf("authz: get grant: %w", err)
 	}
@@ -120,21 +135,33 @@ func (s *SQLStore) GetGrant(clientID, tenant, route string) (*Grant, error) {
 	g.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
 	g.PairingHash = pairingHash
 	g.PairingIssuedAt, _ = time.Parse(time.RFC3339Nano, pairingIssued)
+	g.PairingExpiresAt, _ = time.Parse(time.RFC3339Nano, pairingExpires)
+	if pairingUsed.Valid {
+		t, _ := time.Parse(time.RFC3339Nano, pairingUsed.String)
+		g.PairingConsumedAt = &t
+	}
 	return &g, nil
 }
 
-// SetPairingSecret stores only the hash of the pairing secret. It fails if
-// the grant does not exist: a silently-dropped secret would look like a
-// successful approval while the consent step can never succeed.
-func (s *SQLStore) SetPairingSecret(clientID, tenant, route, secret string) error {
+// SetPairingSecret stores only the hash of the pairing secret, stamps its
+// expiry, and clears any prior consumption so a rotated credential starts
+// clean. It fails if the grant does not exist: a silently-dropped secret
+// would look like a successful approval while the consent step can never
+// succeed.
+func (s *SQLStore) SetPairingSecret(clientID, tenant, route, secret string, ttl time.Duration) error {
 	if secret == "" {
 		return fmt.Errorf("authz: pairing secret is required")
 	}
+	if ttl <= 0 {
+		return fmt.Errorf("authz: pairing ttl must be positive")
+	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	expires := time.Now().UTC().Add(ttl).Format(time.RFC3339Nano)
 	res, err := s.db.Exec(
-		`UPDATE authz_grants SET pairing_hash=?, pairing_issued_at=?, updated_at=?
+		`UPDATE authz_grants SET pairing_hash=?, pairing_issued_at=?, pairing_expires_at=?,
+		 pairing_consumed_at=NULL, updated_at=?
 		 WHERE client_id=? AND tenant_id=? AND route_id=?`,
-		HashSecret(secret), now, now, clientID, tenant, route)
+		HashSecret(secret), now, expires, now, clientID, tenant, route)
 	if err != nil {
 		return fmt.Errorf("authz: set pairing secret: %w", err)
 	}
@@ -148,20 +175,48 @@ func (s *SQLStore) SetPairingSecret(clientID, tenant, route, secret string) erro
 	return nil
 }
 
-// CheckPairingSecret compares the presented secret against the stored hash
-// in constant time.
-func (s *SQLStore) CheckPairingSecret(clientID, tenant, route, secret string) (bool, error) {
-	var stored string
-	err := s.db.QueryRow(
-		`SELECT pairing_hash FROM authz_grants WHERE client_id=? AND tenant_id=? AND route_id=?`,
-		clientID, tenant, route).Scan(&stored)
+// ConsumePairingSecret atomically validates and burns the pairing secret:
+// read, expiry, consumption, and compare all happen in one transaction, so
+// a replay cannot race the single-use consumption. A wrong, expired, or
+// already-used secret fails closed without burning anything.
+func (s *SQLStore) ConsumePairingSecret(clientID, tenant, route, secret string) (bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, fmt.Errorf("authz: pairing tx: %w", err)
+	}
+	defer tx.Rollback()
+	var (
+		stored  string
+		expires string
+		used    sql.NullString
+	)
+	err = tx.QueryRow(
+		`SELECT pairing_hash, pairing_expires_at, pairing_consumed_at
+		 FROM authz_grants WHERE client_id=? AND tenant_id=? AND route_id=?`,
+		clientID, tenant, route).Scan(&stored, &expires, &used)
 	if err != nil {
 		return false, fmt.Errorf("authz: check pairing secret: %w", err)
 	}
-	if stored == "" {
+	if stored == "" || used.Valid {
 		return false, nil
 	}
-	return hmac.Equal([]byte(stored), []byte(HashSecret(secret))), nil
+	if exp, perr := time.Parse(time.RFC3339Nano, expires); perr == nil && time.Now().After(exp) {
+		return false, nil
+	}
+	if !hmac.Equal([]byte(stored), []byte(HashSecret(secret))) {
+		return false, nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := tx.Exec(
+		`UPDATE authz_grants SET pairing_consumed_at=?, updated_at=?
+		 WHERE client_id=? AND tenant_id=? AND route_id=?`,
+		now, now, clientID, tenant, route); err != nil {
+		return false, fmt.Errorf("authz: consume pairing secret: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("authz: pairing commit: %w", err)
+	}
+	return true, nil
 }
 
 // RevokeToken durably revokes one token by its jti.
@@ -190,17 +245,53 @@ func (s *SQLStore) IsTokenRevoked(jti, tenant, route string) (bool, error) {
 	return n > 0, nil
 }
 
-// CreateConsent stores a one-time consent challenge.
+// CreateConsent stores a one-time consent challenge, including the
+// canonical resource so the completion step can rebind every field of the
+// transaction.
 func (s *SQLStore) CreateConsent(c Consent) error {
 	if c.Challenge == "" {
 		return fmt.Errorf("authz: consent challenge is required")
 	}
 	if _, err := s.db.Exec(
 		`INSERT INTO authz_consent(challenge, client_id, tenant_id, route_id, redirect_uri,
-		   code_challenge, state, expires_at) VALUES(?,?,?,?,?,?,?,?)`,
+		   code_challenge, state, resource, expires_at) VALUES(?,?,?,?,?,?,?,?,?)`,
 		c.Challenge, c.ClientID, c.Tenant, c.Route, c.RedirectURI,
-		c.CodeChallenge, c.State, c.ExpiresAt.UTC().Format(time.RFC3339Nano)); err != nil {
+		c.CodeChallenge, c.State, c.Resource, c.ExpiresAt.UTC().Format(time.RFC3339Nano)); err != nil {
 		return fmt.Errorf("authz: create consent: %w", err)
+	}
+	return nil
+}
+
+// CountPendingConsents reports unconsumed, unexpired challenges for a route.
+func (s *SQLStore) CountPendingConsents(tenant, route string) (int, error) {
+	var n int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(1) FROM authz_consent
+		 WHERE tenant_id=? AND route_id=? AND consumed_at IS NULL AND expires_at > ?`,
+		tenant, route, time.Now().UTC().Format(time.RFC3339Nano)).Scan(&n); err != nil {
+		return 0, fmt.Errorf("authz: count consents: %w", err)
+	}
+	return n, nil
+}
+
+// PruneAuthzExpired deletes lifecycle-expired authorization rows. Codes and
+// challenges go once consumed or expired; revocations are retained for
+// DefaultRevocationRetention (far beyond any token lifetime) so a pruned
+// row can never resurrect access.
+func (s *SQLStore) PruneAuthzExpired(now time.Time) error {
+	nowStr := now.UTC().Format(time.RFC3339Nano)
+	revCutoff := now.UTC().Add(-DefaultRevocationRetention).Format(time.RFC3339Nano)
+	if _, err := s.db.Exec(
+		`DELETE FROM authz_codes WHERE consumed_at IS NOT NULL OR expires_at < ?`, nowStr); err != nil {
+		return fmt.Errorf("authz: prune codes: %w", err)
+	}
+	if _, err := s.db.Exec(
+		`DELETE FROM authz_consent WHERE consumed_at IS NOT NULL OR expires_at < ?`, nowStr); err != nil {
+		return fmt.Errorf("authz: prune consents: %w", err)
+	}
+	if _, err := s.db.Exec(
+		`DELETE FROM authz_revocations WHERE revoked_at < ?`, revCutoff); err != nil {
+		return fmt.Errorf("authz: prune revocations: %w", err)
 	}
 	return nil
 }
@@ -219,10 +310,10 @@ func (s *SQLStore) ConsumeConsent(challenge string) (*Consent, error) {
 	)
 	err = tx.QueryRow(
 		`SELECT challenge, client_id, tenant_id, route_id, redirect_uri, code_challenge,
-		        state, expires_at, consumed_at FROM authz_consent WHERE challenge=?`,
+		        state, resource, expires_at, consumed_at FROM authz_consent WHERE challenge=?`,
 		challenge).
 		Scan(&c.Challenge, &c.ClientID, &c.Tenant, &c.Route, &c.RedirectURI,
-			&c.CodeChallenge, &c.State, &expires, &consumed)
+			&c.CodeChallenge, &c.State, &c.Resource, &expires, &consumed)
 	if err != nil {
 		return nil, fmt.Errorf("authz: unknown consent challenge: %w", err)
 	}
@@ -285,18 +376,71 @@ func (s *SQLStore) ListAuthzAudit(limit int) ([]AuthzAudit, error) {
 }
 
 // ApproveGrant sets a grant active, creating it if the client has not yet
-// initiated an authorize request. The operator approval is the security
-// boundary; a token still requires a code exchange.
+// initiated an authorize request. A revoked grant is never resurrected:
+// the conditional upsert leaves a revoked row untouched, and a
+// zero-row-count result is reported as a refusal.
 func (s *SQLStore) ApproveGrant(clientID, tenant, route string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := s.db.Exec(
+	res, err := s.db.Exec(
 		`INSERT INTO authz_grants(client_id, tenant_id, route_id, status, created_at, updated_at)
 		 VALUES(?,?,?,?,?,?)
 		 ON CONFLICT(client_id, tenant_id, route_id)
-		 DO UPDATE SET status=?, updated_at=?`,
-		clientID, tenant, route, string(GrantActive), now, now, string(GrantActive), now)
+		 DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at
+		 WHERE authz_grants.status <> 'revoked'`,
+		clientID, tenant, route, string(GrantActive), now, now)
 	if err != nil {
 		return fmt.Errorf("authz: approve grant: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("authz: grant for client %q route %q is revoked; revocation is terminal", clientID, route)
+	}
+	return nil
+}
+
+// ApproveGrantWithPairingSecret activates the grant and issues the pairing
+// credential in ONE transaction. An approval whose credential cannot be
+// persisted must not leave an ACTIVE grant that no consent can complete,
+// and a revoked grant is refused.
+func (s *SQLStore) ApproveGrantWithPairingSecret(clientID, tenant, route, secret string, ttl time.Duration) error {
+	if secret == "" {
+		return fmt.Errorf("authz: pairing secret is required")
+	}
+	if ttl <= 0 {
+		return fmt.Errorf("authz: pairing ttl must be positive")
+	}
+	now := time.Now().UTC()
+	nowStr := now.Format(time.RFC3339Nano)
+	expires := now.Add(ttl).Format(time.RFC3339Nano)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("authz: approve tx: %w", err)
+	}
+	defer tx.Rollback()
+	var status string
+	err = tx.QueryRow(
+		`SELECT status FROM authz_grants WHERE client_id=? AND tenant_id=? AND route_id=?`,
+		clientID, tenant, route).Scan(&status)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("authz: approve grant: %w", err)
+	}
+	if err == nil && status == string(GrantRevoked) {
+		return fmt.Errorf("authz: grant for client %q route %q is revoked; revocation is terminal", clientID, route)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO authz_grants(client_id, tenant_id, route_id, status, created_at, updated_at,
+		   pairing_hash, pairing_issued_at, pairing_expires_at, pairing_consumed_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,NULL)
+		 ON CONFLICT(client_id, tenant_id, route_id)
+		 DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at,
+		   pairing_hash=excluded.pairing_hash, pairing_issued_at=excluded.pairing_issued_at,
+		   pairing_expires_at=excluded.pairing_expires_at, pairing_consumed_at=NULL
+		 WHERE authz_grants.status <> 'revoked'`,
+		clientID, tenant, route, string(GrantActive), nowStr, nowStr,
+		HashSecret(secret), nowStr, expires); err != nil {
+		return fmt.Errorf("authz: approve grant: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("authz: approve commit: %w", err)
 	}
 	return nil
 }

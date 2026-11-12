@@ -111,6 +111,17 @@ func isManagedAuthzPath(escapedPath string) bool {
 	return mcpOAuthEndpoints[escapedPath]
 }
 
+// managedAuthzKind names the public endpoint a request targeted, for rate
+// limiting. Discovery and jwks are not limited: they carry no write path.
+func managedAuthzKind(escapedPath string) (string, bool) {
+	for _, ep := range []string{"/oauth/register", "/oauth/authorize", "/oauth/consent", "/oauth/token", "/oauth/revoke"} {
+		if strings.HasSuffix(escapedPath, ep) {
+			return strings.TrimPrefix(ep, "/oauth/"), true
+		}
+	}
+	return "", false
+}
+
 // serveManagedAuthz serves a managed route's OAuth/metadata request locally.
 // It never forwards these paths to the upstream.
 func (s *Server) serveManagedAuthz(w http.ResponseWriter, r *http.Request, t *routeTarget, routeID string) {
@@ -124,6 +135,16 @@ func (s *Server) serveManagedAuthz(w http.ResponseWriter, r *http.Request, t *ro
 	if err != nil {
 		s.db.Audit("visitor", t.TenantID, t.LeaseID, "mcp_path", "denied", "authz issuer unavailable")
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	// Public endpoints are UNAUTHENTICATED by protocol (DCR, authorize,
+	// consent, token, revoke), so each one is rate limited per tenant +
+	// endpoint kind. A caller cannot drive unbounded durable writes
+	// (registrations, consent challenges, token attempts) against one
+	// route's state.
+	if kind, ok := managedAuthzKind(r.URL.EscapedPath()); ok && !s.throttle.Allow("authz:"+kind+":"+t.TenantID) {
+		s.db.Audit("visitor", t.TenantID, t.LeaseID, "mcp_path", "denied", "authz rate limited: "+kind)
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
 	switch {

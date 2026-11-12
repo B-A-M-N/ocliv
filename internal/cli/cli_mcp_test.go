@@ -183,8 +183,10 @@ func TestManageExposeValidation(t *testing.T) {
 	}
 }
 
-// P2-H: `ocliv mcp 3000` rewrites to the equivalent publish argv with
-// authentication pinned to upstream-oauth; non-ports stay errors.
+// P2-H: `ocliv mcp 3000` rewrites to the equivalent publish argv. The
+// bare alias defaults to the secure MANAGED mode (one-command publish for
+// a local MCP server with no native OAuth); an explicit --auth passes
+// through untouched; non-ports stay errors.
 func TestMCPPortAliasArgs(t *testing.T) {
 	pub, ok := mcpPortAliasArgs([]string{"3000", "--name", "mytools"})
 	if !ok {
@@ -194,8 +196,35 @@ func TestMCPPortAliasArgs(t *testing.T) {
 	if code != apperr.ExitOK {
 		t.Fatalf("alias argv rejected by publish parser: %v", pub)
 	}
-	if cfg.localURL != "http://127.0.0.1:3000/mcp" || cfg.auth != "upstream-oauth" || cfg.name != "mytools" {
+	if cfg.localURL != "http://127.0.0.1:3000/mcp" || cfg.auth != "ocliv-managed" || cfg.name != "mytools" {
 		t.Fatalf("alias misparsed: %+v", cfg)
+	}
+	// Explicit authentication selection is preserved verbatim.
+	//
+	// fixture-anonymous is the PROOF of preservation: an anonymous fixture
+	// must never back a public route, so publish refuses it (exit 2). If
+	// the alias had pinned --auth ocliv-managed the publish would have
+	// been accepted, and the refusal would be indistinguishable from a
+	// broken alias. The refusal therefore IS the assertion.
+	for _, auth := range []string{"upstream-oauth", "fixture-anonymous", "ocliv-managed"} {
+		pub2, ok := mcpPortAliasArgs([]string{"3000", "--auth", auth})
+		if !ok {
+			t.Fatalf("explicit-auth alias not recognized for %s", auth)
+		}
+		cfg2, code := parseMCPPublish(pub2, false)
+		want := apperr.ExitOK
+		if auth == "fixture-anonymous" {
+			want = apperr.ExitCLIValidation
+		}
+		if code != want {
+			t.Fatalf("explicit-auth alias argv %q rejected: %v, want %v", pub2, code, want)
+		}
+		if cfg2.auth != auth {
+			t.Fatalf("explicit --auth %s was not preserved: %+v", auth, cfg2)
+		}
+		if cfg2.auth != auth {
+			t.Fatalf("explicit auth %q overridden to %q", auth, cfg2.auth)
+		}
 	}
 	for _, bad := range [][]string{nil, {}, {"bogus"}, {"0"}, {"70000"}, {"--name"}} {
 		if _, ok := mcpPortAliasArgs(bad); ok {

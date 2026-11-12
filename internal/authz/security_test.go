@@ -61,7 +61,7 @@ func TestDenyByDefault(t *testing.T) {
 	// Authorize without approval: must not redirect with a code (a consent
 	// page is shown instead).
 	auth := doJSON(t, s, http.MethodGet, "/oauth/authorize?response_type=code&client_id="+client+
-		"&redirect_uri=https%3A%2F%2Fclient.example%2Fcb&code_challenge="+CodeChallengeS256("v")+
+		"&redirect_uri=https%3A%2F%2Fclient.example%2Fcb&code_challenge="+CodeChallengeS256("0123456789abcdefghijklmnopqrstuvwxyzABCDEFG")+
 		"&code_challenge_method=S256&resource="+url.QueryEscape(s.RouteURL), "")
 	if auth.Header().Get("Location") != "" {
 		t.Fatalf("unapproved authorize leaked a redirect (status %d)", auth.Code)
@@ -92,7 +92,7 @@ func TestApprovedClientReachesRoute(t *testing.T) {
 	if err := s.Store.ApproveGrant(client, s.tenant(), s.RouteID); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
-	verifier := "sec-verifier"
+	verifier := "v" + strings.Repeat("b", 42)
 	if err := s.Store.CreateCode(Code{
 		Code: "c1", ClientID: client, Tenant: s.tenant(), Route: s.RouteID,
 		RedirectURI: "https://client.example/cb", Challenge: CodeChallengeS256(verifier),
@@ -181,7 +181,7 @@ func TestClientRevocationBlocksNewTokens(t *testing.T) {
 		t.Fatalf("revoke client: %v", err)
 	}
 	auth := doJSON(t, s, http.MethodGet, "/oauth/authorize?response_type=code&client_id="+client+
-		"&redirect_uri=https%3A%2F%2Fclient.example%2Fcb&code_challenge="+CodeChallengeS256("v")+
+		"&redirect_uri=https%3A%2F%2Fclient.example%2Fcb&code_challenge="+CodeChallengeS256("0123456789abcdefghijklmnopqrstuvwxyzABCDEFG")+
 		"&code_challenge_method=S256", "")
 	if auth.Code == http.StatusFound {
 		t.Fatal("revoked client obtained a code")

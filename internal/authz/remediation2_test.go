@@ -30,7 +30,7 @@ func TestConsentPageNotURLCredential(t *testing.T) {
 	params.Set("client_id", clientID)
 	params.Set("redirect_uri", "http://127.0.0.1:59999/cb")
 	params.Set("response_type", "code")
-	params.Set("code_challenge", CodeChallengeS256("v"))
+	params.Set("code_challenge", CodeChallengeS256("0123456789abcdefghijklmnopqrstuvwxyzABCDEFG"))
 	params.Set("code_challenge_method", "S256")
 	params.Set("resource", s.RouteURL)
 	params.Set("state", "xyz")
@@ -47,8 +47,14 @@ func TestConsentPageNotURLCredential(t *testing.T) {
 		t.Fatal("pending authorize must not redirect")
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "/oauth/consent") {
-		t.Fatalf("consent page has no consent form: %q", body)
+	if !strings.Contains(body, `action="`+s.IssuerURL+`/consent"`) {
+		t.Fatalf("consent page has no route-scoped consent form: %q", body)
+	}
+	if !strings.Contains(body, `name="challenge"`) {
+		t.Fatalf("consent page carries no transaction challenge: %q", body)
+	}
+	if !strings.Contains(body, `name="pairing_secret"`) {
+		t.Fatalf("consent page carries no credential field: %q", body)
 	}
 	// The secret must not be accepted as a URL parameter.
 	req2 := httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+params.Encode()+"&pairing_code=anything", nil)
@@ -58,17 +64,19 @@ func TestConsentPageNotURLCredential(t *testing.T) {
 		t.Fatal("pairing_code in the URL must not authorize anything")
 	}
 
-	// Extract the challenge from the page and POST the secret.
+	// Extract the challenge from the page and POST the secret. The operator
+	// approval is transactional with the credential: an ACTIVE grant with
+	// no usable credential must never exist, so approve+issue is one step.
 	challenge := extractChallenge(t, body)
 	secret := "operator-secret"
-	if err := store.SetPairingSecret(clientID, "tenant-test", "r-test", secret); err != nil {
+	if err := store.ApproveGrantWithPairingSecret(clientID, "tenant-test", "r-test", secret, time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	form := url.Values{}
 	form.Set("challenge", challenge)
 	form.Set("client_id", clientID)
 	form.Set("redirect_uri", "http://127.0.0.1:59999/cb")
-	form.Set("code_challenge", CodeChallengeS256("v"))
+	form.Set("code_challenge", CodeChallengeS256("0123456789abcdefghijklmnopqrstuvwxyzABCDEFG"))
 	form.Set("code_challenge_method", "S256")
 	form.Set("resource", s.RouteURL)
 	form.Set("state", "xyz")
@@ -95,8 +103,10 @@ func TestConsentPageNotURLCredential(t *testing.T) {
 	}
 }
 
-// An already-consented (ACTIVE) grant must complete the normal OAuth flow
-// with NO Ocliv-specific parameters.
+// An authorized (ACTIVE) grant is served the consent page like any other
+// authorization: standard OAuth parameters are ACCEPTED, but approval alone
+// never completes a transaction. See TestActiveGrantAloneNeverYieldsACode
+// for the security counterpart.
 func TestActiveGrantNeedsNoOclivParams(t *testing.T) {
 	s, _, store := newTestServer(t)
 	clientID := "client-normal"
@@ -110,22 +120,68 @@ func TestActiveGrantNeedsNoOclivParams(t *testing.T) {
 	}
 	// Standard authorization request only: client_id, redirect_uri,
 	// response_type, code_challenge, code_challenge_method, state, resource.
+	// No Ocliv-specific authorization parameter is sent, and none is
+	// required: an ordinary OAuth client drives the request.
 	q := url.Values{}
 	q.Set("client_id", clientID)
 	q.Set("redirect_uri", "http://127.0.0.1:59999/cb")
 	q.Set("response_type", "code")
-	q.Set("code_challenge", CodeChallengeS256("v"))
+	q.Set("code_challenge", CodeChallengeS256("0123456789abcdefghijklmnopqrstuvwxyzABCDEFG"))
 	q.Set("code_challenge_method", "S256")
 	q.Set("resource", s.RouteURL)
 	q.Set("state", "s")
 	req := httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+q.Encode(), nil)
 	rec := httptest.NewRecorder()
 	s.ServeAuthorize(rec, req)
-	if rec.Code != http.StatusFound {
-		t.Fatalf("ordinary OAuth authorize status=%d, want 302", rec.Code)
+	// The request is accepted and served the consent page. It is NOT
+	// rejected for a missing Ocliv parameter, and it never yields a code
+	// on its own: an approved client_id is not proof of consent.
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ordinary OAuth authorize status=%d, want 200 consent page", rec.Code)
 	}
-	if !strings.HasPrefix(rec.Header().Get("Location"), "http://127.0.0.1:59999/cb?code=") {
-		t.Fatalf("redirect=%q", rec.Header().Get("Location"))
+	if rec.Header().Get("Location") != "" {
+		t.Fatalf("authorize redirected without consent: %q", rec.Header().Get("Location"))
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `name="challenge"`) {
+		t.Fatalf("consent page carries no transaction challenge: %q", body)
+	}
+}
+
+// TestActiveGrantAloneNeverYieldsACode is the security counterpart of
+// TestActiveGrantNeedsNoOclivParams: the operator's APPROVAL is not
+// consent. An approved public client_id must not, by itself, produce an
+// authorization code — otherwise anyone who learns a client_id can run
+// their own PKCE flow and inherit the operator's approval.
+//
+// Failing-first: before the consent model this returned 302 with a code.
+func TestActiveGrantAloneNeverYieldsACode(t *testing.T) {
+	s, _, store := newTestServer(t)
+	clientID := "client-approved-not-consented"
+	if err := store.RegisterClient(Client{ID: clientID, Name: "c",
+		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateGrant(Grant{ClientID: clientID, Tenant: "tenant-test", Route: "r-test",
+		Status: GrantActive, CreatedAt: time.Now(), UpdatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	q := url.Values{}
+	q.Set("client_id", clientID)
+	q.Set("redirect_uri", "http://127.0.0.1:59999/cb")
+	q.Set("response_type", "code")
+	q.Set("code_challenge", CodeChallengeS256("0123456789abcdefghijklmnopqrstuvwxyzABCDEFG"))
+	q.Set("code_challenge_method", "S256")
+	q.Set("resource", s.RouteURL)
+	q.Set("state", "s")
+	req := httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	s.ServeAuthorize(rec, req)
+	if rec.Header().Get("Location") != "" {
+		t.Fatalf("an approved but unconsented client obtained a code: %q", rec.Header().Get("Location"))
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("authorize status=%d, want 200 consent page", rec.Code)
 	}
 }
 
@@ -179,7 +235,7 @@ func TestRevokedClientCannotRedeemCode(t *testing.T) {
 	code := "code-to-redeem"
 	if err := store.CreateCode(Code{Code: code, ClientID: clientID, Tenant: "tenant-test",
 		Route: "r-test", RedirectURI: "http://127.0.0.1:59999/cb",
-		Challenge: CodeChallengeS256("v"), ChallengeMethod: "S256",
+		Challenge: CodeChallengeS256("0123456789abcdefghijklmnopqrstuvwxyzABCDEFG"), ChallengeMethod: "S256",
 		ExpiresAt: time.Now().Add(5 * time.Minute)}); err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +247,7 @@ func TestRevokedClientCannotRedeemCode(t *testing.T) {
 	form.Set("code", code)
 	form.Set("client_id", clientID)
 	form.Set("redirect_uri", "http://127.0.0.1:59999/cb")
-	form.Set("code_verifier", "v")
+	form.Set("code_verifier", "0123456789abcdefghijklmnopqrstuvwxyzABCDEFG")
 	form.Set("resource", s.RouteURL)
 	req := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -267,7 +323,7 @@ func TestResourceParameterMustMatchRoute(t *testing.T) {
 		q.Set("client_id", clientID)
 		q.Set("redirect_uri", "http://127.0.0.1:59999/cb")
 		q.Set("response_type", "code")
-		q.Set("code_challenge", CodeChallengeS256("v"))
+		q.Set("code_challenge", CodeChallengeS256("0123456789abcdefghijklmnopqrstuvwxyzABCDEFG"))
 		q.Set("code_challenge_method", "S256")
 		if resource != "" {
 			q.Set("resource", resource)
@@ -282,11 +338,15 @@ func TestResourceParameterMustMatchRoute(t *testing.T) {
 	if code := authorize(""); code == http.StatusFound {
 		t.Fatal("authorize without resource was allowed")
 	}
-	if code := authorize("https://evil.example/r/x/mcp"); code == http.StatusFound {
-		t.Fatal("authorize with a foreign resource was allowed")
+	if code := authorize("https://evil.example/r/x/mcp"); code != http.StatusBadRequest {
+		t.Fatalf("authorize with a foreign resource = %d, want 400 invalid_target", code)
 	}
-	if code := authorize(s.RouteURL); code != http.StatusFound {
-		t.Fatalf("authorize with the canonical resource = %d, want 302", code)
+	// The canonical resource is ACCEPTED. Every authorization goes through
+	// the consent page, so the success status is the consent page (200),
+	// not a redirect: the authorize request must carry only standard
+	// OAuth parameters.
+	if code := authorize(s.RouteURL); code != http.StatusOK {
+		t.Fatalf("authorize with the canonical resource = %d, want 200 consent page", code)
 	}
 }
 

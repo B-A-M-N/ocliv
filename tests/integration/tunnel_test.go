@@ -289,8 +289,12 @@ func TestNamedReclaimCutsOverTraffic(t *testing.T) {
 		t.Fatalf("pre-reclaim app1 visitor hits=%d", got)
 	}
 
-	// Same tenant, new key, new destination, same hostname.
-	k2, kid2 := h.enrollKey(t, "tenant-test")
+	// Same tenant, SAME owner key, fresh data dir (so it cannot resume),
+	// new destination, same hostname: this is the publisher-restart
+	// reclaim. Automatic reclaim is reserved for the owning key (P0-2);
+	// the cross-key case is covered by
+	// TestNamedReclaimCrossKeyRefused.
+	k2, kid2 := h.agentKey, h.keyID
 	dir2, err := os.MkdirTemp("", "ocliv-agent-2-*")
 	if err != nil {
 		t.Fatal(err)
@@ -348,6 +352,114 @@ func TestNamedReclaimCutsOverTraffic(t *testing.T) {
 	}
 	if n != 0 {
 		t.Fatal("old lease row survives reclamation")
+	}
+}
+
+// TestNamedReclaimCrossKeyRefused (P0-2): a DIFFERENT agent key in the
+// SAME tenant must not reclaim a named hostname held by another key. The
+// reclaim rebinds the retired lease's publications (and, for managed
+// routes, their operator approval state), so a cross-key takeover would
+// hand one publisher another publisher's route. Automatic reclaim is
+// reserved for the owning key; the denial is audited and the original
+// lease keeps serving.
+func TestNamedReclaimCrossKeyRefused(t *testing.T) {
+	app1 := startLocalApp(t)
+	defer app1.srv.Close()
+	h := newHarness(t)
+	defer h.db.Close()
+	defer h.relaySrv.Close()
+	h.startAgentOpts(t, app1.Port, config.Agent{Name: "xkey"})
+	cookie1 := redeem(t, h)
+	oldID := h.attached.LeaseID
+
+	// A second key enrolled in the SAME tenant.
+	k2, kid2 := h.enrollKey(t, "tenant-test")
+	dir2, err := os.MkdirTemp("", "ocliv-agent-xkey-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	rn := &agent.Runner{
+		Cfg:                config.Agent{RelayURL: h.relaySrv.URL, Port: app1.Port, DataDir: dir2, Name: "xkey"},
+		Key:                k2,
+		KeyID:              kid2,
+		Target:             fmt.Sprintf("127.0.0.1:%d", app1.Port),
+		HandshakeTransport: h.handshakeTransport(),
+	}
+	attached2 := make(chan agent.Attached, 4)
+	rn.OnAttach = func(a agent.Attached) { attached2 <- a }
+	go func() { _ = rn.Run(ctx2) }()
+	select {
+	case <-attached2:
+		t.Fatal("a foreign key in the same tenant reclaimed the named hostname")
+	case <-time.After(6 * time.Second):
+		// Expected: the reclaim is refused, so no attach happens.
+	}
+
+	// The original lease still owns the hostname and keeps serving.
+	resp := h.visitorReq(t, "GET", "/", nil, authedHeaders(cookie1))
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("original hostname stopped serving after the refused reclaim: %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	var n int
+	if err := h.db.SQL().QueryRow(`SELECT COUNT(*) FROM leases WHERE id=?`, oldID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatal("the original lease row was disturbed by the refused reclaim")
+	}
+	// The denial is audited (category/result, not action).
+	var denied int
+	if err := h.db.SQL().QueryRow(
+		`SELECT COUNT(1) FROM audit_events WHERE category='lease_reclaim' AND result='denied'`).Scan(&denied); err != nil {
+		t.Fatal(err)
+	}
+	if denied < 1 {
+		t.Fatal("cross-key reclaim denial left no audit row")
+	}
+}
+
+// TestMgmtCrossKeySameTenantRefused pins the management-plane boundary the
+// reclaim path was missing (P0-2's basis): a real, enrolled key in the
+// SAME tenant may not mutate another key's lease or create routes on it.
+// The signature verifies, the tenant matches, and the call is still
+// refused because the lease's agent_key_id differs.
+func TestMgmtCrossKeySameTenantRefused(t *testing.T) {
+	app := startLocalApp(t)
+	defer app.srv.Close()
+	h := newHarness(t)
+	defer h.db.Close()
+	defer h.relaySrv.Close()
+	h.startAgent(t, app.Port)
+
+	// A second key, really enrolled, in the SAME tenant.
+	k2, kid2 := h.enrollKey(t, "tenant-test")
+
+	// Mutations on the owner's lease: refused on the key boundary.
+	for _, action := range []string{"revoke", "rotate", "close", "share"} {
+		if code, _ := h.mgmt(t, k2, kid2, "POST", action); code != http.StatusForbidden {
+			t.Fatalf("same-tenant foreign key mgmt %s: want 403 got %d", action, code)
+		}
+	}
+	// Route creation on the owner's lease: refused on the key boundary.
+	if code, raw := h.mgmt(t, k2, kid2, "POST", "mcp-route/managed-oauth"); code != http.StatusForbidden {
+		t.Fatalf("same-tenant foreign key route create: want 403 got %d (%s)", code, raw)
+	}
+	// The owner's own lease is untouched by the refusals.
+	if code, _ := h.mgmt(t, h.agentKey, h.keyID, "GET", "status"); code != http.StatusOK {
+		t.Fatalf("owner status after refusals: want 200 got %d", code)
+	}
+	// The denials are audited.
+	var denied int
+	if err := h.db.SQL().QueryRow(
+		`SELECT COUNT(1) FROM audit_events WHERE actor='agent' AND result='denied'`).Scan(&denied); err != nil {
+		t.Fatal(err)
+	}
+	if denied < 1 {
+		t.Fatal("cross-key management denials left no audit rows")
 	}
 }
 

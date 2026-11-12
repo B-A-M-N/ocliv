@@ -492,6 +492,13 @@ func publishLocalProbeOK(out mcpProbeOutcome, auth string) bool {
 	return out.Verified || (out.Auth == "AUTH_REQUIRED" && auth == "upstream-oauth")
 }
 
+// mcpIngressProfile maps the CLI-facing --auth value to the relay-facing
+// ingress profile. They differ only for the managed mode, which is exactly
+// why a live publish is the only reliable test of this mapping.
+func mcpIngressProfile(auth string) string {
+	return mcpAuthProfiles[auth]
+}
+
 // mcpAccessMode maps the --auth profile to the lease access mode born
 // at allocation (P1). The strings duplicate relay constants by design:
 // the CLI submits its intent and the relay validates it authoritatively.
@@ -916,7 +923,11 @@ func runMCPPublish(argv []string, serve bool) int {
 	// printed endpoint is live, never speculative.
 	var routeID, routeURL, routeLeaseID string
 	if !serve {
-		profile := cfg.auth
+		// The route's ingress profile is the relay-facing name, not the
+		// CLI-facing --auth value: `ocliv-managed` maps to `managed-oauth`.
+		// The other two names happen to coincide, which is why this only
+		// broke for the managed mode.
+		profile := mcpIngressProfile(cfg.auth)
 		// The route is owned by the lease that exists at registration
 		// time; runSteadyState may re-assign a to a newer attachment, so
 		// the DELETE below must use this ID, not the updated a.LeaseID.

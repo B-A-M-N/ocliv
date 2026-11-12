@@ -221,16 +221,15 @@ func cmdAuthzApprove(argv []string) int {
 		fmt.Fprintf(os.Stderr, "client %s is revoked for tenant=%s route=%s; delete the grant first\n", client, tenant, route)
 		return apperr.ExitCLIValidation
 	}
-	if err := st.ApproveGrant(client, tenant, route); err != nil {
-		fmt.Fprintln(os.Stderr, "error: "+err.Error())
-		return apperr.ExitInternal
-	}
 	secret, err := authz.MintPairingSecret()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return apperr.ExitInternal
 	}
-	if err := st.SetPairingSecret(client, tenant, route, secret); err != nil {
+	// Activation and credential issuance are ONE step: an approval that
+	// cannot persist its credential must not leave an ACTIVE grant that no
+	// consent can ever complete.
+	if err := st.ApproveGrantWithPairingSecret(client, tenant, route, secret, authz.DefaultPairingTTL); err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return apperr.ExitInternal
 	}
@@ -238,7 +237,9 @@ func cmdAuthzApprove(argv []string) int {
 	fmt.Printf("approved client %s for tenant=%s route=%s\n", client, tenant, route)
 	fmt.Println("Pairing secret (show once; deliver it to the client operator over a private channel):")
 	fmt.Println(secret)
-	fmt.Println("The client must present it as pairing_code on the authorization request.")
+	fmt.Println("The client must present it in the consent form (pairing_secret) when the")
+	fmt.Println("authorization page is shown. It is single-use and expires; run this command")
+	fmt.Println("again to authorize another authorization flow.")
 	return apperr.ExitOK
 }
 

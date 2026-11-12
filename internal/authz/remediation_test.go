@@ -28,10 +28,10 @@ func TestServeRevokeInvalidatesToken(t *testing.T) {
 		}
 	}
 	secretA, secretB := "secret-a", "secret-b"
-	if err := store.SetPairingSecret(clientA, "tenant-test", "r-test", secretA); err != nil {
+	if err := store.ApproveGrantWithPairingSecret(clientA, "tenant-test", "r-test", secretA, time.Hour); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.SetPairingSecret(clientB, "tenant-test", "r-test", secretB); err != nil {
+	if err := store.ApproveGrantWithPairingSecret(clientB, "tenant-test", "r-test", secretB, time.Hour); err != nil {
 		t.Fatal(err)
 	}
 

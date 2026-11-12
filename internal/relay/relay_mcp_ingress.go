@@ -92,15 +92,25 @@ const (
 	IngressMCPManaged
 )
 
+// Ingress profile names as stored in mcp_publications.profile. The managed
+// profile is special: the relay IS the Authorization Server, so there is no
+// upstream discovery to verify and no re-verification to wait for. Every
+// place that clears verified_at must preserve it for managed rows.
+const (
+	ingressProfileUpstreamOAuth    = "upstream-oauth"
+	ingressProfileAnonymousFixture = "fixture-anonymous"
+	ingressProfileManaged          = "managed-oauth"
+)
+
 // parseIngressProfile maps the stored profile string to its typed policy.
 // Unknown values fail closed: a misconfigured row admits nothing.
 func parseIngressProfile(s string) (IngressProfile, bool) {
 	switch s {
-	case "upstream-oauth":
+	case ingressProfileUpstreamOAuth:
 		return IngressMCPUpstreamOAuth, true
-	case "fixture-anonymous":
+	case ingressProfileAnonymousFixture:
 		return IngressMCPAnonymousFixture, true
-	case "managed-oauth":
+	case ingressProfileManaged:
 		return IngressMCPManaged, true
 	default:
 		return IngressInvalid, false
@@ -111,11 +121,11 @@ func parseIngressProfile(s string) (IngressProfile, bool) {
 func profileString(p IngressProfile) (string, bool) {
 	switch p {
 	case IngressMCPUpstreamOAuth:
-		return "upstream-oauth", true
+		return ingressProfileUpstreamOAuth, true
 	case IngressMCPAnonymousFixture:
-		return "fixture-anonymous", true
+		return ingressProfileAnonymousFixture, true
 	case IngressMCPManaged:
-		return "managed-oauth", true
+		return ingressProfileManaged, true
 	default:
 		return "", false
 	}

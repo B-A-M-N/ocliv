@@ -203,16 +203,66 @@ func CodeChallengeS256(verifier string) string {
 
 // VerifyPKCE reports whether the stored challenge matches the presented
 // verifier using the S256 method. A plain (unsalted) challenge is never
-// accepted: only "S256" is supported.
+// accepted: only "S256" is supported. Both values are validated against
+// RFC 7636 syntax before comparison, so a truncated or malformed verifier
+// fails here instead of passing a weakened check.
 func VerifyPKCE(method, challenge, verifier string) error {
 	if method != "S256" {
 		return fmt.Errorf("authz: unsupported code challenge method %q (only S256)", method)
 	}
-	if challenge == "" || verifier == "" {
-		return fmt.Errorf("authz: missing code challenge or verifier")
+	if err := ValidateCodeVerifier(verifier); err != nil {
+		return err
+	}
+	if err := ValidateCodeChallengeS256(challenge); err != nil {
+		return err
 	}
 	if CodeChallengeS256(verifier) != challenge {
 		return fmt.Errorf("authz: PKCE verification failed")
+	}
+	return nil
+}
+
+// RFC 7636 §4.1 bounds: the verifier is 43-128 characters from the
+// unreserved set.
+const (
+	pkceVerifierMinLen = 43
+	pkceVerifierMaxLen = 128
+)
+
+// validPKCEUnreserved reports whether r is in the RFC 7636 unreserved set
+// (ALPHA / DIGIT / "-" / "." / "_" / "~").
+func validPKCEUnreserved(r rune) bool {
+	return (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') ||
+		r == '-' || r == '.' || r == '_' || r == '~'
+}
+
+// ValidateCodeVerifier enforces the RFC 7636 §4.1 verifier grammar. A
+// one-character or otherwise non-conforming verifier is rejected rather
+// than hashed into a weak comparison.
+func ValidateCodeVerifier(verifier string) error {
+	if len(verifier) < pkceVerifierMinLen || len(verifier) > pkceVerifierMaxLen {
+		return fmt.Errorf("authz: code verifier must be %d-%d characters", pkceVerifierMinLen, pkceVerifierMaxLen)
+	}
+	for _, r := range verifier {
+		if !validPKCEUnreserved(r) {
+			return fmt.Errorf("authz: code verifier contains an invalid character")
+		}
+	}
+	return nil
+}
+
+// ValidateCodeChallengeS256 enforces the RFC 7636 §4.2 challenge grammar:
+// the unpadded base64url encoding of exactly 32 bytes (a SHA-256 digest).
+func ValidateCodeChallengeS256(challenge string) error {
+	if len(challenge) != 43 {
+		return fmt.Errorf("authz: S256 code challenge must be 43 base64url characters")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(challenge)
+	if err != nil {
+		return fmt.Errorf("authz: S256 code challenge is not valid base64url")
+	}
+	if len(raw) != 32 {
+		return fmt.Errorf("authz: S256 code challenge must encode a 32-byte digest")
 	}
 	return nil
 }
