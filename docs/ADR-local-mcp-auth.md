@@ -1,163 +1,261 @@
-# ADR: Authenticating local MCP servers that lack native OAuth
+# ADR: Authorization for local MCP services
 
 - Status: Proposed — design only, no implementation
-- Date: 2026-11-11
-- Scope: how to publish local MCP servers (e.g. `/opt/ir-controller`) that
-  have no native OAuth discovery, without weakening Ocliv's strict upstream
-  OAuth verification.
+- Date: 2026-11-11 (revised; supersedes the first revision of this file)
+- Scope: publishing **local MCP servers that have no native OAuth** without
+  adding a mandatory external identity provider, reverse proxy, OAuth server,
+  or per-service adapter — and keeping the endpoint free and persistent.
 
-## Context
+## Problem
 
-Ocliv's purpose is secure publication of MCP services from our machines to
-external orchestrators (ChatGPT and other MCP clients). Today a publishable MCP
-server must serve standard OAuth 2.0 discovery and protocol endpoints:
+Ocliv must stay a lightweight, self-hostable tunnel for local HTTP services,
+MCP servers, and existing MCP gateways. Publishing an MCP service today
+requires the upstream to serve standard OAuth discovery (RFC 9728 PRM +
+RFC 8414 AS metadata + `/oauth/*`). Local MCP servers do not, so they cannot
+be published.
 
-- `/.well-known/oauth-protected-resource/mcp` (RFC 9728)
-- `/.well-known/oauth-authorization-server` (RFC 8414)
-- `/oauth/authorize`, `/oauth/token`, `/oauth/register`, `/oauth/revoke`
+Correction to the first revision: the fix must not add a mandatory external
+IdP/proxy/adapter, must not cost money, and must not turn a publisher relaunch
+into a setup ritual. The endpoint has to come back with one command and no
+re-enrollment, re-configuration, or re-approval.
 
-The relay forwards those paths verbatim to the publisher's upstream
-(`internal/relay/relay_mcp_ingress.go:395-433`) and validates the AS metadata
-strictly. Local MCP servers have no OAuth discovery, so they cannot be
-published. That is a core requirement, not an edge case: the value is exposing
-*our own* local tools, most of which will never grow an OAuth stack.
+## Requirements
 
-Hard constraints:
+R1. Preserve the proven relay, TLS edge, tunnel transport, enrollment,
+    publication lifecycle, and security invariants.
+R2. Separate tunnel transport from authorization, **without a separate
+    user-managed gateway process**.
+R3. One reusable authorization module, configured **once per relay**, with
+    strict per-tenant, per-publication, and per-client boundaries. Evaluate
+    the existing Auth0 option first. No mandatory
+    Keycloak/Authentik/Zitadel/Hydra.
+R4. Three explicit publishing classes:
+    - C1 generic HTTP service with a visitor-access policy;
+    - C2 native HTTP MCP server/gateway, including OAuth passthrough;
+    - C3 local MCP server without OAuth, protected by Ocliv-managed
+      authorization.
+R5. Publisher-side stdio-to-HTTP adapter built on the existing bounded MCP
+    machinery (child lifecycle, cancellation, streaming, errors, limits). No
+    arbitrary remote command execution.
+R6. Secure auth is the default for remotely published MCP tools; operator
+    approval/revocation; unknown client = no tool access; **no unauthenticated
+    fallback**.
+R7. RFC 9728 PRM, AS discovery, PKCE, resource indicators (RFC 8707),
+    audience isolation, CIMD, DCR where required. Proven security libraries;
+    no hand-rolled OAuth crypto or token verification.
+R8. Route-specific authorization and explicit grants. Validate before
+    forwarding; never forward an external bearer to an unauthenticated
+    upstream; tunnel enrollment is not end-user authorization.
+R9. Preserve MCP semantics (streaming, cancellation). Qualify legacy MCP
+    versions and the current 2026-07-28 protocol separately.
+R10. An existing MCP gateway may be published as one upstream; Ocliv must not
+    duplicate gateway aggregation/routing/orchestration.
+R11. **Persistent endpoint**: relaunching the publisher re-establishes the
+    same endpoint with no re-enrollment, re-configuration, or re-approval.
+R12. **Free**: the default path requires no paid or hosted service.
 
-- Strict upstream OAuth discovery must not be weakened.
-- The relay's "the relay performs no OAuth itself" property should not be
-  casually reversed — it is what keeps the relay a dumb, auditable pipe.
-- Prefer established, maintained OAuth/OIDC components over a hand-rolled AS.
+## Approaches
 
-## Decision drivers
+### A. Shared relay-side authorization module — recommended
 
-- External clients require RFC 9728 PRM + RFC 8414 AS metadata,
-  authorization-code + PKCE, and RFC 7591 dynamic client registration.
-- Client registration, consent, audience validation, token lifecycle,
-  least-privilege tool authorization, upstream identity, and local-bypass
-  resistance must each be answered explicitly.
-- Minimal operational footprint on the publisher machine.
-- No change to the relay's security model.
-
-## Approach A — publisher-side authentication adapter
-
-A gateway on the publisher machine fronts the local MCP server:
-
-```
-external client -> relay /r/<id>/... -> adapter (public) -> local MCP (127.0.0.1)
-                                       |  PRM + AS metadata
-                                       |  /oauth/authorize|token|register|revoke
-                                       |  token validation on /mcp
-                                       +-> upstream identity header -> MCP server
-```
-
-The adapter is the upstream the relay already understands; **no relay change**.
-The local MCP server stays unmodified and loopback-only.
-
-### A1 — thin gateway in front of an established IdP (recommended)
-
-- Established AS/IdP: **Keycloak**, **Authentik**, **Zitadel**, or
-  **ory/hydra** (API-only OAuth2 AS). These own client registration, consent,
-  token issuance/lifecycle/rotation/revocation, and JWKS.
-- A thin gateway (Go, ~300-500 LOC, or a reverse proxy with a JWT filter) serves
-  the PRM + AS metadata, proxies `/oauth/*` to the IdP, and validates the IdP's
-  access token on `/mcp` before proxying to the loopback MCP server.
-- Upstream identity: the gateway injects a header (e.g. `X-Ocliv-Upstream-Sub`)
-  derived from the validated token; the MCP server trusts it because it is
-  loopback-only and the gateway is the sole caller.
-- Local bypass: the MCP server binds 127.0.0.1 only; the gateway is the only
-  process that can reach it. A 0600 Unix socket is even stronger.
-- Least-privilege tools: the gateway maps token scopes/claims to tool allowlists
-  (e.g. `ir:blast` vs `ir:emulate`) before proxying.
-
-### A2 — self-contained adapter on an OAuth library
-
-- Build the adapter directly on **ory/fosite** (maintained Go OAuth2 framework)
-  or an equivalent library, serving discovery + authorize/token/register itself.
-- Fewer moving parts than A1, but we own the AS: client storage, consent screen,
-  token signing, rotation, and revocation become our code. This is "building an
-  authorization server" with training wheels — the driver prefers established
-  components, so A1 is favored unless an IdP is deemed too heavy.
-
-## Approach B — relay-managed OAuth
-
-The relay itself serves PRM + AS metadata and the `/oauth/*` endpoints for
-`managed-oauth` routes, authenticates the client (via an IdP or local
-credentials), and forwards MCP to the publisher's loopback upstream with an
-injected identity header.
+A new `internal/authz` package inside the relay, configured once per relay.
+The relay is the Authorization Server for C3 routes: it serves PRM + AS
+metadata + `/oauth/*`, issues signed tokens, and validates them at admission.
 
 ```
-external client -> relay (AS + MCP forward) -> local MCP (127.0.0.1)
+client -> relay /r/<id>/... -> [authz module] -> local MCP (loopback, tunneled)
+                                       ^ jwks / issuer key (relay DB)
 ```
 
-### Consequences
+- **No new process, no new deployment, no external service.** The module is a
+  distinct package; the transport path is unchanged.
+- **Configured once per relay**: issuer key + approval policy live in the
+  relay DB; every tenant/publication inherits the boundary.
+- **Persistent**: clients, grants, and the issuer key persist in the relay DB,
+  so a publisher relaunch rebinds the same route with no re-approval.
+- **Free**: self-hosted issuer; $0.
+- **Cost**: the relay grows a security-critical OAuth surface. Mitigated by
+  keeping it a separate package with its own tests; the relay already
+  terminates TLS, holds the enrollment keys, and audits every route decision.
 
-- The relay stops being a dumb pipe: it becomes a security-critical OAuth issuer.
-  A bug in the relay's OAuth is full public exposure across every route.
-- Client registration/consent/token storage/rotation become relay features
-  (new tables, new crypto, new attack surface, new upgrade coupling).
-- The local MCP server must trust the relay's injected header; the relay is the
-  sole caller, so this is acceptable, but it inverts the current trust model.
-- One AS for all routes (operational simplicity) at the cost of one very
-  high-value target.
+### B. Embedded publisher-side module
+
+The same `internal/authz` package linked into the `ocliv mcp publish` process.
+The publisher serves the OAuth endpoints locally (loopback) and forwards MCP to
+the local server; the relay sees a standard `upstream-oauth` upstream and is
+**unchanged**.
+
+- Keeps the relay a dumb pipe (best for R1).
+- But the auth state lives on the publisher machine, so R11 depends on local
+  persistence, and R3's "configured once per relay" becomes "configured per
+  publisher". Multi-tenant boundary enforcement is weaker (each publisher is
+  its own issuer).
+- Publisher footprint grows (issuer key, client store, approval UX).
+
+### C. External-IdP passthrough (Auth0 first)
+
+The relay forwards OAuth to an external AS (Auth0, or any OIDC issuer). The
+MCP server is local; the relay validates the IdP's token and forwards MCP.
+
+- Smallest Ocliv code (no issuer of our own).
+- **Violates R12** unless a free tier is acceptable; violates the
+  "no mandatory external service" rule. Auth0 free tier is $0 but hosted and
+  has tenant/MAU limits.
+- Best treated as an **optional mode** for operators who already have an IdP,
+  not the default.
 
 ## Comparison
 
-| Dimension | A1 thin gateway + established IdP | A2 self-contained adapter | B relay-managed OAuth |
+| Requirement | A relay-side | B publisher-side | C external IdP |
 |---|---|---|---|
-| Relay changes | none | none | large (new AS, tables, crypto) |
-| New security-critical component | gateway (thin) + established IdP | adapter (owns AS) | the relay itself |
-| Client registration / consent | IdP (mature) | our code | our code |
-| Token lifecycle / rotation / revocation | IdP (mature) | our code | our code |
-| Audience / issuer validation | IdP + gateway | adapter | relay |
-| Least-privilege tools | gateway scope->tool map | adapter | relay |
-| Upstream identity | gateway header | adapter header | relay header |
-| Local-bypass resistance | loopback-only MCP | loopback-only MCP | loopback-only MCP |
-| ChatGPT / MCP client compatibility | standard OAuth discovery | standard OAuth discovery | standard OAuth discovery |
-| Operational footprint | IdP + gateway | gateway only | relay only |
-| Time to first secure publish | medium (IdP setup) | medium-small | large |
-| Attack surface added | small (thin gateway) | medium | large (relay) |
-
-## Security boundaries (both approaches)
-
-1. The MCP server binds loopback (or a 0600 Unix socket); never `0.0.0.0`.
-2. The OAuth layer is the only path to the MCP server; it validates the token
-   on every `/mcp` request, not just at login.
-3. The MCP server independently validates the injected upstream identity, or
-   the OAuth layer is provably the sole caller and the MCP server is
-   loopback-only.
-4. Audience is pinned to the route; issuer is pinned to the AS; tokens are
-   short-lived; refresh/rotation is the IdP's job (A1) or ours (A2/B).
-5. Dynamic client registration is constrained: allowlisted redirect URIs, PKCE
-   required, no implicit grant.
-6. Consent is explicit and auditable.
-7. Tool authorization is least-privilege (scopes/claims -> tool allowlist).
-8. No external bearer is ever forwarded upstream verbatim.
-9. Strict upstream discovery is unchanged; `upstream-oauth` stays the default
-   and any new mode is explicit and separate.
+| R1 relay invariants | preserved (transport untouched) | preserved (relay unchanged) | preserved |
+| R2 no separate process | yes (in-process module) | yes (in-process) | yes |
+| R3 once per relay | **yes** | no (per publisher) | yes |
+| R4 three classes | yes | yes | yes |
+| R6 auth default, no fallback | yes | yes | yes |
+| R7 proven libraries | yes | yes | yes (IdP) |
+| R11 persistent relaunch | **yes** (relay DB) | yes (local state) | yes |
+| R12 free | **yes** (self-hosted) | **yes** | only free tier |
+| Relay attack surface | grows (isolated module) | unchanged | unchanged |
+| Publisher footprint | unchanged | grows | unchanged |
+| Extra deployment | none | none | external service |
 
 ## Recommendation
 
-**Approach A1**: a thin publisher-side gateway in front of an established IdP
-(Keycloak / Authentik / Zitadel, or ory/hydra for an API-only AS). It keeps the
-relay a dumb pipe, puts client registration/consent/token lifecycle in
-maintained components, and preserves strict discovery. A2 is the fallback if
-standing up an IdP is unacceptable. **Do not** choose B unless a concrete
-requirement forces a single centralized AS; the relay's current "no OAuth"
-property is a security feature, not a limitation.
+**A — shared relay-side authorization module**, with **C as an optional
+passthrough mode** (Auth0 evaluated first, since the Skybridge work already
+integrated it). Reject B: it fragments the per-relay boundary and makes R11
+depend on publisher-local state.
 
-## Explicitly out of scope (this ADR)
+Rationale: A is the only option that satisfies R2, R3, R11, and R12
+simultaneously with no new deployment and no cost. The relay already terminates
+TLS, holds the enrollment keys, and audits every route decision — adding a
+bounded, separately-tested issuer is the smallest change that meets the
+product constraint "one command, authenticated endpoint, forever".
 
-- No implementation of any new auth mode.
-- No change to `upstream-oauth` discovery or its strictness.
-- No selection of a specific IdP product until a concrete upstream is chosen.
+## Reusable Go components
 
-## Open questions
+| Component | Location | Reuse |
+|---|---|---|
+| Bounded stdio→HTTP MCP adapter | `internal/mcp/mcp.go` (`Options`, `New`, `Adapter.Start`) | R5: `ocliv mcp publish --stdio -- CMD` wraps this directly; child lifecycle, scrubbed env, body/concurrency caps, fail-closed retire all inherited. |
+| MCP JSON-RPC envelope | `internal/mcp/jsonrpc.go` | unchanged. |
+| Visitor token / session / CSRF primitives | `internal/access/access.go` | approval-session cookies, CSRF, safe-method checks for the consent screen. |
+| Route admission + OAuth path routing | `internal/relay/relay_mcp_ingress.go` | extend `admitPathRoute` with a managed-auth branch. |
+| Publication lifecycle (durable route IDs, per-name stability) | `internal/store` + `internal/relay` | R11: route IDs are already stable per host/profile/name. |
+| Management-plane audit + key attribution | `internal/store.AuditKey` (schemaV7) | audit client registrations, approvals, denials. |
+| Enrollment / identity | `internal/identity` | tunnel keys unchanged; enrollment stays distinct from end-user authorization (R8). |
+| CLI dispatch + port alias | `internal/cli/cli_mcp.go` | add `--stdio` and `--auth ocliv-managed`; keep the `mcp PORT` alias. |
 
-1. Which IdP (Keycloak vs Authentik vs Zitadel vs hydra) for the first real
-   upstream?
-2. Does the first real upstream need per-tool scopes, or is route-level access
-   enough?
-3. Who operates the IdP — the relay host, or each publisher machine?
-4. Is a Unix-socket upstream acceptable to the relay's forwarding, or must it
-   stay TCP loopback?
+New code is limited to `internal/authz/` plus thin wiring.
+
+## Code-edit notes
+
+1. **`internal/authz/` (new)** — four files:
+   - `issuer.go`: Ed25519 (or RS256) issuer key persisted in the relay DB;
+     JWKS document; token mint/verify via `golang-jwt/jwt/v5` (or
+     `lestrrat-go/jwx`); audience + tenant + publication + client claims.
+   - `store.go`: client registrations, authorization codes, grants/approvals,
+     issuer key. New tables in `schemaV8`.
+   - `handlers.go`: PRM (RFC 9728), AS metadata (RFC 8414), `/oauth/authorize`
+     (consent + PKCE), `/oauth/token`, `/oauth/register` (RFC 7591),
+     `/oauth/revoke`, JWKS. OAuth flow logic on a proven library
+     (`ory/fosite` or `go-oauth2/oauth2`) — **no hand-rolled crypto**.
+   - `authorizer.go`: admission check — issuer, audience, expiry, tenant,
+     publication, client status, scope→tool allowlist.
+2. **`internal/store/store.go`** — `schemaV8`: `authz_clients`,
+   `authz_codes`, `authz_grants`, `authz_issuer_key`. Forward-only migration;
+   rollback note like V7 (binary + DB must match).
+3. **`internal/relay/relay_mcp_ingress.go`** — for managed routes, route
+   `/.well-known/*` and `/r/<id>/oauth/*` to the authz module instead of the
+   upstream; require a valid bearer on `/r/<id>/mcp`; inject an upstream
+   identity header and **never forward the external bearer**.
+4. **`internal/cli/cli_mcp.go` / `cli_mcp_publish.go`** — add `--auth
+   ocliv-managed` (default for C3) and `--stdio`; `--stdio` starts
+   `mcp.Adapter` and publishes its loopback address.
+5. **`internal/cli/cli_authz.go` (new)** — `ocliv auth list|approve|revoke|
+   status`; operator approval/revocation UX; unknown client denied by default.
+6. **`internal/cli/cli_status.go`** — show endpoint + auth mode + client/grant
+   status.
+
+## Security boundaries
+
+1. The local MCP server stays loopback-only (or a 0600 Unix socket); the relay
+   is the only path.
+2. The authz module validates the bearer on **every** `/mcp` request; no
+   session-only trust.
+3. The external bearer is never forwarded upstream; the relay injects a
+   relay-minted upstream identity header.
+4. Audience is pinned per route (RFC 8707 resource indicator); issuer pinned to
+   the relay; tokens short-lived; refresh/rotation via the module.
+5. Tenant isolation: a client grant is scoped to one tenant + one publication;
+   a client cannot move between routes.
+6. Enrollment (tunnel key) ≠ end-user authorization (OIDC grant). No fallback.
+7. Unknown/unapproved client → no tool access (deny by default).
+8. Consent is explicit; every approval/revocation/issuance is audited with
+   `AuditKey`.
+9. DCR constrained: allowlisted redirect URIs, PKCE S256 required, no implicit
+   grant, no public-client bearer issuance without PKCE.
+10. stdio adapter: command/args/dir/env are operator-pinned at launch; no
+    remote selection; child kill/wait and body/concurrency caps unchanged.
+
+## Test cases
+
+Unit (`internal/authz`)
+- Token mint/verify: signature, `aud`, `iss`, `exp`, `sub`, scope claims.
+- Audience isolation: a token for route A is rejected on route B.
+- Tenant isolation: a client grant in tenant X is rejected for tenant Y.
+- PKCE: missing/invalid `code_verifier` → denied; S256 enforced.
+- DCR: registration, duplicate, invalid redirect URI; no implicit grant.
+- JWKS: key rotation publishes a new key; old tokens fail closed.
+
+Integration (`tests/integration`)
+- **Acceptance**: publish a local MCP server with no OAuth in one command →
+  external HTTPS endpoint → no bearer 401 → approved client 200 `tools/list`.
+- **R11**: kill the publisher, relaunch the same command → same endpoint, no
+  re-enrollment, no re-approval.
+- **R5**: `publish --stdio -- CMD` → adapter serves MCP; child killed on
+  shutdown; oversize body rejected; no remote command selection.
+- **R8**: enrollment key alone cannot call tools; external bearer not forwarded
+  (assert the upstream sees the relay identity, not the client bearer).
+- **Negative**: unapproved client → 401/403, zero upstream execution; revoked
+  client → denied; expired token → denied.
+- **Regression**: existing `upstream-oauth` strict-discovery tests unchanged and
+  green; legacy MCP version and 2026-07-28 qualified separately.
+- **R10**: publish an existing MCP gateway as one upstream; tools/list returns
+  the gateway's own tools (no Ocliv-side aggregation).
+
+## Incremental implementation sequence
+
+1. `internal/authz` core (issuer, store, handlers, authorizer) + unit tests;
+   no relay wiring yet.
+2. `schemaV8` + migration test (with the binary+DB rollback note).
+3. Relay wiring: managed routes, admission, bearer validation, upstream
+   identity injection.
+4. Publisher CLI: `--auth ocliv-managed`, `--stdio`; `ocliv auth` operator UX.
+5. Integration: acceptance, R11 relaunch, R5 stdio, negative paths.
+6. Optional mode C (Auth0 passthrough) behind the same route shape.
+7. MCP-version qualification (legacy vs 2026-07-28) and gateway publication.
+
+## Acceptance criterion
+
+After one-time relay setup and publisher enrollment:
+
+```
+ocliv mcp publish 8765
+```
+
+produces a stable HTTPS endpoint for a previously unauthenticated local MCP
+service. An unknown client gets no tool access; an operator-approved client
+gets authenticated access. Relaunching the publisher restores the same
+endpoint with no further setup. No external IdP, proxy, or adapter is required,
+and the path costs nothing to run.
+
+## Explicitly out of scope
+
+- No implementation until this design is reviewed.
+- No change to `upstream-oauth` discovery strictness or its tests.
+- No new mandatory container, external service, or per-publisher IdP.
+- No claim of zero-configuration public hosting: DNS, reachable public
+  ingress, and a hosted relay are still required.
+- The IR controller is not the first validation target; use a harmless local
+  MCP service with read-only tools.
