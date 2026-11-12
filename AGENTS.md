@@ -44,7 +44,7 @@ go build ./...
 go vet ./...
 gofmt -l internal/ tests/
 go test ./internal/... -count=1
-go test -count=1 -timeout 420s ./tests/integration/   # 280s is too tight: the green suite takes 331s
+go test -count=1 -timeout 420s ./tests/integration/
 go test -race ./internal/relay/ ./internal/agent/ ./internal/config/ ./internal/cli/ ./internal/mcp/
 ```
 
@@ -52,6 +52,14 @@ No CI config or Makefile exists in-tree; the commands above are the
 gates. Run the full integration suite once after relay/transport
 changes, not after every edit. One focused test run per change; never
 re-run an unchanged check to collect evidence.
+
+The integration suite takes ~282s end-to-end (2026-11-12 measurement;
+it has grown as regression coverage was added). The whole-suite timeout
+is therefore 420s. That increase is CI headroom for a longer suite, NOT
+a performance result and not an excuse for slower tests: individual
+tests still carry their own internal deadlines (agent attach waits,
+visitor deadline loops, agent reconnect windows), and a per-test
+regression toward that 282s envelope is a defect, not a baseline.
 
 ## Workflow A — local smoke (one machine, no network)
 
@@ -208,7 +216,7 @@ with its reason instead of silently dropping it.
 - P1-E dynamic DNS refresh (`setup/refresh.go`, `--refresh-dns`): FIXED — change-only updates, no relay restart, change/no-change CLI tests.
 - P1-F named status states (`cli_status.go`, `doctor` already verified/unverified): FIXED — RELAY DISCONNECTED / AUTH REQUIRED / RECONNECTING / ROUTE OFFLINE with Next actions in human + JSON; attachment never claimed as public reachability.
 - P1-G durability (`config/leases.go`): FIXED the one found gap — crashed-save `.tmp-*` sweep with failing-first regression; rest of the gate list (restart, revoke races, restore rollback, leak bounds) VERIFIED NON-ISSUE against existing suites (`lifecycle`, `revoke`, `relay_backup`, `exchange_adversarial`).
-- P2-H `ocliv mcp PORT` alias (`cli_mcp.go`): FIXED — thin rewrite to existing publish with `--auth upstream-oauth` pinned; parser-level regression test.
+- P2-H `ocliv mcp PORT` alias (`cli_mcp.go`): FIXED — thin rewrite to existing publish. The bare alias now DEFAULTS to the relay-side managed mode (`--auth ocliv-managed`: one-command publish for a local MCP server with no native OAuth, operator-authorized clients through the per-transaction consent flow); an EXPLICIT `--auth` (any value, including upstream-oauth passthrough) passes through untouched. Parser-level regressions pin both directions. (Supersedes the earlier "pinned upstream-oauth" wording above and the SAPRE §6 claim-vs-reality line, which describe pre-2026-11-12 behavior.)
 - P2-I README + everyday-first help: FIXED — truthful quickstart, capability matrix, BLOCKED/NOT VERIFIED labels where true.
 - P2-J shared-relay readiness (`docs/SHARED-RELAY.md`): recorded as BLOCKED — operating requirements + client contract specified; no operated relay, no anonymous free-for-all.
 - Broad gates at `804f21a`: build + vet + `go test ./internal/...` green, full integration suite green (211s), race on relay/agent/cli/config/setup green. Soak, clean-host install, public ChatGPT registration: NOT VERIFIED (operator-gated).
@@ -377,3 +385,110 @@ Scope: production relay on PiInDaSky (.170) at `bamnlabs.dynv6.net` (Caddy TLS e
   `sudo cp -a /usr/local/bin/ocliv.bak-20261111-165127 /usr/local/bin/ocliv` **and** `sudo cp -a /var/lib/ocliv/ocliv.db.bak-20261111-165127 /var/lib/ocliv/ocliv.db`, then `sudo systemctl restart ocliv-relay`. Do not attempt binary-only rollback.
 - **Artifact retirement (qualification cleanup).** The public OAuth lab fixture and its publisher were stopped/disabled on bamn's user manager and the publication `rdZp9IR6xkQKtpu_nLtUEw` unpublished (verified: units `inactive`/`disabled`, `mcp list` empty, route 404, relay 200/200, Caddy/SSH/Tailscale/Pi-hole/DNS/firewall unchanged). Source, units, env, resource file and deploy scripts preserved under `~/ocliv-relay-deploy/fixture-preserved/`. The `isolation-probe` key (`key-47a7f03865a2df0e`) was revoked (403 after). No enrollment codes/tokens in persistent artifacts (codes are hashed verifiers at rest).
 - **Deferred, not dismissed — local MCP servers without native OAuth.** Supporting local MCP servers (e.g. `/opt/ir-controller`) is a core architectural requirement, not an edge case. Strict upstream discovery stays; the revised design (shared relay-side authorization module vs embedded publisher-side vs external-IdP passthrough; free, persistent, one-command publish) is tracked in `docs/ADR-local-mcp-auth.md` and is explicitly NOT implemented.
+
+### 2026-11-12 managed-auth security-correction round (`abbbe34` → working tree)
+
+Scope: the 2026-11-11 managed-auth rereview of the relay-side Authorization
+Server for local MCP servers with no native OAuth (`internal/authz/`,
+managed publish/approval CLI, managed-route ingress). One bounded
+security-correction pass: no new identity providers, no gateway
+aggregation, no per-tool policy, no deployment machinery.
+
+**Committed vs uncommitted.** `abbbe34` is the committed baseline. The six
+pre-existing modified tracked files from the prior pass (`cli_authz_test.go`,
+`cli_mcp_publish.go`, `relay_leases.go`, `relay_mcp_ingress.go`,
+`relay_mgmt_routes.go`, `mcp_managed_authz_test.go` — ingress-profile naming
+and managed `verified_at` preservation) plus ALL of this round's changes are
+UNCOMMITTED in the working tree; nothing below is in a commit. This pass made
+no code commits of its own. A concurrent second agent session was editing the
+same tree mid-remediation; it was reconciled to ONE design (its `ConsentedAt`
+latch was discarded because a once-consented grant would issue codes forever,
+re-opening P0-1) with snapshots preserved outside the repo; final-state proof:
+`grep -rn 'ConsentedAt\|RecordConsent' internal/ tests/` returns empty.
+
+- **P0-1 — an approved client ID was sufficient authorization.** FIXED
+  (uncommitted). `ServeAuthorize` (`internal/authz/handlers.go`) no longer has
+  an ACTIVE-grant branch: operator approval (ACTIVE) and transaction
+  authorization are separated, every authorization renders the consent page,
+  and only a completed consent — the operator's single-use pairing credential
+  against a one-time, transaction-bound challenge — calls `issueCode`.
+  Existing tokens keep working on the durable grant. Red-before/green-after:
+  `TestActiveGrantAloneNeverYieldsACode`; `TestActiveGrantNeedsNoOclivParams`
+  re-scored to the new semantics (ACTIVE grant → consent page, never a silent
+  code); integration `TestManagedAuthzConsentPageFlow` (standard params alone
+  → 200 consent page, no Location; fresh credential → code).
+- **P0-2 — named-lease reclaim crossed publisher-key ownership.** FIXED
+  (uncommitted). The reclaim transaction in `insertLease`
+  (`internal/relay/relay_leases.go`) now reads `agent_key_id` and refuses a
+  different key in the same tenant with `CodeConflict` plus one
+  `lease_reclaim/denied` audit row (written after rollback — the store pool is
+  single-connection). Automatic reclaim is reserved for the SAME key
+  (publisher restart); a cross-key takeover requires an explicit, audited
+  ownership-transfer operation, which does NOT exist yet. Regression:
+  `TestNamedReclaimCrossKeyRefused` (two distinct enrolled keys in one tenant:
+  no attach, original lease keeps serving, denied audit row);
+  `TestNamedReclaimCutsOverTraffic` re-scoped from the old cross-key success
+  case to same-key reclaim.
+- **Management-plane cross-key boundary.** VERIFIED NON-ISSUE + pinned.
+  `agentLeaseAuth` (`relay_mgmt.go`) signature-verifies the caller, binds the
+  signing key to the lease, and single-use-nonces mutations;
+  `serveMCPRouteMutation` (`relay_mgmt_routes.go`) re-checks
+  `rowTenant`/`rowKey` before any rebind. New
+  `TestMgmtCrossKeySameTenantRefused` proves a real second key in the same
+  tenant gets 403 on revoke/rotate/close/share and route creation, the
+  owner's lease is unaffected, and the denials are audited. This is a DISTINCT
+  boundary from P0-2 (durable lease lifecycle vs authenticated management
+  plane) and is now covered separately.
+- **Consent flow (P1 cluster).** FIXED (uncommitted): the consent form's
+  action is the canonical route-scoped AS URL (`IssuerURL + "/consent"`, not
+  the server-root path route dispatch never served) —
+  `TestManagedAuthzConsentFormActionIsRouteScoped` parses the action from the
+  rendered HTML and completes the transaction by POSTing to THAT URL
+  (browser-style, not a manually constructed substitute). `ServeConsent`
+  rebinds the full transaction (tenant, route, client, redirect, PKCE
+  challenge, state, resource) and records consent ok/denied audit rows.
+  Approval + credential issuance is one atomic store operation
+  (`ApproveGrantWithPairingSecret`; a revoked grant is never resurrected).
+  Pairing credentials are single-use AND expiring (schemaV11;
+  `ConsumePairingSecret` burns atomically inside a transaction). `issueCode`
+  composes the redirect through `url.Values` — pre-existing query parameters
+  survive, and RFC 9207 `iss` is included.
+- **PKCE grammar (P1).** FIXED (uncommitted): RFC 7636 §4.1 verifier
+  syntax/length (43–128 unreserved characters) and §4.2 S256 challenge
+  encoding are enforced at both authorize and token; the old one-character
+  test verifiers were normalized, not the enforcement weakened.
+- **Bounded authorization state (P1).** FIXED (uncommitted): per-route
+  registration (200) and pending-consent (100) quotas (429 past the caps),
+  per-tenant+endpoint rate limiting on the public OAuth endpoints
+  (`relay_authz.go`), and `PruneAuthitExpired` in `reconcileBoot`
+  (revocations retained 30 days, far beyond token TTL, so pruning can never
+  resurrect access).
+- **P2 — one-command managed publishing.** FIXED (uncommitted): the bare
+  `ocliv mcp PORT` alias defaults to `--auth ocliv-managed`; an explicit
+  `--auth` (any value) passes through untouched.
+- **Runbook.** `docs/qualification/MANAGED-AUTHZ-QUALIFICATION.md`
+  (uncommitted) corrected: consent mechanics replace the removed
+  `pairing_code` GET flow; the token exchange supplies the required
+  `resource` and a conforming verifier; negative paths N8–N11 added
+  (approval-alone, replayed credential, expired credential, short verifier);
+  the owner-key reclaim boundary is documented; and the absence of refresh
+  tokens is recorded as a known limit (1-hour access tokens; a new
+  authorization needs a fresh credential).
+
+**Test evidence (this tree; all remediated code uncommitted).** `go build
+./...`, `go vet ./...`, `gofmt -l internal/ tests/` clean;
+`go test ./internal/... -count=1` green (all packages); full integration
+suite green (282s; gate timeout raised to 420s); `go test -race` green on
+relay/agent/config/cli/mcp. New regressions live in
+`internal/authz/boundary_test.go` (uncommitted) plus
+`tests/integration/{mcp_managed_authz,tunnel}_test.go`.
+
+**External managed-auth qualification: NOT VERIFIED.** Nothing in this round
+was exercised against real public HTTPS. The runbook's verdict table
+(including the new rows 17–18) stays unfilled until an isolated staging run
+on the existing Pi infrastructure with a separate database and a harmless
+upstream MCP server. Local green is not public qualification.
+
+**Production deployment: NOT PERFORMED.** The working relay on PiInDaSky
+(.170) was not touched: no binary swap, no schemaV11 migration of the
+production database, no service changes.
