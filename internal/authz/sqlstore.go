@@ -123,17 +123,27 @@ func (s *SQLStore) GetGrant(clientID, tenant, route string) (*Grant, error) {
 	return &g, nil
 }
 
-// SetPairingSecret stores only the hash of the pairing secret.
+// SetPairingSecret stores only the hash of the pairing secret. It fails if
+// the grant does not exist: a silently-dropped secret would look like a
+// successful approval while the consent step can never succeed.
 func (s *SQLStore) SetPairingSecret(clientID, tenant, route, secret string) error {
 	if secret == "" {
 		return fmt.Errorf("authz: pairing secret is required")
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err := s.db.Exec(
+	res, err := s.db.Exec(
 		`UPDATE authz_grants SET pairing_hash=?, pairing_issued_at=?, updated_at=?
 		 WHERE client_id=? AND tenant_id=? AND route_id=?`,
-		HashSecret(secret), now, now, clientID, tenant, route); err != nil {
+		HashSecret(secret), now, now, clientID, tenant, route)
+	if err != nil {
 		return fmt.Errorf("authz: set pairing secret: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("authz: set pairing secret: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("authz: no grant for client %q tenant %q route %q", clientID, tenant, route)
 	}
 	return nil
 }
@@ -169,13 +179,71 @@ func (s *SQLStore) RevokeToken(jti, clientID, tenant, route string) error {
 	return nil
 }
 
-// IsTokenRevoked reports whether a jti is revoked.
-func (s *SQLStore) IsTokenRevoked(jti string) (bool, error) {
+// IsTokenRevoked reports whether a jti is revoked for this tenant+route.
+func (s *SQLStore) IsTokenRevoked(jti, tenant, route string) (bool, error) {
 	var n int
-	if err := s.db.QueryRow(`SELECT COUNT(1) FROM authz_revocations WHERE jti=?`, jti).Scan(&n); err != nil {
+	if err := s.db.QueryRow(
+		`SELECT COUNT(1) FROM authz_revocations WHERE jti=? AND tenant_id=? AND route_id=?`,
+		jti, tenant, route).Scan(&n); err != nil {
 		return false, fmt.Errorf("authz: token revocation check: %w", err)
 	}
 	return n > 0, nil
+}
+
+// CreateConsent stores a one-time consent challenge.
+func (s *SQLStore) CreateConsent(c Consent) error {
+	if c.Challenge == "" {
+		return fmt.Errorf("authz: consent challenge is required")
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO authz_consent(challenge, client_id, tenant_id, route_id, redirect_uri,
+		   code_challenge, state, expires_at) VALUES(?,?,?,?,?,?,?,?)`,
+		c.Challenge, c.ClientID, c.Tenant, c.Route, c.RedirectURI,
+		c.CodeChallenge, c.State, c.ExpiresAt.UTC().Format(time.RFC3339Nano)); err != nil {
+		return fmt.Errorf("authz: create consent: %w", err)
+	}
+	return nil
+}
+
+// ConsumeConsent atomically marks a challenge consumed and returns it.
+func (s *SQLStore) ConsumeConsent(challenge string) (*Consent, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("authz: consent tx: %w", err)
+	}
+	defer tx.Rollback()
+	var (
+		c        Consent
+		expires  string
+		consumed sql.NullString
+	)
+	err = tx.QueryRow(
+		`SELECT challenge, client_id, tenant_id, route_id, redirect_uri, code_challenge,
+		        state, expires_at, consumed_at FROM authz_consent WHERE challenge=?`,
+		challenge).
+		Scan(&c.Challenge, &c.ClientID, &c.Tenant, &c.Route, &c.RedirectURI,
+			&c.CodeChallenge, &c.State, &expires, &consumed)
+	if err != nil {
+		return nil, fmt.Errorf("authz: unknown consent challenge: %w", err)
+	}
+	c.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expires)
+	if c.ExpiresAt.IsZero() || time.Now().After(c.ExpiresAt) {
+		return nil, fmt.Errorf("authz: consent challenge expired")
+	}
+	if consumed.Valid {
+		return nil, fmt.Errorf("authz: consent challenge already used")
+	}
+	if _, err := tx.Exec(
+		`UPDATE authz_consent SET consumed_at=? WHERE challenge=?`,
+		time.Now().UTC().Format(time.RFC3339Nano), challenge); err != nil {
+		return nil, fmt.Errorf("authz: consume consent: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("authz: consent commit: %w", err)
+	}
+	now := time.Now()
+	c.ConsumedAt = &now
+	return &c, nil
 }
 
 // AuditAuthz records an authorization-plane decision.

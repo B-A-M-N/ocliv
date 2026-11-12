@@ -138,15 +138,19 @@ func routeReqBody(t *testing.T, h *harness, host, path, body string) *http.Respo
 	return resp
 }
 
-// managedAuthorize runs the authorization step with the operator's pairing
-// secret and returns the code from the redirect Location, or "" when no code
-// was issued.
+// managedAuthorize runs the authorization step. For a pending grant it
+// completes the consent page (POST of the operator's pairing credential
+// against the one-time challenge); for an ACTIVE grant it is the ordinary
+// OAuth authorization-code redirect with no Ocliv-specific parameters.
+// It returns the code from the redirect Location, or "" when no code was
+// issued.
 func managedAuthorize(t *testing.T, h *harness, rid, clientID, pairing, verifier string) string {
 	t.Helper()
 	challenge := base64.RawURLEncoding.EncodeToString(func() []byte {
 		sum := sha256.Sum256([]byte(verifier))
 		return sum[:]
 	}())
+	routeURL := "https://public.example.org/r/" + rid + "/mcp"
 	q := url.Values{}
 	q.Set("client_id", clientID)
 	q.Set("redirect_uri", "http://127.0.0.1:59999/cb")
@@ -154,9 +158,7 @@ func managedAuthorize(t *testing.T, h *harness, rid, clientID, pairing, verifier
 	q.Set("code_challenge", challenge)
 	q.Set("code_challenge_method", "S256")
 	q.Set("state", "xyz")
-	if pairing != "" {
-		q.Set("pairing_code", pairing)
-	}
+	q.Set("resource", routeURL)
 	req, err := http.NewRequest(http.MethodGet, h.relaySrv.URL+"/r/"+rid+"/oauth/authorize?"+q.Encode(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -166,10 +168,48 @@ func managedAuthorize(t *testing.T, h *harness, rid, clientID, pairing, verifier
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	resp.Body.Close()
 	if resp.StatusCode != http.StatusFound {
-		return ""
+		if pairing == "" {
+			return ""
+		}
+		// Complete consent with the operator's pairing credential.
+		marker := `name="challenge" value="`
+		i := strings.Index(string(body), marker)
+		if i < 0 {
+			t.Fatalf("no consent challenge (status %d): %s", resp.StatusCode, body)
+		}
+		rest := string(body)[i+len(marker):]
+		j := strings.Index(rest, `"`)
+		if j < 0 {
+			t.Fatalf("unterminated challenge: %s", rest)
+		}
+		challengeID := rest[:j]
+		form := url.Values{}
+		form.Set("challenge", challengeID)
+		form.Set("client_id", clientID)
+		form.Set("redirect_uri", "http://127.0.0.1:59999/cb")
+		form.Set("code_challenge", challenge)
+		form.Set("state", "xyz")
+		form.Set("resource", routeURL)
+		form.Set("pairing_secret", pairing)
+		creq, err := http.NewRequest(http.MethodPost, h.relaySrv.URL+"/r/"+rid+"/oauth/consent",
+			strings.NewReader(form.Encode()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		creq.Host = "public.example.org"
+		creq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		cresp, err := visitorClient.Do(creq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cresp.Body.Close()
+		if cresp.StatusCode != http.StatusFound {
+			t.Fatalf("consent status=%d, want 302", cresp.StatusCode)
+		}
+		resp = cresp
 	}
 	loc, err := url.Parse(resp.Header.Get("Location"))
 	if err != nil {
@@ -187,6 +227,7 @@ func managedToken(t *testing.T, h *harness, rid, clientID, code, verifier string
 	form.Set("client_id", clientID)
 	form.Set("redirect_uri", "http://127.0.0.1:59999/cb")
 	form.Set("code_verifier", verifier)
+	form.Set("resource", "https://public.example.org/r/"+rid+"/mcp")
 	req, err := http.NewRequest(http.MethodPost, h.relaySrv.URL+"/r/"+rid+"/oauth/token",
 		strings.NewReader(form.Encode()))
 	if err != nil {
@@ -240,16 +281,13 @@ func TestManagedAuthzApprovedClientExecutesOnce(t *testing.T) {
 	h, up, rid, _ := managedHarness(t)
 	clientID := managedDCR(t, h, rid)
 
-	// Operator approval (the publication-level boundary).
+	// Operator approval (the publication-level boundary). Approval alone is
+	// not consent: the grant must still be completed through the consent
+	// page with the operator's pairing credential.
 	st := authz.NewSQLStore(h.db.SQL())
 	tenant := publicationTenant(t, h, rid)
 	if err := st.ApproveGrant(clientID, tenant, rid); err != nil {
 		t.Fatalf("approve: %v", err)
-	}
-	// An approved client_id alone is not enough: without the pairing secret
-	// no authorization code is issued.
-	if code := managedAuthorize(t, h, rid, clientID, "", "verifier-2-nosecret"); code != "" {
-		t.Fatal("authorization issued a code with an approved client_id but no pairing secret")
 	}
 	if err := st.SetPairingSecret(clientID, tenant, rid, "pairing-2"); err != nil {
 		t.Fatalf("pairing secret: %v", err)
@@ -731,6 +769,147 @@ func TestManagedAuthzOAuthTokenRevocation(t *testing.T) {
 	resp2.Body.Close()
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("invalid-token revoke status=%d, want 200", resp2.StatusCode)
+	}
+}
+
+// TestManagedAuthzConsentPageFlow: through the public route, a pending
+// approval renders a standards-compatible consent page (never a credential
+// in the URL), the operator completes it with a one-time POST, and a
+// consented grant then completes the ordinary OAuth flow with only standard
+// parameters.
+func TestManagedAuthzConsentPageFlow(t *testing.T) {
+	h, up, rid, _ := managedHarness(t)
+	clientID := managedDCR(t, h, rid)
+	tenant := publicationTenant(t, h, rid)
+	st := authz.NewSQLStore(h.db.SQL())
+
+	routeURL := "https://public.example.org/r/" + rid + "/mcp"
+	verifier := "verifier-consent"
+	challengeSum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(challengeSum[:])
+	q := url.Values{}
+	q.Set("client_id", clientID)
+	q.Set("redirect_uri", "http://127.0.0.1:59999/cb")
+	q.Set("response_type", "code")
+	q.Set("code_challenge", challenge)
+	q.Set("code_challenge_method", "S256")
+	q.Set("state", "xyz")
+	q.Set("resource", routeURL)
+
+	// 1. Pending: consent page, not a redirect, and no credential in the URL.
+	// This also records the pending grant the pairing secret binds to.
+	req, err := http.NewRequest(http.MethodGet, h.relaySrv.URL+"/r/"+rid+"/oauth/authorize?"+q.Encode(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "public.example.org"
+	resp, err := visitorClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("pending authorize status=%d, want 200 consent page", resp.StatusCode)
+	}
+	if resp.Header.Get("Location") != "" {
+		t.Fatal("pending authorize must not redirect")
+	}
+	page := string(body)
+	if !strings.Contains(page, "/oauth/consent") {
+		t.Fatalf("no consent form in page: %q", page)
+	}
+	if strings.Contains(page, "pairing-consent") {
+		t.Fatal("the pairing credential appears in the page/URL")
+	}
+
+	// The operator issues the pairing credential for the now-pending grant.
+	if err := st.SetPairingSecret(clientID, tenant, rid, "pairing-consent"); err != nil {
+		t.Fatalf("pairing secret: %v", err)
+	}
+
+	// 2. Complete consent by POST against the one-time challenge.
+	marker := `name="challenge" value="`
+	i := strings.Index(page, marker)
+	if i < 0 {
+		t.Fatalf("no challenge field: %q", page)
+	}
+	rest := page[i+len(marker):]
+	j := strings.Index(rest, `"`)
+	if j < 0 {
+		t.Fatalf("unterminated challenge: %q", rest)
+	}
+	challengeID := rest[:j]
+	form := url.Values{}
+	form.Set("challenge", challengeID)
+	form.Set("client_id", clientID)
+	form.Set("redirect_uri", "http://127.0.0.1:59999/cb")
+	form.Set("code_challenge", challenge)
+	form.Set("state", "xyz")
+	form.Set("resource", routeURL)
+	form.Set("pairing_secret", "pairing-consent")
+	creq, err := http.NewRequest(http.MethodPost, h.relaySrv.URL+"/r/"+rid+"/oauth/consent",
+		strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	creq.Host = "public.example.org"
+	creq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	cresp, err := visitorClient.Do(creq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cresp.Body.Close()
+	if cresp.StatusCode != http.StatusFound {
+		t.Fatalf("consent status=%d, want 302", cresp.StatusCode)
+	}
+	loc, err := url.Parse(cresp.Header.Get("Location"))
+	if err != nil || loc.Query().Get("code") == "" {
+		t.Fatalf("consent redirect=%q", cresp.Header.Get("Location"))
+	}
+	code1 := loc.Query().Get("code")
+
+	// 3. The challenge is one-time.
+	creq2, err := http.NewRequest(http.MethodPost, h.relaySrv.URL+"/r/"+rid+"/oauth/consent",
+		strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	creq2.Host = "public.example.org"
+	creq2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	cresp2, err := visitorClient.Do(creq2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cresp2.Body.Close()
+	if cresp2.StatusCode == http.StatusFound {
+		t.Fatal("consent challenge replayed")
+	}
+
+	// 4. A consented grant completes the ordinary flow with only standard
+	// parameters, and the issued token works.
+	status, tokBody := managedToken(t, h, rid, clientID, code1, verifier)
+	if status != http.StatusOK {
+		t.Fatalf("token status=%d body=%s", status, tokBody)
+	}
+	var tok struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal([]byte(tokBody), &tok); err != nil || tok.AccessToken == "" {
+		t.Fatalf("token reply unparseable: %v (%q)", err, tokBody)
+	}
+	before := up.execs.Load()
+	if c, _ := managedCall(t, h, rid, tok.AccessToken); c != http.StatusOK {
+		t.Fatalf("consented call status=%d, want 200", c)
+	}
+	if got := up.execs.Load() - before; got != 1 {
+		t.Fatalf("consented call executed %d tools, want 1", got)
+	}
+
+	// 5. A second authorize (ACTIVE) is a plain redirect with standard params.
+	code2 := managedAuthorize(t, h, rid, clientID, "", "verifier-consent-2")
+	if code2 == "" {
+		t.Fatal("active grant produced no code with standard parameters only")
 	}
 }
 

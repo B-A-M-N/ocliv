@@ -57,6 +57,24 @@ type Grant struct {
 	PairingIssuedAt time.Time
 }
 
+// Consent is a one-time, expiring, transaction-bound pairing challenge.
+// It carries the authorization request it was created for, so a stolen
+// challenge cannot be replayed against a different transaction.
+type Consent struct {
+	Challenge     string
+	ClientID      string
+	Tenant        string
+	Route         string
+	RedirectURI   string
+	CodeChallenge string
+	State         string
+	ExpiresAt     time.Time
+	ConsumedAt    *time.Time
+}
+
+// Expired reports whether the challenge has passed its expiry.
+func (c *Consent) Expired() bool { return time.Now().After(c.ExpiresAt) }
+
 // AuthzAudit is one authorization-plane decision record.
 type AuthzAudit struct {
 	Time     time.Time
@@ -105,10 +123,16 @@ type Store interface {
 	// stored hash, in constant time.
 	CheckPairingSecret(clientID, tenant, route, secret string) (bool, error)
 
+	// CreateConsent stores a one-time consent challenge.
+	CreateConsent(c Consent) error
+	// ConsumeConsent atomically marks a challenge consumed and returns it.
+	ConsumeConsent(challenge string) (*Consent, error)
+
 	// RevokeToken durably revokes one token by its jti.
 	RevokeToken(jti, clientID, tenant, route string) error
-	// IsTokenRevoked reports whether a jti is revoked. Checked at admission.
-	IsTokenRevoked(jti string) (bool, error)
+	// IsTokenRevoked reports whether a jti is revoked for this tenant+route.
+	// Revocation is scoped so one route's revocation cannot affect another.
+	IsTokenRevoked(jti, tenant, route string) (bool, error)
 
 	// AuditAuthz records an authorization-plane decision.
 	AuditAuthz(actor, tenant, route, clientID, action, result, detail string) error
@@ -126,6 +150,7 @@ type MemStore struct {
 	grants      map[string]*Grant // key: clientID + "\x00" + tenant + "\x00" + route
 	codes       map[string]*Code
 	revocations map[string]bool
+	consent     map[string]*Consent
 	audit       []AuthzAudit
 }
 
@@ -316,15 +341,57 @@ func (m *MemStore) RevokeToken(jti, clientID, tenant, route string) error {
 	if m.revocations == nil {
 		m.revocations = map[string]bool{}
 	}
-	m.revocations[jti] = true
+	m.revocations[revocationKey(jti, tenant, route)] = true
 	return nil
 }
 
-// IsTokenRevoked reports whether a jti is revoked.
-func (m *MemStore) IsTokenRevoked(jti string) (bool, error) {
+// IsTokenRevoked reports whether a jti is revoked for this tenant+route.
+func (m *MemStore) IsTokenRevoked(jti, tenant, route string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.revocations[jti], nil
+	return m.revocations[revocationKey(jti, tenant, route)], nil
+}
+
+func revocationKey(jti, tenant, route string) string {
+	return jti + "\x00" + tenant + "\x00" + route
+}
+
+// CreateConsent stores a one-time consent challenge.
+func (m *MemStore) CreateConsent(c Consent) error {
+	if c.Challenge == "" {
+		return fmt.Errorf("authz: consent challenge is required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.consent == nil {
+		m.consent = map[string]*Consent{}
+	}
+	if _, ok := m.consent[c.Challenge]; ok {
+		return fmt.Errorf("authz: consent challenge collision")
+	}
+	cp := c
+	m.consent[c.Challenge] = &cp
+	return nil
+}
+
+// ConsumeConsent atomically marks a challenge consumed and returns it.
+func (m *MemStore) ConsumeConsent(challenge string) (*Consent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.consent[challenge]
+	if !ok {
+		return nil, fmt.Errorf("authz: unknown consent challenge")
+	}
+	if c.ConsumedAt != nil {
+		return nil, fmt.Errorf("authz: consent challenge already used")
+	}
+	if c.Expired() {
+		return nil, fmt.Errorf("authz: consent challenge expired")
+	}
+	now := time.Now()
+	c.ConsumedAt = &now
+	cp := *c
+	return &cp, nil
 }
 
 // AuditAuthz records an authorization-plane decision.

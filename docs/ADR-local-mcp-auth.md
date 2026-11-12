@@ -81,30 +81,39 @@ already holds enrollment verifiers and the issuer private key).
 
 **A public client_id is not a credential.** RFC 7591 clients here are public
 (`token_endpoint_auth_method=none`), so knowing a client_id proves nothing.
-Approval therefore issues a **pairing secret** per grant, delivered
-out-of-band by the operator to the intended client operator, and the
-authorization endpoint requires it. Client registration is never access, and
-an approved client_id alone is never enough to obtain a code.
+Approval therefore issues a **pairing credential** per grant and the operator
+completes authorization through a **consent page**, never by placing the
+credential in a URL. Client registration is never access; an approved
+client_id alone is never enough to obtain a code.
 
 ```
 1. operator: ocliv mcp publish --local ... --auth ocliv-managed
    -> relay creates a managed route (mode ocliv-managed), prints endpoint
 2. client:   DCR POST /r/<id>/oauth/register  -> client_id (NO access)
-3. client:   GET /r/<id>/oauth/authorize      -> pending grant, no code issued
-4. operator: ocliv authz pending --data <dir>
-   operator: ocliv authz approve --data <dir> --client <id> \
+3. client:   GET /r/<id>/oauth/authorize?...&resource=<route>
+   -> 200 HTML CONSENT PAGE (no code, no credential in the URL)
+4. operator: ocliv authz approve --data <dir> --client <id> \
                --tenant <t> --route <id>
-   -> grant ACTIVE + pairing secret printed ONCE
-5. operator: delivers the pairing secret to the client operator privately
-6. client:   GET /r/<id>/oauth/authorize?...&pairing_code=<secret>
-   -> 302 + code (PKCE); NO code without the pairing secret
-7. client:   POST /r/<id>/oauth/token         -> access token (aud=route, sub=client)
-8. client:   POST /r/<id>/mcp with bearer     -> authorized at publication level
+   -> grant ACTIVE + pairing credential printed ONCE
+5. operator: delivers the credential to the client operator privately
+6. operator: POST /r/<id>/oauth/consent  (challenge + pairing_secret)
+   -> 302 + code (PKCE); challenge is one-time and expiring
+7. client:   POST /r/<id>/oauth/token?...&resource=<route> -> access token
+8. client:   POST /r/<id>/mcp with bearer -> authorized at publication level
 ```
 
+- The consent challenge is bound to the authorization transaction
+  (client_id, redirect_uri, code_challenge, state) and expires; replay,
+  expiry, and transaction mismatch all fail closed.
+- Once consented, the grant is ACTIVE and later authorizations complete the
+  ordinary OAuth flow with **standard parameters only** — no Ocliv-specific
+  authorization parameter exists.
 - `--tenant` and `--route` are **required** on approve/revoke. An ambiguous
   approval is an error, never a guess, and multiple grants are never approved
   in one call.
+- The canonical `resource` is **required** on both the authorization and the
+  token request and must equal the route URL exactly; the token audience is
+  bound to the same value.
 - Approval is **per tenant + per publication + per client**. A client approved
   on route A cannot use the token on route B (audience binding).
 - The client's registered metadata (name, logo) is display-only; it never
@@ -112,6 +121,11 @@ an approved client_id alone is never enough to obtain a code.
 - `approve`, `revoke`, and `rotate-key` write `authz_audit` records (time,
   actor, tenant, route, client, action, result, detail). The actor is recorded
   as `operator` (local authority), not as an enrollment key id.
+- **Client-level revocation is enforced at admission**: a revoked client's
+  existing tokens are refused on the next request, and `ServeToken` rechecks
+  before redeeming a code. Every managed token carries a `jti`; a token
+  without one is refused at admission because it could not be individually
+  revoked. Token revocation is scoped to (jti, tenant, route).
 - Deny by default: an unapproved client gets no code, no token, no tool call.
 
 ## 2. Publication-level boundary (R13)

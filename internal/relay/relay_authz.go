@@ -135,6 +135,8 @@ func (s *Server) serveManagedAuthz(w http.ResponseWriter, r *http.Request, t *ro
 		srv.ServeJWKS(w, r)
 	case strings.HasSuffix(r.URL.EscapedPath(), "/oauth/authorize"):
 		srv.ServeAuthorize(w, r)
+	case strings.HasSuffix(r.URL.EscapedPath(), "/oauth/consent"):
+		srv.ServeConsent(w, r)
 	case strings.HasSuffix(r.URL.EscapedPath(), "/oauth/token"):
 		srv.ServeToken(w, r)
 	case strings.HasSuffix(r.URL.EscapedPath(), "/oauth/register"):

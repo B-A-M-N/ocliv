@@ -59,16 +59,24 @@ func (a *Authorizer) AuthorizeClaims(r *http.Request, routeURL, issuerURL, tenan
 	if grant.Status != GrantActive {
 		return nil, fmt.Errorf("authz: client %q is not approved (status %q)", claims.Subject, grant.Status)
 	}
-	// Token-specific revocation (RFC 7009). Checked on every request so a
-	// revoked token is denied immediately, not at its expiry.
-	if claims.ID != "" {
-		revoked, err := a.store.IsTokenRevoked(claims.ID)
-		if err != nil {
-			return nil, fmt.Errorf("authz: revocation check: %w", err)
-		}
-		if revoked {
-			return nil, fmt.Errorf("authz: token %q is revoked", claims.ID)
-		}
+	// Client-level revocation: a revoked client's existing tokens stop at
+	// admission, not just at the next token exchange.
+	if client, cerr := a.store.GetClient(claims.Subject); cerr != nil || client.RevokedAt != nil {
+		return nil, fmt.Errorf("authz: client %q is revoked", claims.Subject)
+	}
+	// Every managed token must carry a jti. A token without one cannot be
+	// individually revoked, so it is refused rather than admitted.
+	if claims.ID == "" {
+		return nil, fmt.Errorf("authz: token has no jti; refusing unmanaged token")
+	}
+	// Token-specific revocation (RFC 7009), scoped to this tenant + route.
+	// Checked on every request so a revoked token is denied immediately.
+	revoked, err := a.store.IsTokenRevoked(claims.ID, tenant, routeID)
+	if err != nil {
+		return nil, fmt.Errorf("authz: revocation check: %w", err)
+	}
+	if revoked {
+		return nil, fmt.Errorf("authz: token %q is revoked", claims.ID)
 	}
 	return claims, nil
 }

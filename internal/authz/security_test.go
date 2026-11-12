@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -57,15 +58,13 @@ func TestDenyByDefault(t *testing.T) {
 	_ = json.Unmarshal(reg.Body.Bytes(), &rr)
 	client := rr["client_id"].(string)
 
-	// Authorize without approval: must not redirect with a code.
+	// Authorize without approval: must not redirect with a code (a consent
+	// page is shown instead).
 	auth := doJSON(t, s, http.MethodGet, "/oauth/authorize?response_type=code&client_id="+client+
 		"&redirect_uri=https%3A%2F%2Fclient.example%2Fcb&code_challenge="+CodeChallengeS256("v")+
-		"&code_challenge_method=S256", "")
-	if auth.Code != http.StatusAccepted {
-		t.Fatalf("unapproved authorize: %d", auth.Code)
-	}
+		"&code_challenge_method=S256&resource="+url.QueryEscape(s.RouteURL), "")
 	if auth.Header().Get("Location") != "" {
-		t.Fatal("unapproved authorize leaked a redirect")
+		t.Fatalf("unapproved authorize leaked a redirect (status %d)", auth.Code)
 	}
 
 	// Token exchange with a forged code must fail.
@@ -103,7 +102,8 @@ func TestApprovedClientReachesRoute(t *testing.T) {
 	}
 	tok := doJSON(t, s, http.MethodPost, "/oauth/token",
 		"grant_type=authorization_code&code=c1&client_id="+client+
-			"&redirect_uri=https%3A%2F%2Fclient.example%2Fcb&code_verifier="+verifier)
+			"&redirect_uri=https%3A%2F%2Fclient.example%2Fcb&code_verifier="+verifier+
+			"&resource="+url.QueryEscape(s.RouteURL))
 	if tok.Code != http.StatusOK {
 		t.Fatalf("token: %d", tok.Code)
 	}
@@ -128,6 +128,7 @@ func TestAudienceIsolation(t *testing.T) {
 	raw, err := s.Issuer.Mint(TokenClaims{
 		Issuer: s.IssuerURL, Subject: client, Audience: s.RouteURL,
 		Tenant: s.tenant(), Route: s.RouteID, Expiry: time.Now().Add(time.Hour).Unix(),
+		ID: "jti-" + client,
 	})
 	if err != nil {
 		t.Fatalf("mint: %v", err)
@@ -150,6 +151,7 @@ func TestImmediateRevocation(t *testing.T) {
 	raw, err := s.Issuer.Mint(TokenClaims{
 		Issuer: s.IssuerURL, Subject: client, Audience: s.RouteURL,
 		Tenant: s.tenant(), Route: s.RouteID, Expiry: time.Now().Add(time.Hour).Unix(),
+		ID: "jti-" + client,
 	})
 	if err != nil {
 		t.Fatalf("mint: %v", err)
@@ -233,7 +235,7 @@ func TestKeyRotation(t *testing.T) {
 	_ = store.RegisterClient(Client{ID: "cli_1", RedirectURIs: []string{"https://x/cb"}})
 	_ = store.CreateGrant(Grant{ClientID: "cli_1", Tenant: "t", Route: "r", Status: GrantActive})
 
-	oldTok, err := old.Mint(TokenClaims{Issuer: "iss", Subject: "cli_1", Audience: "aud", Tenant: "t", Route: "r", Expiry: time.Now().Add(time.Hour).Unix()})
+	oldTok, err := old.Mint(TokenClaims{Issuer: "iss", Subject: "cli_1", Audience: "aud", Tenant: "t", Route: "r", Expiry: time.Now().Add(time.Hour).Unix(), ID: "jti-old"})
 	if err != nil {
 		t.Fatalf("old mint: %v", err)
 	}
@@ -248,7 +250,7 @@ func TestKeyRotation(t *testing.T) {
 	if err := auth.Authorize(req, "aud", "iss", "t", "r"); err == nil {
 		t.Fatal("old key accepted after rotation")
 	}
-	newTok, err := newIssuer.Mint(TokenClaims{Issuer: "iss", Subject: "cli_1", Audience: "aud", Tenant: "t", Route: "r", Expiry: time.Now().Add(time.Hour).Unix()})
+	newTok, err := newIssuer.Mint(TokenClaims{Issuer: "iss", Subject: "cli_1", Audience: "aud", Tenant: "t", Route: "r", Expiry: time.Now().Add(time.Hour).Unix(), ID: "jti-new"})
 	if err != nil {
 		t.Fatalf("new mint: %v", err)
 	}

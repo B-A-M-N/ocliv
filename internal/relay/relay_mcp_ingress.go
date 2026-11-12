@@ -213,6 +213,7 @@ const mcpOAuthUpstreamPrefix = "/oauth/"
 // route may serve. Anything else under /oauth/ fails closed.
 var mcpOAuthEndpoints = map[string]bool{
 	"/oauth/authorize": true,
+	"/oauth/consent":   true,
 	"/oauth/token":     true,
 	"/oauth/register":  true,
 	"/oauth/revoke":    true,

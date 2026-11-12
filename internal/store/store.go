@@ -182,6 +182,17 @@ CREATE TABLE IF NOT EXISTS authz_audit (
 CREATE INDEX IF NOT EXISTS idx_authz_audit_time ON authz_audit(time);
 `
 
+// schemaV10 replaces the URL-borne pairing credential with a one-time,
+// expiring, transaction-bound consent challenge.
+const schemaV10 = `
+CREATE TABLE IF NOT EXISTS authz_consent (
+  challenge TEXT PRIMARY KEY, client_id TEXT NOT NULL, tenant_id TEXT NOT NULL,
+  route_id TEXT NOT NULL, redirect_uri TEXT NOT NULL,
+  code_challenge TEXT NOT NULL, state TEXT NOT NULL DEFAULT '',
+  expires_at TEXT NOT NULL, consumed_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_authz_consent_expires ON authz_consent(expires_at);
+`
+
 // applyMigration runs one versioned migration body and its version
 // stamp in a single transaction: a failure anywhere rolls back the
 // body, so a version is never recorded for half-applied work (P1-2).
@@ -206,7 +217,7 @@ func applyMigration(sqldb *sql.DB, version int, body string) error {
 }
 
 // currentSchema is the newest version Open must reach.
-const currentSchema = 9
+const currentSchema = 10
 
 // DB wraps the SQLite handle.
 type DB struct {
@@ -315,6 +326,7 @@ func Open(path string) (*DB, error) {
 		{7, schemaV7},
 		{8, schemaV8},
 		{9, schemaV9},
+		{10, schemaV10},
 	}
 	for _, m := range migrations {
 		var v int

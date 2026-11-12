@@ -116,29 +116,30 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   https://<fqdn>/r/<id>/oauth/register
 # -> {"client_id":"..."}
 
-# Before approval: no code is issued.
-curl -sS -o /dev/null -w '%{http_code}\n' \
-  "https://<fqdn>/r/<id>/oauth/authorize?client_id=<cid>&redirect_uri=http%3A%2F%2F127.0.0.1%3A59999%2Fcb&response_type=code&code_challenge=<S256>&code_challenge_method=S256"
+# Start authorization. The canonical resource is REQUIRED (MCP spec).
+curl -sS -o /dev/null -w '%{http_code}\n' -D - \
+  "https://<fqdn>/r/<id>/oauth/authorize?client_id=<cid>&redirect_uri=http%3A%2F%2F127.0.0.1%3A59999%2Fcb&response_type=code&code_challenge=<S256>&code_challenge_method=S256&resource=https%3A%2F%2F<fqdn>%2Fr%2F<id>%2Fmcp"
 ```
 
-**Oracle:** `202` with `status: pending_approval` and **no** `Location`
-header. **Fail-closed:** a `302` with a code before approval means the
-publication boundary is not the gate.
+**Oracle:** `200` with an HTML **consent page** (a form posting to
+`/oauth/consent`). **No** `Location` header. **Fail-closed:** a `302` with
+a code before the operator consents means the publication boundary is not
+the gate. Confirm the page does **not** contain the pairing credential and
+that the credential appears nowhere in the request URL.
 
 ```sh
-# Relay host: the operator approves. This is the ONLY grant path.
+# Relay host: the operator issues the pairing credential for the pending
+# grant. --tenant and --route are REQUIRED.
 ocliv authz pending --data /var/lib/ocliv
 ocliv authz approve --data /var/lib/ocliv --client <cid> \
   --tenant <tenant> --route <id>
 ```
 
-**Oracle:** `approved client <cid> ...` followed by a **pairing secret**
-printed once. `ocliv authz list --data /var/lib/ocliv` shows `status=active`
-for exactly one row.
+**Oracle:** `approved client <cid> ...` followed by the **pairing
+credential**, printed once.
 
-**Deliver the pairing secret to the client operator over a private channel.**
-It appears in the authorization URL, so treat it as a secret: no logs, no
-chat, no ticket.
+**Deliver the credential to the client operator over a private channel.**
+It is submitted in the consent form body, never in a URL.
 
 **Fail-closed:** approving without `--tenant`/`--route` is refused (an
 ambiguous approval is never guessed); approving a client with no pending
@@ -147,10 +148,19 @@ grant is refused.
 ### 3.5 Full client flow
 
 ```sh
-# Authorize WITH the pairing secret (capture the code from the redirect).
+# Complete consent by POSTing the credential against the one-time challenge.
 # -> 302, Location: http://127.0.0.1:59999/cb?code=...&state=xyz
-curl -sS -o /dev/null -w '%{http_code}\n' -D - \
-  "https://<fqdn>/r/<id>/oauth/authorize?client_id=<cid>&redirect_uri=http%3A%2F%2F127.0.0.1%3A59999%2Fcb&response_type=code&code_challenge=<S256>&code_challenge_method=S256&pairing_code=<secret>"
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-urlencode 'challenge=<challenge-from-the-page>' \
+  --data-urlencode 'client_id=<cid>' \
+  --data-urlencode 'redirect_uri=http://127.0.0.1:59999/cb' \
+  --data-urlencode 'code_challenge=<S256>' \
+  --data-urlencode 'resource=https://<fqdn>/r/<id>/mcp' \
+  --data-urlencode 'pairing_secret=<credential>' \
+  https://<fqdn>/r/<id>/oauth/consent
+
+# Exchange with PKCE. resource is required and must match the route.
 curl -fsS -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
   --data-urlencode 'grant_type=authorization_code' \
   --data-urlencode 'code=<code>' \
@@ -221,11 +231,32 @@ client T4's token still returns 200. An invalid token presented to
 **Fail-closed:** still 200 after revocation means the endpoint is
 advertised but not implemented.
 
-### 3.8 Issuer key rotation
+### 3.8 Publisher restart preserves approval
 
-Start from a **currently ACTIVE grant and a valid pre-rotation token**.
-Mint a fresh token for client T5 after confirming its grant is `active`; do
-not reuse a token from an earlier section.
+Run this **before** key rotation so the token is still valid.
+
+Use a client T6 whose grant is ACTIVE and whose token is still valid.
+
+```sh
+# Stop the publisher, then republish the same name.
+ocliv mcp publish --local http://127.0.0.1:8765/mcp \
+  --auth ocliv-managed --name managed-qual
+# Present T6's SAME pre-restart token (no re-approval, no new credential).
+```
+
+**Starting state required:** T6 has an ACTIVE grant and a valid, unexpired,
+unrevoked token minted **before** the restart. Do not reuse a token from
+§3.6/§3.7.
+
+**Oracle:** the endpoint is byte-identical, the token still works, and
+`ocliv authz list` still shows exactly one `active` grant for T6.
+**Fail-closed:** a new route id, or a working token after an unapproved
+republish, means approval state is not bound to route identity.
+
+### 3.9 Issuer key rotation
+
+Use a **separate client T5** with a currently ACTIVE grant and a valid
+pre-rotation token, minted fresh after §3.8. Do not reuse any earlier token.
 
 ```sh
 # Relay host. Confirm the grant first.
@@ -235,24 +266,11 @@ ocliv authz rotate-key --data /var/lib/ocliv
 # Present the SAME pre-rotation token -> must be 401 immediately.
 ```
 
+**Starting state required:** T5 has an ACTIVE grant, a valid unexpired
+token minted after §3.8, and its jti is not revoked.
+
 **Oracle:** 401 on the next request, with no relay restart. **Fail-closed:**
 still 200 means the running relay kept the retired key in memory.
-
-### 3.9 Publisher restart preserves approval
-
-Use a client T6 whose grant is ACTIVE and whose token is still valid.
-
-```sh
-# Stop the publisher, then republish the same name.
-ocliv mcp publish --local http://127.0.0.1:8765/mcp \
-  --auth ocliv-managed --name managed-qual
-# Present T6's SAME pre-restart token (no re-approval, no new pairing secret).
-```
-
-**Oracle:** the endpoint is byte-identical, the token still works, and
-`ocliv authz list` still shows exactly one `active` grant for T6.
-**Fail-closed:** a new route id, or a working token after an unapproved
-republish, means approval state is not bound to route identity.
 
 ### 3.10 Incompatible mode change is refused
 
@@ -287,15 +305,18 @@ offline (`503`) and must not forward.
 | 2 | Route-scoped PRM/AS match the endpoint | | |
 | 3 | No-bearer denied, zero upstream hits | | |
 | 4 | Registration without approval issues no code | | |
-| 5 | Approval requires explicit tenant+route; issues one pairing secret | | |
-| 6 | Approved client_id without the pairing secret gets no code (403) | | |
-| 7 | DCR → PKCE+pairing → token → authorized call | | |
-| 8 | Negative paths N1–N7 (401/403/400 as specified), zero executions | | |
-| 9 | OAuth token revocation (RFC 7009) immediate; unrelated client unaffected | | |
-| 10 | Key rotation immediate, from an ACTIVE grant + live token | | |
-| 11 | Republish preserves route id + approval, same token still valid | | |
-| 12 | Incompatible mode change refused (409) | | |
-| 13 | Teardown stops serving | | |
+| 5 | Approval requires explicit tenant+route; issues one pairing credential | | |
+| 6 | Pending approval renders a consent page; no credential in the URL | | |
+| 7 | DCR → consent → PKCE+resource → token → authorized call | | |
+| 8 | Consented grant completes the standard flow with standard params only | | |
+| 9 | Negative paths N1–N7 (401/403/400 as specified), zero executions | | |
+| 10 | OAuth token revocation (RFC 7009) immediate; unrelated client unaffected | | |
+| 11 | Revoked client's existing token and previously issued code both refused | | |
+| 12 | Token without a jti is refused at admission | | |
+| 13 | Key rotation immediate, from an ACTIVE grant + live token | | |
+| 14 | Republish preserves route id + approval, same token still valid | | |
+| 15 | Incompatible mode change refused (409) | | |
+| 16 | Teardown stops serving | | |
 
 **Overall disposition:** PASS only if every row is PASS with recorded
 evidence. Any FAIL is a defect, not a qualification gap to be argued away.

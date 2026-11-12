@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -317,40 +318,42 @@ func TestProtectedResourceAndASMetadata(t *testing.T) {
 }
 
 func TestAuthorizePendingThenActive(t *testing.T) {
-	s, _, _ := newTestServer(t)
+	s, _, store := newTestServer(t)
 	client := register(t, s, "https://client.example/cb")
 
-	// First authorize: pending, no code, no redirect.
+	// First authorize: pending, so a consent page, not a redirect.
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/oauth/authorize?response_type=code&client_id="+client+
 		"&redirect_uri=https%3A%2F%2Fclient.example%2Fcb&code_challenge="+CodeChallengeS256("verifier")+
-		"&code_challenge_method=S256&state=xyz", nil)
+		"&code_challenge_method=S256&state=xyz&resource="+url.QueryEscape(s.RouteURL), nil)
 	s.ServeAuthorize(w, r)
-	if w.Code != http.StatusAccepted {
+	if w.Code != http.StatusOK {
 		t.Fatalf("first authorize: status=%d", w.Code)
 	}
 	if w.Header().Get("Location") != "" {
 		t.Fatal("pending authorize must not redirect")
 	}
 
-	// Approval issues the operator's pairing secret; the client must present
-	// it to obtain a code. Without it an approved client_id alone is not
-	// enough.
-	if err := s.Store.ApproveGrant(client, s.tenant(), s.RouteID); err != nil {
-		t.Fatalf("approve: %v", err)
-	}
-	if err := s.Store.SetPairingSecret(client, s.tenant(), s.RouteID, "pair-secret"); err != nil {
+	// The operator approves and issues the pairing credential; consent is
+	// given by POST against the one-time challenge.
+	if err := store.SetPairingSecret(client, s.tenant(), s.RouteID, "pair-secret"); err != nil {
 		t.Fatalf("pairing secret: %v", err)
 	}
-
-	// Second authorize, with the pairing secret: redirect with a code.
+	challenge := extractChallenge(t, w.Body.String())
+	form := url.Values{}
+	form.Set("challenge", challenge)
+	form.Set("client_id", client)
+	form.Set("redirect_uri", "https://client.example/cb")
+	form.Set("code_challenge", CodeChallengeS256("verifier"))
+	form.Set("state", "xyz")
+	form.Set("resource", s.RouteURL)
+	form.Set("pairing_secret", "pair-secret")
 	w2 := httptest.NewRecorder()
-	r2 := httptest.NewRequest(http.MethodGet, "/oauth/authorize?response_type=code&client_id="+client+
-		"&redirect_uri=https%3A%2F%2Fclient.example%2Fcb&code_challenge="+CodeChallengeS256("verifier")+
-		"&code_challenge_method=S256&state=xyz&pairing_code=pair-secret", nil)
-	s.ServeAuthorize(w2, r2)
+	r2 := httptest.NewRequest(http.MethodPost, "/oauth/consent", strings.NewReader(form.Encode()))
+	r2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	s.ServeConsent(w2, r2)
 	if w2.Code != http.StatusFound {
-		t.Fatalf("active authorize: status=%d", w2.Code)
+		t.Fatalf("consent: status=%d", w2.Code)
 	}
 	loc := w2.Header().Get("Location")
 	if !strings.HasPrefix(loc, "https://client.example/cb?code=") {
@@ -400,7 +403,8 @@ func TestTokenExchangeAndVerify(t *testing.T) {
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/oauth/token",
 		strings.NewReader("grant_type=authorization_code&code=code1&client_id="+client+
-			"&redirect_uri=https%3A%2F%2Fclient.example%2Fcb&code_verifier="+verifier))
+			"&redirect_uri=https%3A%2F%2Fclient.example%2Fcb&code_verifier="+verifier+
+			"&resource="+url.QueryEscape(s.RouteURL)))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	s.ServeToken(w, r)
 	if w.Code != http.StatusOK {
