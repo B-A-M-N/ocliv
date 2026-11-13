@@ -20,10 +20,18 @@ package agent
 // retry path, so a cross-key conflict produced an endless "reconnecting"
 // loop with no actionable message.
 import (
+	"errors"
 	"fmt"
 
 	"ocliv/internal/protocol"
 )
+
+// ErrLeaseOwnership marks the terminal denial an agent receives when the
+// requested publication name belongs to a different agent key (or a
+// different tenant). It is a TYPED sentinel, not a message convention:
+// the CLI maps it to its own corrective action, and a wording change can
+// never silently reclassify the failure.
+var ErrLeaseOwnership = errors.New("lease ownership conflict")
 
 // attachDenialVerdict is the agent's decision for one close code.
 type attachDenialVerdict int
@@ -76,11 +84,16 @@ func attachDenialMessage(code int) string {
 }
 
 // attachDenialError renders a denial as an error, wrapped as permanent
-// when the class says no retry can fix it.
+// when the class says no retry can fix it. The ownership denial carries
+// the typed sentinel so the CLI can map it to its own corrective action
+// without matching on message wording.
 func attachDenialError(code int) error {
 	msg := attachDenialMessage(code)
 	if msg == "" {
 		return fmt.Errorf("no session attach: relay closed with code %d", code)
+	}
+	if code == protocol.CloseCodeAttachOwnership {
+		return Permanent(fmt.Errorf("%w: %s", ErrLeaseOwnership, msg))
 	}
 	if classifyAttachDenial(code) == attachDenialPermanent {
 		return Permanent(fmt.Errorf("%s", msg))

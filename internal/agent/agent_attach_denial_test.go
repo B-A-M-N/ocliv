@@ -17,6 +17,7 @@ package agent
 //          same tenant holds the name. A retry can never win it, so the
 //          agent must stop and say so.
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -79,5 +80,23 @@ func TestTerminalCredentialMessageStaysDistinct(t *testing.T) {
 	}
 	if strings.Contains(strings.ToLower(cred), "--name") {
 		t.Fatalf("the credential denial wrongly suggests --name: %q", cred)
+	}
+}
+
+// TestOwnershipDenialCarriesTheTypedSentinel pins that the ownership
+// denial is recognizable by TYPE (not by wording), so the CLI can map it
+// to the right corrective action even if the message text changes.
+func TestOwnershipDenialCarriesTheTypedSentinel(t *testing.T) {
+	err := attachDenialError(protocol.CloseCodeAttachOwnership)
+	if !errors.Is(err, ErrLeaseOwnership) {
+		t.Fatalf("the ownership denial does not carry the sentinel: %v", err)
+	}
+	if !IsPermanent(err) {
+		t.Fatal("the ownership denial is not permanent")
+	}
+	// The credential denial must NOT carry it.
+	cred := attachDenialError(protocol.CloseCodeAttachDenied)
+	if errors.Is(cred, ErrLeaseOwnership) {
+		t.Fatalf("the credential denial wrongly carries the ownership sentinel: %v", cred)
 	}
 }

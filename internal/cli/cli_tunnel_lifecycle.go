@@ -4,6 +4,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -122,6 +123,12 @@ func runnerExit(err error) (int, string) {
 	}
 	msg := err.Error()
 	switch {
+	case errors.Is(err, agent.ErrLeaseOwnership):
+		// A name held by another publisher key: re-enrolling would NOT
+		// help (the credential is valid), so the hint must not send the
+		// operator down that path.
+		return apperr.ExitAuth, "publication name is held by another agent key in this tenant: " +
+			"publish under a different --name, or ask the operator to transfer or revoke the existing one"
 	case strings.Contains(msg, "protocol_incompatible"):
 		return apperr.ExitProtocol, "relay protocol mismatch: upgrade ocliv, then run `ocliv doctor`"
 	case strings.Contains(msg, "must use https"):
