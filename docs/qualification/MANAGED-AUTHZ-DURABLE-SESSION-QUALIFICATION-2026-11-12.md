@@ -89,19 +89,89 @@ refresh #2 (replay of the rotated) -> 400  {"error":"invalid_grant",
 
 ## Known limits that remain
 
-- The TypeScript SDK client was not driven.
+- The TypeScript SDK client was not driven. **(Resolved in pass 5 below: it was driven, over public
+  HTTPS, end to end.)**
 - Refresh across a *real* wall-clock hour was not waited out; the one-hour TTL was simulated by
   making the SDK's own expiry accounting stale, then exercising the relay's real refresh grant.
-- A **restarted** SDK client whose access token has already expired does **not** refresh silently:
-  the SDK has no cached AS metadata after a restart, so it re-runs discovery and, on the 401, starts
-  a full authorization (browser consent) instead of using its refresh token. Unattended continuity is
-  therefore proven for a long-lived client process, not yet for a crash-restarted one.
+- A **restarted Python** SDK client whose access token has already expired does **not** refresh
+  silently: that SDK has no cached AS metadata after a restart, so it re-runs discovery and, on the
+  401, starts a full authorization (browser consent) instead of using its refresh token. Unattended
+  continuity is therefore proven for a long-lived Python client process. **The TypeScript SDK does
+  not share this limitation — see pass 5 below.**
 - ChatGPT registration, CIMD, permanent public ingress, ACME/Caddy edge and production deployment
   remain unverified/operator-gated.
 - The cross-key conflict still surfaces as an endless "reconnecting" loop (close code 4409 is
   retryable); the security property is verified, the operator-facing UX is not.
 
+---
+
+# Pass 5 — the TypeScript SDK client (`@modelcontextprotocol/sdk` 1.32.2)
+
+**Date:** 2026-11-12/13 · **Binary:** `84b7f6cb86557758a6462d7936bfd0812c08b6e4abc32351301e35ba82462790`
+(rebuilt from `4a83550`) · **Client:** official MCP **TypeScript** SDK `1.32.2` (Node 22.22.3) ·
+**Stack:** isolated staging (`relay 127.0.0.1:18082`, health `127.0.0.1:18096`, staging DB
+`/tmp/ocliv-qual5/data`, harmless upstream `127.0.0.1:18999`, public edge
+`https://pop-os.tail8d285a.ts.net`). Production untouched.
+
+## Why this pass existed
+
+The review asked for "at least one current SDK client"; only the Python SDK had been driven. The TS
+SDK also has different recovery semantics, so it was the right second client to test against the
+managed-authorization path.
+
+## Evidence
+
+```
+session-1-begin      fresh client: 401 challenge -> discovery -> DCR -> consent
+authorize-url        https://pop-os.tail8d285a.ts.net/r/Vz2y.../oauth/authorize?...   (no credential in the URL)
+auth-result          REDIRECT
+callback-received    hasCode=true        (real browser submitted the single-use pairing credential)
+auth-result          AUTHORIZED
+token-stored         rotation=false  hasRefresh=true
+initialize-ok        session-1
+tools-list           ["qual_ping"]
+tools-call           pong:ocliv-qual-1
+```
+
+Server-side rejection → unattended recovery in a **new process** (the crash-restart case):
+
+```
+# RFC 7009 revoke of the ACCESS token only  -> 200, and the token is then refused (401)
+restart-begin        new process, persisted tokens + client info only
+token-stored         rotation=true   hasRefresh=true     <-- refreshed through the relay's grant
+initialize-ok        restart-session
+tools-list           ["qual_ping"]
+tools-call           pong:ocliv-qual-3
+restart-complete     unattended=true
+```
+
+No browser leg, no operator credential, no new consent: the TS SDK met the 401, discovered the
+route-scoped token endpoint and rotated its session through the relay's refresh grant. Relay-side
+evidence: two rows in `authz_revocations` (the RFC 7009 access-token revocation, and the access token
+retired by the rotation), both scoped to the client, tenant and route.
+
+Rotation semantics, live over the public edge on this stack as well: the first refresh with a live
+refresh token returned `200` with a new pair; the same token afterwards returned
+`400 {"error":"invalid_grant","error_description":"refresh token already rotated or revoked"}`.
+
+The harmless upstream counted exactly one execution per authorized `tools/call` (3 total) and none
+for any 401/400 path.
+
+## What pass 5 changes
+
+- The "current SDK client" requirement is now met by **two independent official SDKs** (Python
+  1.28.1 and TypeScript 1.32.2), both over public HTTPS, both discovering the authorization server
+  from the relay's own 401 challenge.
+- **Crash-restart continuity is proven** (TS SDK): a restarted client with only persisted
+  credentials recovers unattended through the refresh grant. The Python SDK's re-consent behaviour
+  is an SDK-side limitation, not a relay defect — the relay issued it a valid, unrotated refresh
+  token both times.
+- Not exercised: the TypeScript SDK against a *real wall-clock* token expiry (the trigger used here
+  was a server-side revocation of the access token, which is the same recovery path and a stronger
+  test), and CIMD.
+
 ## Teardown
 
-Staging relay, publishers, upstream and `/tmp/ocliv-qual4` removed after the run. The production
-relay was never contacted.
+Staging relay, publishers, upstream and `/tmp/ocliv-qual5` removed after the run. The funnel
+configuration was left exactly as inherited (proxy → `127.0.0.1:18082`); the production relay was
+never contacted, read or restarted.
