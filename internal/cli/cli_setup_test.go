@@ -464,3 +464,111 @@ func TestSetupRefreshDNSNeedsHostname(t *testing.T) {
 		t.Fatalf("exit=%d, want %d", code, apperr.ExitCLIValidation)
 	}
 }
+
+// The single-host edge serves exactly ONE apex hostname and needs no
+// wildcard record. `setup --auto` hardcoded --edge tunnel, which both
+// rendered the wrong ingress for MCP hosting AND made a missing
+// *.t.<domain> record block an otherwise-valid single-host deployment.
+// The edge is now selectable and the wildcard proof applies only to the
+// edges that actually serve the tunnel namespace.
+func TestSetupSingleHostEdgeNeedsNoWildcardRecord(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	oldLookup := setupLookupHost
+	setupLookupHost = func(ctx context.Context, host string) ([]string, error) {
+		// Apex resolves here; the tunnel wildcard does NOT exist.
+		if strings.Contains(host, ".t.") {
+			return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+		}
+		return []string{"203.0.113.9"}, nil
+	}
+	defer func() { setupLookupHost = oldLookup }()
+	upd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("addresses updated"))
+	}))
+	defer upd.Close()
+	echo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("203.0.113.9\n"))
+	}))
+	defer echo.Close()
+	t.Setenv("OCLIV_DYNV6_ENDPOINT", upd.URL)
+	t.Setenv("DYNV6_TOKEN", "TESTTOKEN")
+	out := t.TempDir()
+	var code int
+	captured := captureOutput(t, func() {
+		code = cmdSetup([]string{"--auto", "--hostname", "lab.dynv6.net", "--edge", "single-host",
+			"--acme-email", "ops@mailtest.invalid-test", "--out", out,
+			"--echo-v4", echo.URL, "--echo-v6", ""})
+	})
+	// Provisioning still cannot complete without root/Caddy, so the
+	// outcome remains ACTION_REQUIRED - but the REASON must now be edge
+	// provisioning, never the missing wildcard record.
+	if code != apperr.ExitRelayTLS {
+		t.Fatalf("exit=%d, want %d", code, apperr.ExitRelayTLS)
+	}
+	if strings.Contains(captured, "*.t.lab.dynv6.net") {
+		t.Fatalf("single-host edge demanded a wildcard record:\n%s", captured)
+	}
+	// The rendered deployment must be the single-host edge, not the
+	// wildcard tunnel namespace.
+	rendered, err := os.ReadFile(filepath.Join(out, "Caddyfile"))
+	if err != nil {
+		t.Fatalf("deployment not rendered: %v", err)
+	}
+	if strings.Contains(string(rendered), "*.t.") {
+		t.Fatalf("rendered the tunnel namespace instead of a single-host edge:\n%s", rendered)
+	}
+}
+
+// The tunnel edge (the default) still REQUIRES the wildcard record:
+// this is existing behaviour the fix must not weaken.
+func TestSetupTunnelEdgeStillRequiresWildcard(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	oldLookup := setupLookupHost
+	setupLookupHost = func(ctx context.Context, host string) ([]string, error) {
+		if strings.Contains(host, ".t.") {
+			return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+		}
+		return []string{"203.0.113.9"}, nil
+	}
+	defer func() { setupLookupHost = oldLookup }()
+	upd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("addresses updated"))
+	}))
+	defer upd.Close()
+	echo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("203.0.113.9\n"))
+	}))
+	defer echo.Close()
+	t.Setenv("OCLIV_DYNV6_ENDPOINT", upd.URL)
+	t.Setenv("DYNV6_TOKEN", "TESTTOKEN")
+	out := t.TempDir()
+	var code int
+	captured := captureOutput(t, func() {
+		// --edge tunnel is the default and serves the tunnel namespace,
+		// so it must still demand the wildcard record. (The wildcard edge
+		// additionally needs a DNS plugin at init, so it is not reachable
+		// from setup without one.)
+		code = cmdSetup([]string{"--auto", "--hostname", "lab.dynv6.net", "--edge", "tunnel",
+			"--acme-email", "ops@mailtest.invalid-test", "--out", out,
+			"--echo-v4", echo.URL, "--echo-v6", ""})
+	})
+	if code != apperr.ExitRelayTLS {
+		t.Fatalf("exit=%d, want %d (wildcard unverified)", code, apperr.ExitRelayTLS)
+	}
+	if !strings.Contains(captured, "*.t.lab.dynv6.net") {
+		t.Fatalf("wildcard edge lost its record instruction:\n%s", captured)
+	}
+}
+
+func TestSetupRejectsUnknownEdge(t *testing.T) {
+	echo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("203.0.113.9\n"))
+	}))
+	defer echo.Close()
+	if code := cmdSetup([]string{"--auto", "--edge", "cloudflare",
+		"--echo-v4", echo.URL, "--echo-v6", ""}); code != apperr.ExitCLIValidation {
+		t.Fatalf("exit=%d, want %d", code, apperr.ExitCLIValidation)
+	}
+}

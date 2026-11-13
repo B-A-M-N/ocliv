@@ -58,6 +58,12 @@ func cmdSetup(argv []string) int {
 	zone := ""
 	confirmCreate := false
 	refreshDNS := false
+	// edge selects the ingress shape the rendered deployment uses. The
+	// default stays "tunnel" (the per-tunnel wildcard namespace) so
+	// existing behaviour is unchanged; MCP hosting on ONE public apex
+	// hostname needs --edge single-host, which does not require a
+	// wildcard record.
+	edge := "tunnel"
 	echoV4, echoV6 := defaultEchoV4, defaultEchoV6
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
@@ -115,6 +121,11 @@ func cmdSetup(argv []string) int {
 			zone = argv[i]
 		case a == "--confirm-create":
 			confirmCreate = true
+		case strings.HasPrefix(a, "--edge="):
+			edge = strings.TrimPrefix(a, "--edge=")
+		case a == "--edge" && i+1 < len(argv):
+			i++
+			edge = argv[i]
 		case strings.HasPrefix(a, "--echo-v4="):
 			echoV4 = strings.TrimPrefix(a, "--echo-v4=")
 		case a == "--echo-v4" && i+1 < len(argv):
@@ -129,6 +140,10 @@ func cmdSetup(argv []string) int {
 			fmt.Fprintf(os.Stderr, "unknown setup flag %q; see `ocliv help`\n", a)
 			return apperr.ExitCLIValidation
 		}
+	}
+	if edge != "tunnel" && edge != "single-host" && edge != "wildcard" {
+		fmt.Fprintln(os.Stderr, "error: --edge must be single-host, wildcard, or tunnel")
+		return apperr.ExitCLIValidation
 	}
 	if dryRun && hostname == "" {
 		fmt.Fprintln(os.Stderr, "--dry-run needs --hostname ZONE.dynv6.net")
@@ -164,7 +179,7 @@ func cmdSetup(argv []string) int {
 		printSetupNext(d)
 		return apperr.ExitOK
 	}
-	return runSetupDNS(ctx, d, hostname, tokenFile, acmeEmail, outDir, dataDir, dryRun)
+	return runSetupDNS(ctx, d, hostname, tokenFile, acmeEmail, outDir, dataDir, dryRun, edge)
 }
 
 // runSetupDNS syncs the dynv6 zone to the observed egress addresses.
@@ -224,7 +239,7 @@ func readDynv6Token(tokenFile, hostname string) (string, int) {
 	return token, apperr.ExitOK
 }
 
-func runSetupDNS(ctx context.Context, d setup.Detection, hostname, tokenFile, acmeEmail, outDir, dataDir string, dryRun bool) int {
+func runSetupDNS(ctx context.Context, d setup.Detection, hostname, tokenFile, acmeEmail, outDir, dataDir string, dryRun bool, edge string) int {
 	token, code := readDynv6Token(tokenFile, hostname)
 	if code != apperr.ExitOK {
 		return code
@@ -244,7 +259,7 @@ func runSetupDNS(ctx context.Context, d setup.Detection, hostname, tokenFile, ac
 	if acmeEmail == "" {
 		return apperr.ExitOK
 	}
-	return runSetupRender(ctx, d, hostname, acmeEmail, outDir, dataDir)
+	return runSetupRender(ctx, d, hostname, acmeEmail, outDir, dataDir, edge)
 }
 
 // runSetupRender generates the reviewable single-host deployment for
@@ -252,7 +267,7 @@ func runSetupDNS(ctx context.Context, d setup.Detection, hostname, tokenFile, ac
 // the observed egress, and only then persists relay_url. Caddy,
 // systemd, and enrollment stay manual until the next slice automates
 // them; this function activates nothing.
-func runSetupRender(ctx context.Context, d setup.Detection, hostname, acmeEmail, outDir, dataDir string) int {
+func runSetupRender(ctx context.Context, d setup.Detection, hostname, acmeEmail, outDir, dataDir, edge string) int {
 	dir, _, _, err := agentFiles()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
@@ -261,7 +276,7 @@ func runSetupRender(ctx context.Context, d setup.Detection, hostname, acmeEmail,
 	if outDir == "" {
 		outDir = filepath.Join(dir, "setup-"+strings.ToLower(hostname))
 	}
-	initArgv := []string{"--domain", hostname, "--edge", "tunnel", "--mcp-host", hostname,
+	initArgv := []string{"--domain", hostname, "--edge", edge, "--mcp-host", hostname,
 		"--acme-email", acmeEmail, "--out", outDir}
 	if code := cmdRelayInit(initArgv); code != apperr.ExitOK {
 		return code
@@ -282,19 +297,24 @@ func runSetupRender(ctx context.Context, d setup.Detection, hostname, acmeEmail,
 			hostname, strings.Join(addrs, ","), nonEmpty(d.EgressV4), nonEmpty(d.EgressV6))
 		return apperr.ExitRelayTLS
 	}
-	// The tunnel edge also serves per-tunnel hostnames under
+	// The tunnel and wildcard edges serve per-tunnel hostnames under
 	// *.t.<domain> (on-demand ACME). An apex A/AAAA update is not
-	// wildcard provisioning: prove a fresh tunnel hostname resolves
-	// here before claiming the deployment is complete.
-	if wmatched, _, werr := verifyWildcardDNS(ctx, hostname, []string{d.EgressV4, d.EgressV6}); werr != nil || !wmatched {
-		fmt.Fprintf(os.Stderr, "ACTION REQUIRED: *.t.%s does not resolve to this host here", hostname)
-		if werr != nil {
-			fmt.Fprintf(os.Stderr, " (%v)", werr)
+	// wildcard provisioning, so those edges must prove a fresh tunnel
+	// hostname resolves here before claiming the deployment is
+	// complete. The single-host edge serves exactly ONE apex hostname
+	// and needs no wildcard record: requiring one there would block a
+	// perfectly valid single-host MCP deployment.
+	if edge == "tunnel" || edge == "wildcard" {
+		if wmatched, _, werr := verifyWildcardDNS(ctx, hostname, []string{d.EgressV4, d.EgressV6}); werr != nil || !wmatched {
+			fmt.Fprintf(os.Stderr, "ACTION REQUIRED: *.t.%s does not resolve to this host here", hostname)
+			if werr != nil {
+				fmt.Fprintf(os.Stderr, " (%v)", werr)
+			}
+			fmt.Fprintf(os.Stderr, "; tunnel hostnames like <id>.t.%s would not validate.\n", hostname)
+			fmt.Fprintf(os.Stderr, "ACTION REQUIRED: create one wildcard record — *.t.%s A %s%s — then re-run `ocliv setup --auto --hostname %s --acme-email %s`\n",
+				hostname, nonEmpty(d.EgressV4), wildcardAAAASuffix(d.EgressV6), hostname, acmeEmail)
+			return apperr.ExitRelayTLS
 		}
-		fmt.Fprintf(os.Stderr, "; tunnel hostnames like <id>.t.%s would not validate.\n", hostname)
-		fmt.Fprintf(os.Stderr, "ACTION REQUIRED: create one wildcard record — *.t.%s A %s%s — then re-run `ocliv setup --auto --hostname %s --acme-email %s`\n",
-			hostname, nonEmpty(d.EgressV4), wildcardAAAASuffix(d.EgressV6), hostname, acmeEmail)
-		return apperr.ExitRelayTLS
 	}
 	_, _, cfgPath, err := agentFiles()
 	if err != nil {
