@@ -119,3 +119,80 @@ func TestManagedChallengeMissingBearerHasNoErrorCodeAndInvalidDoes(t *testing.T)
 		t.Fatalf("invalid-bearer challenge lost the metadata URL: %q", ic)
 	}
 }
+
+// TestManagedDenialNeverRedirectsToUnlockPage pins the other half of
+// Priority 1 A: an unauthorized MCP API request must be ANSWERED, not
+// REDIRECTED. A 302 to the unlock page would send an API caller's
+// FollowRedirects into POSTing its bearer to an HTML form, and would make
+// a standards-shaped SDK report "too many redirects" instead of the 401
+// that drives OAuth discovery.
+//
+// The relay's public path DOES redirect credential-less browser visits
+// (relay_public.go: the visitor branch at the bottom of serveRouted).
+// What this pins is that the MCP branch never reaches it: the managed
+// authorization failure answers with the challenge directly.
+func TestManagedDenialNeverRedirectsToUnlockPage(t *testing.T) {
+	s, db := newMCPServer(t)
+	priv := enrollTestKey(t, db.SQL(), "key-test", "tenant-test")
+	insertMCPLeaseRow(t, db, "lse-nr", "owner.t.example.test", AccessModeMCPManaged, "ACTIVE", 1, nil)
+	liveFabricatedSession(t, s, "lse-nr", 1)
+	route := publishRoute(t, s, priv, "key-test", "lse-nr", "managed-oauth")
+
+	for _, tc := range []struct{ name, bearer string }{
+		{"missing bearer", ""},
+		{"invalid bearer", "not-a-real-token"},
+	} {
+		rec := doManagedTool(t, s, route, tc.bearer)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s: status=%d, want 401 (an MCP denial must not redirect)", tc.name, rec.Code)
+		}
+		if loc := rec.Header().Get("Location"); loc != "" {
+			t.Fatalf("%s: carried a Location header %q - an API caller would be sent to an unlock page", tc.name, loc)
+		}
+		for _, sc := range []int{http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+			if rec.Code == sc {
+				t.Fatalf("%s: status=%d is a redirect", tc.name, rec.Code)
+			}
+		}
+		// It must still carry the challenge that starts discovery.
+		if !strings.Contains(rec.Header().Get("WWW-Authenticate"), `resource_metadata="`) {
+			t.Fatalf("%s: lost the discovery challenge", tc.name)
+		}
+	}
+}
+
+// TestManagedRouteDiscoveryIsNotBehindAuthorization pins that the
+// discovery document stays public even when the tool path is locked: a
+// client must be able to follow the challenge without already holding a
+// token (that is the whole point of the challenge).
+func TestManagedRouteDiscoveryIsNotBehindAuthorization(t *testing.T) {
+	s, db := newMCPServer(t)
+	priv := enrollTestKey(t, db.SQL(), "key-test", "tenant-test")
+	insertMCPLeaseRow(t, db, "lse-ds", "owner.t.example.test", AccessModeMCPManaged, "ACTIVE", 1, nil)
+	liveFabricatedSession(t, s, "lse-ds", 1)
+	route := publishRoute(t, s, priv, "key-test", "lse-ds", "managed-oauth")
+
+	prm := "https://public.example.org/.well-known/oauth-protected-resource/r/" + route + "/mcp"
+	req := httptest.NewRequest(http.MethodGet, prm, nil)
+	req.Host = "public.example.org"
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("discovery status=%d, want 200 (discovery must not require a token)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"resource":"https://public.example.org/r/`+route+`/mcp"`) {
+		t.Fatalf("discovery not bound to this route: %s", rec.Body.String())
+	}
+	// And the AS metadata the PRM names is also public.
+	as := "https://public.example.org/.well-known/oauth-authorization-server/r/" + route + "/oauth"
+	areq := httptest.NewRequest(http.MethodGet, as, nil)
+	areq.Host = "public.example.org"
+	arec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(arec, areq)
+	if arec.Code != http.StatusOK {
+		t.Fatalf("AS metadata status=%d, want 200", arec.Code)
+	}
+	if !strings.Contains(arec.Body.String(), `"issuer":"https://public.example.org/r/`+route+`/oauth"`) {
+		t.Fatalf("AS metadata issuer not bound to this route: %s", arec.Body.String())
+	}
+}
