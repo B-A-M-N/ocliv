@@ -180,10 +180,13 @@ func (s *Server) serveManagedAuthz(w http.ResponseWriter, r *http.Request, t *ro
 	}
 	// Public endpoints are UNAUTHENTICATED by protocol (DCR, authorize,
 	// consent, token, revoke), so each one is rate limited per tenant +
-	// endpoint kind. A caller cannot drive unbounded durable writes
-	// (registrations, consent challenges, token attempts) against one
-	// route's state.
-	if kind, ok := managedAuthzKind(r.URL.EscapedPath()); ok && !s.throttle.Allow("authz:"+kind+":"+t.TenantID) {
+	// endpoint KIND + ROUTE. The route is part of the key: a flood
+	// against one route's public endpoint is an attack on that route,
+	// and must not deny legitimate callers on an unrelated route in the
+	// same tenant (the durable client quota is already per route). A
+	// caller cannot drive unbounded durable writes (registrations,
+	// consent challenges, token attempts) against one route's state.
+	if kind, ok := managedAuthzKind(r.URL.EscapedPath()); ok && !s.throttle.Allow("authz:"+kind+":"+t.TenantID+":"+t.RouteID) {
 		s.db.Audit("visitor", t.TenantID, t.LeaseID, "mcp_path", "denied", "authz rate limited: "+kind)
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
