@@ -180,15 +180,25 @@ func (s *Server) managedPRMURL(routeID string) string {
 }
 
 // writeManagedBearerChallenge answers a failed managed MCP authorization
-// with an RFC 6750 Bearer [REDACTED] whose resource_uri is this route's
-// RFC 9728 metadata URL, so a standards-shaped MCP client can discover the
-// Authorization Server and start OAuth instead of dead-ending on a bare
-// 401. A MISSING credential is challenged without an error code; a
-// PRESENTED but invalid one carries error="invalid_token". The request is
-// never redirected to a generic unlock page: an API caller that follows a
-// 302 would silently POST its bearer to an HTML form.
+// with an RFC 6750 Bearer challenge whose resource_metadata parameter is
+// this route's RFC 9728 metadata URL, so a standards-shaped MCP client
+// can discover the Authorization Server and start OAuth instead of
+// dead-ending on a bare 401.
+//
+// The PARAMETER NAME is `resource_metadata` (RFC 9728 §5.1, and the MCP
+// 2025-11-25 authorization spec's "include the resource metadata URL in
+// the WWW-Authenticate HTTP header under `resource_metadata`"). It was
+// `resource_uri` before, which no client parses: the official SDK reads
+// `resource_metadata` and silently fell back to guessing the well-known
+// path, which happened to match Ocliv's own layout. A client that trusts
+// the challenge would have dead-ended.
+//
+// A MISSING credential is challenged without an error code; a PRESENTED
+// but invalid one carries error="invalid_token". The request is never
+// redirected to a generic unlock page: an API caller that follows a 302
+// would silently POST its bearer to an HTML form.
 func (s *Server) writeManagedBearerChallenge(w http.ResponseWriter, r *http.Request, t *routeTarget) {
-	challenge := `Bearer resource_uri="` + s.managedPRMURL(t.RouteID) + `"`
+	challenge := `Bearer resource_metadata="` + s.managedPRMURL(t.RouteID) + `"`
 	if presentedBearer(r) != "" {
 		challenge += `, error="invalid_token", error_description="the access token is expired, revoked, or not valid for this route"`
 	}

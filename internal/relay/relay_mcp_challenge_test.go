@@ -2,7 +2,7 @@ package relay
 
 // A: a managed MCP route must challenge like an RFC 6750 / RFC 9728
 // resource. MCP SDK clients discover the Authorization Server from the
-// WWW-Authenticate resource_uri, so a bare 401 is an unusable endpoint:
+// WWW-Authenticate resource_metadata, so a bare 401 is an unusable endpoint:
 // the client has no path to authorization.
 
 import (
@@ -46,8 +46,8 @@ func TestManagedRouteChallengesWithResourceMetadata(t *testing.T) {
 	}
 	challenge := rec.Header().Get("WWW-Authenticate")
 	wantURI := "https://public.example.org/.well-known/oauth-protected-resource/r/" + route + "/mcp"
-	if !strings.Contains(challenge, `resource_uri="`+wantURI+`"`) {
-		t.Fatalf("challenge %q missing route-scoped resource_uri %q", challenge, wantURI)
+	if !strings.Contains(challenge, `resource_metadata="`+wantURI+`"`) {
+		t.Fatalf("challenge %q missing route-scoped resource_metadata %q", challenge, wantURI)
 	}
 	if !strings.HasPrefix(challenge, "Bearer ") {
 		t.Fatalf("challenge %q is not a Bearer challenge", challenge)
@@ -62,7 +62,7 @@ func TestManagedRouteChallengesWithResourceMetadata(t *testing.T) {
 	mrec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(mrec, mreq)
 	if mrec.Code != http.StatusOK {
-		t.Fatalf("challenge resource_uri status=%d, want 200", mrec.Code)
+		t.Fatalf("challenge resource_metadata status=%d, want 200", mrec.Code)
 	}
 	if !strings.Contains(mrec.Body.String(), `"resource":"https://public.example.org/r/`+route+`/mcp"`) {
 		t.Fatalf("PRM body not bound to this route: %s", mrec.Body.String())
@@ -70,7 +70,7 @@ func TestManagedRouteChallengesWithResourceMetadata(t *testing.T) {
 }
 
 // A presented-but-invalid bearer is distinguished: 401 with
-// error="invalid_token" and the same resource_uri.
+// error="invalid_token" and the same resource_metadata.
 func TestManagedRouteInvalidBearerChallengeDistinguished(t *testing.T) {
 	s, db := newMCPServer(t)
 	priv := enrollTestKey(t, db.SQL(), "key-test", "tenant-test")
@@ -87,8 +87,8 @@ func TestManagedRouteInvalidBearerChallengeDistinguished(t *testing.T) {
 	if !strings.Contains(challenge, `error="invalid_token"`) {
 		t.Fatalf("invalid-bearer challenge lacks error=invalid_token: %q", challenge)
 	}
-	if !strings.Contains(challenge, `resource_uri="https://public.example.org/.well-known/oauth-protected-resource/r/`+route+`/mcp"`) {
-		t.Fatalf("invalid-bearer challenge lacks the route resource_uri: %q", challenge)
+	if !strings.Contains(challenge, `resource_metadata="https://public.example.org/.well-known/oauth-protected-resource/r/`+route+`/mcp"`) {
+		t.Fatalf("invalid-bearer challenge lacks the route resource_metadata: %q", challenge)
 	}
 }
 
@@ -128,7 +128,7 @@ func TestManagedRouteForeignAudienceRejected(t *testing.T) {
 		t.Fatalf("foreign-audience token status=%d, want 401", rec.Code)
 	}
 	challenge := rec.Header().Get("WWW-Authenticate")
-	if !strings.Contains(challenge, `resource_uri="https://public.example.org/.well-known/oauth-protected-resource/r/`+routeA+`/mcp"`) {
+	if !strings.Contains(challenge, `resource_metadata="https://public.example.org/.well-known/oauth-protected-resource/r/`+routeA+`/mcp"`) {
 		t.Fatalf("challenge for the wrong route: %q", challenge)
 	}
 }
