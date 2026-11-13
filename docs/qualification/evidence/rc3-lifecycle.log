@@ -1,0 +1,27 @@
+PASS 6a the publication exists before the restart  rows=[('tLr9k_MPbqi55NoNcaU1gA', 'lse-F_-xu5PHvwU62wCIAAcT7g')]
+PASS 6b after the publisher stops the route is 503 (retained, offline)  status=503
+PASS 6c the publication is retained offline  rows=[('tLr9k_MPbqi55NoNcaU1gA',)]
+PASS 6d the same-key restart keeps the SAME route id  rows=[('tLr9k_MPbqi55NoNcaU1gA', 'lse-C2Q47S7R2Bo2oeO8n9u0Eg')]
+PASS 6e the publication moved to a NEW lease  lease lse-F_-xu5PHvwU62wCIAAcT7g -> lse-C2Q47S7R2Bo2oeO8n9u0Eg
+PASS 6f the route serves again (401 = alive, auth required)  status=401
+PASS 6g exactly ONE publication row for the name
+PASS 6h a second key can be enrolled in the same tenant
+PASS 6i the second key enrolled  Enrolled as key-a5b5a66a2d4883f7
+Relay: https://pop-os.tail8d285a.ts.net
+PASS 6j two keys exist in the tenant  keys=[('key-4e4495cfe622c7c1',), ('key-a5b5a66a2d4883f7',)]
+PASS 6k the cross-key takeover is REFUSED with a non-zero exit  exit=4
+PASS 6l the refusal is terminal and actionable  msg='ease)\npublication name is held by another agent key in this tenant: publish under a different --name, or ask the operator to transfer or revoke the existing one'
+PASS 6m the original owner still owns the publication  owner=[('key-4e4495cfe622c7c1',)]
+PASS 6n the original route still serves
+PASS 6o the refusal is audited  rows=[('lease_reclaim', 'denied'), ('attach', 'denied'), ('mcp_path', 'denied')]
+PASS 7a the route has operator grants before unpublish  grants=[('cli_DtU-XaIJ6JaDpvNuYCXElA', 'active')]
+PASS 7b unpublish succeeds  exit=0 ✓ MCP route removed: tLr9k_MPbqi55NoNcaU1gA
+PASS 7c the publication is gone  rows=[]
+PASS 7d the route's grants were RETIRED with the route  grants=[('cli_DtU-XaIJ6JaDpvNuYCXElA', 'revoked')]
+PASS 7e the grant rows still exist (durable history, not deleted)  1 -> 1
+PASS 7f client registrations are preserved  clients=[('cli_DtU-XaIJ6JaDpvNuYCXElA',)]
+PASS 7g the route is 404 after unpublish  status=404
+
+=== RESULT ===
+checks: 22, passed: 22, failed: 0
+EXIT=0

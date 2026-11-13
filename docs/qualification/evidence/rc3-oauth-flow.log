@@ -1,0 +1,22 @@
+PASS 8a unauthenticated call refused  status=401
+PASS 8b refusal executed no upstream call  upstream 0 -> 0
+{"event": "authorize-url", "url": "https://pop-os.tail8d285a.ts.net/r/tLr9k_MPbqi55NoNcaU1gA/oauth/authorize?response_type=code&client_id=cli_DtU-XaIJ6JaDpvNuYCXElA&redirect_uri=http%3A%2F%2F127.0.0.1%3A59997%2Fcallback&state=e9Cg4K4plSNCWgw-r_890scg1ml4mmJ_UBN02U-UqRw&code_challenge=QEIbdazvdOAOyDaDjumR_loIBKctWQD_IlgDOGdQ3s4&code_challenge_method=S256&resource=https%3A%2F%2Fpop-os.tail8d285a.ts.net%2Fr%2FtLr9k_MPbqi55NoNcaU1gA%2Fmcp"}
+{"event": "callback-received", "state": "e9Cg4K4plSNCWgw-r_890scg1ml4mmJ_UBN02U-UqRw"}
+{"event": "initialize-ok"}
+PASS 3a tools/list over public HTTPS  tools=['qual_ping']
+PASS 3b tools/call reached the upstream  result='pong:ocliv-qual-1'
+PASS 1a SDK holds an access+refresh pair
+PASS 2a DCR registered the client with the relay  client_id=cli_DtU-XaIJ6JaDpvNuYCXElA
+PASS 2b the operator grant is ACTIVE  grants=[('active',)]
+PASS 3c exactly one authorized upstream execution  upstream 0 -> 1
+PASS 5a token revocation returns 200  status=200
+PASS 5b the revoked token is refused  status=401
+PASS 5c the refusal executed no upstream call  upstream 1 -> 1
+PASS 4a the refresh grant issues a new pair  status=200
+PASS 4b the new pair is usable
+PASS 4c the renewed token reaches the upstream  status=200 upstream 1 -> 2
+PASS 4d replay of the rotated refresh token is refused  status=400
+
+=== RESULT ===
+checks: 15, passed: 15, failed: 0
+EXIT=0
