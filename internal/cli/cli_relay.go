@@ -362,6 +362,12 @@ func cmdRelayServe(argv []string) int {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// Authorization-state maintenance rides the relay's own lifecycle:
+	// expired codes/challenges, retention-expired revocations, and
+	// abandoned client registrations are reclaimed while the relay runs,
+	// not only at startup. No second service is created; the loop ends
+	// with the relay.
+	go srv.RunAuthzMaintenance(ctx)
 	// G06: bound slow-trickle connections. ReadTimeout caps total request
 	// ingress (the 64MiB body cap keeps this generous for legit uploads);
 	// IdleTimeout reaps dead keep-alive connections. WriteTimeout stays

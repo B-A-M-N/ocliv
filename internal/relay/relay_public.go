@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -165,6 +166,47 @@ func mcpUpstreamPathAllowed(t *routeTarget, escapedPath string) bool {
 	return escapedPath == mcpASWellKnownUpstreamPath || mcpOAuthEndpoints[escapedPath]
 }
 
+// managedPRMURL is the route-scoped RFC 9728 protected-resource metadata
+// URL: the path-inserted well-known form for exactly this route's tool
+// endpoint. It is what a client following WWW-Authenticate fetches to
+// discover the route-scoped Authorization Server, so it must name this
+// route and no other.
+func (s *Server) managedPRMURL(routeID string) string {
+	base := "https://" + s.mcpHost
+	if s.mcpPort != 0 && s.mcpPort != 443 {
+		base += ":" + strconv.Itoa(s.mcpPort)
+	}
+	return base + mcpWellKnownPrefix + routeID + "/mcp"
+}
+
+// writeManagedBearerChallenge answers a failed managed MCP authorization
+// with an RFC 6750 Bearer [REDACTED] whose resource_uri is this route's
+// RFC 9728 metadata URL, so a standards-shaped MCP client can discover the
+// Authorization Server and start OAuth instead of dead-ending on a bare
+// 401. A MISSING credential is challenged without an error code; a
+// PRESENTED but invalid one carries error="invalid_token". The request is
+// never redirected to a generic unlock page: an API caller that follows a
+// 302 would silently POST its bearer to an HTML form.
+func (s *Server) writeManagedBearerChallenge(w http.ResponseWriter, r *http.Request, t *routeTarget) {
+	challenge := `Bearer resource_uri="` + s.managedPRMURL(t.RouteID) + `"`
+	if presentedBearer(r) != "" {
+		challenge += `, error="invalid_token", error_description="the access token is expired, revoked, or not valid for this route"`
+	}
+	w.Header().Set("WWW-Authenticate", challenge)
+	http.Error(w, "unauthorized", http.StatusUnauthorized)
+}
+
+// presentedBearer returns the bearer credential the client actually sent
+// on the application Authorization header (not Ocliv's own
+// X-Ocliv-Authorization credential, which never reaches this path).
+func presentedBearer(r *http.Request) string {
+	h := strings.TrimSpace(r.Header.Get("Authorization"))
+	if len(h) > 7 && strings.EqualFold(h[:7], "Bearer ") {
+		return strings.TrimSpace(h[7:])
+	}
+	return ""
+}
+
 // serveRouted enforces visitor authorization for one admitted route
 // target — wildcard or path — and forwards it upstream. It is the only
 // place path-routed requests meet the auth policy: handlePublic admits,
@@ -201,7 +243,7 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request, t *routeTar
 		client, err := s.authorizeManaged(r, t.TenantID, t.RouteID)
 		if err != nil {
 			s.db.Audit("visitor", t.TenantID, t.LeaseID, "mcp_path", "denied", "managed bearer rejected")
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			s.writeManagedBearerChallenge(w, r, t)
 			return
 		}
 		// Inject the relay-minted upstream identity and strip the external

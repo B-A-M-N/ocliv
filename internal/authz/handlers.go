@@ -31,6 +31,10 @@ type Server struct {
 	IssuerURL string // exact AS issuer string
 	CodeTTL   time.Duration
 	TokenTTL  time.Duration
+	// RefreshTTL bounds a refresh token. Zero selects
+	// DefaultRefreshTTL. Refresh tokens rotate on use; the operator's
+	// client revocation remains the terminal authority.
+	RefreshTTL time.Duration
 	// ConsentTTL bounds a pending consent challenge. Zero selects
 	// DefaultConsentTTL.
 	ConsentTTL time.Duration
@@ -126,17 +130,19 @@ func (s *Server) ProtectedResourceMetadata() map[string]any {
 func (s *Server) AuthorizationServerMetadata() map[string]any {
 	base := s.IssuerURL
 	return map[string]any{
-		"issuer":                                base,
-		"authorization_endpoint":                base + "/authorize",
-		"token_endpoint":                        base + "/token",
-		"registration_endpoint":                 base + "/register",
-		"revocation_endpoint":                   base + "/revoke",
-		"jwks_uri":                              base + "/jwks",
-		"response_types_supported":              []string{"code"},
-		"grant_types_supported":                 []string{"authorization_code"},
-		"code_challenge_methods_supported":      []string{"S256"},
-		"token_endpoint_auth_methods_supported": []string{"none"},
-		"resource_indicators_supported":         true,
+		"issuer":                                     base,
+		"authorization_endpoint":                     base + "/authorize",
+		"token_endpoint":                             base + "/token",
+		"registration_endpoint":                      base + "/register",
+		"revocation_endpoint":                        base + "/revoke",
+		"jwks_uri":                                   base + "/jwks",
+		"response_types_supported":                   []string{"code"},
+		"response_modes_supported":                   []string{"query"},
+		"grant_types_supported":                      []string{"authorization_code", "refresh_token"},
+		"code_challenge_methods_supported":           []string{"S256"},
+		"token_endpoint_auth_methods_supported":      []string{"none"},
+		"revocation_endpoint_auth_methods_supported": []string{"none"},
+		"resource_indicators_supported":              true,
 	}
 }
 
@@ -166,6 +172,12 @@ type registerReq struct {
 	LogoURI                 string   `json:"logo_uri"`
 	ClientURI               string   `json:"client_uri"`
 	SoftwareID              string   `json:"software_id"`
+	// ApplicationType is the RFC 8251 "native"/"web" marker MCP clients
+	// are expected to send. A "web" client must not use a loopback
+	// redirect: the loopback exception exists for native applications
+	// only, and an absent value is treated as unspecified (older
+	// clients send nothing).
+	ApplicationType string `json:"application_type"`
 }
 
 // ServeRegister implements RFC 7591 dynamic client registration. It creates a
@@ -196,37 +208,62 @@ func (s *Server) ServeRegister(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// A "web" application type with a loopback redirect is the exact
+	// shape RFC 8251 / the MCP authorization guidance tells the AS to
+	// refuse: the loopback http exception exists for native clients,
+	// which prove nothing about their channel. Absent or "native" is
+	// accepted (older MCP clients omit the field entirely).
+	if strings.EqualFold(req.ApplicationType, "web") {
+		for _, uri := range req.RedirectURIs {
+			if u, perr := url.Parse(uri); perr == nil && isCanonicalLoopbackHost(u.Hostname()) {
+				writeJSON(w, http.StatusBadRequest, map[string]string{
+					"error":             "invalid_redirect_uri",
+					"error_description": "a web client may not use a loopback redirect",
+				})
+				return
+			}
+		}
+	}
 	// SSRF hardening: the relay never fetches client-supplied URLs. The
 	// metadata is stored for display/audit only.
 
-	// Bounded registration: public DCR writes durable rows, so a route may
-	// hold at most MaxClientsPerRoute clients. Revoked clients still count:
-	// their id reservation is permanent.
-	if n, err := s.Store.CountClients(s.tenant(), s.RouteID); err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	} else if n >= MaxClientsPerRoute {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{
-			"error":             "invalid_client_metadata",
-			"error_description": "registration quota for this route is exhausted",
-		})
-		return
-	}
+	// Bounded registration: public DCR writes durable rows, so a route
+	// may hold at most MaxClientsPerRoute clients. Revoked clients still
+	// count: their id reservation is permanent. The bound check and the
+	// insert are ONE atomic store step, so concurrent registrations
+	// cannot cross the quota. At the bound, safe reclamation of
+	// abandoned registrations (never approved, past the pending
+	// lifetime) runs once and the attempt is retried, so a full table of
+	// dead registrations does not permanently deny a legitimate client.
 	id, err := MintClientID()
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	if err := s.Store.RegisterClient(Client{
+	client := Client{
 		ID:           id,
 		Name:         req.ClientName,
 		RedirectURIs: append([]string(nil), req.RedirectURIs...),
 		CreatedAt:    time.Now(),
 		Tenant:       s.tenant(),
 		Route:        s.RouteID,
-	}); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_client_metadata", "error_description": err.Error()})
-		return
+	}
+	if err := s.Store.TryRegisterClient(client); err != nil {
+		if err != ErrClientQuota {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_client_metadata", "error_description": err.Error()})
+			return
+		}
+		if _, perr := s.Store.PruneAbandonedClients(time.Now()); perr != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		if err := s.Store.TryRegisterClient(client); err != nil {
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{
+				"error":             "invalid_client_metadata",
+				"error_description": "registration quota for this route is exhausted",
+			})
+			return
+		}
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"client_id":                  id,
@@ -506,7 +543,17 @@ func (s *Server) ServeConsent(w http.ResponseWriter, r *http.Request) {
 	s.issueCode(w, r, clientID, redirectURI, challenge, "S256", state)
 }
 
-// ServeToken exchanges an authorization code for an access token.
+// DefaultRefreshTTL bounds a refresh token. It is deliberately short of
+// "forever": an operator's client revocation is the terminal authority,
+// and a rotating credential with a bounded life keeps a stolen refresh
+// token useful only within its window (and only until first replay).
+var DefaultRefreshTTL = 30 * 24 * time.Hour
+
+// ServeToken exchanges an authorization code for an access token, and a
+// refresh token for a fresh pair under RFC 6749 §6 rotation: the presented
+// refresh token is consumed on use, so a replay of an already-rotated
+// token fails closed and the operator's revocation of the client's grant
+// terminates the lineage.
 func (s *Server) ServeToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -516,10 +563,18 @@ func (s *Server) ServeToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if r.Form.Get("grant_type") != "authorization_code" {
+	switch r.Form.Get("grant_type") {
+	case "authorization_code":
+		s.serveCodeGrant(w, r)
+	case "refresh_token":
+		s.serveRefreshGrant(w, r)
+	default:
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported_grant_type"})
-		return
 	}
+}
+
+// serveCodeGrant exchanges an authorization code for tokens.
+func (s *Server) serveCodeGrant(w http.ResponseWriter, r *http.Request) {
 	codeStr := r.Form.Get("code")
 	clientID := r.Form.Get("client_id")
 	redirectURI := r.Form.Get("redirect_uri")
@@ -559,30 +614,166 @@ func (s *Server) ServeToken(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant", "error_description": "client is not approved for this route"})
 		return
 	}
-	jti, err := MintJTI()
+	accessJTI, err := MintJTI()
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	token, err := s.Issuer.Mint(TokenClaims{
+	access, err := s.Issuer.Mint(TokenClaims{
 		Issuer:   s.IssuerURL,
 		Subject:  clientID,
 		Audience: s.RouteURL,
 		Tenant:   s.tenant(),
 		Route:    s.RouteID,
 		Expiry:   time.Now().Add(s.tokenTTL()).Unix(),
-		ID:       jti,
+		ID:       accessJTI,
+	})
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	refreshJTI, err := MintJTI()
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	refresh, err := s.Issuer.Mint(TokenClaims{
+		Issuer:    s.IssuerURL,
+		Subject:   clientID,
+		Audience:  s.RouteURL,
+		Tenant:    s.tenant(),
+		Route:     s.RouteID,
+		Expiry:    time.Now().Add(s.refreshTTL()).Unix(),
+		ID:        refreshJTI,
+		TokenType: "refresh",
 	})
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"access_token": token,
-		"token_type":   "Bearer",
-		"expires_in":   int(s.tokenTTL().Seconds()),
-		"scope":        "",
+		"access_token":  access,
+		"token_type":    "Bearer",
+		"expires_in":    int(s.tokenTTL().Seconds()),
+		"refresh_token": refresh,
+		"scope":         "",
 	})
+}
+
+// serveRefreshGrant rotates a refresh token. Every check the code grant
+// applies to the client still applies here: the client must not be
+// revoked and its grant must still be ACTIVE, so an operator's revocation
+// terminates the refresh lineage without hunting individual tokens.
+func (s *Server) serveRefreshGrant(w http.ResponseWriter, r *http.Request) {
+	clientID := r.Form.Get("client_id")
+	refreshStr := r.Form.Get("refresh_token")
+	resource := r.Form.Get("resource")
+	if clientID == "" || refreshStr == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	if resource != s.RouteURL {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_target",
+			"error_description": "resource must be this route's canonical URL"})
+		return
+	}
+	claims, err := s.Issuer.Verify(refreshStr)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant",
+			"error_description": "refresh token verification failed"})
+		return
+	}
+	// A refresh credential is only ever accepted here: an access token
+	// presented to this grant (or a refresh token at the tool path) is a
+	// credential-kind confusion and is refused.
+	if claims.TokenType != "refresh" || claims.ID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant",
+			"error_description": "not a refresh token"})
+		return
+	}
+	if claims.Subject != clientID || !claims.ValidateAudience(s.RouteURL) ||
+		!claims.ValidateIssuer(s.IssuerURL) || claims.Tenant != s.tenant() || claims.Route != s.RouteID {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant",
+			"error_description": "refresh token is not bound to this client and route"})
+		return
+	}
+	// Rotation with replay detection: the presented token must be
+	// unrevoked. A rotated-out (replayed) token lands here and fails
+	// closed — RFC 6749 §6 behavior.
+	if revoked, rerr := s.Store.IsTokenRevoked(claims.ID, s.tenant(), s.RouteID); rerr != nil || revoked {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant",
+			"error_description": "refresh token already rotated or revoked"})
+		return
+	}
+	if client, cerr := s.Store.GetClient(clientID); cerr != nil || client.RevokedAt != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_client",
+			"error_description": "client revoked"})
+		return
+	}
+	grant, err := s.Store.GetGrant(clientID, s.tenant(), s.RouteID)
+	if err != nil || grant.Status != GrantActive {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant",
+			"error_description": "client is not approved for this route"})
+		return
+	}
+	// Burn the presented refresh token first: the rotation commits the
+	// single-use property before the new pair exists.
+	if err := s.Store.RevokeToken(claims.ID, clientID, s.tenant(), s.RouteID); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	accessJTI, err := MintJTI()
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	access, err := s.Issuer.Mint(TokenClaims{
+		Issuer:   s.IssuerURL,
+		Subject:  clientID,
+		Audience: s.RouteURL,
+		Tenant:   s.tenant(),
+		Route:    s.RouteID,
+		Expiry:   time.Now().Add(s.tokenTTL()).Unix(),
+		ID:       accessJTI,
+	})
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	refreshJTI, err := MintJTI()
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	refresh, err := s.Issuer.Mint(TokenClaims{
+		Issuer:    s.IssuerURL,
+		Subject:   clientID,
+		Audience:  s.RouteURL,
+		Tenant:    s.tenant(),
+		Route:     s.RouteID,
+		Expiry:    time.Now().Add(s.refreshTTL()).Unix(),
+		ID:        refreshJTI,
+		TokenType: "refresh",
+	})
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"access_token":  access,
+		"token_type":    "Bearer",
+		"expires_in":    int(s.tokenTTL().Seconds()),
+		"refresh_token": refresh,
+		"scope":         "",
+	})
+}
+
+// refreshTTL bounds a refresh token. Zero selects DefaultRefreshTTL.
+func (s *Server) refreshTTL() time.Duration {
+	if s.RefreshTTL > 0 {
+		return s.RefreshTTL
+	}
+	return DefaultRefreshTTL
 }
 
 // ServeRevoke implements RFC 7009 token revocation for the route.

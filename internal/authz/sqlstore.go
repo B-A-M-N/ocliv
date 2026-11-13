@@ -78,6 +78,72 @@ func (s *SQLStore) CountClients(tenant, route string) (int, error) {
 	return n, nil
 }
 
+// TryRegisterClient registers a client only if the route's client table
+// still has room, with the bound check and the insert inside ONE
+// transaction: two separate statements would let concurrent public
+// registrations both observe room for one and both insert, crossing the
+// bound. Revoked registrations still count: their id reservation is
+// permanent.
+func (s *SQLStore) TryRegisterClient(c Client) error {
+	if c.ID == "" {
+		return fmt.Errorf("authz: client id is required")
+	}
+	uris, err := json.Marshal(c.RedirectURIs)
+	if err != nil {
+		return fmt.Errorf("authz: redirect uris: %w", err)
+	}
+	createdAt := c.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("authz: register tx: %w", err)
+	}
+	defer tx.Rollback()
+	var n int
+	if err := tx.QueryRow(
+		`SELECT COUNT(1) FROM authz_clients WHERE tenant_id=? AND route_id=?`,
+		c.Tenant, c.Route).Scan(&n); err != nil {
+		return fmt.Errorf("authz: count clients: %w", err)
+	}
+	if n >= MaxClientsPerRoute {
+		return ErrClientQuota
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO authz_clients(id, name, redirect_uris, created_at, tenant_id, route_id) VALUES(?,?,?,?,?,?)`,
+		c.ID, c.Name, string(uris), createdAt.UTC().Format(time.RFC3339Nano), c.Tenant, c.Route); err != nil {
+		return fmt.Errorf("authz: register client: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("authz: register commit: %w", err)
+	}
+	return nil
+}
+
+// PruneAbandonedClients reclaims registrations that are older than
+// MaxPendingClientAge and have NO grant row on their route. The predicate
+// preserves every identity with authorization state: a revoked client
+// (its id reservation is security-relevant), and any client a grant row
+// attaches to — active or revoked. Deleting those would forge a new
+// identity over retained authority.
+func (s *SQLStore) PruneAbandonedClients(now time.Time) (int, error) {
+	cutoff := now.Add(-MaxPendingClientAge).UTC().Format(time.RFC3339Nano)
+	res, err := s.db.Exec(
+		`DELETE FROM authz_clients
+		 WHERE created_at < ? AND revoked_at IS NULL
+		   AND NOT EXISTS (SELECT 1 FROM authz_grants g
+		                    WHERE g.client_id=authz_clients.id
+		                      AND g.tenant_id=authz_clients.tenant_id
+		                      AND g.route_id=authz_clients.route_id)`,
+		cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("authz: prune abandoned clients: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
 // RevokeClient marks a client revoked. The row is retained so the id cannot
 // be re-registered to bypass the revocation.
 func (s *SQLStore) RevokeClient(id string) error {
@@ -200,7 +266,14 @@ func (s *SQLStore) ConsumePairingSecret(clientID, tenant, route, secret string) 
 	if stored == "" || used.Valid {
 		return false, nil
 	}
-	if exp, perr := time.Parse(time.RFC3339Nano, expires); perr == nil && time.Now().After(exp) {
+	// Fail closed on unusable expiry state: an empty or unparseable
+	// timestamp means the persisted state is corrupt, and a credential
+	// whose expiry cannot be proven unexpired is denied. The old
+	// condition (perr == nil && expired) skipped the check entirely
+	// when parsing failed, turning corruption into an eternal
+	// credential.
+	exp, perr := time.Parse(time.RFC3339Nano, expires)
+	if perr != nil || exp.IsZero() || time.Now().After(exp) {
 		return false, nil
 	}
 	if !hmac.Equal([]byte(stored), []byte(HashSecret(secret))) {

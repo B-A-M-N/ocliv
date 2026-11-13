@@ -1,11 +1,13 @@
 package relay
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"ocliv/internal/authz"
 	"ocliv/internal/store"
@@ -120,6 +122,45 @@ func managedAuthzKind(escapedPath string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// authzMaintenanceInterval bounds how often expired authorization state
+// is reclaimed while the relay runs. Pruning already runs at startup
+// (reconcileBoot); this covers a long-lived relay. It is a variable so
+// tests can drive the same loop on a short cadence.
+var authzMaintenanceInterval = 10 * time.Minute
+
+// RunAuthzMaintenance periodically reclaims expired authorization state
+// for as long as the relay lives: consumed/expired codes and consent
+// challenges, revocations past their retention window, and client
+// registrations that never obtained approval past the pending lifetime.
+// It rides the relay's own lifecycle context (no second service), is
+// cancellable, performs only bounded indexed deletes, and can never
+// resurrect access: authority lives in grants and clients, which pruning
+// never touches. A failure is audited and the loop continues: a missed
+// cycle costs space, not safety.
+func (s *Server) RunAuthzMaintenance(ctx context.Context) {
+	if s.authz == nil {
+		return
+	}
+	t := time.NewTicker(authzMaintenanceInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			now := time.Now()
+			if err := s.authz.Store().PruneAuthzExpired(now); err != nil {
+				s.db.Audit("system", "", "", "authz-prune", "error",
+					"pruning authorization state failed: "+errShort(err))
+			}
+			if _, err := s.authz.Store().PruneAbandonedClients(now); err != nil {
+				s.db.Audit("system", "", "", "authz-prune", "error",
+					"reclaiming abandoned registrations failed: "+errShort(err))
+			}
+		}
+	}
 }
 
 // serveManagedAuthz serves a managed route's OAuth/metadata request locally.

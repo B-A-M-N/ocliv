@@ -80,6 +80,64 @@ func (s *Server) agentKeyAuth(r *http.Request) (tenantID, keyID string, auth boo
 	return tenant, key, true
 }
 
+// errNoPublication reports an ownership-scoped delete that matched
+// nothing. Callers map it to the same non-disclosing 404 they use for
+// an unknown route, so "not yours" and "never existed" are
+// indistinguishable to the caller.
+var errNoPublication = fmt.Errorf("mcp route: no owned publication")
+
+// deletePublicationAtomically removes one publication and retires the
+// route's operator approvals in ONE transaction.
+//
+// The delete and the approval retirement commit together or not at all:
+// a route-less publication with surviving approvals would leave
+// authority over a route the caller just deleted (a later route reusing
+// the id could inherit it, and the operator's listing would claim
+// approvals for a gone route), while a caller told "deleted" while the
+// cleanup failed would be a fabricated success. Ownership comes from the
+// authenticated (tenant, key) pair; false means the row is not this
+// caller's, which is a 404, never a disclosure.
+func (s *Server) deletePublicationAtomically(tenant, keyID, routeID string) (bool, int, error) {
+	var retired int64
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	err := withTx(s.db.SQL(), func(tx *sql.Tx) error {
+		res, err := tx.Exec(
+			`DELETE FROM mcp_publications WHERE route_id=? AND tenant_id=? AND owner_key_id=?`,
+			routeID, tenant, keyID)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return errNoPublication
+		}
+		if s.authz == nil {
+			return nil
+		}
+		// The route is gone, so its approvals die with it. Scoped to
+		// (tenant, route): no other route's approvals are touched.
+		ures, err := tx.Exec(
+			`UPDATE authz_grants SET status='revoked', updated_at=?
+			 WHERE tenant_id=? AND route_id=? AND status<>'revoked'`,
+			now, tenant, routeID)
+		if err != nil {
+			return err
+		}
+		retired, _ = ures.RowsAffected()
+		return nil
+	})
+	if err != nil {
+		if err == errNoPublication {
+			return false, 0, nil
+		}
+		return false, 0, err
+	}
+	return true, int(retired), nil
+}
+
 // handleAgentPublications serves key-scoped publication management
 // (P0-D): GET lists every publication owned by the calling key,
 // DELETE removes exactly one owned publication by route ID, leaving
@@ -109,16 +167,17 @@ func (s *Server) handleAgentPublications(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	res, err := s.db.SQL().Exec(
-		`DELETE FROM mcp_publications WHERE route_id=? AND tenant_id=? AND owner_key_id=?`,
-		routeID, tenant, keyID)
+	deleted, retired, err := s.deletePublicationAtomically(tenant, keyID, routeID)
 	if err != nil {
+		// The transaction rolled back both halves: the publication is
+		// still there and the caller is told it failed, never a
+		// partial success.
 		s.db.AuditKey("agent", tenant, keyID, "", "mcp-route-delete", "error",
-			"route "+routeID+" delete failed")
+			"route "+routeID+" delete failed: "+errShort(err))
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	if n, _ := res.RowsAffected(); n != 1 {
+	if !deleted {
 		// No row matched this (route, tenant, key) triple. The relay
 		// deliberately does not disclose whether the route exists under
 		// another owner, so "already gone" and "not owned" share the
@@ -130,33 +189,17 @@ func (s *Server) handleAgentPublications(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "unknown route", http.StatusNotFound)
 		return
 	}
-	// The route is gone, so its approvals must die with it: an operator
-	// approval is authority over a route that no longer exists, and a
-	// later route reusing the id must not inherit it. The revocation is
-	// scoped to (tenant, route), so no other route is touched.
-	s.retireRouteApprovals(tenant, routeID)
+	// The route is gone, so its approvals died with it in the same
+	// transaction: an operator approval is authority over a route that
+	// no longer exists, and a later route reusing the id must not
+	// inherit it. The retirement is scoped to (tenant, route), so no
+	// other route is touched.
+	if retired > 0 {
+		s.db.Audit("system", tenant, "", "authz-revoke", "ok",
+			"revoked "+itoa(uint64(retired))+" approval(s) for removed route "+routeID)
+	}
 	s.db.AuditKey("agent", tenant, keyID, "", "mcp-route-delete", "ok", "route "+routeID+" removed")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
-}
-
-// retireRouteApprovals revokes every operator approval of one route.
-// It is a no-op when the relay has no managed mode. A failure is audited
-// but never fails the delete: the route is already gone, so the access
-// decision is fail-closed either way.
-func (s *Server) retireRouteApprovals(tenant, routeID string) {
-	if s.authz == nil {
-		return
-	}
-	n, err := s.authz.Store().RevokeGrantsForRoute(tenant, routeID)
-	if err != nil {
-		s.db.Audit("system", tenant, "", "authz-revoke", "error",
-			"revoking approvals for route "+routeID+" failed: "+errShort(err))
-		return
-	}
-	if n > 0 {
-		s.db.Audit("system", tenant, "", "authz-revoke", "ok",
-			"revoked "+itoa(uint64(n))+" approval(s) for removed route "+routeID)
-	}
 }
 
 // serveKeyPublications lists every publication owned by one key: identity
@@ -459,18 +502,39 @@ func (s *Server) serveMCPRouteMutation(w http.ResponseWriter, r *http.Request, t
 			http.Error(w, "unknown route", http.StatusNotFound)
 			return
 		}
-		res, err := s.db.SQL().Exec(`DELETE FROM mcp_publications WHERE route_id=? AND lease_id=?`, rest, leaseID)
-		if err != nil {
+		// Same transaction discipline as the owner-key delete: the
+		// publication row and its route's approvals commit together or
+		// not at all. The lease-scoped delete keeps the existing
+		// ambiguous 404 for a route not bound to this lease.
+		if err := withTx(s.db.SQL(), func(tx *sql.Tx) error {
+			res, err := tx.Exec(`DELETE FROM mcp_publications WHERE route_id=? AND lease_id=?`, rest, leaseID)
+			if err != nil {
+				return err
+			}
+			if n, _ := res.RowsAffected(); n != 1 {
+				return errNoPublication
+			}
+			if s.authz == nil {
+				return nil
+			}
+			now := time.Now().UTC().Format(time.RFC3339Nano)
+			if _, err := tx.Exec(
+				`UPDATE authz_grants SET status='revoked', updated_at=?
+				 WHERE tenant_id=? AND route_id=? AND status<>'revoked'`,
+				now, tenant, rest); err != nil {
+				return err
+			}
+			return nil
+		}); err != nil {
+			if err == errNoPublication {
+				http.Error(w, "unknown route", http.StatusNotFound)
+				return
+			}
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
-		if n, _ := res.RowsAffected(); n != 1 {
-			http.Error(w, "unknown route", http.StatusNotFound)
-			return
-		}
-		// Same reasoning as the owner-key delete: the route is gone, so
-		// its operator approvals are retired with it.
-		s.retireRouteApprovals(tenant, rest)
+		// The route is gone, so its operator approvals were retired with
+		// it in the same transaction.
 		s.db.Audit("agent", tenant, leaseID, "mcp-route-delete", "ok", "route "+rest+" removed")
 		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 	default:

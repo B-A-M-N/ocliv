@@ -28,7 +28,19 @@ const (
 	// MaxPendingConsentsPerRoute bounds outstanding (unconsumed,
 	// unexpired) consent challenges per route.
 	MaxPendingConsentsPerRoute = 100
+	// MaxPendingClientAge bounds how long a registration that has never
+	// received operator approval stays durable. Public DCR is
+	// unauthenticated, so without a lifetime a full route's client table
+	// could be permanently exhausted by registrations nobody completes.
+	// Reclamation only ever touches clients with NO grant row: an
+	// approved (or revoked) identity carries authorization state and is
+	// never deleted to make room.
+	MaxPendingClientAge = 24 * time.Hour
 )
+
+// ErrClientQuota reports a route whose durable client table is full. The
+// handler maps it to a bounded 429 after safe reclamation.
+var ErrClientQuota = fmt.Errorf("authz: route client quota exhausted")
 
 // GrantStatus is the operator approval state of a client grant.
 type GrantStatus string
@@ -181,6 +193,18 @@ type Store interface {
 	// CountPendingConsents reports unconsumed, unexpired consent
 	// challenges for a route.
 	CountPendingConsents(tenant, route string) (int, error)
+	// TryRegisterClient registers a client only if the route's client
+	// table still has room, as ONE atomic step: the bound check and the
+	// insert share a transaction, so concurrent public registrations
+	// cannot cross the quota. ErrClientQuota reports exhaustion.
+	TryRegisterClient(c Client) error
+	// PruneAbandonedClients deletes registrations that are older than
+	// MaxPendingClientAge and have NO grant row on this route: pending
+	// registrations nobody ever completed are reclaimable so the table
+	// cannot be permanently exhausted, while approved and revoked
+	// identities (and any client a grant row attaches to) are preserved.
+	// It returns how many rows were reclaimed.
+	PruneAbandonedClients(now time.Time) (int, error)
 	// PruneAuthzExpired deletes lifecycle-expired authorization rows:
 	// consumed or expired codes, consumed or expired challenges, and
 	// revocations past their retention window. Pruning can never
@@ -473,6 +497,57 @@ func (m *MemStore) CountClients(tenant, route string) (int, error) {
 	n := 0
 	for _, c := range m.clients {
 		if c.Tenant == tenant && c.Route == route {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// TryRegisterClient is the in-memory bound check + insert under the store
+// mutex, so it is atomic by construction. It deliberately does NOT call
+// RegisterClient: sync.Mutex is not reentrant, so the insert is inlined
+// here under the same lock hold.
+func (m *MemStore) TryRegisterClient(c Client) error {
+	if c.ID == "" {
+		return fmt.Errorf("authz: client id is required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.clients[c.ID]; ok {
+		return fmt.Errorf("authz: client %q already registered", c.ID)
+	}
+	n := 0
+	for _, existing := range m.clients {
+		if existing.Tenant == c.Tenant && existing.Route == c.Route {
+			n++
+		}
+	}
+	if n >= MaxClientsPerRoute {
+		return ErrClientQuota
+	}
+	cp := c
+	m.clients[c.ID] = &cp
+	return nil
+}
+
+// PruneAbandonedClients removes registrations older than
+// MaxPendingClientAge that no grant row attaches to. A revoked client
+// and any client with a grant (active OR revoked) are preserved.
+func (m *MemStore) PruneAbandonedClients(now time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cutoff := now.Add(-MaxPendingClientAge)
+	claimed := make(map[string]bool, len(m.grants))
+	for _, g := range m.grants {
+		claimed[grantKey(g.ClientID, g.Tenant, g.Route)] = true
+	}
+	n := 0
+	for id, c := range m.clients {
+		if c.RevokedAt != nil || claimed[grantKey(id, c.Tenant, c.Route)] {
+			continue
+		}
+		if c.CreatedAt.Before(cutoff) {
+			delete(m.clients, id)
 			n++
 		}
 	}

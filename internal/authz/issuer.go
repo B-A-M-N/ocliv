@@ -21,6 +21,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/netip"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +40,12 @@ type TokenClaims struct {
 	Scope    string // optional scope string
 	Expiry   int64  // unix seconds
 	ID       string // token id (jti)
+	// TokenType marks a refresh token ("refresh"); an access token
+	// leaves it empty. A refresh token is never accepted at the tool
+	// path, and an access token is never accepted at the refresh
+	// grant, so the two credential kinds cannot substitute for each
+	// other.
+	TokenType string
 }
 
 // Claims are the verified contents of an access token.
@@ -46,6 +54,10 @@ type Claims struct {
 	Tenant string `json:"tenant,omitempty"`
 	Route  string `json:"route,omitempty"`
 	Scope  string `json:"scope,omitempty"`
+	// TokenType is "refresh" for a refresh token; an access token
+	// leaves it unset. A legacy token minted before the field existed
+	// is accepted as an access token for backward compatibility.
+	TokenType string `json:"typ,omitempty"`
 }
 
 // Issuer signs and verifies the relay's access tokens. It is safe for
@@ -113,9 +125,10 @@ func (i *Issuer) Mint(c TokenClaims) (string, error) {
 			NotBefore: jwt.NewNumericDate(now),
 			ID:        c.ID,
 		},
-		Tenant: c.Tenant,
-		Route:  c.Route,
-		Scope:  c.Scope,
+		Tenant:    c.Tenant,
+		Route:     c.Route,
+		Scope:     c.Scope,
+		TokenType: c.TokenType,
 	}
 	tok := jwt.NewWithClaims(i.method, claims)
 	tok.Header["kid"] = i.kid
@@ -267,43 +280,54 @@ func ValidateCodeChallengeS256(challenge string) error {
 	return nil
 }
 
-// ValidateRedirectURI checks a client-supplied redirect URI. It rejects
-// non-HTTPS schemes (except loopback for native clients), private and
-// link-local addresses, wildcard hosts, and mismatches with the registered
-// allowlist. The relay never fetches the URI.
+// ValidateRedirectURI checks a client-supplied redirect URI.
+//
+// Parsing uses net/url (never string splitting, which cannot read a
+// bracketed IPv6 authority) and host classification uses net/netip, so
+// every literal form — IPv4, IPv6, IPv4-mapped-IPv6, ULA, link-local —
+// is classified once, correctly. The rules:
+//
+//   - scheme is https, or http only when the host is a canonical
+//     loopback (a native client callback);
+//   - http's loopback exception covers 127.0.0.0/8, ::1, and
+//     IPv4-mapped loopback (::ffff:127.0.0.0/104, unmapped before the
+//     check) — every form that actually connects to the loopback
+//     interface — plus the name "localhost";
+//   - private, link-local, unique-local, and other non-public literals
+//     are rejected even when the caller supplied them in its own
+//     allowlist (DCR is public, so the allowlist is not a trust
+//     boundary);
+//   - userinfo, fragments, and opaque forms are rejected;
+//   - the URI must appear EXACTLY in the registered allowlist.
+//
+// The relay never fetches the URI.
 func ValidateRedirectURI(uri string, allowlist []string) error {
 	if uri == "" {
 		return fmt.Errorf("authz: empty redirect uri")
 	}
-	u := strings.ToLower(uri)
-	// Scheme: https always; http only for an exact loopback host.
-	if !strings.HasPrefix(u, "https://") {
-		if !strings.HasPrefix(u, "http://") {
-			return fmt.Errorf("authz: redirect uri must use https")
-		}
-		host := strings.TrimPrefix(u, "http://")
-		host = strings.SplitN(host, "/", 2)[0]
-		host = strings.SplitN(host, ":", 2)[0]
-		if host != "127.0.0.1" && host != "localhost" && host != "[::1]" {
-			return fmt.Errorf("authz: plain http redirect uri is only allowed for loopback")
-		}
+	u, err := url.Parse(uri)
+	if err != nil {
+		return fmt.Errorf("authz: redirect uri is not a parseable URL: %w", err)
 	}
-	// No userinfo, no fragment.
-	if strings.Contains(uri, "@") || strings.Contains(uri, "#") {
-		return fmt.Errorf("authz: redirect uri must not contain userinfo or a fragment")
+	if u.Opaque != "" || u.Host == "" || u.User != nil || u.Fragment != "" || u.RawFragment != "" {
+		return fmt.Errorf("authz: redirect uri must not contain userinfo, a fragment, or an opaque form")
 	}
-	// Host must be public: reject private/link-local/loopback literals even
-	// when the caller supplied them in the allowlist (a client can register
-	// its own allowlist, so the allowlist alone is not a trust boundary).
-	// Exception: an http loopback redirect is allowed for native clients.
-	host := strings.SplitN(strings.SplitN(u, "://", 2)[1], "/", 2)[0]
-	host = strings.SplitN(host, ":", 2)[0]
-	host = strings.Trim(host, "[]")
-	if IsPrivateHost(host) {
-		isLoopback := host == "127.0.0.1" || host == "localhost" || host == "::1"
-		if !(isLoopback && strings.HasPrefix(u, "http://")) {
-			return fmt.Errorf("authz: redirect uri host %q is private or loopback", host)
-		}
+	switch u.Scheme {
+	case "https":
+	case "http":
+	default:
+		return fmt.Errorf("authz: redirect uri must use https (http only for a loopback native client)")
+	}
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("authz: redirect uri has no host")
+	}
+	isLoopback := isCanonicalLoopbackHost(host)
+	if u.Scheme == "http" && !isLoopback {
+		return fmt.Errorf("authz: plain http redirect uri is only allowed for loopback")
+	}
+	if isNonPublicHost(host) && !(isLoopback && u.Scheme == "http") {
+		return fmt.Errorf("authz: redirect uri host %q is private or loopback", host)
 	}
 	// Exact allowlist match.
 	for _, allowed := range allowlist {
@@ -312,6 +336,41 @@ func ValidateRedirectURI(uri string, allowlist []string) error {
 		}
 	}
 	return fmt.Errorf("authz: redirect uri %q is not in the client allowlist", uri)
+}
+
+// isCanonicalLoopbackHost reports whether the host names this machine's
+// loopback interface in any literal form (IPv4, IPv6, IPv4-mapped-IPv6)
+// or by the reserved name.
+func isCanonicalLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return addr.Unmap().IsLoopback()
+}
+
+// isNonPublicHost reports whether the host is a private, link-local,
+// unique-local, multicast, unspecified, or otherwise non-public address
+// literal. DNS names that are not "localhost" are treated as public:
+// the exact allowlist still binds them, and the relay never fetches them.
+func isNonPublicHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap()
+	if addr.Is4() {
+		return addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() ||
+			addr.IsLinkLocalMulticast() || addr.IsMulticast() || addr.IsUnspecified()
+	}
+	return addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() ||
+		addr.IsLinkLocalMulticast() || addr.IsMulticast() || addr.IsUnspecified()
 }
 
 // IsPrivateHost reports whether a host is a private, link-local, loopback, or

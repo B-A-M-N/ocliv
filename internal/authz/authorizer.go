@@ -41,6 +41,14 @@ func (a *Authorizer) AuthorizeClaims(r *http.Request, routeURL, issuerURL, tenan
 	if !claims.ValidateIssuer(issuerURL) {
 		return nil, fmt.Errorf("authz: issuer mismatch: got %q want %q", claims.Issuer, issuerURL)
 	}
+	// Credential-kind separation: a refresh token is only ever valid at
+	// the token endpoint's refresh grant. Presenting one at the tool
+	// path would trade a long-lived renewal credential for route access,
+	// so it is refused here. An access token (unset typ, including
+	// legacy tokens minted before the field existed) is unaffected.
+	if claims.TokenType != "" && claims.TokenType != "access" {
+		return nil, fmt.Errorf("authz: %s tokens are not valid for route access", claims.TokenType)
+	}
 	if !claims.ValidateAudience(routeURL) {
 		return nil, fmt.Errorf("authz: audience mismatch for route %q", routeURL)
 	}
