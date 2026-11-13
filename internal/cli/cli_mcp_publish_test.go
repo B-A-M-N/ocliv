@@ -179,10 +179,14 @@ func TestAbandonPublishedRouteDeletesAndReports(t *testing.T) {
 	}
 }
 
-// Remote publication of operator-selected subprocesses is disabled
-// (P0-1, P0-2): neither auth mode may combine with --stdio, in publish
-// or serve mode, until the stdio bridge can enforce authentication.
-func TestParseMCPPublishStdioDisabled(t *testing.T) {
+// stdio publication is supported ONLY with relay-managed authorization
+// (P0-1, P0-2): the stdio adapter is a plain loopback HTTP server with no
+// OAuth of its own, so an upstream-oauth or anonymous-fixture publication
+// could never prove its resource binding. The child is pinned by local
+// argv only, so no remote client can select what runs.
+func TestParseMCPPublishStdioAuthModes(t *testing.T) {
+	// Non-managed profiles are refused with --stdio, in publish and
+	// serve mode alike.
 	for _, serve := range []bool{false, true} {
 		for _, auth := range []string{"upstream-oauth", "fixture-anonymous"} {
 			argv := []string{"--stdio", "--auth=" + auth, "--dir=/tmp/x", "--env=A=B", "--", "/bin/srv", "--flag"}
@@ -190,6 +194,27 @@ func TestParseMCPPublishStdioDisabled(t *testing.T) {
 				t.Errorf("stdio publish (serve=%v auth=%s) accepted, want rejection", serve, auth)
 			}
 		}
+	}
+	// Managed authorization IS accepted for --stdio in publish mode, with
+	// the argv-pinned child: this is the supported stdio shape, and it
+	// must not silently rot into "stdio is disabled".
+	argv := []string{"--stdio", "--auth=ocliv-managed", "--dir=/tmp/x", "--env=A=B", "--", "/bin/srv", "--flag"}
+	c, code := parseMCPPublish(argv, false)
+	if code != 0 {
+		t.Fatalf("publish --stdio --auth ocliv-managed rejected: code=%d (the supported stdio shape must parse)", code)
+	}
+	if !c.stdio || c.auth != "ocliv-managed" {
+		t.Fatalf("stdio config misparsed: %+v", c)
+	}
+	if len(c.cmd) != 2 || c.cmd[0] != "/bin/srv" || c.cmd[1] != "--flag" {
+		t.Fatalf("child argv not pinned verbatim: %+v", c.cmd)
+	}
+	if c.dir != "/tmp/x" || len(c.env) != 1 || c.env[0] != "A=B" {
+		t.Fatalf("stdio child environment not preserved: dir=%q env=%v", c.dir, c.env)
+	}
+	// serve has no route, so the stdio child would be unreachable there.
+	if _, code := parseMCPPublish(argv, true); code == 0 {
+		t.Error("mcp serve --stdio accepted, want rejection (serve registers no route)")
 	}
 }
 
