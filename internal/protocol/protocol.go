@@ -40,6 +40,27 @@ const (
 	FClose         = 0x0A
 )
 
+// Websocket close codes the relay uses when it denies an agent attach.
+// Both ends read these constants, so the wire contract lives in one place.
+//
+// The classes are what the agent acts on:
+//   - CloseCodeAttachDenied: terminal credential denial (revoked or
+//     unknown identity). A retry can never fix it.
+//   - CloseCodeAttachConflict: an allocation race. Retryable with backoff.
+//   - CloseCodeAttachExpired: the lease expired under this identity.
+//     One stale-record drop plus one reconnect is permitted.
+//   - CloseCodeAttachOwnership: the requested name is held by ANOTHER
+//     agent key (or another tenant). Terminal: a retry can never win a
+//     name the publisher does not own, so the agent stops and says so
+//     instead of looping forever.
+const (
+	CloseCodeAttachDenied    = 4401
+	CloseCodeAttachConflict  = 4409
+	CloseCodeAttachExpired   = 4410
+	CloseCodeAttachQuota     = 4429
+	CloseCodeAttachOwnership = 4413
+)
+
 // RequestHead is sent relay -> agent before any stream data (C01: auth and
 // route validation happen before this frame is ever written).
 type RequestHead struct {

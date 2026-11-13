@@ -480,17 +480,46 @@ func cmdRelayDoctor(argv []string) int {
 }
 
 // cmdIssueEnroll mints a one-time enrollment code (operator only).
+//
+// The tenant argument is a SCOPE decision: an explicit --tenant must be
+// honored exactly, because a publisher enrolled in the wrong tenant lands
+// in the wrong administrative scope. Both spellings are accepted (--tenant
+// NAME and --tenant=NAME); an explicit but empty or missing value is
+// REFUSED (exit 2, no code minted) instead of being ignored. Only the
+// complete absence of --tenant means "mint a fresh enrollment in a new
+// tenant namespace".
 func cmdIssueEnroll(argv []string) int {
 	_, dataDir, _ := relayFlags(argv)
 	var tenant string
-	for _, a := range argv {
+	tenantSet := false
+	for i := 0; i < len(argv); i++ {
+		a := argv[i]
 		if a == "--help" || a == "-h" {
-			fmt.Fprintln(os.Stderr, "usage: ocliv relay issue-enroll [--data DIR] [--tenant=NAME]")
+			fmt.Fprintln(os.Stderr, "usage: ocliv relay issue-enroll [--data DIR] [--tenant NAME]")
 			return apperr.ExitCLIValidation
+		}
+		if a == "--tenant" {
+			// Space form: the value is the NEXT argument. A missing
+			// value is a refusal, never a silently invented scope. A
+			// following flag is not a value either: consuming it would
+			// bind the enrollment to the literal string "--data".
+			if i+1 >= len(argv) || strings.HasPrefix(argv[i+1], "--") {
+				fmt.Fprintln(os.Stderr, "issue-enroll: --tenant needs a value")
+				return apperr.ExitCLIValidation
+			}
+			i++
+			tenant = argv[i]
+			tenantSet = true
+			continue
 		}
 		if strings.HasPrefix(a, "--tenant=") {
 			tenant = strings.TrimPrefix(a, "--tenant=")
+			tenantSet = true
 		}
+	}
+	if tenantSet && strings.TrimSpace(tenant) == "" {
+		fmt.Fprintln(os.Stderr, "issue-enroll: --tenant needs a non-empty value")
+		return apperr.ExitCLIValidation
 	}
 	restrictFileCreation()
 	db, err := store.Open(filepath.Join(dataDir, "ocliv.db"))

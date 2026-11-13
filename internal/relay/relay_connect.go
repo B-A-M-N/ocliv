@@ -225,23 +225,16 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	ls, attached, aerr := s.allocateOrResume(tenant, keyID, intent)
 	if aerr != nil {
 		// Distinct close codes so the agent can tell terminal denials
-		// (stop, F09) from retryable conflicts (back off and retry) and
+		// (stop, F09) from retryable conflicts (back off and retry),
 		// replacement-permitted expiry (drop the stale local record and
-		// reconnect once for a fresh lease, P0-4): 4401 terminal, 4409
-		// conflict, 4410 expired-replaceable, 4429 quota.
-		closeCode := 4401
+		// reconnect once for a fresh lease, P0-4), and OWNERSHIP denials
+		// (the name belongs to another key or tenant: terminal, because
+		// no retry can win a name this publisher does not own).
+		closeCode := attachCloseCode(aerr)
 		denyCode := "denied"
 		var ae *apperr.Error
 		if asApperr(aerr, &ae) {
 			denyCode = string(ae.Code)
-			switch ae.Code {
-			case apperr.CodeConflict:
-				closeCode = 4409
-			case apperr.CodeExpired:
-				closeCode = 4410
-			case apperr.CodeQuotaLease:
-				closeCode = 4429
-			}
 		}
 		conn.Close(websocket.StatusCode(closeCode), "lease denied")
 		s.db.Audit("agent", tenant, "", "attach", "denied", denyCode)

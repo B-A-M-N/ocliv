@@ -716,10 +716,19 @@ func (s *Server) serveRefreshGrant(w http.ResponseWriter, r *http.Request) {
 			"error_description": "client is not approved for this route"})
 		return
 	}
-	// Burn the presented refresh token first: the rotation commits the
-	// single-use property before the new pair exists.
-	if err := s.Store.RevokeToken(claims.ID, clientID, s.tenant(), s.RouteID); err != nil {
+	// Burn the presented refresh token BEFORE minting the new pair, and
+	// let the burn decide: only the caller that actually burned the
+	// token may issue a replacement. Two simultaneous rotations of one
+	// refresh token therefore cannot both succeed — the loser is told
+	// invalid_grant instead of receiving a second live lineage.
+	burned, berr := s.Store.BurnToken(claims.ID, clientID, s.tenant(), s.RouteID)
+	if berr != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if !burned {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant",
+			"error_description": "refresh token already rotated or revoked"})
 		return
 	}
 	accessJTI, err := MintJTI()

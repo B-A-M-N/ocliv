@@ -384,18 +384,21 @@ func (rn *Runner) once(ctx context.Context) error {
 		raw, err = transport.ReadControl(ctx, conn)
 		if err != nil {
 			conn.Close(websocket.StatusProtocolError, "no attach")
-			// The relay closes denied attaches with distinct codes (F09):
-			// 4401 is terminal, 4410 permits one replacement for an
-			// expired lease under the same valid identity, anything
-			// else is retryable.
-			if closeCode(err) == 4410 && intentLease != "" && !replaced {
+			// The relay closes denied attaches with distinct codes
+			// (F09): 4401 is terminal, 4409 is a retryable
+			// allocation race, 4410 permits one replacement for an
+			// expired lease under the same valid identity, and 4413
+			// is an OWNERSHIP conflict — the name belongs to another
+			// key or tenant, which no retry can win.
+			code := closeCode(err)
+			if classifyAttachDenial(code) == attachDenialReplaceOnce && intentLease != "" && !replaced {
 				rn.dropStaleLease(intentLease)
 				intentLease = ""
 				replaced = true
 				continue
 			}
-			if closeCode(err) == 4401 {
-				return Permanent(fmt.Errorf("agent lease permanently denied by relay"))
+			if classifyAttachDenial(code) == attachDenialPermanent {
+				return attachDenialError(code)
 			}
 			return fmt.Errorf("no session attach: %w", err)
 		}

@@ -42,8 +42,14 @@ const (
 	CodeExpired       Code = "expired"
 	CodeClosed        Code = "closed"
 	CodeConflict      Code = "conflict"
-	CodeStoreFault    Code = "store_unavailable"
-	CodeCancelled     Code = "cancelled"
+	// CodeOwnershipConflict is a name held by a different owner: another
+	// agent key in the same tenant, or another tenant. It is separated
+	// from CodeConflict because the two have opposite retry semantics —
+	// an allocation race is won by retrying, an ownership conflict never
+	// is.
+	CodeOwnershipConflict Code = "ownership_conflict"
+	CodeStoreFault        Code = "store_unavailable"
+	CodeCancelled         Code = "cancelled"
 )
 
 // Error is a typed Ocliv failure with a stable code.

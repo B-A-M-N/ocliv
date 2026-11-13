@@ -213,6 +213,14 @@ type Store interface {
 
 	// RevokeToken durably revokes one token by its jti.
 	RevokeToken(jti, clientID, tenant, route string) error
+	// BurnToken atomically revokes one token by its jti and reports
+	// whether THIS call performed the burn. It is the single-use
+	// primitive for refresh rotation: exactly one concurrent caller can
+	// burn a given refresh token, and every other caller is told it
+	// lost. A separate method from RevokeToken because RFC 7009
+	// revocation is idempotent (a repeat revoke is a success), while a
+	// rotation burn must be observable to the loser.
+	BurnToken(jti, clientID, tenant, route string) (bool, error)
 	// IsTokenRevoked reports whether a jti is revoked for this tenant+route.
 	// Revocation is scoped so one route's revocation cannot affect another.
 	IsTokenRevoked(jti, tenant, route string) (bool, error)
@@ -603,6 +611,26 @@ func (m *MemStore) RevokeToken(jti, clientID, tenant, route string) error {
 	}
 	m.revocations[revocationKey(jti, tenant, route)] = time.Now()
 	return nil
+}
+
+// BurnToken atomically revokes a token by jti and reports whether THIS
+// call performed the burn. The check and the write share the mutex, so
+// exactly one of several concurrent callers can burn a given token.
+func (m *MemStore) BurnToken(jti, clientID, tenant, route string) (bool, error) {
+	if jti == "" {
+		return false, fmt.Errorf("authz: token jti is required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.revocations == nil {
+		m.revocations = map[string]time.Time{}
+	}
+	key := revocationKey(jti, tenant, route)
+	if _, already := m.revocations[key]; already {
+		return false, nil
+	}
+	m.revocations[key] = time.Now()
+	return true, nil
 }
 
 // IsTokenRevoked reports whether a jti is revoked for this tenant+route.

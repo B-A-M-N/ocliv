@@ -70,6 +70,11 @@ type mcpPublishConfig struct {
 	env      []string
 	cmd      []string
 	serve    bool // serve: lifecycle without route registration
+	// freshPublication asks for a NEW publication identity even when
+	// the service already has one. Without it, publishing the same
+	// service again reuses the durable identity derived from the
+	// service, so the public URL survives restarts (P1).
+	freshPublication bool
 	// strictDiscovery refuses to enter steady state when OAuth
 	// resource discovery is unproven (P0-B). Discovery verification
 	// is the default for publish: strict deletes the route and fails
@@ -261,6 +266,8 @@ func parseMCPPublish(argv []string, serve bool) (mcpPublishConfig, int) {
 			c.ttl = v
 		} else if !seenDashDash && a == "--strict-discovery" {
 			c.strictDiscovery = true
+		} else if !seenDashDash && a == "--fresh-publication" {
+			c.freshPublication = true
 		} else if !seenDashDash && a == "--dev-allow-unverified-discovery" {
 			c.devAllowUnverified = true
 		} else if !seenDashDash && (a == "--resource-file" || strings.HasPrefix(a, "--resource-file=")) {
@@ -576,8 +583,21 @@ func mcpTunnelOptions(port int, v6 bool, c mcpPublishConfig) (tunnelOptions, int
 	if c.relay != "" {
 		argv = append(argv, "--relay="+c.relay)
 	}
-	if c.name != "" {
-		argv = append(argv, "--name="+c.name)
+	// The publication identity (P1): an explicit --name always wins;
+	// otherwise the name is DERIVED from the service, so publishing the
+	// same service again rebinds the same durable route instead of
+	// minting a second one with a different URL. A --fresh-publication
+	// request deliberately asks for a NEW identity, so it appends a
+	// distinguishing suffix rather than reusing the derived one.
+	name := c.name
+	if name == "" {
+		name = defaultPublicationName(port, c.localURL, c.auth)
+		if c.freshPublication {
+			name = freshPublicationName(name)
+		}
+	}
+	if name != "" {
+		argv = append(argv, "--name="+name)
 	}
 	if c.ttl != "" {
 		argv = append(argv, "--ttl="+c.ttl)

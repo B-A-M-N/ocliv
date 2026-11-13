@@ -292,7 +292,7 @@ func (s *SQLStore) ConsumePairingSecret(clientID, tenant, route, secret string) 
 	return true, nil
 }
 
-// RevokeToken durably revokes one token by its jti.
+// RevokeToken durably revokes a token by jti.
 func (s *SQLStore) RevokeToken(jti, clientID, tenant, route string) error {
 	if jti == "" {
 		return fmt.Errorf("authz: token jti is required")
@@ -305,6 +305,32 @@ func (s *SQLStore) RevokeToken(jti, clientID, tenant, route string) error {
 		return fmt.Errorf("authz: revoke token: %w", err)
 	}
 	return nil
+}
+
+// BurnToken atomically revokes a token by jti and reports whether THIS
+// call performed the burn.
+//
+// The insert is the whole decision: the row is created only by the caller
+// that wins, and every other caller sees zero affected rows. That makes
+// the burn single-use under concurrency without a separate read, so two
+// simultaneous rotations of one refresh token cannot both succeed.
+func (s *SQLStore) BurnToken(jti, clientID, tenant, route string) (bool, error) {
+	if jti == "" {
+		return false, fmt.Errorf("authz: token jti is required")
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	res, err := s.db.Exec(
+		`INSERT INTO authz_revocations(jti, client_id, tenant_id, route_id, revoked_at)
+		 VALUES(?,?,?,?,?) ON CONFLICT(jti) DO NOTHING`,
+		jti, clientID, tenant, route, now)
+	if err != nil {
+		return false, fmt.Errorf("authz: burn token: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("authz: burn token: %w", err)
+	}
+	return n == 1, nil
 }
 
 // IsTokenRevoked reports whether a jti is revoked for this tenant+route.

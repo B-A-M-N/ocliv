@@ -331,7 +331,7 @@ func (s *Server) insertLease(tenantID, keyID, label string, intent LeaseIntent, 
 			err := tx.QueryRow(`SELECT tenant_id, agent_key_id, status, id FROM leases WHERE hostname=?`, hostname).Scan(&owner, &ownerKey, &st, &oldID)
 			if err == nil {
 				if owner != tenantID {
-					return apperr.E(apperr.CodeConflict, "named host owned by another tenant", nil)
+					return apperr.E(apperr.CodeOwnershipConflict, "named host owned by another tenant", nil)
 				}
 				// Same tenant is not enough (P0-2): the reclaim rebinds
 				// the retired lease's publications — and for managed
@@ -342,7 +342,7 @@ func (s *Server) insertLease(tenantID, keyID, label string, intent LeaseIntent, 
 				// transfer, which does not exist, so it is refused here.
 				if ownerKey != keyID {
 					reclaimDenied = true
-					return apperr.E(apperr.CodeConflict, "named host is held by another agent key in this tenant", nil)
+					return apperr.E(apperr.CodeOwnershipConflict, "named host is held by another agent key in this tenant", nil)
 				}
 				// Same owner: reclaim the name; old generations are fenced.
 				// The old lease id is captured so its live session and
