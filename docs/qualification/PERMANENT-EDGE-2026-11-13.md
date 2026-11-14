@@ -60,12 +60,49 @@ Nothing below has been exercised on real infrastructure.
   Tailscale for any participant.
 - A hosted assistant's endpoint registration and tool calls.
 - `packaging/caddy/Caddyfile.single-host.local` (loopback smoke-test
-  variant of the single-host edge) - written but UNVALIDATED and
-  uncommitted. The command that would have run `caddy validate` on it was
-  refused by the destructive-action guard (it also carried an unnecessary
-  `mv`); that guard forbids retrying, rephrasing, or routing around, so
-  it is left for the operator. `docs/SETUP.md` no longer references the
-  file for that reason.
+  variant of the single-host edge) - passed its one read-only
+  `caddy validate` today through the normal in-band guard ("Valid
+  configuration") and is now RUN end-to-end at loopback by
+  `scripts/verify-single-host-loopback.sh` (see the executed section
+  below). It is committed with that harness, which depends on it.
+  `caddy validate` alone was NOT a working-edge proof: the variant
+  carried `auto_https off`, which also disables certificate
+  automation, so `tls internal` materialized no policy and every
+  handshake died with a TLS internal-error alert. Fixed to
+  `auto_https disable_redirects` (the same global block the production
+  single-host file uses); found by the loopback run, not by the
+  syntax check.
+
+## Executed at loopback (2026-11-13, no DNS / no ACME / no Tailscale)
+
+Reproduce with `scripts/verify-single-host-loopback.sh` (docker, go,
+curl, python3; a throwaway client container with `--add-host` stands in
+for the resolver, since the Go CLI cannot `--resolve` like curl and
+this box has no root to edit /etc/hosts). The relay runs loopback-only
+behind a real Caddy serving `Caddyfile.single-host.local` (internal CA,
+`:8443`), and every client check verifies TLS STRICTLY against the
+extracted internal CA — no `-k` anywhere. Live result, 9/9 PASS:
+
+| Check | Result |
+|---|---|
+| relay health ready on loopback | PASS |
+| edge up, strict-TLS readiness with the extracted internal CA | PASS |
+| `GET /v1/agent/challenge` over the edge | 405 (relay answered - TLS + Host + proxy path live) |
+| smuggled `Host: evil.test` at the EDGE | empty 200 - no Caddy site matched, nothing proxied (outer fail-closed) |
+| smuggled `Host: evil.test` at the RELAY directly | 421 `misdirected: agent control requires the relay hostname` (inner defense in depth) |
+| `GET /r/<unknown>/mcp` on the right host | 404 (non-disclosing) |
+| client WITHOUT the internal CA | TLS failure (closed by default) |
+| enrollment exchange through the edge (`ocliv login --cacert`) | exit 0 |
+| agent attach through the edge (`ocliv <port>`, WSS + yamux) | `"status":"ACTIVE"`, route live generation 1, lease id minted |
+
+Findings from this run (both fixed/recorded, none in the production
+template): the fixture's `auto_https off` bug above; the loopback edge
+needs `--relay-host` set to the apex for agent paths (without it every
+agent-path request 421s - the single-host shape shares one hostname for
+control and routes); `relay doctor` dials port 443 by design and cannot
+be the oracle for a non-443 loopback edge (the strict-TLS control-path
+probes replace it here); the visitor/MCP publication legs need a real
+upstream with an auth profile and stay for the public run.
 
 ## Blockers (operator-gated, none locally actionable)
 

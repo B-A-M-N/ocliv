@@ -1,0 +1,55 @@
+# Loopback smoke-test variant of the single-host edge.
+#
+# NO DNS, NO ACME, NO Tailscale. It serves the *same routing contract* as
+# packaging/caddy/Caddyfile.single-host - exact-Host dispatch, path-based
+# MCP routes (/r/<route-id>/mcp), and the forwarding-header boundary - on
+# 127.0.0.1 with a Caddy internal (locally trusted) certificate. Use it to
+# prove the single-host edge works before buying a domain or opening a
+# port; use Caddyfile.single-host for anything public.
+#
+# Start the relay behind it:
+#
+#   ocliv relay serve --listen=127.0.0.1:8080 \
+#     --domain ocliv.local --mcp-host ocliv.local --mcp-port 8443
+#
+# Point a client at it WITHOUT touching /etc/hosts:
+#
+#   curl --resolve ocliv.local:8443:127.0.0.1 \
+#     https://ocliv.local:8443/r/<route-id>/mcp
+#
+# MCP SDK clients work the same way: set the server URL to
+# https://ocliv.local:8443/r/<route-id>/mcp and resolve ocliv.local:8443 to
+# 127.0.0.1. --mcp-port is required: a non-443 edge must declare it or the
+# minted route URLs point at a closed port while Host matching (which
+# strips numeric ports) still works.
+#
+# Run it with the host network so the relay stays reachable on loopback:
+#
+#   caddy run --config Caddyfile.single-host.local --adapter caddyfile
+{
+	# Loopback only: no ACME order, no HTTP->HTTPS redirect, no :80.
+	# disable_redirects (NOT "auto_https off"): "off" also disables
+	# certificate automation, so `tls internal` below materializes no
+	# policy and every handshake dies with a TLS internal-error alert.
+	# Proven live 2026-11-13 by scripts/verify-single-host-loopback.sh.
+	auto_https disable_redirects
+}
+
+ocliv.local:8443 {
+	# Caddy's internal CA issues a real certificate for this name. It is
+	# trusted only by clients that carry Caddy's root (see
+	# `caddy trust`, or export it from $CAROOT). It is NOT a public trust
+	# anchor and must never back a public edge.
+	tls internal
+
+	reverse_proxy 127.0.0.1:8080 {
+		# Same trusted-edge contract as the public single-host edge:
+		# overwrite the forwarding headers, never append them, so a
+		# visitor cannot forge a client identity the relay would trust.
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+		# Strip anything the visitor smuggled in: routing reads r.Host,
+		# never a forwarded host label.
+		header_up -X-Forwarded-Host
+	}
+}

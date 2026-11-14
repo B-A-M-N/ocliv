@@ -81,9 +81,10 @@ Three edges, three issuance models. Pick with `--edge`, one per relay:
   with a negative control that removes it. Live issuance on a public
   host remains NOT VERIFIED. (A loopback smoke-test variant of this
   edge, for exercising the single-host path with no DNS and no ACME,
-  is not yet committed: it exists in the working tree as
-  `packaging/caddy/Caddyfile.single-host.local` and still needs a
-  `caddy validate` before it can be documented here.)
+  is committed: `packaging/caddy/Caddyfile.single-host.local`, run by
+  `scripts/verify-single-host-loopback.sh` — internal CA, strict-TLS
+  control chain, enrollment and attach PASS at loopback; public trust
+  and external reachability are NOT part of that run.)
 - **Wildcard edge (`Caddyfile`, `--edge wildcard`).** One DNS-01
   wildcard certificate covering all tunnel hostnames. Needs a Caddy
   DNS-provider plugin and credentials (`--dns-provider/--dns-env`);
