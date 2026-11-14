@@ -28,9 +28,15 @@ import (
 
 // setupManagedDestinations are the system files bootstrap may
 // replace; every completed step failure rolls them back to the
-// pre-install backups, and success cleans the backups up.
+// pre-install backups, and success cleans the backups up. The set is
+// the COMPLETE clean-host artifact list: without the binary,
+// launcher, and environment file the unit cannot run at all, so a
+// bootstrap that installed only the Caddyfile and unit left a fresh
+// host unable to start (2026-11-13 clean-host completion).
 var setupManagedDestinations = []string{
 	"/etc/caddy/Caddyfile",
+	"/etc/ocliv/relay.env",
+	"/usr/local/bin/ocliv-relay-launch.sh",
 	"/etc/systemd/system/ocliv-relay.service",
 }
 
@@ -404,7 +410,9 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir string) (
 		Path:         d.Path,
 		Hostname:     hostname,
 		DeployDir:    deployDir,
+		DataDir:      dataDir,
 	}
+	self, selfErr := os.Executable()
 	steps, blockReason := setup.PlanBootstrap(env)
 	if blockReason != "" && len(steps) == 0 {
 		fmt.Printf("ACTION REQUIRED: edge provisioning blocked: %s\n", blockReason)
@@ -420,8 +428,24 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir string) (
 		fmt.Printf("auto: %s ... ", s.Title)
 		var err error
 		switch s.Title {
+		case "create service account":
+			err = setup.EnsureServiceAccount(setup.RelayUser, dataDir)
+		case "install binary":
+			if selfErr != nil {
+				err = fmt.Errorf("cannot locate the running binary: %v", selfErr)
+				break
+			}
+			err = setup.InstallBinaryTo(self, setup.DefaultCleanHostArtifacts.Binary)
+		case "install launcher":
+			err = setup.InstallLauncherTo(setup.DefaultCleanHostArtifacts.Launcher)
+		case "create data directory":
+			err = setup.EnsureDataDir(dataDir, setup.RelayUser)
+		case "install relay environment":
+			err = setup.InstallEnvTo(deployDir, setup.DefaultCleanHostArtifacts.EnvFile)
 		case "install Caddyfile":
 			err = setup.InstallCaddyfile(deployDir)
+		case "activate and reload Caddy":
+			err = setup.ActivateAndReloadCaddy()
 		case "install systemd unit":
 			err = setup.InstallUnit(deployDir)
 		case "enable and start relay":
@@ -445,7 +469,10 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir string) (
 			// system files: roll back to the pre-install
 			// configuration instead of leaving a half-install.
 			// Newly created files are removed entirely; rollback
-			// failures are reported, never silently ignored.
+			// failures are reported, never silently ignored. The
+			// binary and data directory roll back beside the
+			// managed files: a clean host whose env step failed
+			// must not keep a launcher-less binary behind.
 			rollbackFailed := false
 			restoredAny := false
 			for _, dst := range setupManagedDestinations {
@@ -456,14 +483,33 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir string) (
 				}
 				restoredAny = restoredAny || restored
 			}
+			restored, rerr := setup.RollbackBinary(setup.DefaultCleanHostArtifacts.Binary)
+			if rerr != nil {
+				fmt.Printf("rollback FAILED for binary %s: %v\n", setup.DefaultCleanHostArtifacts.Binary, rerr)
+				rollbackFailed = true
+			}
+			restoredAny = restoredAny || restored
+			restored, rerr = setup.RollbackDataDir(dataDir)
+			if rerr != nil {
+				fmt.Printf("rollback FAILED for data dir %s: %v\n", dataDir, rerr)
+				rollbackFailed = true
+			}
+			restoredAny = restoredAny || restored
 			if rollbackFailed {
 				fmt.Printf("manual recovery: inspect backups (*.ocliv-bak) and journal (*.ocliv-new) beside the destinations above, restore by hand, then re-run\n")
 			} else if restoredAny {
 				// The unit install reloads the manager at install
 				// time; re-read the restored files so the daemon
 				// does not keep the rolled-back config in memory.
+				// The Caddyfile may also have been restored under
+				// a running Caddy (the activate step reloaded it):
+				// re-read it there too, best effort, after the
+				// files are back.
 				if rerr := setup.ReloadServiceManager(); rerr != nil {
 					fmt.Printf("warning: service-manager reload after rollback failed: %v\n", rerr)
+				}
+				if rerr := setup.ReloadCaddy(); rerr != nil {
+					fmt.Printf("warning: caddy reload after rollback failed (the restored Caddyfile is on disk; a stopped Caddy is left stopped): %v\n", rerr)
 				}
 			}
 			return apperr.ExitInternal, false

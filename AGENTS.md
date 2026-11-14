@@ -549,3 +549,80 @@ itself is verified.
 **Production deployment: NOT PERFORMED.** The working relay on PiInDaSky
 (.170) was not touched: no binary swap, no schemaV11 migration of the
 production database, no service changes.
+
+### 2026-11-13 permanent-edge correction round (working tree, uncommitted)
+
+Scope: two bounded corrections — (1) the false "443-only because no
+challenge override appears in `caddy adapt`" claim, and (2) the
+incomplete clean-host bootstrap. The production Pi relay was NOT
+touched: no deployment, no binary swap, no database change.
+
+- **ACME claim correction: FIXED (uncommitted).** The earlier
+  "issuance uses TLS-ALPN-01 because the issuers carry no challenge
+  override" conclusion was not established: Caddy enables HTTP-01 and
+  TLS-ALPN-01 by default, so the absence of a challenge override
+  proves nothing and the issuer still attempts HTTP-01 over port 80
+  first. `packaging/caddy/Caddyfile.single-host` now carries an
+  explicit `issuer acme { email {$OCLIV_ACME_EMAIL}
+  disable_http_challenge }` block, keeping the contact email and the
+  trusted-edge proxy contract; the generic tunnel edge's certificate
+  policy is untouched. Red-before/green-after:
+  `TestSingleHostTemplatePinsTLSALPNChallenge` fails on the old
+  template and passes on the fixed one. `scripts/verify-single-host-edge.sh`
+  now asserts the explicit disable (issuer module+email, and
+  `challenges.http.disabled: true` on every issuer) instead of an
+  absence, and runs two negative controls: adapting the same file with
+  `disable_http_challenge` REMOVED shows the issuer NOT proven
+  :80-free (the retired absence-check passed on both configs — it was
+  vacuous), and adapting with the global `http_port` trap shows the
+  disable surviving while an inert alternate_port plus an app-level
+  `http_port` appear (the trap is inert-but-misleading on the pinned
+  edge; on any unpinned edge it flips the issuer to HTTP-01 on an
+  alternate port). Live evidence: real `caddy:2-alpine` `caddy
+  validate` + `caddy adapt` in this pass — one server on `:443`, no
+  `http_port`, issuer `challenges.http.disabled: true`, loopback
+  upstream. Docs reconciled: `docs/SETUP.md`, `docs/MCP-HOSTING.md`,
+  `docs/qualification/PERMANENT-EDGE-2026-11-13.md` (the wrong row now
+  carries an explicit correction paragraph). `packaging/caddy/Caddyfile.single-host.local`
+  (loopback smoke variant) passed its one read-only `caddy validate`
+  today through the normal in-band guard; it stays uncommitted
+  (optional fixture).
+- **Clean-host bootstrap completion: FIXED (uncommitted).**
+  `ocliv setup --auto` previously installed only the Caddyfile and the
+  unit, leaving a fresh host without the service account, binary,
+  launcher, environment file, or data directory the unit requires —
+  the relay could not start. `PlanBootstrap` now plans the complete
+  set in prerequisite order (service account → binary → launcher →
+  data dir → env → Caddyfile → Caddy activation → unit → relay start
+  → enrollment; non-root prints all ten manual commands), `internal/setup`
+  gained the executors (`EnsureServiceAccount` — idempotent, never
+  removes; `EnsureDataDir`/`RollbackDataDir` — existing state never
+  removed; `InstallBinaryTo`/`RollbackBinary` — first-candidate
+  rollback; `InstallEnvTo` — 0600 + marker + unmanaged refusal;
+  `InstallLauncherTo` — 0755, shebang on line 1, embedded source via
+  `packaging/systemd.RelayLauncher()`; `ActivateAndReloadCaddy` —
+  enable/start + reload; rollback-only `ReloadCaddy` that never starts
+  a stopped Caddy), and `runSetupBootstrap` rolls the binary and data
+  dir back beside the managed files. Unmanaged destinations are still
+  refused, not overwritten. Failing-first tests:
+  `internal/setup/bootstrap_cleanhost_test.go` (11 tests: plan
+  completeness/order, non-root manual set, account idempotence +
+  loud-failure, data-dir create/keep/rollback, binary
+  first-candidate rollback + fresh-install removal, env 0600+marker+
+  unmanaged refusal, launcher shebang/mark/perms) — red on the
+  pre-fix tree, green after.
+- **Gates (this tree).** `go build ./...`, `go vet ./...`,
+  `gofmt -l internal/ tests/` clean; `go test ./internal/... -count=1`
+  green (all packages); `go test ./packaging/... -count=1` green;
+  full integration suite run once (recorded when it completes).
+- **NOT VERIFIED / operator-gated (unchanged by this pass).** Live
+  root execution of any bootstrap executor, real ACME issuance on the
+  permanent edge, public reachability of any host's 443, the
+  acceptance target (an ordinary public HTTPS MCP round trip with no
+  Tailscale), ChatGPT registration, permanent ingress. `tailscale
+  funnel reset` needs the operator's password (no passwordless sudo
+  on this box); the single stale entry (`pop-os.tail8d285a.ts.net` →
+  127.0.0.1:18082, nothing listening) was re-confirmed read-only
+  today and left for the operator to remove with
+  `sudo tailscale funnel reset`. The Pi relay (`.170`) stays
+  offline and untouched; `10.9.66.193` was NOT commandeered.

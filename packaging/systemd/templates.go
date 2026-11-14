@@ -23,3 +23,12 @@ var dnsRefreshTimer string
 
 // RefreshTimer retriggers the DNS refresh on a fixed schedule.
 func RefreshTimer() string { return dnsRefreshTimer }
+
+//go:embed ocliv-relay-launch.sh
+var relayLauncher string
+
+// RelayLauncher is the ExecStart wrapper the relay unit runs. The
+// embedded copy is what `setup --auto` installs on a clean host, so a
+// freshly provisioned relay has exactly the script the reviewed unit
+// expects — no source checkout required.
+func RelayLauncher() string { return relayLauncher }
