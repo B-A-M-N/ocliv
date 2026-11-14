@@ -151,9 +151,19 @@ Requirements you can actually verify before enrolling anything:
    off-LAN (`getent hosts <relay-host>`, then probe the returned address).
 2. **Caddy edge** — serve the host with the single-host edge
    (`packaging/caddy/Caddyfile.single-host`, normal ACME HTTPS). No
-   wildcard DNS is needed for `/r/<route-id>/mcp`; if another service
-   owns port 80 (e.g. Pi-hole), set Caddy's global `http_port` to a free
-   port and let issuance use TLS-ALPN-01 on 443.
+   wildcard DNS is needed for `/r/<route-id>/mcp`.
+   **Only TCP 443 must be forwarded.** Verified by adapting this exact
+   file with `caddy adapt`: it produces one HTTP server listening on
+   `:443` and no `http_port`, and its ACME issuers carry no challenge
+   override, so issuance uses TLS-ALPN-01 on 443. Port 80 is *not*
+   required by this edge, so a host where another service owns :80
+   (e.g. Pi-hole) can run it unmodified.
+   Do **not** "fix" a port-80 conflict by setting Caddy's global
+   `http_port`: adapting that change switches the issuers to
+   `challenges.http.alternate_port`, i.e. HTTP-01 on the alternate
+   port, which silently adds a second forwarded port and breaks the
+   ordinary 443-only deployment. If something else owns :80, leave this
+   Caddyfile alone — it does not use it.
 3. **Relay, loopback only** — run it behind that edge with the exact
    external hostname:
    `ocliv relay serve --listen=127.0.0.1:8080 --data /var/lib/ocliv --domain <domain> --mcp-host <relay-host>`
@@ -179,8 +189,8 @@ its own fix, and skipping ahead produces wrong conclusions:
 | Symptom | Layer | What it means | Fix |
 |---|---|---|---|
 | `getent hosts <host>` returns nothing / the wrong address | DNS | the record is absent or not yet propagated | wait for propagation, or correct the record; a dynamic-DNS provider token belongs in `DYNV6_TOKEN`/`--token-file`, never argv |
-| DNS resolves, but TCP 443 times out from off-LAN | Firewall / port forward | the host is reachable but the port is not | forward 443 (and the ACME port you chose) at the router; verify from an external vantage, not from inside the LAN (NAT loopback makes in-LAN tests pass falsely) |
-| TCP 443 connects but the certificate is invalid or self-signed | TLS / ACME | issuance did not complete | confirm Caddy's HTTP-01/TLS-ALPN-01 path; check the Caddy log for an order failure |
+| DNS resolves, but TCP 443 times out from off-LAN | Firewall / port forward | the host is reachable but the port is not | forward **443 only** at the router (the single-host edge needs no other port, and issuance uses TLS-ALPN-01 on 443); verify from an external vantage, not from inside the LAN (NAT loopback makes in-LAN tests pass falsely) |
+| TCP 443 connects but the certificate is invalid or self-signed | TLS / ACME | issuance did not complete | confirm Caddy's ACME order — this edge uses TLS-ALPN-01 on 443, so an order failure means port 443 was not reachable at issuance time; check the Caddy log for the order error |
 | TCP 443 + valid TLS, but the route 404s | Relay routing | unknown/expired route, or dead lease | republish; check `mcp doctor` |
 | Route 503 + `Retry-After` | Publication | lease inactive/offline | reconnect the agent/publisher |
 | `setup --auto` stops after DNS with a stated reason | Detection | CGNAT, missing token, or no viable path | read the printed reason and fix that prerequisite; **Ocliv cannot bypass CGNAT** — you need an externally reachable relay |
@@ -229,6 +239,18 @@ are deliberately kept distinct from a permanent Caddy/ACME edge, which
 has not been exercised: ordinary-DNS + ACME issuance, public port 443
 reachability, and a hosted-assistant registration remain unproven. Do
 not promote the staging evidence into a permanent-edge claim.
+
+One *config-level* fact about the permanent edge **is** verified, and it
+is the only permanent-edge claim below that does not rest on staging:
+`packaging/caddy/Caddyfile.single-host`, adapted with a real
+`caddy 2-alpine` `caddy adapt`, yields exactly one HTTP server listening
+on `:443`, no `http_port`, and ACME issuers with no challenge override —
+so the permanent edge binds **443 alone** and issues via TLS-ALPN-01 on
+443. The same adapter proves the tempting-looking "fix" for a busy :80
+(global `http_port`) would instead force HTTP-01 on an alternate port,
+adding a second forwarded port. That is a configuration proof from the
+adapter, **not** a live ACME issuance and not evidence that any host's
+443 is externally reachable — those remain NOT VERIFIED.
 
 Staging evidence in hand (Funnel edge, isolated stack, relay rebuilt from
 HEAD, official Python MCP SDK 1.28.1 and the official TypeScript SDK):
