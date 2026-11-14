@@ -239,18 +239,32 @@ are deliberately kept distinct from a permanent Caddy/ACME edge, which
 has not been exercised: ordinary-DNS + ACME issuance, public port 443
 reachability, and a hosted-assistant registration remain unproven. Do
 not promote the staging evidence into a permanent-edge claim.
+Permanent-edge evidence and its blockers are recorded separately in
+[docs/qualification/PERMANENT-EDGE-2026-11-13.md](qualification/PERMANENT-EDGE-2026-11-13.md).
 
-One *config-level* fact about the permanent edge **is** verified, and it
-is the only permanent-edge claim below that does not rest on staging:
-`packaging/caddy/Caddyfile.single-host`, adapted with a real
-`caddy 2-alpine` `caddy adapt`, yields exactly one HTTP server listening
-on `:443`, no `http_port`, and ACME issuers with no challenge override —
-so the permanent edge binds **443 alone** and issues via TLS-ALPN-01 on
-443. The same adapter proves the tempting-looking "fix" for a busy :80
-(global `http_port`) would instead force HTTP-01 on an alternate port,
-adding a second forwarded port. That is a configuration proof from the
-adapter, **not** a live ACME issuance and not evidence that any host's
-443 is externally reachable — those remain NOT VERIFIED.
+Several *configuration-level* facts about the permanent edge **are**
+verified, and they are the only permanent-edge claims here that do not
+rest on staging:
+
+- `packaging/caddy/Caddyfile.single-host`, adapted with a real
+  `caddy 2-alpine` `caddy adapt`, yields exactly one HTTP server
+  listening on `:443`, no `http_port`, and ACME issuers with no
+  challenge override, so the permanent edge binds **443 alone** and
+  issues via TLS-ALPN-01 on 443. The same adapter proves the
+  tempting-looking "fix" for a busy :80 (global `http_port`) would
+  instead force HTTP-01 on an alternate port, adding a second forwarded
+  port.
+- What `ocliv setup --edge single-host` and `relay init` render is that
+  exact file (`templates.go` go:embeds it, pinned by
+  `TestEmbeddedTemplatesMatchOnDiskFiles`), and it carries the
+  trusted-edge header contract and nothing from the tunnel namespace.
+- `ocliv setup` could not select the single-host edge at all until
+  `f0bc949`; it hardcoded the tunnel edge and blocked single-host on a
+  wildcard record it never needs.
+
+These are configuration proofs from the adapter and from tests, **not** a
+live ACME issuance and not evidence that any host's 443 is externally
+reachable; those remain NOT VERIFIED.
 
 Staging evidence in hand (Funnel edge, isolated stack, relay rebuilt from
 HEAD, official Python MCP SDK 1.28.1 and the official TypeScript SDK):
