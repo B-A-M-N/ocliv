@@ -72,9 +72,11 @@ Three edges, three issuance models. Pick with `--edge`, one per relay:
   adapting the file with a real `caddy adapt`: one server listening on
   `:443`, no `http_port`, ACME issuers with no challenge override
   (TLS-ALPN-01 on 443). Live issuance on a public host remains NOT
-  VERIFIED. To smoke-test it with no DNS and no ACME, see
-  `packaging/caddy/Caddyfile.single-host.local` (loopback, `tls
-  internal`).
+  VERIFIED. (A loopback smoke-test variant of this edge, for exercising
+  the single-host path with no DNS and no ACME, is not yet committed: it
+  exists in the working tree as
+  `packaging/caddy/Caddyfile.single-host.local` and still needs a
+  `caddy validate` before it can be documented here.)
 - **Wildcard edge (`Caddyfile`, `--edge wildcard`).** One DNS-01
   wildcard certificate covering all tunnel hostnames. Needs a Caddy
   DNS-provider plugin and credentials (`--dns-provider/--dns-env`);
