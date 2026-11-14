@@ -504,6 +504,30 @@ func TestSetupPortGuidanceDistinguishesEdges(t *testing.T) {
 	}
 }
 
+// `--edge` selects the ingress shape for the automated self-hosting path
+// (commit f0bc949). A flag that is absent from `ocliv help` is a flag
+// operators cannot discover, and the mandate asks for easy configuration.
+// This pins it so the flag cannot silently vanish from the help again.
+func TestHelpDocumentsSetupEdge(t *testing.T) {
+	var code int
+	out := captureStdout(t, func() {
+		code = Run([]string{"help"})
+	})
+	if code != 0 {
+		t.Fatalf("help exit=%d, want 0", code)
+	}
+	if !strings.Contains(out, "--edge") {
+		t.Fatalf("help does not document the setup --edge flag:\n%s", out)
+	}
+	// The three accepted values must be named, or the operator cannot
+	// choose, and single-host is the one MCP hosting actually needs.
+	for _, want := range []string{"single-host", "tunnel", "wildcard"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("help does not name --edge value %q:\n%s", want, out)
+		}
+	}
+}
+
 // The single-host edge serves exactly ONE apex hostname and needs no
 // wildcard record. `setup --auto` hardcoded --edge tunnel, which both
 // rendered the wrong ingress for MCP hosting AND made a missing
