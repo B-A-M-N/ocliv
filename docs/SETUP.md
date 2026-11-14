@@ -12,8 +12,9 @@ config so `ocliv 3000` and `ocliv mcp publish` just work afterwards.
 2. The token available as `DYNV6_TOKEN` or an owner-only file:
    `printf '%s' "$TOKEN" > ~/.dynv6-token && chmod 600 ~/.dynv6-token`.
    Never pass it as a CLI argument (it would land in shell history).
-3. If detection reports `nat-ipv4-needs-forward`: forward TCP 80 and
-   443 in the router admin page to this host's LAN address.
+3. If detection reports `nat-ipv4-needs-forward`: forward TCP 443 (and
+   80 if you keep the default tunnel edge) in the router admin page to
+   this host's LAN address. See *Ports* below.
 4. An ACME contact email for certificates: `--acme-email you@addr`.
 5. Root for the install steps (Caddy/systemd). Without root, setup
    prints the exact manual commands instead.
@@ -33,10 +34,16 @@ printf '%s' "$TOKEN" > ~/.dynv6-token && chmod 600 ~/.dynv6-token
 #    Preview the DNS update (token redacted, nothing sent).
 ocliv setup --auto --hostname lab.dynv6.net --token-file ~/.dynv6-token --dry-run
 
-# 3. Full bootstrap: DNS sync, tunnel-edge render, DNS verify,
-#    relay_url persist, Caddy install, systemd enable, auto-enroll.
+# 3. Full bootstrap: DNS sync, edge render (see --edge below), DNS
+#    verify, relay_url persist, Caddy install, systemd enable,
+#    auto-enroll.
 sudo ocliv setup --auto --hostname lab.dynv6.net \
   --acme-email you@addr --token-file ~/.dynv6-token
+
+#    Hosting MCP servers on ONE public hostname instead? Pick the
+#    single-host edge (needs no wildcard record, and only TCP 443):
+sudo ocliv setup --auto --hostname lab.dynv6.net \
+  --acme-email you@addr --token-file ~/.dynv6-token --edge single-host
 
 # 4. From another network (no -k): expect relay 4xx, not TLS errors.
 curl -v https://lab.dynv6.net/v1/agent/challenge
@@ -49,29 +56,53 @@ invoked command (e.g. in a shell profile), never as an inline
 
 ## Certificate strategy (read before operating)
 
-Two edges, two issuance models — do not confuse them:
+Three edges, three issuance models. Pick with `--edge`, one per relay:
 
-- **Tunnel edge (default, `Caddyfile.tunnel`).** On-demand
-  per-hostname certificates, each new `*.t.<domain>` tunnel hostname
-  getting its own cert after the relay's ask guard approves the
-  request. Ask guard tested; issuance itself is unverified against
-  public ACME (see qualification table below).
+- **Tunnel edge (`Caddyfile.tunnel`, `--edge tunnel`, setup's default).**
+  On-demand per-hostname certificates: each new `*.t.<domain>` tunnel
+  hostname gets its own cert after the relay's ask guard approves the
+  request. Ask guard is tested; issuance itself is unverified against
+  public ACME (see the qualification table below). This is the
+  production shape for generic `ocliv 3000` tunnels.
+- **Single-host edge (`Caddyfile.single-host`, `--edge single-host`).**
+  ONE public apex hostname carries agent control, unlock pages, and the
+  path-based MCP routes `/r/<route-id>/mcp`. Plain ACME on 443, so it
+  needs **no wildcard DNS record at all** and no DNS plugin. This is the
+  edge for MCP hosting; `docs/MCP-HOSTING.md` documents it. Verified by
+  adapting the file with a real `caddy adapt`: one server listening on
+  `:443`, no `http_port`, ACME issuers with no challenge override
+  (TLS-ALPN-01 on 443). Live issuance on a public host remains NOT
+  VERIFIED. To smoke-test it with no DNS and no ACME, see
+  `packaging/caddy/Caddyfile.single-host.local` (loopback, `tls
+  internal`).
 - **Wildcard edge (`Caddyfile`, `--edge wildcard`).** One DNS-01
   wildcard certificate covering all tunnel hostnames. Needs a Caddy
   DNS-provider plugin and credentials (`--dns-provider/--dns-env`);
   `relay init --check` rejects a file with the dns line commented out.
+  Not reachable from `setup` without that plugin.
 
-Neither is free of limits: per-hostname issuance is bounded by public
-rate limits, wildcard issuance by DNS-plugin availability. Pick one
-edge per relay; the MCP single-host path needs no wildcard at all.
+Each model is bounded differently: per-hostname issuance by public rate
+limits, single-host by the one apex certificate you already need,
+wildcard by DNS-plugin availability. Choose one edge per relay.
+
+**Ports.** Forward TCP 443 always. Forward TCP 80 as well only if you
+keep the default tunnel edge (it can fall back to HTTP-01); the
+single-host edge uses TLS-ALPN-01 on 443 and does not need port 80, so a
+host where another service owns :80 (Pi-hole, for example) can run it
+unmodified. Do not "solve" a busy :80 by setting Caddy's global
+`http_port`: that switches the issuers to HTTP-01 on the alternate port,
+silently adding a second forwarded port.
 
 ## What setup does and does not do
 
-Done automatically: egress/path detection, dynv6 A/AAAA sync, tunnel
-Caddyfile + systemd unit render, local consistency check, DNS-match
-verification, relay_url persistence, Caddy install with backup and
-validate-restore, relay enable, enrollment (mint + exchange, which
-also proves DNS → Caddy → relay end to end).
+Done automatically: egress/path detection, dynv6 A/AAAA sync,
+edge Caddyfile (the one `--edge` selected) + systemd unit render, local
+consistency check, DNS-match verification, relay_url persistence, Caddy
+install with backup and validate-restore, relay enable, enrollment
+(mint + exchange, which also proves DNS to Caddy to relay end to end).
+For the tunnel and wildcard edges, a fresh `*.t.<domain>` probe hostname
+must resolve here too; the single-host edge needs only the apex and is
+not blocked on a wildcard record it never uses.
 
 Still manual by design: creating the dynv6 account/token, the router
 port forward, installing Caddy itself when missing, and revocation/
@@ -86,7 +117,7 @@ recovery decisions (below).
 | `dns ... not resolving here yet` | Propagation | Wait, then re-run the same command; nothing half-written persists |
 | `dns ... not to observed egress` | Stale record / wrong zone | Check the zone answers for this host (dig from another network); fix and re-run |
 | `enrollment failed: relay unreachable` | Caddy/relay not serving | `systemctl status ocliv-relay`, `caddy validate`, `ocliv relay doctor` |
-| ACME issuance fails | Port 80/443 blocked or DNS wrong | Verify inbound with the curl probe; port 80 is required for issuance |
+| ACME issuance fails | Port blocked or DNS wrong | Verify inbound with the off-network curl probe. For the single-host edge, 443 alone suffices (TLS-ALPN-01); for the default tunnel edge, also allow 80 (HTTP-01 fallback) |
 | Caddy config replaced badly | Failed validate | Setup restores `/etc/caddy/Caddyfile.ocliv-bak` automatically |
 | IP address changed (dynv6) | DHCP/PPPoE renewal | `ocliv setup --refresh-dns --hostname ZONE` (DNS-only, no re-provisioning), or enable the refresh timer below |
 | Relay down after reboot | Service not enabled | `systemctl enable --now ocliv-relay`; certificates renew automatically via Caddy |

@@ -75,7 +75,19 @@ See [docs/SETUP.md](docs/SETUP.md), [docs/HOME-HOST.md](docs/HOME-HOST.md),
 ## Security notes
 
 - Tunnels are protected by default; `--public` is explicit and visible.
-- `ocliv mcp` refuses to publish an MCP server without usable OAuth
-  protection (`--auth upstream-oauth`); arbitrary stdio servers stay local-only.
+- `ocliv mcp` never publishes an MCP server without authorization. Two
+  profiles: `--auth upstream-oauth` when your server has its own OAuth
+  (the resource binding is proven before the route serves), and
+  `--auth ocliv-managed`, which the bare `ocliv mcp PORT` alias defaults
+  to, where the relay terminates OAuth for that one route. Anonymous
+  fixtures are refused outright for publish.
+- stdio MCP servers can be published, but only with relay-managed
+  authorization: `mcp publish --stdio --auth ocliv-managed -- CMD`. The
+  child is started locally and pinned by your own argv (no remote client
+  picks the executable, arguments, workdir, or environment), runs behind
+  a loopback-bounded adapter, and the relay enforces the bearer.
+  `--stdio` with `upstream-oauth` is refused, because the stdio adapter
+  has no upstream OAuth to verify. `mcp expose` stays loopback-only and
+  is never remotely reachable.
 - DNS tokens come from `DYNV6_TOKEN` or a `0600` file, never argv; transport
   errors are sanitized so tokens never reach logs or output.
