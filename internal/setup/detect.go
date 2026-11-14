@@ -26,7 +26,8 @@ const (
 	// PathDirectV4: host holds its own public IPv4; serve directly.
 	PathDirectV4
 	// PathNATV4: public v4 exists upstream of a router; needs a port
-	// forward (TCP 80/443) or UPnP mapping before inbound works.
+	// forward (TCP 443, plus 80 only for the tunnel edge's HTTP-01
+	// fallback) or a UPnP mapping before inbound works.
 	PathNATV4
 	// PathCGNAT: egress is carrier-grade NAT; no direct IPv4 path.
 	// IPv6 (if present) or a provider relay is the only route.
@@ -102,13 +103,13 @@ func Classify(localV4, localV6 []netip.Addr, egressV4, egressV6 netip.Addr, ok4,
 	switch {
 	case d.DirectV6:
 		d.Path = PathDirectV6
-		d.Notes = append(d.Notes, "global IPv6 on-host: Caddy can serve :80/:443 directly; verify inbound from an external network")
+		d.Notes = append(d.Notes, "global IPv6 on-host: Caddy can serve :443 directly; verify inbound from an external network. TCP 80 is needed only by the tunnel edge (HTTP-01 fallback); the single-host edge binds 443 alone")
 	case d.DirectV4:
 		d.Path = PathDirectV4
-		d.Notes = append(d.Notes, "public IPv4 on-host: Caddy can serve :80/:443 directly; verify inbound from an external network")
+		d.Notes = append(d.Notes, "public IPv4 on-host: Caddy can serve :443 directly; verify inbound from an external network. TCP 80 is needed only by the tunnel edge (HTTP-01 fallback); the single-host edge binds 443 alone")
 	case ok4 && !d.CGNATv4:
 		d.Path = PathNATV4
-		d.Notes = append(d.Notes, "behind a router: forward TCP 80 and 443 to this host (or enable UPnP), then verify inbound from an external network")
+		d.Notes = append(d.Notes, "behind a router: forward TCP 443 to this host (TCP 80 only for the tunnel edge's HTTP-01 fallback, or enable UPnP), then verify inbound from an external network")
 	case d.CGNATv4:
 		d.Path = PathCGNAT
 		d.Notes = append(d.Notes, "carrier-grade NAT: no direct IPv4 inbound path exists; use IPv6 if available, else a provider relay")

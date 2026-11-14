@@ -465,6 +465,45 @@ func TestSetupRefreshDNSNeedsHostname(t *testing.T) {
 	}
 }
 
+// The port guidance must not state TCP 80 as unconditional. Adapting
+// packaging/caddy/Caddyfile.single-host with a real caddy adapt proves
+// that edge binds :443 alone and issues via TLS-ALPN-01, so only the
+// default tunnel edge (which can fall back to HTTP-01) needs port 80.
+// An operator told to open a port they do not need is actionable
+// guidance being wrong, and one told nothing about the exception is
+// incomplete, so both halves are pinned.
+func TestSetupPortGuidanceDistinguishesEdges(t *testing.T) {
+	echo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("203.0.113.9\n"))
+	}))
+	defer echo.Close()
+	var code int
+	out := captureStdout(t, func() {
+		code = cmdSetup([]string{"--auto", "--echo-v4", echo.URL, "--echo-v6", ""})
+	})
+	if code != apperr.ExitOK {
+		t.Fatalf("exit=%d", code)
+	}
+	if !strings.Contains(out, "443") {
+		t.Fatalf("guidance never names TCP 443, the port every edge needs:\n%s", out)
+	}
+	// The exact over-claim that must not come back.
+	for _, stale := range []string{"TCP 80 and 443", "TCP 80/443"} {
+		if strings.Contains(out, stale) {
+			t.Fatalf("port guidance still states %q as unconditional:\n%s", stale, out)
+		}
+	}
+	// The exception must be named and attributed to the edge that needs it.
+	if !strings.Contains(out, "tunnel edge") {
+		t.Fatalf("guidance does not name the edge that still needs port 80:\n%s", out)
+	}
+	// And it must say why for the single-host edge, or the operator cannot
+	// decide which edge to run.
+	if !strings.Contains(out, "single-host") {
+		t.Fatalf("guidance does not distinguish the single-host edge:\n%s", out)
+	}
+}
+
 // The single-host edge serves exactly ONE apex hostname and needs no
 // wildcard record. `setup --auto` hardcoded --edge tunnel, which both
 // rendered the wrong ingress for MCP hosting AND made a missing
