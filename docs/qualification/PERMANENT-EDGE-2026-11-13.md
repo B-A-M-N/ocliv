@@ -16,17 +16,32 @@ staging there.
 
 ## Verified (configuration level)
 
-Reproduce with `scripts/verify-single-host-edge.sh` (7 assertions + a
-negative control) and `go test ./packaging/caddy/`.
+Reproduce with `scripts/verify-single-host-edge.sh` (8 assertions + two
+negative controls) and `go test ./packaging/caddy/`.
+
+**Correction of an earlier claim in this file (2026-11-13, same day).**
+The first version of this document asserted that issuance uses
+TLS-ALPN-01 because "the ACME issuers carry no challenge override
+(Caddy default is TLS-ALPN-01 on the TLS port)". That claim was NOT
+established: Caddy enables HTTP-01 and TLS-ALPN-01 by default, and an
+issuer with no challenge override still attempts HTTP-01 over port 80
+before falling back. Operator review caught that the adapted JSON
+simply does not show the default. The template now explicitly disables
+HTTP-01 (`disable_http_challenge` in the `issuer acme` block), the
+verification script asserts the explicit disable instead of an absence,
+and its negative controls adapt the same file with the pin removed
+(issuer then NOT proven :80-free) and with the global `http_port` trap
+(the disable survives; the trap is inert-but-misleading on this edge,
+and a real HTTP-01 flip on any unpinned edge).
 
 | Claim | Evidence |
 |---|---|
 | The single-host edge binds TCP 443 and needs no other port | `caddy adapt` on `packaging/caddy/Caddyfile.single-host` (`caddy:2-alpine`) yields exactly one HTTP server: `listen: [":443"]`, no `http_port` |
-| Issuance uses TLS-ALPN-01 on 443, not HTTP-01 | Same adaptation: the ACME issuers carry no challenge override (Caddy default is TLS-ALPN-01 on the TLS port) |
+| Issuance is PINNED to TLS-ALPN-01 on 443, not HTTP-01 | Same adaptation: the ACME issuer is explicit (`module: acme`, contact email carried) and carries `challenges.http.disabled: true`. The negative control (same file with `disable_http_challenge` removed) shows the issuer then has NO challenges field, i.e. HTTP-01+TLS-ALPN-01 both live — so the assertion is non-vacuous |
 | A host where another service owns :80 can run it unmodified | Follows from the two rows above: there is no :80 server and no HTTP-01 dependency |
 | The trusted-edge header contract is present | `reverse_proxy 127.0.0.1:8080` with `header_up X-Forwarded-For {remote_host}`, `header_up X-Forwarded-Proto {scheme}`, and `header_up -X-Forwarded-Host` |
-| Setting global `http_port` is a trap, not a fix | Adapting with `http_port 8080` switches the issuers to `challenges.http.alternate_port: 8080`, i.e. HTTP-01 on an alternate port, silently adding a second forwarded port. Documented as an explicit do-not-do |
-| What `setup` / `relay init` renders IS the reviewed file | `packaging/caddy/templates.go` go:embeds `Caddyfile.single-host`, `Caddyfile`, and `Caddyfile.tunnel`; `TestEmbeddedTemplatesMatchOnDiskFiles` pins the embed to the on-disk source, so a divergent second template cannot appear unnoticed |
+| Setting global `http_port` is a trap, not a fix | Adapting with `http_port 8080` on the pinned file keeps `challenges.http.disabled: true` (the pin survives) and adds an inert `alternate_port` plus an app-level `http_port: 8080`. On an unpinned edge the same line flips the issuer to HTTP-01 on the alternate port. Documented as an explicit do-not-do |
+| What `setup` / `relay init` renders IS the reviewed file | `packaging/caddy/templates.go` go:embeds `Caddyfile.single-host`, `Caddyfile`, and `Caddyfile.tunnel`; `TestEmbeddedTemplatesMatchOnDiskFiles` pins the embed to the on-disk source, so a divergent second template cannot appear unnoticed; `TestSingleHostTemplatePinsTLSALPNChallenge` pins `disable_http_challenge` in the template (red-before the template fix) |
 | The single-host edge carries nothing from the tunnel namespace | `TestSingleHostTemplateHasNoTunnelNamespace` (no `on_demand_tls`, no ask endpoint, no `*.t.`) |
 | The on-demand tunnel edge keeps its abuse guard | `TestTunnelTemplateKeepsAskGuard` - failing-first proven: deleting the `ask http://127.0.0.1:8080/v1/internal/ask` line turns it red; template restored byte-for-byte afterwards |
 | `ocliv setup --auto` can render the single-host edge at all | Commit `f0bc949`: `runSetupRender` hardcoded `--edge tunnel` and `verifyWildcardDNS` ran unconditionally, which both produced the wrong ingress for MCP hosting and blocked a single-host deployment on a wildcard record it never needs. `--edge single-host|wildcard|tunnel` now selects it; the wildcard proof is gated to the tunnel-namespace edges |

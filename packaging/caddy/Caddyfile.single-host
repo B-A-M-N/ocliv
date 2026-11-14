@@ -11,6 +11,15 @@
 # append, the forwarding headers, and strip anything the visitor
 # smuggled in (same trusted-edge contract as the wildcard Caddyfile).
 #
+# Issuance is PINNED to TLS-ALPN-01 on 443. Caddy enables HTTP-01 and
+# TLS-ALPN-01 by default, so the default issuer still attempts HTTP-01
+# over port 80 first; on a host where another service owns :80 (Pi-hole)
+# that path is unusable. `disable_http_challenge` makes the choice
+# explicit instead of relying on a challenge the adapted config never
+# shows. Never "fix" a busy :80 by setting the GLOBAL http_port: that
+# switches this issuer to HTTP-01 on an alternate port and adds a second
+# forwarded port (documented do-not-do).
+#
 # Replace {$OCLIV_HOST} and {$OCLIV_ACME_EMAIL} at deploy time. Validate
 # with: caddy validate --config Caddyfile.single-host --adapter caddyfile
 {
@@ -18,7 +27,12 @@
 }
 
 {$OCLIV_HOST} {
-	tls {$OCLIV_ACME_EMAIL}
+	tls {
+		issuer acme {
+			email {$OCLIV_ACME_EMAIL}
+			disable_http_challenge
+		}
+	}
 
 	reverse_proxy 127.0.0.1:8080 {
 		# Overwrite: the relay treats the rightmost entry as the

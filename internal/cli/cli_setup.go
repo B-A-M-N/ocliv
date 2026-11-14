@@ -623,11 +623,11 @@ func printSetupNext(d setup.Detection) {
 		}
 		fmt.Printf("- Pick a free DNS name (e.g. a dynv6 hostname) and point it at this host's public %s address.\n", fam)
 		fmt.Printf("- Allow TCP 443 inbound in the host firewall; this host can serve directly (relay stays on 127.0.0.1, Caddy terminates TLS).\n")
-		fmt.Printf("- TCP 80 is needed only by the default `--edge tunnel` (its HTTP-01 fallback); `--edge single-host` binds 443 alone, so a host where another service owns :80 can run it unmodified.\n")
+		fmt.Printf("- TCP 80 is needed only by the default `--edge tunnel` (its HTTP-01 fallback); `--edge single-host` binds 443 alone and pins TLS-ALPN-01 (HTTP-01 explicitly disabled), so a host where another service owns :80 can run it unmodified.\n")
 		fmt.Printf("- Re-run `ocliv setup --auto` once DNS resolves here; provisioning continues from the stored detection.\n")
 	case setup.PathNATV4:
 		fmt.Printf("- In the router admin page, forward TCP 443 to this host (%s).\n", firstOr(d.LocalV4, "its LAN address"))
-		fmt.Printf("- Add TCP 80 only if you keep the default `--edge tunnel` (HTTP-01 fallback); `--edge single-host` needs 443 alone.\n")
+		fmt.Printf("- Add TCP 80 only if you keep the default `--edge tunnel` (HTTP-01 fallback); `--edge single-host` needs 443 alone (HTTP-01 explicitly disabled, TLS-ALPN-01 on 443).\n")
 		fmt.Printf("- Pick a free DNS name (e.g. dynv6) pointing at the router's public IPv4; keep it updated if the address changes.\n")
 		fmt.Printf("- Re-run `ocliv setup --auto` after the forward is in place.\n")
 	case setup.PathCGNAT:

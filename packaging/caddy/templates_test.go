@@ -49,6 +49,31 @@ func TestSingleHostTemplateCarriesHeaderContract(t *testing.T) {
 	}
 }
 
+// The single-host edge must PIN the ACME challenge, not hope for one.
+// Caddy enables HTTP-01 and TLS-ALPN-01 by default, so "no challenge
+// override in the adapted JSON" is not evidence of anything: with the
+// default set the issuer still attempts HTTP-01 (port 80) before
+// falling back. On a host where another service owns :80 (Pi-hole),
+// the edge must explicitly disable HTTP-01. This assertion is
+// intentional-but-strict: it pins disable_http_challenge in the
+// template, and scripts/verify-single-host-edge.sh proves with a real
+// `caddy adapt` that the adapted issuer honours it.
+func TestSingleHostTemplatePinsTLSALPNChallenge(t *testing.T) {
+	s := SingleHost()
+	if !strings.Contains(s, "disable_http_challenge") {
+		t.Error("single-host template does not disable the HTTP-01 challenge; " +
+			"Caddy enables HTTP-01 and TLS-ALPN-01 by default, so the edge would " +
+			"attempt issuance over port 80 (owned by Pi-hole on the intended host) " +
+			"and only fall back to TLS-ALPN-01. Pin it with disable_http_challenge.")
+	}
+	if !strings.Contains(s, "issuer acme") {
+		t.Error("single-host template must select the acme issuer explicitly to carry the challenge pin")
+	}
+	if !strings.Contains(s, "email {$OCLIV_ACME_EMAIL}") {
+		t.Error("single-host template lost the ACME contact email in the explicit issuer block")
+	}
+}
+
 // The single-host edge serves ONE apex hostname. Anything belonging to
 // the tunnel namespace in it would mean relay init is emitting the wrong
 // ingress for MCP hosting.

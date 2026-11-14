@@ -152,18 +152,26 @@ Requirements you can actually verify before enrolling anything:
 2. **Caddy edge** — serve the host with the single-host edge
    (`packaging/caddy/Caddyfile.single-host`, normal ACME HTTPS). No
    wildcard DNS is needed for `/r/<route-id>/mcp`.
-   **Only TCP 443 must be forwarded.** Verified by adapting this exact
+   **Only TCP 443 must be forwarded.** Proven by adapting this exact
    file with `caddy adapt`: it produces one HTTP server listening on
-   `:443` and no `http_port`, and its ACME issuers carry no challenge
-   override, so issuance uses TLS-ALPN-01 on 443. Port 80 is *not*
+   `:443`, no `http_port`, and an issuer that EXPLICITLY disables the
+   HTTP-01 challenge (`challenges.http.disabled: true`), so issuance is
+   pinned to TLS-ALPN-01 on 443. Do not read that as "the default
+   configuration happens to bind 443": Caddy enables HTTP-01 and
+   TLS-ALPN-01 by default, and an issuer with NO challenge override
+   still attempts HTTP-01 over port 80 first — `scripts/verify-single-host-edge.sh`
+   pins this with a negative control that removes `disable_http_challenge`
+   and shows the issuer is then NOT proven :80-free. Port 80 is *not*
    required by this edge, so a host where another service owns :80
    (e.g. Pi-hole) can run it unmodified.
    Do **not** "fix" a port-80 conflict by setting Caddy's global
-   `http_port`: adapting that change switches the issuers to
-   `challenges.http.alternate_port`, i.e. HTTP-01 on the alternate
-   port, which silently adds a second forwarded port and breaks the
-   ordinary 443-only deployment. If something else owns :80, leave this
-   Caddyfile alone — it does not use it.
+   `http_port`: on any edge without an explicit challenge pin that
+   line switches the issuer to `challenges.http.alternate_port`
+   (HTTP-01 on an alternate port) and adds a second forwarded port,
+   and on this pinned edge it is inert-but-misleading — it writes an
+   unused alternate_port plus an app-level `http_port` while the
+   disable survives. Either way it does not use :80, so if something
+   else owns :80, leave this Caddyfile alone.
 3. **Relay, loopback only** — run it behind that edge with the exact
    external hostname:
    `ocliv relay serve --listen=127.0.0.1:8080 --data /var/lib/ocliv --domain <domain> --mcp-host <relay-host>`
@@ -248,12 +256,14 @@ rest on staging:
 
 - `packaging/caddy/Caddyfile.single-host`, adapted with a real
   `caddy 2-alpine` `caddy adapt`, yields exactly one HTTP server
-  listening on `:443`, no `http_port`, and ACME issuers with no
-  challenge override, so the permanent edge binds **443 alone** and
-  issues via TLS-ALPN-01 on 443. The same adapter proves the
-  tempting-looking "fix" for a busy :80 (global `http_port`) would
-  instead force HTTP-01 on an alternate port, adding a second forwarded
-  port.
+  listening on `:443`, no `http_port`, and an issuer that EXPLICITLY
+  disables HTTP-01 (`challenges.http.disabled: true`), so the
+  permanent edge binds **443 alone** and issues via TLS-ALPN-01 on
+  443 — a pinned configuration, not a default that happens to look
+  right. `scripts/verify-single-host-edge.sh` asserts the explicit
+  disable and carries a negative control (the same file with
+  `disable_http_challenge` removed is NOT proven :80-free), so the
+  check cannot pass vacuously.
 - What `ocliv setup --edge single-host` and `relay init` render is that
   exact file (`templates.go` go:embeds it, pinned by
   `TestEmbeddedTemplatesMatchOnDiskFiles`), and it carries the

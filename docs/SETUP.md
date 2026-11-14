@@ -66,15 +66,22 @@ Three edges, three issuance models. Pick with `--edge`, one per relay:
   production shape for generic `ocliv 3000` tunnels.
 - **Single-host edge (`Caddyfile.single-host`, `--edge single-host`).**
   ONE public apex hostname carries agent control, unlock pages, and the
-  path-based MCP routes `/r/<route-id>/mcp`. Plain ACME on 443, so it
-  needs **no wildcard DNS record at all** and no DNS plugin. This is the
-  edge for MCP hosting; `docs/MCP-HOSTING.md` documents it. Verified by
-  adapting the file with a real `caddy adapt`: one server listening on
-  `:443`, no `http_port`, ACME issuers with no challenge override
-  (TLS-ALPN-01 on 443). Live issuance on a public host remains NOT
-  VERIFIED. (A loopback smoke-test variant of this edge, for exercising
-  the single-host path with no DNS and no ACME, is not yet committed: it
-  exists in the working tree as
+  path-based MCP routes `/r/<route-id>/mcp`. ACME issuance PINNED to
+  TLS-ALPN-01 on 443 (the template's issuer carries
+  `disable_http_challenge`, so the edge never needs port 80 and a host
+  where another service owns :80 — Pi-hole — can run it unmodified), and
+  no wildcard DNS record or DNS plugin. This is the edge for MCP
+  hosting; `docs/MCP-HOSTING.md` documents it. Proven by adapting the
+  file with a real `caddy adapt`: one server listening on `:443`, no
+  `http_port`, and `challenges.http.disabled: true` on the ACME issuer.
+  The pin is deliberate: Caddy enables HTTP-01 and TLS-ALPN-01 by
+  default, so an issuer with NO challenge override is not proof of
+  anything (it still attempts HTTP-01 over :80 first).
+  `scripts/verify-single-host-edge.sh` asserts the explicit disable
+  with a negative control that removes it. Live issuance on a public
+  host remains NOT VERIFIED. (A loopback smoke-test variant of this
+  edge, for exercising the single-host path with no DNS and no ACME,
+  is not yet committed: it exists in the working tree as
   `packaging/caddy/Caddyfile.single-host.local` and still needs a
   `caddy validate` before it can be documented here.)
 - **Wildcard edge (`Caddyfile`, `--edge wildcard`).** One DNS-01
@@ -89,18 +96,23 @@ wildcard by DNS-plugin availability. Choose one edge per relay.
 
 **Ports.** Forward TCP 443 always. Forward TCP 80 as well only if you
 keep the default tunnel edge (it can fall back to HTTP-01); the
-single-host edge uses TLS-ALPN-01 on 443 and does not need port 80, so a
-host where another service owns :80 (Pi-hole, for example) can run it
-unmodified. Do not "solve" a busy :80 by setting Caddy's global
-`http_port`: that switches the issuers to HTTP-01 on the alternate port,
-silently adding a second forwarded port.
+single-host edge disables HTTP-01 explicitly and issues via TLS-ALPN-01
+on 443, so it does not need port 80 and a host where another service
+owns :80 (Pi-hole, for example) can run it unmodified. Do not "solve" a
+busy :80 by setting Caddy's global `http_port`: on edges without an
+explicit challenge pin that switches the issuer to HTTP-01 on an
+alternate port, and on the pinned single-host edge it is inert —
+either way it is never the fix.
 
 ## What setup does and does not do
 
 Done automatically: egress/path detection, dynv6 A/AAAA sync,
 edge Caddyfile (the one `--edge` selected) + systemd unit render, local
-consistency check, DNS-match verification, relay_url persistence, Caddy
-install with backup and validate-restore, relay enable, enrollment
+consistency check, DNS-match verification, relay_url persistence, and —
+as root — the COMPLETE clean-host install: service account, binary,
+launcher, `/etc/ocliv/relay.env` (0600), `/var/lib/ocliv` (0700,
+service-owned), Caddyfile install with backup and validate-restore,
+Caddy enable/reload, relay unit install, relay enable, enrollment
 (mint + exchange, which also proves DNS to Caddy to relay end to end).
 For the tunnel and wildcard edges, a fresh `*.t.<domain>` probe hostname
 must resolve here too; the single-host edge needs only the apex and is
@@ -109,6 +121,12 @@ not blocked on a wildcard record it never uses.
 Still manual by design: creating the dynv6 account/token, the router
 port forward, installing Caddy itself when missing, and revocation/
 recovery decisions (below).
+
+A later step's failure rolls the whole install back to the previous
+state (files restored, the first-candidate binary restored, a data dir
+this run created is removed — a pre-existing one never is, and the
+service account is never deleted). An existing destination WITHOUT the
+`# managed by ocliv setup` marker is refused, not overwritten.
 
 ## Failure and recovery
 
@@ -119,7 +137,7 @@ recovery decisions (below).
 | `dns ... not resolving here yet` | Propagation | Wait, then re-run the same command; nothing half-written persists |
 | `dns ... not to observed egress` | Stale record / wrong zone | Check the zone answers for this host (dig from another network); fix and re-run |
 | `enrollment failed: relay unreachable` | Caddy/relay not serving | `systemctl status ocliv-relay`, `caddy validate`, `ocliv relay doctor` |
-| ACME issuance fails | Port blocked or DNS wrong | Verify inbound with the off-network curl probe. For the single-host edge, 443 alone suffices (TLS-ALPN-01); for the default tunnel edge, also allow 80 (HTTP-01 fallback) |
+| ACME issuance fails | Port blocked or DNS wrong | Verify inbound with the off-network curl probe. For the single-host edge, 443 alone suffices (HTTP-01 explicitly disabled, TLS-ALPN-01 on 443); for the default tunnel edge, also allow 80 (HTTP-01 fallback) |
 | Caddy config replaced badly | Failed validate | Setup restores `/etc/caddy/Caddyfile.ocliv-bak` automatically |
 | IP address changed (dynv6) | DHCP/PPPoE renewal | `ocliv setup --refresh-dns --hostname ZONE` (DNS-only, no re-provisioning), or enable the refresh timer below |
 | Relay down after reboot | Service not enabled | `systemctl enable --now ocliv-relay`; certificates renew automatically via Caddy |

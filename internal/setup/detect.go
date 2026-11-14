@@ -103,10 +103,10 @@ func Classify(localV4, localV6 []netip.Addr, egressV4, egressV6 netip.Addr, ok4,
 	switch {
 	case d.DirectV6:
 		d.Path = PathDirectV6
-		d.Notes = append(d.Notes, "global IPv6 on-host: Caddy can serve :443 directly; verify inbound from an external network. TCP 80 is needed only by the tunnel edge (HTTP-01 fallback); the single-host edge binds 443 alone")
+		d.Notes = append(d.Notes, "global IPv6 on-host: Caddy can serve :443 directly; verify inbound from an external network. TCP 80 is needed only by the tunnel edge (HTTP-01 fallback); the single-host edge binds 443 alone and pins TLS-ALPN-01 (HTTP-01 explicitly disabled, so nothing needs :80)")
 	case d.DirectV4:
 		d.Path = PathDirectV4
-		d.Notes = append(d.Notes, "public IPv4 on-host: Caddy can serve :443 directly; verify inbound from an external network. TCP 80 is needed only by the tunnel edge (HTTP-01 fallback); the single-host edge binds 443 alone")
+		d.Notes = append(d.Notes, "public IPv4 on-host: Caddy can serve :443 directly; verify inbound from an external network. TCP 80 is needed only by the tunnel edge (HTTP-01 fallback); the single-host edge binds 443 alone and pins TLS-ALPN-01 (HTTP-01 explicitly disabled, so nothing needs :80)")
 	case ok4 && !d.CGNATv4:
 		d.Path = PathNATV4
 		d.Notes = append(d.Notes, "behind a router: forward TCP 443 to this host (TCP 80 only for the tunnel edge's HTTP-01 fallback, or enable UPnP), then verify inbound from an external network")

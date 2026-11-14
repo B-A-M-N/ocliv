@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # Verifies the permanent single-host edge CONTRACT from the adapter alone
 # (no server, no ACME order, no network). This is a configuration proof:
-# it says what the edge binds and which ACME challenge it uses, and it
-# pins the tempting-looking port-80 "fix" that must NOT be applied.
+# it says what the edge binds and PROVES the ACME challenge is pinned to
+# TLS-ALPN-01 on 443 (HTTP-01 explicitly disabled) — the retired
+# "no challenge override" check was vacuous, because Caddy enables
+# HTTP-01 by default and the adapted JSON simply does not show it.
+# It also pins the tempting-looking port-80 "fix" that must NOT be
+# applied, and carries two negative controls so nothing here passes
+# vacuously.
 #
 # It proves nothing about whether any host's 443 is externally reachable.
 # That stays NOT VERIFIED until an external client actually connects.
@@ -56,38 +61,85 @@ sys.exit(0 if ok else 1)
 check "exactly one HTTP server" "len(d['apps']['http']['servers'])==1"
 check "that server listens on 443 alone" "d['apps']['http']['servers']['srv0']['listen']==[':443']"
 check "no http_port override" "'http_port' not in d['apps']['http']"
-check "ACME issuers carry no challenge override (default: TLS-ALPN-01 on 443)" \
-	"all('challenges' not in i for i in d['apps']['tls']['automation']['policies'][0]['issuers'])"
+# The issuer must be explicit (module + contact email) AND must pin
+# the challenge. Caddy enables HTTP-01 and TLS-ALPN-01 by default, so
+# the ABSENCE of a challenges field is not evidence of anything: with
+# the default set the issuer still attempts HTTP-01 over port 80
+# first. Only an explicit challenges.http.disabled is proof this edge
+# never needs :80. assert_http01_disabled returns False for both an
+# absent challenges field and an enabled http challenge, so the
+# default-config issuer fails this check.
+check "ACME issuer is explicit with the contact email" \
+	"all(i.get('module')=='acme' and i.get('email')=='ops@example.org' for i in d['apps']['tls']['automation']['policies'][0]['issuers'])"
+check "HTTP-01 challenge is EXPLICITLY disabled on every issuer (pins TLS-ALPN-01 on 443)" \
+	"all(i.get('challenges',{}).get('http',{}).get('disabled') is True for i in d['apps']['tls']['automation']['policies'][0]['issuers'])"
 check "reverse proxy targets the loopback relay" \
 	"d['apps']['http']['servers']['srv0']['routes'][0]['handle'][0]['routes'][0]['handle'][0]['upstreams']==[{'dial':'127.0.0.1:8080'}]"
 check "X-Forwarded-Host is stripped, not forwarded" \
 	"d['apps']['http']['servers']['srv0']['routes'][0]['handle'][0]['routes'][0]['handle'][0]['headers']['request']['delete']==['X-Forwarded-Host']"
 
-# The negative control: adding the "fix" for a busy :80 switches the
-# issuer to HTTP-01 on an alternate port. This pins WHY the checked-in
-# file must not be changed that way.
-python3 - "$work/Caddyfile" <<'PY'
+# Negative control 1 (vacuity guard): adapt the SAME file with
+# disable_http_challenge removed — the pre-correction template. Its
+# issuer carries NO challenges field at all, which is exactly why the
+# retired "no challenge override" check proved nothing (it passed on
+# both configs). The explicit-disable check above MUST fail on this
+# variant, or it is vacuous too.
+cp "$work/Caddyfile" "$work/no-pin"
+python3 - "$work/no-pin" <<'PY'
 import sys
 p = sys.argv[1]
 s = open(p).read()
-old = '{\n\tauto_https disable_redirects\n}'
-new = '{\n\thttp_port {$OCLIV_HTTP_PORT:80}\n\tauto_https disable_redirects\n}'
-assert old in s, 'single-host global block anchor not found'
-open(p, 'w').write(s.replace(old, new))
+old = '			disable_http_challenge\n'
+assert old in s, 'disable_http_challenge anchor not found'
+open(p, 'w').write(s.replace(old, ''))
 PY
-moved="$(adapt "$work/Caddyfile" 8080 | python3 -c 'import sys,json; print(json.dumps(json.load(sys.stdin)))')"
+nopin="$(adapt "$work/no-pin" "" | python3 -c 'import sys,json; print(json.dumps(json.load(sys.stdin)))')"
 if python3 -c "
 import json,sys
 d=json.loads(sys.argv[1])
 iss=d['apps']['tls']['automation']['policies'][0]['issuers']
-def port(i):
-    p=i.get('challenges',{}).get('http',{}).get('alternate_port')
-    return str(p) if p is not None else None
-sys.exit(0 if any(port(i)=='8080' for i in iss) else 1)
-" "$moved"; then
-	echo "PASS: global http_port would force HTTP-01 on an alternate port (documented do-not-do)"
+def disabled(i):
+    c=i.get('challenges',{}).get('http',{})
+    return c.get('disabled') is True
+# The variant MUST NOT be proven disabled: absent challenges means the
+# default set (HTTP-01 + TLS-ALPN-01) is live.
+sys.exit(1 if any(disabled(i) for i in iss) else 0)
+" "$nopin"; then
+	echo "PASS: without disable_http_challenge the issuer is NOT proven HTTP-01-free (the check is not vacuous)"
 else
-	echo "FAIL: http_port no longer forces HTTP-01; this script's warning is stale" >&2
+	echo "FAIL: the explicit-disable check passes even on the unpinned template; it proves nothing" >&2
+	fail=1
+fi
+
+# Negative control 2 (the documented trap): adding the global
+# http_port "fix" for a busy :80 can no longer flip THIS edge to
+# HTTP-01 — the pin wins — but it still writes an inert
+# challenges.http.alternate_port and an app-level http_port, i.e. it
+# changes nothing useful while looking like a fix. On an edge WITHOUT
+# the pin the same line switches the issuer to HTTP-01 on the alternate
+# port. Either way it is a do-not-do; this pins that the pin survives.
+cp "$work/Caddyfile" "$work/http-port"
+python3 - "$work/http-port" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = '{\n	auto_https disable_redirects\n}'
+new = '{\n	http_port {$OCLIV_HTTP_PORT:80}\n	auto_https disable_redirects\n}'
+assert old in s, 'single-host global block anchor not found'
+open(p, 'w').write(s.replace(old, new))
+PY
+moved="$(adapt "$work/http-port" 8080 | python3 -c 'import sys,json; print(json.dumps(json.load(sys.stdin)))')"
+if python3 -c "
+import json,sys
+d=json.loads(sys.argv[1])
+iss=d['apps']['tls']['automation']['policies'][0]['issuers']
+def disabled(i):
+    return i.get('challenges',{}).get('http',{}).get('disabled') is True
+sys.exit(0 if d['apps']['http'].get('http_port')==8080 and all(disabled(i) for i in iss) else 1)
+" "$moved"; then
+	echo "PASS: global http_port stays inert on the pinned edge (app-level port appears, the HTTP-01 disable survives)"
+else
+	echo "FAIL: http_port overrode the challenge pin; the edge is no longer proven :80-free" >&2
 	fail=1
 fi
 
@@ -95,4 +147,4 @@ if [ "$fail" -ne 0 ]; then
 	echo "single-host edge contract: FAIL" >&2
 	exit 1
 fi
-echo "single-host edge contract: OK (443 alone, TLS-ALPN-01, loopback upstream)"
+echo "single-host edge contract: OK (443 alone, HTTP-01 explicitly disabled, loopback upstream)"
