@@ -377,8 +377,13 @@ still unestablished.
 
 Executed documented commands as written against a release-mode binary
 in disposable dirs (`/tmp`, never the tree):
-- `mcp publish --stdio -- echo hi` → exit 2, usage, no route created
-  (remote-stdio refusal intact).
+- `mcp publish --stdio -- echo hi` -> exit 2, usage, no route created.
+- NOTE (correction 2026-11-13): that command is refused because `--stdio`
+  without `--auth ocliv-managed` is refused, not because stdio publication
+  is disabled. `mcp publish --stdio --auth ocliv-managed -- CMD` is
+  supported (see the Round 31 NOTE). The original wording "remote-stdio
+  refusal intact" described the behaviour correctly for the command as
+  written but characterized it wrongly.
 - `relay init` single-host without `--mcp-host` → exit 2 with
   actionable error; `--check` on the empty dir correctly reports all
   four files missing (exit 8), not success.
@@ -811,10 +816,23 @@ quirk only; public behavior is the oracle.
 - Disposition: VERIFIED NON-ISSUE for this leg.
 
 ## Round 31 — MCP publish/expose boundary re-audit (2026-11-01)
-- `parseMCPPublish` refuses `--stdio` under both auth modes (P0-1/P0-2:
-  bridge cannot enforce upstream OAuth, fixture profile cannot bound
-  an arbitrary child) and refuses anonymous-fixture publication (P0-F);
-  `mcp expose` is loopback-only with no tunnel path.
+- NOTE (SUPERSEDED 2026-11-13, read the current code, not this line): the
+  assertion below that `--stdio` is refused under *both* auth modes is no
+  longer true. `--stdio --auth ocliv-managed` is SUPPORTED: the child is
+  started locally and pinned by the operator's own argv (no remote client
+  can select an executable, arguments, workdir, or environment), runs
+  behind a loopback-bounded adapter, and the relay terminates
+  authorization for the route. The stdio adapter has no upstream OAuth to
+  verify, so `--stdio --auth upstream-oauth` is still refused, and
+  `--stdio --auth fixture-anonymous` is still refused; `mcp serve --stdio`
+  is still refused because serve registers no route. The security property
+  survived; it narrowed to the profiles that cannot prove a resource
+  binding. Pinned by `TestParseMCPPublishStdioAuthModes`.
+- ORIGINAL (as audited 2026-11-01): `parseMCPPublish` refuses `--stdio`
+  under both auth modes (P0-1/P0-2: bridge cannot enforce upstream OAuth,
+  fixture profile cannot bound an arbitrary child) and refuses
+  anonymous-fixture publication (P0-F); `mcp expose` is loopback-only with
+  no tunnel path.
 - Publish order: local URL validation → local probe → protocol probe
   (AUTH_REQUIRED accepted as presence only for upstream-oauth) →
   tunnel → route; nothing registered remotely on local failure.
@@ -1060,6 +1078,18 @@ Drill (container removed afterwards, zero host footprint):
   pointed at the IP) and keeps the DNS-01 requirement for wildcard.
   Template carries the same header contract as the other edges.
 - Setup renders the tunnel edge (single-host cannot serve tunnels).
+- NOTE (SUPERSEDED 2026-11-13, commit `f0bc949`): setup is no longer pinned
+  to the tunnel edge. `runSetupRender` hardcoded `--edge tunnel`, so the
+  automated path always produced the per-tunnel wildcard namespace, and
+  `verifyWildcardDNS` ran unconditionally, so a single-host deployment
+  (which needs no wildcard record) was blocked with ACTION REQUIRED after
+  the apex check had already passed. `ocliv setup --edge
+  single-host|wildcard|tunnel` now selects the edge (default `tunnel`, so
+  existing behaviour is unchanged), and the wildcard proof applies only to
+  the edges that actually serve the tunnel namespace. Pinned by
+  `TestSetupSingleHostEdgeNeedsNoWildcardRecord` plus
+  `TestSetupTunnelEdgeStillRequiresWildcard`, which proves the fix did not
+  weaken the tunnel edge's existing requirement.
 - Tests: 3 ask tests (approve/deny matrix, off-loopback, spoofed
   Host), 2 init tests, all prior init/authority suites green.
 - NOT VERIFIED live: Caddy parsing the new template (no caddy binary
