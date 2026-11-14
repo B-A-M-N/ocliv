@@ -142,6 +142,15 @@ type revocationSet struct {
 	// tokens/sessions are explicitly revoked capability rows.
 	tokens   map[string]bool
 	sessions map[string]bool
+	// Managed-authorization authority that must never roll backward:
+	// a revoked managed client (authz_clients.revoked_at), a non-active
+	// managed grant (authz_grants.status != 'active'), or a revoked
+	// managed token jti (authz_revocations). Restoring an older database
+	// would otherwise reactivate managed OAuth clients/grants/tokens.
+	authzClients    map[string]bool // authz_clients with revoked_at set
+	authzGrants     map[string]bool // authz_grants with status != 'active'
+	authzJTIs       map[string]bool // authz_revocations jti
+	authzTablesLive bool            // live DB has the managed tables
 	// pubIDs is every publication route_id present. A backup row
 	// (active or tombstoned) absent from live means the publication
 	// was explicitly deleted after the snapshot — restoring would
@@ -247,6 +256,28 @@ func readRevocations(q *sql.DB) (*revocationSet, error) {
 	if s.sessions, err = collectStrings(q, `SELECT id FROM visitor_sessions WHERE revoked_at IS NOT NULL`); err != nil {
 		return nil, apperr.E(apperr.CodeStoreFault, "reading session revocations", err)
 	}
+	// Managed-authorization authority. A database predating the managed
+	// tables (pre-V8) has none: empty sets, and the guard treats missing
+	// tables as "no live managed state to protect" (nothing to roll back).
+	s.authzClients = map[string]bool{}
+	s.authzGrants = map[string]bool{}
+	s.authzJTIs = map[string]bool{}
+	var authzTable string
+	if err := q.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='authz_clients'`).Scan(&authzTable); err == nil && authzTable != "" {
+		s.authzTablesLive = true
+		if s.authzClients, err = collectStrings(q, `SELECT id FROM authz_clients WHERE revoked_at IS NOT NULL`); err != nil {
+			return nil, apperr.E(apperr.CodeStoreFault, "reading managed client revocations", err)
+		}
+		if s.authzGrants, err = collectStrings(q, `SELECT client_id FROM authz_grants WHERE status<>'active'`); err != nil {
+			return nil, apperr.E(apperr.CodeStoreFault, "reading managed grant terminations", err)
+		}
+	}
+	var authzRevTable string
+	if err := q.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='authz_revocations'`).Scan(&authzRevTable); err == nil && authzRevTable != "" {
+		if s.authzJTIs, err = collectStrings(q, `SELECT jti FROM authz_revocations`); err != nil {
+			return nil, apperr.E(apperr.CodeStoreFault, "reading managed token revocations", err)
+		}
+	}
 	var pubTable string
 	if err := q.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='mcp_publications'`).Scan(&pubTable); err == nil && pubTable != "" {
 		if s.pubs, err = collectStrings(q, `SELECT route_id FROM mcp_publications WHERE revoked_at IS NOT NULL`); err != nil {
@@ -337,6 +368,27 @@ func rollbackDiff(live, backup *revocationSet) []string {
 	for id := range live.sessions {
 		if !backup.sessions[id] {
 			missing = append(missing, "session:"+id)
+		}
+	}
+	// Managed-authorization rollback: a live revoked managed client,
+	// terminated grant, or revoked token jti that reads active/unrevoked
+	// (or absent) in the backup would come back to life. Only enforced
+	// when the live DB actually has managed tables.
+	if live.authzTablesLive {
+		for id := range live.authzClients {
+			if !backup.authzClients[id] {
+				missing = append(missing, "authz-client:"+id)
+			}
+		}
+		for id := range live.authzGrants {
+			if !backup.authzGrants[id] {
+				missing = append(missing, "authz-grant:"+id)
+			}
+		}
+		for jti := range live.authzJTIs {
+			if !backup.authzJTIs[jti] {
+				missing = append(missing, "authz-token:"+jti)
+			}
 		}
 	}
 	// Deleted publications (P0-B): a backup row whose route_id is
@@ -583,8 +635,10 @@ func openRevocations(livePath string) (*revocationSet, error) {
 }
 
 // resetRestoredAuthority terminally revokes every key, lease, token,
-// session, and publication in an offline database copy. The operator
-// must re-enroll; nothing restored is usable.
+// session, publication, AND managed OAuth authority (clients, grants)
+// in an offline database copy, and retires the JWT signing key so any
+// token minted under it fails closed. The operator must re-enroll and
+// clients must re-register/re-approve; nothing restored is usable.
 func resetRestoredAuthority(candidatePath string) error {
 	db, err := store.Open(candidatePath)
 	if err != nil {
@@ -611,6 +665,30 @@ func resetRestoredAuthority(candidatePath string) error {
 			if _, err := tx.Exec(`UPDATE mcp_publications SET revoked_at=?, updated_at=? WHERE revoked_at IS NULL`, now, now); err != nil {
 				return err
 			}
+		}
+		// Managed OAuth authority: clients and grants are terminally
+		// revoked, outstanding authorization codes and consent challenges
+		// are consumed, and the JWT signing key is DELETED so every token
+		// minted under the restored authority fails closed (a fresh key is
+		// generated on first use). Without this, --reset-authority would
+		// leave restored managed clients/grants usable.
+		var authzTable string
+		if err := tx.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='authz_clients'`).Scan(&authzTable); err == nil && authzTable != "" {
+			if _, err := tx.Exec(`UPDATE authz_clients SET revoked_at=? WHERE revoked_at IS NULL`, now); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`UPDATE authz_grants SET status='revoked', updated_at=? WHERE status<>'revoked'`, now); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(`UPDATE authz_codes SET consumed_at=? WHERE consumed_at IS NULL`, now); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE authz_consent SET consumed_at=? WHERE consumed_at IS NULL`, now); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM authz_issuer_key`); err != nil {
+			return err
 		}
 		return nil
 	})

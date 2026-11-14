@@ -231,7 +231,11 @@ type Store interface {
 	ListAuthzAudit(limit int) ([]AuthzAudit, error)
 
 	CreateCode(c Code) error
-	ConsumeCode(code string) (*Code, error)
+	// ConsumeCode atomically marks a code consumed and returns it, scoped
+	// to the expected client + tenant + route. The scope check happens
+	// before any consumption write, so a foreign route's redemption
+	// attempt can neither mint tokens nor destroy another route's code.
+	ConsumeCode(code, client, tenant, route string) (*Code, error)
 }
 
 // MemStore is an in-memory Store for tests and local evaluation.
@@ -332,6 +336,17 @@ func (m *MemStore) CreateGrant(g Grant) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	c, ok := m.clients[g.ClientID]
+	if !ok {
+		return fmt.Errorf("authz: grant for unknown client %q", g.ClientID)
+	}
+	if c.Tenant == "" || c.Route == "" {
+		return fmt.Errorf("authz: client %q has no route registration scope; refusing grant", g.ClientID)
+	}
+	if c.Tenant != g.Tenant || c.Route != g.Route {
+		return fmt.Errorf("authz: client %q is registered for tenant %q route %q, not tenant %q route %q",
+			g.ClientID, c.Tenant, c.Route, g.Tenant, g.Route)
+	}
 	k := grantKey(g.ClientID, g.Tenant, g.Route)
 	if _, ok := m.grants[k]; ok {
 		return fmt.Errorf("authz: grant already exists for client %q route %q", g.ClientID, g.Route)
@@ -393,6 +408,17 @@ func (m *MemStore) ApproveGrantWithPairingSecret(clientID, tenant, route, secret
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	c, cok := m.clients[clientID]
+	if !cok {
+		return fmt.Errorf("authz: approve grant for unknown client %q", clientID)
+	}
+	if c.Tenant == "" || c.Route == "" {
+		return fmt.Errorf("authz: client %q has no route registration scope; refusing approval", clientID)
+	}
+	if c.Tenant != tenant || c.Route != route {
+		return fmt.Errorf("authz: client %q is registered for tenant %q route %q, not tenant %q route %q",
+			clientID, c.Tenant, c.Route, tenant, route)
+	}
 	k := grantKey(clientID, tenant, route)
 	now := time.Now()
 	g, ok := m.grants[k]
@@ -724,14 +750,20 @@ func (m *MemStore) CreateCode(c Code) error {
 	return nil
 }
 
-// ConsumeCode atomically marks a code consumed and returns it. A code can
-// only be consumed once; an expired code is rejected.
-func (m *MemStore) ConsumeCode(code string) (*Code, error) {
+// ConsumeCode atomically marks a code consumed and returns it, scoped to
+// the expected client + tenant + route. The scope check happens before any
+// consumption write, so a foreign route's redemption attempt can neither
+// mint tokens nor destroy another route's pending code. A code can only be
+// consumed once; an expired code is rejected.
+func (m *MemStore) ConsumeCode(code, expectedClient, expectedTenant, expectedRoute string) (*Code, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	c, ok := m.codes[code]
 	if !ok {
 		return nil, fmt.Errorf("authz: unknown authorization code")
+	}
+	if c.ClientID != expectedClient || c.Tenant != expectedTenant || c.Route != expectedRoute {
+		return nil, fmt.Errorf("authz: authorization code is not bound to this client and route")
 	}
 	if c.ConsumedAt != nil {
 		return nil, fmt.Errorf("authz: authorization code already used")

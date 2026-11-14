@@ -36,6 +36,9 @@ func TestUnpublishRetiresRouteApprovals(t *testing.T) {
 		{"cli-b", route},
 		{"cli-c", "other-route"},
 	} {
+		if err := az.RegisterClient(authz.Client{ID: c.client, Tenant: "tenant-test", Route: c.r}); err != nil {
+			t.Fatalf("register client %s: %v", c.client, err)
+		}
 		if err := az.CreateGrant(authz.Grant{ClientID: c.client, Tenant: "tenant-test", Route: c.r,
 			Status: authz.GrantActive, CreatedAt: time.Now(), UpdatedAt: time.Now()}); err != nil {
 			t.Fatalf("grant %s: %v", c.client, err)

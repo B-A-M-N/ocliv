@@ -58,10 +58,14 @@ at admission.
 **Consequences for promotion and rollback:**
 
 - The signing key travels with the database. Restoring an older database
-  restores that snapshot's key, so **every token issued after the snapshot
-  was taken fails closed** — affected clients must re-authorize. This is
-  expected, not data loss, but it must be stated to the operator before
-  rollback.
+  restores that snapshot's key, so **tokens issued after the snapshot was
+  taken can still verify** (the key is unchanged and their grants/clients
+  may still be valid in the restored image) — restoring is NOT a reliable
+  way to invalidate them. To actually cut authority you must either
+  revoke the affected clients/grants/tokens in the restored database, or
+  run `--reset-authority` (which now also retires the managed OAuth
+  signing key, so every managed token fails closed). Treat a plain
+  restore as preserving, not revoking, post-backup authority.
 - Do NOT rotate the issuer key as part of this promotion. Rotation is a
   deliberate operation that invalidates all live access tokens
   immediately (grant rows survive, so clients can renew — but only after
@@ -170,11 +174,18 @@ declaring the promotion complete.
 
 ## Rollback (paired — binary AND database)
 
+**Do NOT hand-copy the database with `cp -a`.** A raw `cp -a` bypasses the
+restore-time rollback guard, so it can silently resurrect revoked agent
+keys, terminal leases, tombstoned publications, AND managed OAuth clients/
+grants/tokens that were revoked after the snapshot. Use the application's
+guarded restore, which refuses a restore that would roll any of that
+authority backward (unless you explicitly pass `--reset-authority`):
+
 ```
 sudo systemctl stop ocliv-relay
-sudo cp -a /var/lib/ocliv/ocliv.db.bak-20261113-095500 /var/lib/ocliv/ocliv.db
+sudo /usr/local/bin/ocliv relay restore --data /var/lib/ocliv   --in /var/lib/ocliv/ocliv.db.bak-20261113-095500 --relay-stopped
+# paired binary rollback (no live schema dependency on the binary path):
 sudo cp -a /usr/local/bin/ocliv.bak-20261113-095500 /usr/local/bin/ocliv
-sudo rm -f /var/lib/ocliv/ocliv.db-wal /var/lib/ocliv/ocliv.db-shm
 sudo systemctl start ocliv-relay
 curl -fsS http://127.0.0.1:18080/health/live  && echo
 curl -fsS http://127.0.0.1:18080/health/ready && echo
@@ -188,10 +199,15 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
 database (`case v > currentSchema` fails closed) and the relay stays DOWN.
 Restore both, or neither.
 
-**After a paired rollback, tell the operator what to expect:** tokens
-issued after the backup moment were signed by the issuer key that
-snapshot holds, so they fail closed and those clients must re-authorize
-(a fresh approve + pairing credential each).
+**After a paired rollback, tell the operator what to expect:** the
+restored database brings back the snapshot's signing key AND the
+snapshot's clients/grants. Tokens issued after the backup moment were
+signed by that same key, so **they may still verify and remain usable** —
+a plain restore does not revoke them. If the goal is to cut authority,
+either revoke the affected managed clients/grants/tokens after the
+restore, or restore with `--reset-authority` (which retires the managed
+signing key and revokes managed clients/grants, forcing re-registration
+and re-approval).
 
 ## Explicit non-goals during this promotion
 

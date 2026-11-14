@@ -198,7 +198,8 @@ func TestRefreshTokenRotation(t *testing.T) {
 	s, issuer, store := newTestServer(t)
 	clientID := "client-refresh"
 	if err := store.RegisterClient(Client{ID: clientID, Name: "c",
-		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now()}); err != nil {
+		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now(),
+		Tenant: "tenant-test", Route: "r-test"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.ApproveGrantWithPairingSecret(clientID, s.tenant(), s.RouteID, "pair-r", time.Hour); err != nil {

@@ -54,7 +54,8 @@ func TestConcurrentRefreshSingleWinner(t *testing.T) {
 	s, _, store := newTestServer(t)
 	clientID := "cli-concurrent"
 	if err := store.RegisterClient(Client{ID: clientID, Name: "c",
-		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now()}); err != nil {
+		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now(),
+		Tenant: "tenant-test", Route: "r-test"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.ApproveGrantWithPairingSecret(clientID, s.tenant(), s.RouteID, "pair-c", time.Hour); err != nil {
@@ -185,7 +186,8 @@ func TestAccessTokenExpiresNaturally(t *testing.T) {
 	s.TokenTTL = 2 * time.Second
 	clientID := "cli-expiry"
 	if err := store.RegisterClient(Client{ID: clientID, Name: "c",
-		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now()}); err != nil {
+		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now(),
+		Tenant: "tenant-test", Route: "r-test"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.ApproveGrantWithPairingSecret(clientID, s.tenant(), s.RouteID, "pair-e", time.Hour); err != nil {

@@ -63,10 +63,10 @@ func TestSQLStoreGrantLifecycle(t *testing.T) {
 	applySchema(t, db)
 	s := NewSQLStore(db)
 
-	if err := s.RegisterClient(Client{ID: "cli_1", Name: "c", RedirectURIs: []string{"https://x/cb"}}); err != nil {
+	if err := s.RegisterClient(Client{ID: "cli_1", Name: "c", RedirectURIs: []string{"https://x/cb"}, Tenant: "t", Route: "r"}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	if err := s.RegisterClient(Client{ID: "cli_1"}); err == nil {
+	if err := s.RegisterClient(Client{Tenant: "t", Route: "r", ID: "cli_1"}); err == nil {
 		t.Fatal("duplicate client accepted")
 	}
 	got, err := s.GetClient("cli_1")
@@ -123,10 +123,10 @@ func TestSQLStoreCodeSingleUse(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := s.ConsumeCode("c1"); err != nil {
+	if _, err := s.ConsumeCode("c1", "cli_1", "t", "r"); err != nil {
 		t.Fatalf("first consume: %v", err)
 	}
-	if _, err := s.ConsumeCode("c1"); err == nil {
+	if _, err := s.ConsumeCode("c1", "cli_1", "t", "r"); err == nil {
 		t.Fatal("code replayed")
 	}
 	if err := s.CreateCode(Code{
@@ -134,7 +134,7 @@ func TestSQLStoreCodeSingleUse(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create2: %v", err)
 	}
-	if _, err := s.ConsumeCode("c2"); err == nil {
+	if _, err := s.ConsumeCode("c2", "", "", ""); err == nil {
 		t.Fatal("expired code accepted")
 	}
 }
@@ -181,7 +181,7 @@ func TestSQLStoreClientRevocation(t *testing.T) {
 	db := openTestDB(t)
 	applySchema(t, db)
 	s := NewSQLStore(db)
-	if err := s.RegisterClient(Client{ID: "cli_1", RedirectURIs: []string{"https://x/cb"}}); err != nil {
+	if err := s.RegisterClient(Client{ID: "cli_1", RedirectURIs: []string{"https://x/cb"}, Tenant: "t", Route: "r"}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	if err := s.RevokeClient("cli_1"); err != nil {
@@ -195,7 +195,7 @@ func TestSQLStoreClientRevocation(t *testing.T) {
 		t.Fatal("revoked_at not persisted")
 	}
 	// The id stays reserved.
-	if err := s.RegisterClient(Client{ID: "cli_1"}); err == nil {
+	if err := s.RegisterClient(Client{Tenant: "t", Route: "r", ID: "cli_1"}); err == nil {
 		t.Fatal("revoked client id re-registered")
 	}
 }

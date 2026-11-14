@@ -256,12 +256,12 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request, t *routeTar
 			s.writeManagedBearerChallenge(w, r, t)
 			return
 		}
-		// Inject the relay-minted upstream identity and strip the external
-		// bearer before forwarding.
-		r.Header.Set("X-Ocliv-Upstream-Sub", client)
-		r.Header.Set("X-Ocliv-Route", t.RouteID)
+		// The external bearer is stripped here; the relay-minted upstream
+		// identity is injected INSIDE serveProxied AFTER the visitor-header
+		// sanitizer runs, so a spoofed X-Ocliv-* metadata name can never
+		// reach the upstream.
 		r.Header.Del("Authorization")
-		s.serveProxied(w, r, t, sess, false, false)
+		s.serveProxied(w, r, t, sess, false, false, client)
 		return
 	}
 	// Pending verification (P0-A): a publication that has not completed
@@ -477,7 +477,7 @@ func admittedSessionCurrent(cur, sess *Session, admittedGen uint64) bool {
 // serveProxied forwards one authorized request over a fresh yamux stream.
 // Admission control (budget) runs before stream creation (G02); every stream
 // is bound to one request, one lease, one generation (E02).
-func (s *Server) serveProxied(w http.ResponseWriter, r *http.Request, t *routeTarget, sess *Session, isPublic, viaCookie bool) {
+func (s *Server) serveProxied(w http.ResponseWriter, r *http.Request, t *routeTarget, sess *Session, isPublic, viaCookie bool, managedSub ...string) {
 	// MCP-profile admission (P1-10): these requests bypass Ocliv visitor
 	// authentication, so a dedicated per-(source,lease) rate budget runs
 	// before any stream or budget-slot allocation. Uses the trusted-edge
@@ -566,6 +566,13 @@ func (s *Server) serveProxied(w http.ResponseWriter, r *http.Request, t *routeTa
 	}
 	head.Headers["X-Forwarded-Host"] = strings.ToLower(r.Host)
 	head.Headers["X-Forwarded-Proto"] = publicScheme(r)
+	// Managed OAuth: the relay owns the upstream identity. These headers
+	// are injected AFTER SanitizeVisitorHeaders stripped any externally
+	// supplied value, so only relay-verified metadata reaches upstream.
+	if len(managedSub) > 0 && managedSub[0] != "" {
+		head.Headers["X-Ocliv-Upstream-Sub"] = managedSub[0]
+		head.Headers["X-Ocliv-Route"] = t.RouteID
+	}
 	rawHead, err := protocol.MarshalJSON(head)
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)

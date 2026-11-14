@@ -626,3 +626,144 @@ touched: no deployment, no binary swap, no database change.
   today and left for the operator to remove with
   `sudo tailscale funnel reset`. The Pi relay (`.170`) stays
   offline and untouched; `10.9.66.193` was NOT commandeered.
+
+### 2026-11-14 source-review remediation (authorization boundary + bootstrap atomicity)
+
+Scope: the pasted review (`pasted-text-1.txt`, phases 1–5) implemented on
+`master` (base `e5f56b9`), failing-first, smallest boundary-preserving
+fixes, with Phases 1–4 completed earlier the same day. All gates run on
+the final tree.
+
+- **P1 — token-revocation route binding (`internal/authz/handlers.go` `ServeRevoke`): FIXED.**
+  Revocation is now fenced to (issuer, audience/tenant, route): a token
+  whose issuer/audience/tenant/route does not match the revocation target
+  gets RFC 7009 §2.2's 200-without-effect and makes NO durable write, so
+  a cross-route SQL-poisoning revocation cannot disable another route's
+  token. Red-before: `internal/authz/cross_route_security_test.go`
+  (foreign-token revocation persisted `revoked=true`; replay accepted)
+  FAIL on the unfixed handler; green after.
+- **P1 — client-registration ownership and code redemption scoping: FIXED.**
+  `GetClient`/`ListClients` select `tenant_id, route_id`;
+  `CreateGrant` and `ApproveGrantWithPairingSecret` refuse
+  cross-route/unknown/unbound clients; `ConsumeCode` is scope-aware and
+  atomic (the tenant/route fence executes inside the SQL transaction
+  before consumption, closing the check-then-act race); `MemStore` and
+  the `Store` interface carry the same contract; `AuthorizeClaims` fails
+  closed on a client whose tenant/route does not match the token's.
+  ServeAuthorize/ServeConsent/serveCodeGrant/serveRefreshGrant resolve
+  clients through the route-scoped helper. Red-before:
+  `internal/authz/client_code_scope_test.go` (7 tests, incl.
+  cross-route negative controls) FAIL on the unfixed tree; green after.
+  Numerous pre-existing fixtures updated to register clients with
+  matching Tenant/Route (the fixtures predated ownership enforcement).
+- **P2 — reserved upstream identity headers: FIXED.**
+  `SanitizeVisitorHeaders` (`internal/proxy/proxy.go`) now strips
+  `x-ocliv-upstream-sub` and `x-ocliv-route` from visitor traffic;
+  `serveProxied` (`internal/relay/relay_public.go`) injects
+  `X-Ocliv-Upstream-Sub` and `X-Ocliv-Route` into the upstream-bound
+  head AFTER sanitization, and the managed path only removes the
+  visitor's `Authorization` before delegating. A visitor-spoofed
+  identity header can no longer reach the upstream. Wire-level
+  boundary tests in `internal/relay/relay_mcp_header_boundary_test.go`,
+  red-before/green-after.
+- **P2 — bounded OAuth request parsing and metadata: FIXED.**
+  `ServeRegister` caps the body (`MaxRegisterBody`, `MaxBytesReader`),
+  decodes with `json.Decoder` plus a second decode that rejects trailing
+  bytes, and enforces per-field limits (client name ≤256 chars, redirect
+  URI list ≤32 entries/≤2048 chars each). `ServeConsent`/`ServeToken`/
+  `ServeRevoke` wrap form parsing in `MaxBytesReader(MaxFormBody)`.
+  Red-before: `internal/authz/body_bounds_test.go` (oversize +
+  malformed-input rejection) FAIL on the unfixed tree; green after.
+- **P2 — bootstrap atomic replacement (`internal/setup/bootstrap.go`): FIXED.**
+  `InstallBinaryTo` stages the candidate on the destination filesystem
+  as `<dst>.ocliv-staged`, validates it at the publish boundary
+  (`validateStagedBinary`, an indirection for failure injection), and
+  atomically renames it into place — an interrupted write can only touch
+  the staged artifact, which is swept on failure; `dst` is always either
+  the previous binary or the complete new one. The `.ocliv-bak`
+  rollback point, the FIRST-candidate-wins rule, and ownership checks
+  are preserved; no generic transaction framework was added. Red-before:
+  `internal/setup/bootstrap_atomic_test.go`
+  (`TestInstallBinaryInterruptedBeforeReplacementKeepsPrevious` FAILs on
+  the unfixed direct-`os.WriteFile` path) / green-after; the
+  completed-replacement-then-later-failure rollback test pins the
+  preserved rollback contract.
+- **Schema tension recorded (assessed, no migration):** the review's
+  route-scoped revocation fence coexists with the existing
+  (issuer, tenant, route)-scoped `jti` revocation table; the global-jti
+  question was assessed and deliberately left as-is to avoid a silent
+  persistent-schema change. Route-scoped fencing above is the enforced
+  contract.
+- **Gates (final tree, GOCACHE=/tmp/ocliv-go-build).** `go build ./...`,
+  `go vet ./...`, `gofmt -l internal/ tests/` clean;
+  `go test ./internal/... -count=1` green (all 19 packages);
+  `go test -race ./internal/relay/ ./internal/agent/ ./internal/config/ ./internal/cli/ ./internal/mcp/` green;
+  full integration suite green in 246.75s (timeout 420s).
+- **NOT VERIFIED / operator-gated (unchanged).** No deployment of the
+  current HEAD; the Pi stays on the 2026-11-11 binary. The review's
+  own caution stands: do not deploy solely on these local gates —
+  qualify the actual deployed binary against the real public edge after
+  the operator chooses to deploy.
+
+### 2026-11-14 second review — restore-protection, parser, and bootstrap-durability corrections
+
+Scope: the follow-up deployment review's findings, closed with failing-first
+regressions and focused corrections before any production promotion. All gates
+run on the corrected source (GOCACHE=/tmp/ocliv-go-build).
+
+- **P1 — Restore could resurrect managed authorization (`internal/relay/relay_backup.go`): FIXED.**
+  The restore-time rollback guard now reads `authz_clients.revoked_at`,
+  `authz_grants.status<>'active'`, and `authz_revocations.jti` into the
+  revocation set, and `rollbackDiff` refuses a restore that would roll any of
+  that managed authority backward (guarded on the live DB actually having the
+  managed tables, so pre-V8 databases are not over-refused). `resetRestoredAuthority`
+  now terminally revokes managed clients and grants, consumes outstanding
+  codes/consent challenges, and **deletes the managed JWT signing key**
+  (`DELETE FROM authz_issuer_key`) so every token minted under restored
+  authority fails closed. Red-before: `TestRestoreRejectsManagedRevocationRollback`
+  and `TestResetAuthorityInvalidatesManagedOAuth` FAIL on the unfixed guard
+  (restore accepted; managed client left active); green after. A
+  mutation-check (re-breaking only the managed-client reset) re-confirms the
+  test genuinely asserts. `TestRestoreSafeManagedBackupStillWorks` proves a
+  non-rolling-back restore is still permitted and preserves a legitimate
+  active grant (the guard does not over-refuse).
+- **P2 — Registration parser accepted malformed trailing data (`internal/authz/handlers.go`): FIXED.**
+  The "exactly one JSON value" check now requires `io.EOF` specifically on the
+  second decode; a second value OR malformed trailing bytes (a syntax error)
+  is refused with zero durable writes. Red-before:
+  `TestRegisterRejectsMalformedTrailingJSON` FAILs on the unfixed handler
+  (`object + garbage` registered); green after.
+- **P2 — Bootstrap replacement crash-durability (`internal/setup/bootstrap.go`): FIXED.**
+  `InstallBinaryTo` stages under a UNIQUE per-install name
+  (`<dst>.ocliv-staged-<pid>`, `O_EXCL`) instead of one fixed path, so two
+  concurrent installs cannot write the same temporary; the staged file is
+  `fsync`ed before the atomic rename and the parent directory is `fsync`ed
+  after, so the rename is journaled (power-loss durability). `RollbackBinary`
+  now also stages + `fsync` + atomic-renames the backup into place instead of
+  a direct `os.WriteFile`. `validateStagedBinary` is documented strictly as a
+  test hook for the publish boundary (candidate integrity is established by
+  staging an exact byte copy + atomic rename + fsync; there is no separate
+  signature to check at install time). Regressions:
+  `TestInstallBinaryLeavesNoStagedArtifact`,
+  `TestInstallBinaryValidationFailureSweepsStaged`.
+- **P1 — Promotion plan corrected (`docs/qualification/PRODUCTION-PROMOTION-PLAN.md`): FIXED.**
+  Three corrections: (1) the "post-backup tokens fail closed on restore"
+  claim was WRONG — restoring the DB restores the signing key, so post-backup
+  tokens can still verify; the plan now states a plain restore preserves (not
+  revokes) post-backup authority and points to `--reset-authority` (which now
+  retires the managed signing key) as the real cut. (2) The unsafe manual
+  `cp -a` database restore — which bypasses the rollback guard — is replaced
+  with the guarded `ocliv relay restore --data DIR --in FILE [--reset-authority]
+  --relay-stopped`. (3) The post-rollback expectation text is corrected to
+  match. The CLI restore success message now names managed clients/grants and
+  the retired signing key.
+- **Gates (corrected source).** `go build ./...`, `go vet ./...` (GOCACHE set;
+  default cache is read-only), `gofmt -l internal/ tests/` clean;
+  `go test ./internal/... -count=1` green (all 19 packages);
+  `go test -race ./internal/relay/ ./internal/agent/ ./internal/config/ ./internal/cli/ ./internal/mcp/` green;
+  full integration suite green in 267.15s (420s cap).
+- **Still operator-gated (unchanged).** No production deploy. The Pi stays on
+  the 2026-11-11 binary (`0d47481f…`) until the operator chooses to promote.
+  The legacy-empty-tenant/route managed clients note stands: existing managed
+  OAuth clients may need re-registration/re-approval after upgrading (V11
+  binds clients to a route and the new source refuses unbound registrations).

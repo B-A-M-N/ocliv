@@ -57,7 +57,8 @@ func TestPairingSecretSingleUse(t *testing.T) {
 	s, _, store := newTestServer(t)
 	clientID := "client-single-use"
 	if err := store.RegisterClient(Client{ID: clientID, Name: "c",
-		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now()}); err != nil {
+		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now(),
+		Tenant: "tenant-test", Route: "r-test"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.ApproveGrantWithPairingSecret(clientID, "tenant-test", "r-test", "pair-1", time.Hour); err != nil {
@@ -81,7 +82,8 @@ func TestPairingSecretExpires(t *testing.T) {
 	s, _, store := newTestServer(t)
 	clientID := "client-expiring"
 	if err := store.RegisterClient(Client{ID: clientID, Name: "c",
-		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now()}); err != nil {
+		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now(),
+		Tenant: "tenant-test", Route: "r-test"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.ApproveGrantWithPairingSecret(clientID, "tenant-test", "r-test", "pair-exp", 5*time.Millisecond); err != nil {
@@ -102,7 +104,8 @@ func TestConsentTransactionBinding(t *testing.T) {
 	clientID := "client-binding"
 	redirect := "http://127.0.0.1:59999/cb"
 	if err := store.RegisterClient(Client{ID: clientID, Name: "c",
-		RedirectURIs: []string{redirect}, CreatedAt: time.Now()}); err != nil {
+		RedirectURIs: []string{redirect}, CreatedAt: time.Now(),
+		Tenant: "tenant-test", Route: "r-test"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.ApproveGrantWithPairingSecret(clientID, "tenant-test", "r-test", "pair-bind", time.Hour); err != nil {
@@ -170,7 +173,8 @@ func TestRedirectCompositionPreservesQuery(t *testing.T) {
 	clientID := "client-query"
 	redirect := "http://127.0.0.1:59999/cb?foo=bar&baz=qux"
 	if err := store.RegisterClient(Client{ID: clientID, Name: "c",
-		RedirectURIs: []string{redirect}, CreatedAt: time.Now()}); err != nil {
+		RedirectURIs: []string{redirect}, CreatedAt: time.Now(),
+		Tenant: "tenant-test", Route: "r-test"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.ApproveGrantWithPairingSecret(clientID, "tenant-test", "r-test", "pair-q", time.Hour); err != nil {
@@ -250,7 +254,8 @@ func TestPendingConsentQuota(t *testing.T) {
 	s, _, store := newTestServer(t)
 	clientID := "client-flood"
 	if err := store.RegisterClient(Client{ID: clientID, Name: "c",
-		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now()}); err != nil {
+		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now(),
+		Tenant: "tenant-test", Route: "r-test"}); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < MaxPendingConsentsPerRoute; i++ {
@@ -329,10 +334,10 @@ func TestPruneAuthzExpired(t *testing.T) {
 	if err := m.PruneAuthzExpired(time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.ConsumeCode("old"); err == nil {
+	if _, err := m.ConsumeCode("old", "", "", ""); err == nil {
 		t.Fatal("expired code survived pruning")
 	}
-	if _, err := m.ConsumeCode("live"); err != nil {
+	if _, err := m.ConsumeCode("live", "", "", ""); err != nil {
 		t.Fatalf("live code pruned: %v", err)
 	}
 	if _, err := m.ConsumeConsent("oldc"); err == nil {
@@ -398,6 +403,9 @@ func TestApproveWithPairingSecretIsAtomic(t *testing.T) {
 	db := openTestDB(t)
 	applySchema(t, db)
 	s := NewSQLStore(db)
+	if err := s.RegisterClient(Client{ID: "cli_a", Tenant: "t", Route: "r"}); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.ApproveGrantWithPairingSecret("cli_a", "t", "r", "pair-a", time.Hour); err != nil {
 		t.Fatal(err)
 	}

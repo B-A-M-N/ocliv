@@ -82,8 +82,12 @@ func SanitizeVisitorHeaders(h http.Header) map[string]string {
 		switch ck {
 		case "forwarded", "x-forwarded-host", "x-forwarded-proto",
 			"x-forwarded-for", "x-forwarded-port", "x-forwarded-server",
-			"x-real-ip", strings.ToLower(access.HeaderName), "cookie":
-			continue // handled explicitly below
+			"x-real-ip", strings.ToLower(access.HeaderName), "cookie",
+			// Relay-generated upstream identity metadata. These names are
+			// reserved: a visitor cannot supply them, and the managed
+			// path injects its verified values AFTER this sanitizer runs.
+			"x-ocliv-upstream-sub", "x-ocliv-route":
+			continue
 		}
 		if ck == "connection" {
 			continue

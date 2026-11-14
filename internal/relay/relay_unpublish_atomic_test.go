@@ -24,6 +24,9 @@ func TestUnpublishRollsBackWhenRetirementFails(t *testing.T) {
 	route := publishRoute(t, s, priv, "key-test", "lse-x", "managed-oauth")
 
 	az := authz.NewSQLStore(db.SQL())
+	if err := az.RegisterClient(authz.Client{ID: "cli-x", Tenant: "tenant-test", Route: route}); err != nil {
+		t.Fatal(err)
+	}
 	if err := az.CreateGrant(authz.Grant{ClientID: "cli-x", Tenant: "tenant-test", Route: route,
 		Status: authz.GrantActive, CreatedAt: time.Now(), UpdatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
@@ -60,6 +63,9 @@ func TestUnpublishAtomicSuccessPath(t *testing.T) {
 
 	az := authz.NewSQLStore(db.SQL())
 	for _, c := range []struct{ client, r string }{{"cli-ok", route}, {"cli-other", "another-route"}} {
+		if err := az.RegisterClient(authz.Client{ID: c.client, Tenant: "tenant-test", Route: c.r}); err != nil {
+			t.Fatalf("register client %s: %v", c.client, err)
+		}
 		if err := az.CreateGrant(authz.Grant{ClientID: c.client, Tenant: "tenant-test", Route: c.r,
 			Status: authz.GrantActive, CreatedAt: time.Now(), UpdatedAt: time.Now()}); err != nil {
 			t.Fatal(err)

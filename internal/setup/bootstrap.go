@@ -45,6 +45,17 @@ const ManagedMarker = "# managed by ocliv setup"
 // runCaddyValidate and runDaemonReload are indirection points so
 // install/rollback behavior is testable without a live Caddy or
 // systemd.
+// validateStagedBinary is a TEST HOOK for InstallBinaryTo's publish
+// boundary: the staged candidate is validated immediately before the
+// atomic rename into place, and failure here models an interruption
+// before replacement (dst is untouched and the staged candidate is
+// swept). The default is a no-op because the candidate's integrity is
+// established by staging an exact byte copy and publishing it with an
+// atomic rename + fsync; there is no separate signature to check at
+// install time. Tests inject a failure to prove an invalid candidate is
+// never published. It is exported-package-internal, not a public API.
+var validateStagedBinary = func(string) error { return nil }
+
 var runCaddyValidate = func(dst string) error {
 	return runCmd("caddy", "validate", "--config", dst, "--adapter", "caddyfile")
 }
@@ -508,10 +519,14 @@ func RollbackDataDir(dir string) (restored bool, err error) {
 }
 
 // InstallBinaryTo installs the staged relay binary at dst (0755,
-// root-owned). A previous binary is preserved at <dst>.ocliv-bak and
-// the FIRST candidate wins across consecutive runs: re-running the
-// bootstrap must not overwrite the original rollback point with an
-// already-installed binary. RollbackBinary restores or removes it.
+// root-owned). The candidate is staged on the destination filesystem
+// (<dst>.ocliv-staged), validated at the publish boundary, and
+// atomically renamed into place, so an interruption can never leave a
+// partially written binary at dst. A previous binary is preserved at
+// <dst>.ocliv-bak and the FIRST candidate wins across consecutive
+// runs: re-running the bootstrap must not overwrite the original
+// rollback point with an already-installed binary. RollbackBinary
+// restores or removes it.
 func InstallBinaryTo(src, dst string) error {
 	prev := dst + ".ocliv-bak"
 	if raw, err := os.ReadFile(dst); err == nil {
@@ -527,11 +542,56 @@ func InstallBinaryTo(src, dst string) error {
 	if err != nil {
 		return fmt.Errorf("staged binary %s unreadable: %w", src, err)
 	}
-	if err := os.WriteFile(dst, raw, 0o755); err != nil {
+	// Stage the candidate on the DESTINATION filesystem (a rename
+	// across filesystems is not atomic) under a UNIQUE name: a fixed
+	// staged path would let two concurrent installs write the same
+	// temporary and one rename could publish a torn mix. fsync the
+	// staged file so its content is durable before the rename, then
+	// rename atomically into place and fsync the directory so the
+	// rename itself is journaled (power-loss durability). An
+	// interrupted write can only ever touch the staged artifact, which
+	// is swept on failure — dst is either the previous binary or the
+	// complete new one, never a partial write.
+	staged := fmt.Sprintf("%s.ocliv-staged-%d", dst, os.Getpid())
+	sweep := func() { _ = os.Remove(staged) }
+	f, err := os.OpenFile(staged, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o755)
+	if err != nil {
+		return fmt.Errorf("staging %s: %w", staged, err)
+	}
+	if _, err := f.Write(raw); err != nil {
+		_ = f.Close()
+		sweep()
+		return fmt.Errorf("staging %s: %w", staged, err)
+	}
+	if err := f.Chmod(0o755); err != nil {
+		_ = f.Close()
+		sweep()
+		return fmt.Errorf("chmod %s: %w", staged, err)
+	}
+	// Durable content before the rename is published.
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		sweep()
+		return fmt.Errorf("syncing staged %s: %w", staged, err)
+	}
+	if err := f.Close(); err != nil {
+		sweep()
+		return fmt.Errorf("closing staged %s: %w", staged, err)
+	}
+	if err := validateStagedBinary(staged); err != nil {
+		sweep()
+		return fmt.Errorf("validating staged binary %s: %w", staged, err)
+	}
+	if err := os.Rename(staged, dst); err != nil {
+		sweep()
 		return fmt.Errorf("installing %s: %w", dst, err)
 	}
-	if err := os.Chmod(dst, 0o755); err != nil {
-		return fmt.Errorf("chmod %s: %w", dst, err)
+	// Durable rename: flush the directory so the new name survives a
+	// power loss (best-effort on filesystems without directory fsync).
+	dir, err := os.Open(filepath.Dir(dst))
+	if err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
 	}
 	return nil
 }
@@ -543,8 +603,37 @@ func InstallBinaryTo(src, dst string) error {
 func RollbackBinary(dst string) (restored bool, err error) {
 	prev := dst + ".ocliv-bak"
 	if raw, rerr := os.ReadFile(prev); rerr == nil {
-		if werr := os.WriteFile(dst, raw, 0o755); werr != nil {
+		// Atomic restore: stage the backup on the destination filesystem
+		// and rename it into place (a direct os.WriteFile could leave a
+		// torn binary at dst under an interrupted rollback). On any
+		// failure the backup is kept and dst is untouched.
+		staged := fmt.Sprintf("%s.ocliv-rollback-%d", dst, os.Getpid())
+		werr := func() error {
+			f, ferr := os.OpenFile(staged, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o755)
+			if ferr != nil {
+				return ferr
+			}
+			if _, ferr = f.Write(raw); ferr != nil {
+				_ = f.Close()
+				return ferr
+			}
+			if ferr = f.Chmod(0o755); ferr != nil {
+				_ = f.Close()
+				return ferr
+			}
+			if ferr = f.Sync(); ferr != nil {
+				_ = f.Close()
+				return ferr
+			}
+			return f.Close()
+		}()
+		if werr != nil {
+			_ = os.Remove(staged)
 			return false, fmt.Errorf("binary rollback of %s failed, backup kept at %s: %w", dst, prev, werr)
+		}
+		if rerr := os.Rename(staged, dst); rerr != nil {
+			_ = os.Remove(staged)
+			return false, fmt.Errorf("binary rollback of %s failed, backup kept at %s: %w", dst, prev, rerr)
 		}
 		if rerr := os.Remove(prev); rerr != nil && !os.IsNotExist(rerr) {
 			return true, fmt.Errorf("binary rollback of %s restored but backup removal failed: %w", dst, rerr)

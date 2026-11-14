@@ -247,10 +247,10 @@ func TestIsPrivateHost(t *testing.T) {
 
 func TestStoreGrantLifecycle(t *testing.T) {
 	m := NewMemStore()
-	if err := m.RegisterClient(Client{ID: "cli_1", RedirectURIs: []string{"https://x/cb"}}); err != nil {
+	if err := m.RegisterClient(Client{ID: "cli_1", RedirectURIs: []string{"https://x/cb"}, Tenant: "t", Route: "r"}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	if err := m.RegisterClient(Client{ID: "cli_1"}); err == nil {
+	if err := m.RegisterClient(Client{Tenant: "t", Route: "r", ID: "cli_1"}); err == nil {
 		t.Fatal("duplicate client accepted")
 	}
 	if err := m.CreateGrant(Grant{ClientID: "cli_1", Tenant: "t", Route: "r", Status: GrantPending}); err != nil {
@@ -280,16 +280,16 @@ func TestCodeSingleUse(t *testing.T) {
 	if err := m.CreateCode(Code{Code: "c1", ClientID: "cli_1", ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := m.ConsumeCode("c1"); err != nil {
+	if _, err := m.ConsumeCode("c1", "cli_1", "", ""); err != nil {
 		t.Fatalf("first consume: %v", err)
 	}
-	if _, err := m.ConsumeCode("c1"); err == nil {
+	if _, err := m.ConsumeCode("c1", "cli_1", "", ""); err == nil {
 		t.Fatal("code replayed")
 	}
 	if err := m.CreateCode(Code{Code: "c2", ExpiresAt: time.Now().Add(-time.Minute)}); err != nil {
 		t.Fatalf("create2: %v", err)
 	}
-	if _, err := m.ConsumeCode("c2"); err == nil {
+	if _, err := m.ConsumeCode("c2", "", "", ""); err == nil {
 		t.Fatal("expired code accepted")
 	}
 }

@@ -22,7 +22,8 @@ func TestConsentPageNotURLCredential(t *testing.T) {
 	s, _, store := newTestServer(t)
 	clientID := "client-consent"
 	if err := store.RegisterClient(Client{ID: clientID, Name: "c",
-		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now()}); err != nil {
+		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now(),
+		Tenant: "tenant-test", Route: "r-test"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -111,7 +112,8 @@ func TestActiveGrantNeedsNoOclivParams(t *testing.T) {
 	s, _, store := newTestServer(t)
 	clientID := "client-normal"
 	if err := store.RegisterClient(Client{ID: clientID, Name: "c",
-		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now()}); err != nil {
+		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now(),
+		Tenant: "tenant-test", Route: "r-test"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CreateGrant(Grant{ClientID: clientID, Tenant: "tenant-test", Route: "r-test",
@@ -159,7 +161,8 @@ func TestActiveGrantAloneNeverYieldsACode(t *testing.T) {
 	s, _, store := newTestServer(t)
 	clientID := "client-approved-not-consented"
 	if err := store.RegisterClient(Client{ID: clientID, Name: "c",
-		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now()}); err != nil {
+		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now(),
+		Tenant: "tenant-test", Route: "r-test"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CreateGrant(Grant{ClientID: clientID, Tenant: "tenant-test", Route: "r-test",
@@ -191,7 +194,8 @@ func TestRevokedClientCannotUseExistingToken(t *testing.T) {
 	s, issuer, store := newTestServer(t)
 	clientID := "client-revoked"
 	if err := store.RegisterClient(Client{ID: clientID, Name: "c",
-		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now()}); err != nil {
+		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now(),
+		Tenant: "tenant-test", Route: "r-test"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CreateGrant(Grant{ClientID: clientID, Tenant: "tenant-test", Route: "r-test",
@@ -225,7 +229,8 @@ func TestRevokedClientCannotRedeemCode(t *testing.T) {
 	s, _, store := newTestServer(t)
 	clientID := "client-revoked-code"
 	if err := store.RegisterClient(Client{ID: clientID, Name: "c",
-		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now()}); err != nil {
+		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now(),
+		Tenant: "tenant-test", Route: "r-test"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CreateGrant(Grant{ClientID: clientID, Tenant: "tenant-test", Route: "r-test",
@@ -264,7 +269,8 @@ func TestMissingJTITokenRejected(t *testing.T) {
 	s, issuer, store := newTestServer(t)
 	clientID := "client-nojti"
 	if err := store.RegisterClient(Client{ID: clientID, Name: "c",
-		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now()}); err != nil {
+		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now(),
+		Tenant: "tenant-test", Route: "r-test"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CreateGrant(Grant{ClientID: clientID, Tenant: "tenant-test", Route: "r-test",
@@ -310,7 +316,8 @@ func TestResourceParameterMustMatchRoute(t *testing.T) {
 	s, _, store := newTestServer(t)
 	clientID := "client-resource"
 	if err := store.RegisterClient(Client{ID: clientID, Name: "c",
-		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now()}); err != nil {
+		RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now(),
+		Tenant: "tenant-test", Route: "r-test"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CreateGrant(Grant{ClientID: clientID, Tenant: "tenant-test", Route: "r-test",

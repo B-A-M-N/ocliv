@@ -754,7 +754,7 @@ func cmdRelayRestore(argv []string) int {
 		return exitForRelayErr(err)
 	}
 	if reset {
-		fmt.Println("restore complete with reset-authority: all keys, leases, and publications revoked; re-enroll publishers, then start the relay")
+		fmt.Println("restore complete with reset-authority: all keys, leases, publications, and managed OAuth clients/grants revoked, and the managed signing key retired; re-enroll publishers and re-register/re-approve managed clients, then start the relay")
 	} else {
 		fmt.Println("restore complete: start the relay (restored image takes effect at next start)")
 	}

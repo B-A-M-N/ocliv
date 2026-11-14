@@ -48,8 +48,9 @@ func (s *SQLStore) GetClient(id string) (*Client, error) {
 		revoked   sql.NullString
 	)
 	err := s.db.QueryRow(
-		`SELECT id, name, redirect_uris, created_at, revoked_at FROM authz_clients WHERE id=?`, id).
-		Scan(&c.ID, &c.Name, &uris, &createdAt, &revoked)
+		`SELECT id, name, redirect_uris, created_at, revoked_at, tenant_id, route_id
+		 FROM authz_clients WHERE id=?`, id).
+		Scan(&c.ID, &c.Name, &uris, &createdAt, &revoked, &c.Tenant, &c.Route)
 	if err != nil {
 		return nil, fmt.Errorf("authz: get client: %w", err)
 	}
@@ -163,6 +164,17 @@ func (s *SQLStore) RevokeClient(id string) error {
 func (s *SQLStore) CreateGrant(g Grant) error {
 	if g.ClientID == "" || g.Tenant == "" || g.Route == "" {
 		return fmt.Errorf("authz: grant requires client, tenant, and route")
+	}
+	client, cerr := s.GetClient(g.ClientID)
+	if cerr != nil {
+		return fmt.Errorf("authz: grant for unknown client %q: %w", g.ClientID, cerr)
+	}
+	if client.Tenant == "" || client.Route == "" {
+		return fmt.Errorf("authz: client %q has no route registration scope; refusing grant", g.ClientID)
+	}
+	if client.Tenant != g.Tenant || client.Route != g.Route {
+		return fmt.Errorf("authz: client %q is registered for tenant %q route %q, not tenant %q route %q",
+			g.ClientID, client.Tenant, client.Route, g.Tenant, g.Route)
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err := s.db.Exec(
@@ -507,6 +519,17 @@ func (s *SQLStore) ApproveGrantWithPairingSecret(clientID, tenant, route, secret
 	if ttl <= 0 {
 		return fmt.Errorf("authz: pairing ttl must be positive")
 	}
+	client, cerr := s.GetClient(clientID)
+	if cerr != nil {
+		return fmt.Errorf("authz: approve grant for unknown client %q: %w", clientID, cerr)
+	}
+	if client.Tenant == "" || client.Route == "" {
+		return fmt.Errorf("authz: client %q has no route registration scope; refusing approval", clientID)
+	}
+	if client.Tenant != tenant || client.Route != route {
+		return fmt.Errorf("authz: client %q is registered for tenant %q route %q, not tenant %q route %q",
+			clientID, client.Tenant, client.Route, tenant, route)
+	}
 	now := time.Now().UTC()
 	nowStr := now.Format(time.RFC3339Nano)
 	expires := now.Add(ttl).Format(time.RFC3339Nano)
@@ -589,9 +612,13 @@ func (s *SQLStore) CreateCode(c Code) error {
 	return nil
 }
 
-// ConsumeCode atomically marks a code consumed and returns it. A code can only
-// be consumed once; an expired code is rejected.
-func (s *SQLStore) ConsumeCode(code string) (*Code, error) {
+// ConsumeCode atomically marks a code consumed and returns it, scoped to
+// the expected client + tenant + route. The scope check happens inside the
+// SQL transaction BEFORE the consumed marker is written, so a foreign
+// route's redemption attempt can neither mint tokens nor destroy another
+// route's pending code. A code can only be consumed once; an expired code
+// is rejected.
+func (s *SQLStore) ConsumeCode(code, expectedClient, expectedTenant, expectedRoute string) (*Code, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, fmt.Errorf("authz: consume code: %w", err)
@@ -609,6 +636,13 @@ func (s *SQLStore) ConsumeCode(code string) (*Code, error) {
 		Scan(&c.Code, &c.ClientID, &c.Tenant, &c.Route, &c.RedirectURI, &c.Challenge, &c.ChallengeMethod, &expiresAt, &consumed)
 	if err != nil {
 		return nil, fmt.Errorf("authz: unknown authorization code")
+	}
+	// Scope fence: the code's own tenant/route/client must match the
+	// authorization server handling the redemption. A mismatch leaves
+	// the row untouched (transaction rolls back), so route A's pending
+	// code survives route B's attempt.
+	if c.ClientID != expectedClient || c.Tenant != expectedTenant || c.Route != expectedRoute {
+		return nil, fmt.Errorf("authz: authorization code is not bound to this client and route")
 	}
 	if consumed.Valid {
 		return nil, fmt.Errorf("authz: authorization code already used")
@@ -632,7 +666,8 @@ func (s *SQLStore) ConsumeCode(code string) (*Code, error) {
 // ListClients returns every registered client, newest first.
 func (s *SQLStore) ListClients() ([]Client, error) {
 	rows, err := s.db.Query(
-		`SELECT id, name, redirect_uris, created_at, revoked_at FROM authz_clients ORDER BY created_at DESC`)
+		`SELECT id, name, redirect_uris, created_at, revoked_at, tenant_id, route_id
+		 FROM authz_clients ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("authz: list clients: %w", err)
 	}
@@ -641,7 +676,7 @@ func (s *SQLStore) ListClients() ([]Client, error) {
 	for rows.Next() {
 		var c Client
 		var uris, createdAt string
-		if err := rows.Scan(&c.ID, &c.Name, &uris, &createdAt, &c.RevokedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.Name, &uris, &createdAt, &c.RevokedAt, &c.Tenant, &c.Route); err != nil {
 			return nil, fmt.Errorf("authz: scan client: %w", err)
 		}
 		c.RedirectURIs = splitList(uris)

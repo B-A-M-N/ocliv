@@ -20,6 +20,24 @@ const (
 	DefaultConsentTTL = 15 * time.Minute
 )
 
+// Bounded-input limits for the public OAuth endpoints (2026-11-14 review
+// P2). Registration writes durable rows, so its request body and every
+// metadata field are individually capped. The form endpoints (authorize,
+// token, consent, revoke) carry no durable client metadata, so a smaller
+// form limit applies.
+const (
+	// MaxRegisterBody bounds one dynamic client registration request.
+	MaxRegisterBody = 1 << 20
+	// MaxFormBody bounds one authorization/token/consent/revoke form.
+	MaxFormBody = 64 << 10
+	// MaxClientName bounds one registered client's display name.
+	MaxClientName = 256
+	// MaxClientURIs bounds the redirect_uris count per registration.
+	MaxClientURIs = 32
+	// MaxRedirectURILength bounds one redirect URI string.
+	MaxRedirectURILength = 2048
+)
+
 // Server serves the route-scoped authorization endpoints for one managed
 // route. It is stateless apart from its Issuer and Store.
 type Server struct {
@@ -188,15 +206,62 @@ func (s *Server) ServeRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	// Bounded input: reject the whole request when the body exceeds the cap
+	// (a valid JSON prefix followed by excess bytes is NOT accepted), and
+	// require exactly one JSON value.
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxRegisterBody))
 	if err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{
+			"error":             "invalid_client_metadata",
+			"error_description": "registration body too large",
+		})
 		return
 	}
 	var req registerReq
-	if err := json.Unmarshal(body, &req); err != nil {
-		http.Error(w, "invalid client metadata", http.StatusBadRequest)
+	dec := json.NewDecoder(strings.NewReader(string(body)))
+	if err := dec.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":             "invalid_client_metadata",
+			"error_description": "malformed registration body",
+		})
 		return
+	}
+	// Exactly one JSON value: the body must contain one complete JSON
+	// document and nothing else. The second decode must report a clean
+	// end-of-input; ANY other outcome — a second value OR malformed
+	// trailing bytes (a syntax error) — is refused. Pre-fix only a second
+	// VALID value was rejected, so "object + garbage" was accepted.
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":             "invalid_client_metadata",
+			"error_description": "registration body must contain exactly one JSON value",
+		})
+		return
+	}
+	// Individually bounded metadata fields.
+	if len(req.ClientName) > MaxClientName {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{
+			"error":             "invalid_client_metadata",
+			"error_description": "client_name too long",
+		})
+		return
+	}
+	if len(req.RedirectURIs) > MaxClientURIs {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{
+			"error":             "invalid_client_metadata",
+			"error_description": "too many redirect_uris",
+		})
+		return
+	}
+	for _, uri := range req.RedirectURIs {
+		if len(uri) > MaxRedirectURILength {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{
+				"error":             "invalid_client_metadata",
+				"error_description": "redirect_uri too long",
+			})
+			return
+		}
 	}
 	if len(req.RedirectURIs) == 0 {
 		http.Error(w, "redirect_uris is required", http.StatusBadRequest)
@@ -273,6 +338,25 @@ func (s *Server) ServeRegister(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// scopedClient returns the client only when its registration belongs to
+// this authorization server's tenant + route. Legacy rows with no stored
+// identity are unbound and fail closed. The relay is a route-scoped AS,
+// so a client_id minted through one route is not an identity on another.
+func (s *Server) scopedClient(id string) (*Client, error) {
+	client, err := s.Store.GetClient(id)
+	if err != nil {
+		return nil, err
+	}
+	if client.Tenant == "" || client.Route == "" {
+		return nil, fmt.Errorf("authz: client %q has no route registration scope", id)
+	}
+	if client.Tenant != s.tenant() || client.Route != s.RouteID {
+		return nil, fmt.Errorf("authz: client %q is registered for tenant %q route %q, not tenant %q route %q",
+			id, client.Tenant, client.Route, s.tenant(), s.RouteID)
+	}
+	return client, nil
+}
+
 // ServeAuthorize starts the authorization code flow. It NEVER issues a code
 // on its own: an ACTIVE grant is the operator's approval of the client, not
 // an authorization of this transaction. A public client_id plus redirect URI
@@ -306,7 +390,7 @@ func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 			"error_description": "resource must be this route's canonical URL"})
 		return
 	}
-	client, err := s.Store.GetClient(clientID)
+	client, err := s.scopedClient(clientID)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_client"})
 		return
@@ -469,6 +553,7 @@ func (s *Server) ServeConsent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, MaxFormBody)
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
@@ -504,7 +589,7 @@ func (s *Server) ServeConsent(w http.ResponseWriter, r *http.Request) {
 			"error_description": "consent transaction mismatch"})
 		return
 	}
-	client, err := s.Store.GetClient(clientID)
+	client, err := s.scopedClient(clientID)
 	if err != nil || client.RevokedAt != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_client"})
 		return
@@ -559,6 +644,7 @@ func (s *Server) ServeToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, MaxFormBody)
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
@@ -589,19 +675,25 @@ func (s *Server) serveCodeGrant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Client-level revocation is rechecked here so a revoked client cannot
-	// redeem an already-issued authorization code.
-	if client, cerr := s.Store.GetClient(clientID); cerr != nil || client.RevokedAt != nil {
+	// redeem an already-issued authorization code. The registration must
+	// also belong to this route: a client_id minted through another
+	// authorization server is not an identity here.
+	client, cerr := s.scopedClient(clientID)
+	if cerr != nil || client.RevokedAt != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_client",
 			"error_description": "client revoked"})
 		return
 	}
 
-	code, err := s.Store.ConsumeCode(codeStr)
+	// Scope-aware atomic consumption: the stored code's tenant/route must
+	// match this endpoint inside the store transaction. A foreign route's
+	// attempt is refused without consuming the code.
+	code, err := s.Store.ConsumeCode(codeStr, clientID, s.tenant(), s.RouteID)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant", "error_description": err.Error()})
 		return
 	}
-	if code.ClientID != clientID || code.RedirectURI != redirectURI {
+	if code.RedirectURI != redirectURI {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant"})
 		return
 	}
@@ -705,7 +797,7 @@ func (s *Server) serveRefreshGrant(w http.ResponseWriter, r *http.Request) {
 			"error_description": "refresh token already rotated or revoked"})
 		return
 	}
-	if client, cerr := s.Store.GetClient(clientID); cerr != nil || client.RevokedAt != nil {
+	if client, cerr := s.scopedClient(clientID); cerr != nil || client.RevokedAt != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_client",
 			"error_description": "client revoked"})
 		return
@@ -791,6 +883,7 @@ func (s *Server) ServeRevoke(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, MaxFormBody)
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
@@ -806,6 +899,16 @@ func (s *Server) ServeRevoke(w http.ResponseWriter, r *http.Request) {
 	claims, err := s.Issuer.Verify(tokenStr)
 	if err != nil {
 		// RFC 7009: an invalid token is treated as already revoked.
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	// Scope fence: a token minted by another route's authorization server
+	// is not this endpoint's credential. RFC 7009 says to answer success
+	// without modifying state, so a caller cannot probe another route's
+	// tokens here either. The binding checks are exactly the ones
+	// admission applies: issuer, audience, tenant, and route.
+	if !claims.ValidateIssuer(s.IssuerURL) || !claims.ValidateAudience(s.RouteURL) ||
+		claims.Tenant != s.tenant() || claims.Route != s.RouteID {
 		w.WriteHeader(http.StatusOK)
 		return
 	}

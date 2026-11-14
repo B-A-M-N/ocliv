@@ -68,9 +68,20 @@ func (a *Authorizer) AuthorizeClaims(r *http.Request, routeURL, issuerURL, tenan
 		return nil, fmt.Errorf("authz: client %q is not approved (status %q)", claims.Subject, grant.Status)
 	}
 	// Client-level revocation: a revoked client's existing tokens stop at
-	// admission, not just at the next token exchange.
-	if client, cerr := a.store.GetClient(claims.Subject); cerr != nil || client.RevokedAt != nil {
+	// admission, not just at the next token exchange. The registration
+	// must also belong to this route: a client_id minted through another
+	// authorization server is not an identity here. Legacy rows with no
+	// stored identity are unbound and fail closed.
+	client, cerr := a.store.GetClient(claims.Subject)
+	if cerr != nil || client.RevokedAt != nil {
 		return nil, fmt.Errorf("authz: client %q is revoked", claims.Subject)
+	}
+	if client.Tenant == "" || client.Route == "" {
+		return nil, fmt.Errorf("authz: client %q has no route registration scope", claims.Subject)
+	}
+	if client.Tenant != tenant || client.Route != routeID {
+		return nil, fmt.Errorf("authz: client %q is registered for tenant %q route %q, not tenant %q route %q",
+			claims.Subject, client.Tenant, client.Route, tenant, routeID)
 	}
 	// Every managed token must carry a jti. A token without one cannot be
 	// individually revoked, so it is refused rather than admitted.

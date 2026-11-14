@@ -19,7 +19,8 @@ func TestServeRevokeInvalidatesToken(t *testing.T) {
 	clientA, clientB := "client-rev-a", "client-rev-b"
 	for _, c := range []string{clientA, clientB} {
 		if err := store.RegisterClient(Client{ID: c, Name: c,
-			RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now()}); err != nil {
+			RedirectURIs: []string{"http://127.0.0.1:59999/cb"}, CreatedAt: time.Now(),
+			Tenant: "tenant-test", Route: "r-test"}); err != nil {
 			t.Fatal(err)
 		}
 		if err := store.CreateGrant(Grant{ClientID: c, Tenant: "tenant-test", Route: "r-test",

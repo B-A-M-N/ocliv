@@ -232,7 +232,7 @@ func TestKeyRotation(t *testing.T) {
 		t.Fatalf("old issuer: %v", err)
 	}
 	store := NewMemStore()
-	_ = store.RegisterClient(Client{ID: "cli_1", RedirectURIs: []string{"https://x/cb"}})
+	_ = store.RegisterClient(Client{ID: "cli_1", RedirectURIs: []string{"https://x/cb"}, Tenant: "t", Route: "r"})
 	_ = store.CreateGrant(Grant{ClientID: "cli_1", Tenant: "t", Route: "r", Status: GrantActive})
 
 	oldTok, err := old.Mint(TokenClaims{Issuer: "iss", Subject: "cli_1", Audience: "aud", Tenant: "t", Route: "r", Expiry: time.Now().Add(time.Hour).Unix(), ID: "jti-old"})
