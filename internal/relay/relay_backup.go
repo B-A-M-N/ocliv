@@ -114,6 +114,17 @@ func verifyChecksum(backupPath string) error {
 	return nil
 }
 
+// authzGrantKey is the full identity of a managed grant: the
+// (tenant_id, route_id, client_id) composite primary key. Keying the
+// rollback guard on client_id alone would let one route's active grant
+// mask another route's revocation (a cross-route authorization
+// rollback). A typed struct, never a concatenated string.
+type authzGrantKey struct {
+	tenantID string
+	routeID  string
+	clientID string
+}
+
 // revocationSet is the security-relevant truth that must never roll
 // backward across a restore. Beyond explicit revocations it covers
 // every terminal lease state (P0-B): a CLOSED or EXPIRED lease must
@@ -147,10 +158,10 @@ type revocationSet struct {
 	// managed grant (authz_grants.status != 'active'), or a revoked
 	// managed token jti (authz_revocations). Restoring an older database
 	// would otherwise reactivate managed OAuth clients/grants/tokens.
-	authzClients    map[string]bool // authz_clients with revoked_at set
-	authzGrants     map[string]bool // authz_grants with status != 'active'
-	authzJTIs       map[string]bool // authz_revocations jti
-	authzTablesLive bool            // live DB has the managed tables
+	authzClients    map[string]bool        // authz_clients with revoked_at set
+	authzGrants     map[authzGrantKey]bool // authz_grants with status != 'active' (keyed by tenant/route/client tuple)
+	authzJTIs       map[string]bool        // authz_revocations jti
+	authzTablesLive bool                   // live DB has the managed tables
 	// pubIDs is every publication route_id present. A backup row
 	// (active or tombstoned) absent from live means the publication
 	// was explicitly deleted after the snapshot — restoring would
@@ -260,7 +271,7 @@ func readRevocations(q *sql.DB) (*revocationSet, error) {
 	// tables (pre-V8) has none: empty sets, and the guard treats missing
 	// tables as "no live managed state to protect" (nothing to roll back).
 	s.authzClients = map[string]bool{}
-	s.authzGrants = map[string]bool{}
+	s.authzGrants = map[authzGrantKey]bool{}
 	s.authzJTIs = map[string]bool{}
 	var authzTable string
 	if err := q.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='authz_clients'`).Scan(&authzTable); err == nil && authzTable != "" {
@@ -268,7 +279,20 @@ func readRevocations(q *sql.DB) (*revocationSet, error) {
 		if s.authzClients, err = collectStrings(q, `SELECT id FROM authz_clients WHERE revoked_at IS NOT NULL`); err != nil {
 			return nil, apperr.E(apperr.CodeStoreFault, "reading managed client revocations", err)
 		}
-		if s.authzGrants, err = collectStrings(q, `SELECT client_id FROM authz_grants WHERE status<>'active'`); err != nil {
+		grows, err := q.Query(`SELECT tenant_id, route_id, client_id FROM authz_grants WHERE status<>'active'`)
+		if err != nil {
+			return nil, apperr.E(apperr.CodeStoreFault, "reading managed grant terminations", err)
+		}
+		for grows.Next() {
+			var k authzGrantKey
+			if err := grows.Scan(&k.tenantID, &k.routeID, &k.clientID); err != nil {
+				grows.Close()
+				return nil, apperr.E(apperr.CodeStoreFault, "reading managed grant terminations", err)
+			}
+			s.authzGrants[k] = true
+		}
+		grows.Close()
+		if err := grows.Err(); err != nil {
 			return nil, apperr.E(apperr.CodeStoreFault, "reading managed grant terminations", err)
 		}
 	}
@@ -380,9 +404,9 @@ func rollbackDiff(live, backup *revocationSet) []string {
 				missing = append(missing, "authz-client:"+id)
 			}
 		}
-		for id := range live.authzGrants {
-			if !backup.authzGrants[id] {
-				missing = append(missing, "authz-grant:"+id)
+		for k := range live.authzGrants {
+			if !backup.authzGrants[k] {
+				missing = append(missing, "authz-grant:"+k.tenantID+"/"+k.routeID+"/"+k.clientID)
 			}
 		}
 		for jti := range live.authzJTIs {

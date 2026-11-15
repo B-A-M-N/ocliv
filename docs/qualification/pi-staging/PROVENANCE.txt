@@ -1,0 +1,7 @@
+Ocliv ARM64 candidate — isolated Pi staging
+source commit : f2d2bec367ae3217f664628337a2d40900645666
+toolchain     : go1.26.10 linux/amd64
+build config  : CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w"
+binary sha256 : fe48fb96a628f6c6e04eb5c53fd890c54a4d7485f2c91dca06b9dbd26e25a06b
+built         : 2026-11-14T23:09:19Z
+production    : 0d47481f2e2b7cbff34df57a713f0e39849be92cd85deabd5f256be07a00d0b1 (running, NOT touched)

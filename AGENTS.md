@@ -767,3 +767,90 @@ run on the corrected source (GOCACHE=/tmp/ocliv-go-build).
   The legacy-empty-tenant/route managed clients note stands: existing managed
   OAuth clients may need re-registration/re-approval after upgrading (V11
   binds clients to a route and the new source refuses unbound registrations).
+
+### 2026-11-14 isolated ARM64 Pi qualification (candidate f2d2bec)
+
+Scope: the staging directive — qualify the exact remediated ARM64 candidate on
+PiInDaSky (10.9.66.170) in isolated loopback staging, no production change, no
+public-edge claim. All seven execution requirements met.
+
+- **Candidate frozen: DONE.** Remediation committed as `f2d2bec` (only the
+  intended fix + regression tests; unrelated `events.jsonl`, `guidance.md`,
+  `lab-backup/` left untracked). ARM64 built
+  (`CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w"`,
+  go1.26.10), SHA-256 `fe48fb96…25a06b`. Provenance in
+  `docs/qualification/pi-staging/PROVENANCE.txt`.
+- **Unprivileged staging: DONE.** Owner-only `~/ocliv-stage` (0700), separate
+  SQLite DB, loopback ports 28080/28085 (relay/health) + 28099 (harmless MCP
+  upstream). No `/var/lib/ocliv`, `/usr/local/bin`, production Caddy, systemd
+  units, Pi-hole, or Tailscale change.
+- **Real-ARM64 exercise: DONE (29/29 PASS).** Startup, **schema V11**,
+  restart persistence (durable publication), health/readiness, managed OAuth
+  discovery (RFC 9728 PRM + RFC 8414 AS metadata), DCR, operator consent,
+  authorization-code exchange, refresh rotation + replay rejection,
+  revocation, and MCP tools/list + tools/call — all through the real ARM64
+  binary and an isolated publisher + harmless counting upstream.
+- **Security boundaries: DONE.** Cross-route authorize/code/revoke refused
+  without destroying legitimate state; cross-route revocation does NOT poison
+  the jti; spoofed `X-Ocliv-Upstream-Sub`/`X-Ocliv-Route` stripped (upstream
+  sees only relay-minted values, external `Authorization` never forwarded);
+  no-bearer/forged/tampered all 401 with **zero** upstream executions;
+  malformed trailing JSON refused; consent-challenge replay rejected.
+- **Recovery rehearsal: DONE (staging only).** Guarded backup; managed
+  revocation rollback **refused** (`restore would resurrect … authz-grant:…`);
+  `--reset-authority` invalidates managed clients/grants **and deletes the
+  signing key** (`authz_issuer_key` → 0). Production DB never opened/migrated.
+- **Production availability preserved: DONE.** BEFORE/AFTER recorded — binary
+  `0d47481f…` unchanged, relay `active`, health `ok/ok`, production listener
+  intact; staging confined to 28080/28085/28099.
+- **Promotion package: DONE.** `docs/qualification/PROMOTION-RUNBOOK-2026-11-14.md`
+  — qualified-commit artifact digest, schema-compatibility results, backup
+  validation, legacy-client (empty tenant/route) re-registration note, restart
+  sequence, post-deploy checks, paired rollback, and explicit operator gates.
+- **Reproduce:** `~/ocliv-stage/pi_qual.py` on the Pi (runs the full suite).
+
+**NOT VERIFIED (out of loopback scope):** public-edge / off-LAN reachability
+and a real authorized `tools/call` through the public HTTPS edge; the live
+production DB schema version (root-only, not yet read); ChatGPT/provider-IdP
+OAuth. Staging qualification does not authorize production promotion — that
+remains an explicit operator decision via the runbook gates.
+
+### 2026-11-14 promotion-review recovery-correction pass (post-f2d2bec)
+
+Scope: the promotion review's narrow recovery-qualification correction pass.
+The isolated 29/29 qualification stays CLOSED/accepted; `f2d2bec` and the
+qualified binary (`fe48fb96…`) were NOT altered or rebuilt. One source fix,
+one runbook correction, one live disposable cross-version proof. No promotion,
+no production mutation.
+
+- **P1 — grant revocation guard keyed on client_id only: FIXED.** The guard's
+  managed-grant identity is the full `(tenant_id, route_id, client_id)`
+  composite PK, now a typed `authzGrantKey` struct (never a concatenated
+  string). Two grants for one client on different routes can no longer mask
+  each other's revocation. Red-before: `TestRestoreRejectsCrossRouteGrantRevocationRollback`
+  FAILs on the unfixed `relay_backup.go` (cross-route rollback accepted) →
+  green-after on the fixed source; full `internal/relay` package green.
+- **P0 — paired rollback is not schema-compatible: FIXED (documentation +
+  live proof).** `relay restore` runs `store.Open` on the backup, which
+  migrates the scratch copy forward to V11 before installing — so no
+  old-binary paired rollback exists. The runbook §5 was rewritten from
+  "paired binary AND database rollback" to **forward-only, roll-forward
+  recovery with the candidate binary** (reinstall known-good candidate; the
+  guarded restore enforces revocation monotonicity; `--reset-authority` cuts
+  managed authority). **Live cross-version proof (disposable, production
+  untouched):** the actual production binary (`0d47481f…`, commit `6472ff8`)
+  creates a **V7** DB; the candidate opens it and migrates to **V11** and
+  serves; the old binary then **refuses the V11 DB** (`unknown state schema
+  version`, fail-closed — not a silent brick); the candidate's guarded restore
+  of the pre-upgrade V7 backup succeeds, migrates it to V11, and the restored
+  DB serves under the candidate. Recovery = roll-forward, proven end-to-end.
+- **P1 — Step 0 schema oracle wrong: FIXED.** `relay doctor` does not report
+  schema version and `sqlite3` is absent on the Pi; the runbook now uses a
+  genuinely read-only Python `sqlite3` query (uri `mode=ro`, `store.Open`
+  never called) reporting `MAX(v)` + the unbound managed-client count, plus a
+  read-only managed-client inventory.
+- **Broad gates on the final source:** build + vet + gofmt clean; `go test
+  ./internal/...` 18/18 green (relay 30s incl. the new regression). The
+  unrelated untracked `events.jsonl`, `guidance.md`, `lab-backup/` were left
+  alone. The qualified binary is unchanged — this pass does not re-qualify
+  transport/OAuth, only the recovery contract.

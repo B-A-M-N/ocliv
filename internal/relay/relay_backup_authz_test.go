@@ -144,3 +144,67 @@ func TestRestoreSafeManagedBackupStillWorks(t *testing.T) {
 		t.Fatalf("legitimate active grant not preserved on safe restore: %q %v", st, err)
 	}
 }
+
+// TestRestoreRejectsCrossRouteGrantRevocationRollback: the guard's grant
+// identity is the composite (tenant_id, route_id, client_id), NOT client_id
+// alone. A client with route A revoked and route B active in live, with the
+// states reversed in the backup, must refuse restoration of A's active
+// grant — pre-fix the guard keys on client_id only, so B's backup-active
+// grant masks A's live revocation and the restore is accepted.
+func TestRestoreRejectsCrossRouteGrantRevocationRollback(t *testing.T) {
+	dir := t.TempDir()
+	db := backupTestDB(t, dir)
+	enrollTestKey(t, db.SQL(), "key-1", "tenant-1")
+	now := "2026-01-01T00:00:00Z"
+	// Live: grant for route B active, grant for route A revoked.
+	// Backup (taken before the flips): grant for route A active, grant
+	// for route B revoked. Restoring the backup must refuse: it would
+	// reactivate A's revoked grant even though B's state matches.
+	if _, err := db.SQL().Exec(
+		`INSERT INTO authz_clients(id, name, redirect_uris, created_at, tenant_id, route_id)
+		 VALUES('cli-x','X','["https://c.example/cb"]','2026-01-01T00:00:00Z','tenant-1','r-a')`); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range []string{"r-a", "r-b"} {
+		if _, err := db.SQL().Exec(
+			`INSERT INTO authz_grants(client_id, tenant_id, route_id, status, created_at, updated_at)
+			 VALUES('cli-x','tenant-1',?,'active',?,?)`, r, now, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Snapshot: A active, B revoked (the operator had already revoked B
+	// before this backup was taken).
+	if _, err := db.SQL().Exec(
+		`UPDATE authz_grants SET status='revoked' WHERE client_id='cli-x' AND route_id='r-b'`); err != nil {
+		t.Fatal(err)
+	}
+	snap := filepath.Join(t.TempDir(), "backup.db")
+	if err := BackupState(db, snap); err != nil {
+		t.Fatal(err)
+	}
+	// Live then flips: B is re-approved (active again), A is revoked.
+	// Restoring the snapshot would reactivate A's revoked grant; B's
+	// backup revocation matches live's active state only by coincidence.
+	if _, err := db.SQL().Exec(
+		`UPDATE authz_grants SET status='active' WHERE client_id='cli-x' AND route_id='r-b'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().Exec(
+		`UPDATE authz_grants SET status='revoked' WHERE client_id='cli-x' AND route_id='r-a'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := RestoreState(dir, snap, false, true); err == nil {
+		t.Fatal("cross-route grant rollback accepted without --reset-authority")
+	}
+	// Live route-A revocation untouched.
+	db2, err := store.Open(filepath.Join(dir, relayDBName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	var st string
+	if err := db2.SQL().QueryRow(
+		`SELECT status FROM authz_grants WHERE client_id='cli-x' AND route_id='r-a'`).Scan(&st); err != nil || st != "revoked" {
+		t.Fatalf("live route-A grant revocation lost after refused restore: %q %v", st, err)
+	}
+}
