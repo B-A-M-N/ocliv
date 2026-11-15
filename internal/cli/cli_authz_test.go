@@ -1,7 +1,11 @@
 package cli
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
+
+	"ocliv/internal/apperr"
 )
 
 // The managed authorization mode must map to a real relay access mode and a
@@ -138,5 +142,88 @@ func TestAuthzClientRequired(t *testing.T) {
 	}
 	if code := cmdAuthzRevoke([]string{"--data", dir, "--client", "c1"}); code == 0 {
 		t.Error("revoke without --tenant/--route returned 0, want failure")
+	}
+}
+
+func TestAuthzRejectsUnknownFlags(t *testing.T) {
+	dir := t.TempDir()
+	for _, argv := range [][]string{
+		{"rotate-key", "--dat", dir},              // misspelled
+		{"list", "--data", dir, "--tenantx", "t"}, // misspelled filter
+		{"list", "--data", dir, "positional"},     // positional not allowed
+	} {
+		if code := cmdAuthz(argv); code != apperr.ExitCLIValidation {
+			t.Errorf("authz %v: got %d, want CLI-validation rejection", argv, code)
+		}
+	}
+}
+
+func TestAuthzRejectsMissingFlagValues(t *testing.T) {
+	dir := t.TempDir()
+	// --data with no following value
+	if code := cmdAuthz([]string{"list", "--data"}); code != apperr.ExitCLIValidation {
+		t.Errorf("authz list --data (missing value): got %d, want validation", code)
+	}
+	// --client with no value on approve
+	if code := cmdAuthz([]string{"approve", "--data", dir, "--client"}); code != apperr.ExitCLIValidation {
+		t.Errorf("authz approve --client (missing value): got %d, want validation", code)
+	}
+	// --tenant with no value on revoke
+	if code := cmdAuthz([]string{"revoke", "--data", dir, "--client", "c", "--tenant"}); code != apperr.ExitCLIValidation {
+		t.Errorf("authz revoke --tenant (missing value): got %d, want validation", code)
+	}
+}
+
+func TestAuthzRejectsConflictingFlags(t *testing.T) {
+	dir := t.TempDir()
+	if code := cmdAuthz([]string{"list", "--data", dir, "--data", dir}); code != apperr.ExitCLIValidation {
+		t.Errorf("duplicate --data accepted: got %d, want validation", code)
+	}
+	if code := cmdAuthz([]string{"list", "--data", dir, "--data=" + dir}); code != apperr.ExitCLIValidation {
+		t.Errorf("duplicate --data (=/form) accepted: got %d, want validation", code)
+	}
+}
+
+func TestAuthzInvalidFlagsNeverCreateDatabase(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "ocliv.db")
+	// Each invalid invocation must fail validation WITHOUT creating a DB.
+	for _, argv := range [][]string{
+		{"rotate-key", "--dat", dir},
+		{"list", "--data", dir, "--bogus", "x"},
+		{"approve", "--data", dir, "--client"},
+	} {
+		cmdAuthz(argv)
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("invalid flags created/kept a database at %s", dbPath)
+	}
+}
+
+func TestAuthzRotateKeyTargetsExplicitDatabase(t *testing.T) {
+	// rotate-key with an explicit --data must target THAT db, not a default.
+	a := t.TempDir()
+	b := t.TempDir()
+	if code := cmdAuthz([]string{"rotate-key", "--data", a}); code != 0 {
+		t.Fatalf("rotate-key explicit --data: %d", code)
+	}
+	if _, err := os.Stat(filepath.Join(a, "ocliv.db")); err != nil {
+		t.Fatalf("rotate-key did not create the explicit --data db: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(b, "ocliv.db")); !os.IsNotExist(err) {
+		t.Fatalf("rotate-key created an unintended db in %s", b)
+	}
+	// And a misspelled flag must NOT fall back to the default dir.
+	c := t.TempDir()
+	wd, _ := os.Getwd()
+	defer os.Chdir(wd)
+	if err := os.Chdir(c); err != nil {
+		t.Fatal(err)
+	}
+	if code := cmdAuthz([]string{"rotate-key", "--dat", a}); code != apperr.ExitCLIValidation {
+		t.Errorf("misspelled --dat: got %d, want validation", code)
+	}
+	if _, err := os.Stat(filepath.Join(c, "ocliv-relay-data", "ocliv.db")); !os.IsNotExist(err) {
+		t.Fatalf("misspelled --dat fell back to the default database dir")
 	}
 }

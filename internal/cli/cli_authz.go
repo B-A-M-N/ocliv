@@ -47,31 +47,112 @@ func authzOpen(dataDir string) (*store.DB, error) {
 	return store.Open(filepath.Join(dataDir, "ocliv.db"))
 }
 
-// authzListFlags parses --data, --tenant, --route, --json.
-func authzListFlags(argv []string) (dataDir, tenant, route string, asJSON bool) {
-	dataDir = "./ocliv-relay-data"
+// authzFlags is the strict parse result for authz subcommands. Every
+// recognized flag must carry a nonempty value; unknown flags, missing
+// values, duplicate flags, and unexpected positional arguments are
+// rejected instead of silently ignored — a misspelled --data could
+// otherwise target ./ocliv-relay-data and mutate the wrong database.
+type authzFlags struct {
+	dataDir string
+	tenant  string
+	route   string
+	client  string
+	asJSON  bool
+}
+
+// authzFlagSpec lists the flags a subcommand accepts and which are required.
+type authzFlagSpec struct {
+	allowed  map[string]bool
+	required map[string]bool
+}
+
+func authzSpecFor(flags ...string) authzFlagSpec {
+	s := authzFlagSpec{allowed: map[string]bool{"data": true}, required: map[string]bool{}}
+	for _, f := range flags {
+		s.allowed[f] = true
+	}
+	return s
+}
+
+// parseAuthzFlags strictly parses argv against the spec. dataDir defaults to
+// ./ocliv-relay-data only when --data was not mentioned at all; a misspelled
+// --data is an error, never a silent default.
+func parseAuthzFlags(argv []string, spec authzFlagSpec) (*authzFlags, error) {
+	f := &authzFlags{}
+	seen := map[string]string{} // flag -> raw arg (for duplicate detection)
 	for i := 0; i < len(argv); i++ {
+		arg := argv[i]
+		name := ""
+		var val string
+		hasVal := false
 		switch {
-		case argv[i] == "--data" && i+1 < len(argv):
+		case strings.HasPrefix(arg, "--"):
+			body := strings.TrimPrefix(arg, "--")
+			if eq := strings.Index(body, "="); eq >= 0 {
+				name = body[:eq]
+				val = body[eq+1:]
+				hasVal = true
+			} else {
+				name = body
+			}
+		default:
+			return nil, fmt.Errorf("unexpected argument %q (authz subcommands take flags only)", arg)
+		}
+		if !spec.allowed[name] {
+			return nil, fmt.Errorf("unknown flag --%s", name)
+		}
+		if !hasVal {
+			if i+1 >= len(argv) {
+				return nil, fmt.Errorf("--%s requires a value", name)
+			}
 			i++
-			dataDir = argv[i]
-		case strings.HasPrefix(argv[i], "--data="):
-			dataDir = strings.TrimPrefix(argv[i], "--data=")
-		case argv[i] == "--tenant" && i+1 < len(argv):
-			i++
-			tenant = argv[i]
-		case strings.HasPrefix(argv[i], "--tenant="):
-			tenant = strings.TrimPrefix(argv[i], "--tenant=")
-		case argv[i] == "--route" && i+1 < len(argv):
-			i++
-			route = argv[i]
-		case strings.HasPrefix(argv[i], "--route="):
-			route = strings.TrimPrefix(argv[i], "--route=")
-		case argv[i] == "--json":
-			asJSON = true
+			val = argv[i]
+		}
+		if val == "" {
+			return nil, fmt.Errorf("--%s value must not be empty", name)
+		}
+		if prev, dup := seen[name]; dup {
+			return nil, fmt.Errorf("--%s given twice (%q and %q)", name, prev, val)
+		}
+		seen[name] = val
+		switch name {
+		case "data":
+			f.dataDir = val
+		case "tenant":
+			f.tenant = val
+		case "route":
+			f.route = val
+		case "client":
+			f.client = val
+		case "json":
+			if !hasVal {
+				// bare --json: boolean flag, value form not supported
+				f.asJSON = true
+				continue
+			}
+			return nil, fmt.Errorf("--json does not take a value")
 		}
 	}
-	return dataDir, tenant, route, asJSON
+	for name := range spec.required {
+		if _, ok := seen[name]; !ok {
+			return nil, fmt.Errorf("--%s is required", name)
+		}
+	}
+	if f.dataDir == "" {
+		f.dataDir = "./ocliv-relay-data"
+	}
+	return f, nil
+}
+
+// authzListFlags is the strict list/pending parser (data, tenant, route, json).
+// It returns ok=false on any parse error, printing the reason to stderr.
+func authzListFlags(argv []string) (dataDir, tenant, route string, asJSON bool, ok bool) {
+	f, err := parseAuthzFlags(argv, authzSpecFor("tenant", "route", "json"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return "", "", "", false, false
+	}
+	return f.dataDir, f.tenant, f.route, f.asJSON, true
 }
 
 type authzGrantRow struct {
@@ -103,7 +184,10 @@ func authzRender(rows []authzGrantRow, asJSON bool, emptyMsg string) int {
 // cmdAuthzPending lists clients registered for a managed route that no
 // operator has approved yet.
 func cmdAuthzPending(argv []string) int {
-	dataDir, tenant, route, asJSON := authzListFlags(argv)
+	dataDir, tenant, route, asJSON, okL := authzListFlags(argv)
+	if !okL {
+		return apperr.ExitCLIValidation
+	}
 	db, err := authzOpen(dataDir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
@@ -135,7 +219,10 @@ func cmdAuthzPending(argv []string) int {
 
 // cmdAuthzList lists every grant.
 func cmdAuthzList(argv []string) int {
-	dataDir, tenant, route, asJSON := authzListFlags(argv)
+	dataDir, tenant, route, asJSON, okL := authzListFlags(argv)
+	if !okL {
+		return apperr.ExitCLIValidation
+	}
 	db, err := authzOpen(dataDir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
@@ -162,23 +249,17 @@ func cmdAuthzList(argv []string) int {
 	return authzRender(out, asJSON, "no client grants")
 }
 
-// authzClientFlags parses --client plus the shared filters.
+// authzClientFlags strictly parses --client plus the shared filters.
+// --client is required; unknown flags and duplicates are rejected.
 func authzClientFlags(argv []string) (dataDir, client, tenant, route string, ok bool) {
-	dataDir, tenant, route, _ = authzListFlags(argv)
-	for i := 0; i < len(argv); i++ {
-		switch {
-		case argv[i] == "--client" && i+1 < len(argv):
-			i++
-			client = argv[i]
-		case strings.HasPrefix(argv[i], "--client="):
-			client = strings.TrimPrefix(argv[i], "--client=")
-		}
+	spec := authzSpecFor("tenant", "route", "client")
+	spec.required["client"] = true
+	f, err := parseAuthzFlags(argv, spec)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return "", "", "", "", false
 	}
-	if client == "" {
-		fmt.Fprintln(os.Stderr, "--client is required")
-		return dataDir, "", "", "", false
-	}
-	return dataDir, client, tenant, route, true
+	return f.dataDir, f.client, f.tenant, f.route, true
 }
 
 // authzAudit writes an authorization-plane decision record. The actor is
@@ -277,7 +358,12 @@ func cmdAuthzRevoke(argv []string) int {
 // cmdAuthzRotateKey rotates the relay's authorization issuer key. Existing
 // tokens signed by the retired key stop validating at admission.
 func cmdAuthzRotateKey(argv []string) int {
-	dataDir, _, _, _ := authzListFlags(argv)
+	f, err := parseAuthzFlags(argv, authzSpecFor())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitCLIValidation
+	}
+	dataDir := f.dataDir
 	db, err := authzOpen(dataDir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())

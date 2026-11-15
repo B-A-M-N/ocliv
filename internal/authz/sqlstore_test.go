@@ -199,3 +199,37 @@ func TestSQLStoreClientRevocation(t *testing.T) {
 		t.Fatal("revoked client id re-registered")
 	}
 }
+
+// TestRotateIssuerCreatesMissingIssuer: rotation on an EMPTY issuer table
+// must persist the new key (INSERT path), not silently update zero rows and
+// report success while leaving nothing stored. Pre-fix RotateIssuer only ran
+// UPDATE ... WHERE id=1, which affects 0 rows without error when the row is
+// absent — the CLI then reports success for a key that was never saved.
+func TestRotateIssuerCreatesMissingIssuer(t *testing.T) {
+	db := openTestDB(t)
+	applySchema(t, db)
+	s := NewSQLStore(db)
+
+	rotated, err := s.RotateIssuer() // empty table
+	if err != nil {
+		t.Fatalf("rotate on empty table: %v", err)
+	}
+	// Reopen a fresh store over the same DB; the returned kid must match
+	// what was actually persisted, and a token from the returned issuer
+	// must verify against the reopened issuer.
+	reopened, err := NewSQLStore(db).LoadIssuer()
+	if err != nil {
+		t.Fatalf("load after rotate: %v", err)
+	}
+	if reopened.KID() != rotated.KID() {
+		t.Fatalf("persisted kid %q != returned kid %q — rotation not saved", reopened.KID(), rotated.KID())
+	}
+	tok, err := rotated.Mint(TokenClaims{Issuer: "iss", Subject: "sub", Audience: "aud",
+		Tenant: "t", Route: "r", Expiry: time.Now().Add(time.Hour).Unix()})
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	if _, err := reopened.Verify(tok); err != nil {
+		t.Fatalf("reopened issuer cannot verify token from returned issuer: %v", err)
+	}
+}

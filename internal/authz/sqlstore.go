@@ -1,6 +1,7 @@
 package authz
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"database/sql"
 	"encoding/json"
@@ -773,15 +774,37 @@ func (s *SQLStore) LoadIssuer() (*Issuer, error) {
 }
 
 // RotateIssuer generates a new issuer key, replacing the old one. Tokens
-// signed by the retired key fail closed at admission.
+// signed by the retired key fail closed at admission. It works whether or
+// not an issuer row already exists (INSERT ... ON CONFLICT covers the empty
+// table, e.g. after --reset-authority or on a fresh database), verifies that
+// exactly one row was persisted, and returns the key actually stored.
 func (s *SQLStore) RotateIssuer() (*Issuer, error) {
 	issuer, err := NewIssuer()
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.db.Exec(
-		`UPDATE authz_issuer_key SET kid=?, priv=?, created_at=? WHERE id=1`,
-		issuer.KID(), issuer.PrivateKeyBytes(), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("authz: rotate issuer key: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(
+		`INSERT INTO authz_issuer_key(id, kid, priv, created_at) VALUES(1,?,?,?)
+		 ON CONFLICT(id) DO UPDATE SET kid=excluded.kid, priv=excluded.priv, created_at=excluded.created_at`,
+		issuer.KID(), issuer.PrivateKeyBytes(), now); err != nil {
+		return nil, fmt.Errorf("authz: rotate issuer key: %w", err)
+	}
+	// Confirm persistence: exactly one row, and it is the key we generated.
+	var kid string
+	var priv []byte
+	if err := tx.QueryRow(`SELECT kid, priv FROM authz_issuer_key WHERE id=1`).Scan(&kid, &priv); err != nil {
+		return nil, fmt.Errorf("authz: rotate issuer key: persistence not verifiable: %w", err)
+	}
+	if kid != issuer.KID() || !bytes.Equal(priv, issuer.PrivateKeyBytes()) {
+		return nil, fmt.Errorf("authz: rotate issuer key: persisted key does not match generated key")
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("authz: rotate issuer key: %w", err)
 	}
 	return issuer, nil
