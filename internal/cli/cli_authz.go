@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -45,6 +46,28 @@ func cmdAuthz(argv []string) int {
 func authzOpen(dataDir string) (*store.DB, error) {
 	restrictFileCreation()
 	return store.Open(filepath.Join(dataDir, "ocliv.db"))
+}
+
+// authzOpenReadOnly opens an EXISTING relay database read-only for
+// observational commands (pending/list). It never creates the database,
+// never migrates it, and never changes its bytes — an inventory command
+// must not have store.Open's create/migrate side effects.
+func authzOpenReadOnly(dataDir string) (*sql.DB, error) {
+	path := filepath.Join(dataDir, "ocliv.db")
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
+	if err != nil {
+		return nil, err
+	}
+	var v int
+	if err := db.QueryRow(`SELECT MAX(v) FROM schema_version`).Scan(&v); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("not an ocliv relay database (%s): %w", path, err)
+	}
+	if v > store.SchemaVersion {
+		db.Close()
+		return nil, fmt.Errorf("database schema version %d is newer than this binary knows (%d)", v, store.SchemaVersion)
+	}
+	return db, nil
 }
 
 // authzFlags is the strict parse result for authz subcommands. Every
@@ -188,13 +211,13 @@ func cmdAuthzPending(argv []string) int {
 	if !okL {
 		return apperr.ExitCLIValidation
 	}
-	db, err := authzOpen(dataDir)
+	db, err := authzOpenReadOnly(dataDir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return apperr.ExitInternal
 	}
 	defer db.Close()
-	st := authz.NewSQLStore(db.SQL())
+	st := authz.NewSQLStore(db)
 	grants, err := st.ListGrants()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
@@ -223,13 +246,13 @@ func cmdAuthzList(argv []string) int {
 	if !okL {
 		return apperr.ExitCLIValidation
 	}
-	db, err := authzOpen(dataDir)
+	db, err := authzOpenReadOnly(dataDir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return apperr.ExitInternal
 	}
 	defer db.Close()
-	st := authz.NewSQLStore(db.SQL())
+	st := authz.NewSQLStore(db)
 	grants, err := st.ListGrants()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())

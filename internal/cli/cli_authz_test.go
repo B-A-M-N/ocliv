@@ -1,11 +1,16 @@
 package cli
 
 import (
+	"bytes"
+	"database/sql"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"ocliv/internal/apperr"
+	"ocliv/internal/store"
 )
 
 // The managed authorization mode must map to a real relay access mode and a
@@ -55,14 +60,28 @@ func TestParseMCPPublishManagedRejectsUpstreamFlags(t *testing.T) {
 }
 
 // The operator authz command set is closed: unknown subcommands fail closed.
-// Reads and key rotation on an empty store are legitimate successes (an
-// empty store is valid; rotation creates the issuer); only a mutating
-// command with a missing client and an unknown subcommand must fail.
+// Inventory commands are READ-ONLY: on an empty data dir (no database) they
+// must fail with a clear "not a relay database" message rather than create
+// one (rereview P2). Mutating commands still create/verify their store:
+// rotate-key on an empty dir is a legitimate success (it creates the
+// issuer). A mutating command with a missing client and an unknown
+// subcommand must fail.
 func TestAuthzCommandSetClosed(t *testing.T) {
 	dir := t.TempDir()
 	for _, sub := range []string{"pending", "list"} {
-		if code := cmdAuthz([]string{sub, "--data", dir}); code != 0 {
-			t.Errorf("authz %s on an empty data dir returned %d, want 0", sub, code)
+		var stderr bytes.Buffer
+		r, w, _ := os.Pipe()
+		old := os.Stderr
+		os.Stderr = w
+		code := cmdAuthz([]string{sub, "--data", dir})
+		w.Close()
+		os.Stderr = old
+		_, _ = io.Copy(&stderr, r)
+		if code == 0 {
+			t.Errorf("authz %s on a nonexistent database returned 0, want a read-only refusal", sub)
+		}
+		if !strings.Contains(stderr.String(), "not an ocliv relay database") {
+			t.Errorf("authz %s refusal should name the cause, got: %s", sub, stderr.String())
 		}
 	}
 	if code := cmdAuthz([]string{"rotate-key", "--data", dir}); code != 0 {
@@ -225,5 +244,78 @@ func TestAuthzRotateKeyTargetsExplicitDatabase(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(c, "ocliv-relay-data", "ocliv.db")); !os.IsNotExist(err) {
 		t.Fatalf("misspelled --dat fell back to the default database dir")
+	}
+}
+
+// TestAuthzListDoesNotCreateDatabase: `authz list` on a data dir with NO
+// database must fail (read-only open), and must NOT create ocliv.db as a
+// side effect. Pre-fix, authzOpen->store.Open would create and migrate one.
+func TestAuthzListDoesNotCreateDatabase(t *testing.T) {
+	dir := t.TempDir()
+	if code := cmdAuthz([]string{"list", "--data", dir}); code == 0 {
+		t.Fatal("authz list on a nonexistent db unexpectedly succeeded")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "ocliv.db")); !os.IsNotExist(err) {
+		t.Fatalf("authz list created a database in %s", dir)
+	}
+}
+
+// TestAuthzPendingDoesNotMigrateDatabase: a pre-V8-shaped database read by
+// `authz pending` must remain at its recorded schema version afterwards.
+func TestAuthzPendingDoesNotMigrateDatabase(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "ocliv.db")
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().Exec(`DELETE FROM schema_version WHERE v > 7`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if code := cmdAuthz([]string{"pending", "--data", dir}); code != 0 {
+		t.Fatalf("pending on a v7 db should succeed read-only, got %d", code)
+	}
+	ro, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	var v int
+	if err := ro.QueryRow(`SELECT MAX(v) FROM schema_version`).Scan(&v); err != nil || v != 7 {
+		t.Fatalf("pending migrated the database: v=%d err=%v", v, err)
+	}
+}
+
+// TestAuthzReadOnlyDoesNotChangeDatabaseBytes: byte-for-byte comparison of
+// the database file around an `authz list` call (mtime aside, content must
+// not change).
+func TestAuthzReadOnlyDoesNotChangeDatabaseBytes(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "ocliv.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := "2026-01-01T00:00:00Z"
+	if _, err := db.SQL().Exec(`INSERT INTO tenants(id,status,created_at) VALUES('t1','active',?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().Exec(`INSERT INTO authz_grants(client_id,tenant_id,route_id,status,created_at,updated_at) VALUES('cli','t1','r','active',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	before, err := os.ReadFile(filepath.Join(dir, "ocliv.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code := cmdAuthz([]string{"list", "--data", dir}); code != 0 {
+		t.Fatalf("authz list on a valid db: %d", code)
+	}
+	after, err := os.ReadFile(filepath.Join(dir, "ocliv.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("authz list changed the database bytes")
 	}
 }
