@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -565,6 +566,38 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir string) (
 	return apperr.ExitOK, true
 }
 
+// sameRelayAuthority compares two relay URLs by scheme+host (path is
+// ignored for identity; ports must match when present).
+func sameRelayAuthority(a, b string) bool {
+	na, err := normalizeRelayAuthority(a)
+	if err != nil {
+		return false
+	}
+	nb, err := normalizeRelayAuthority(b)
+	if err != nil {
+		return false
+	}
+	return na == nb
+}
+
+func normalizeRelayAuthority(raw string) (string, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", fmt.Errorf("empty relay URL")
+	}
+	if !strings.Contains(s, "://") {
+		s = "https://" + s
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return "", err
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("relay URL has no host")
+	}
+	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host), nil
+}
+
 // mintSetupCode mints a one-time enrollment code against the relay's
 // own store. It opens the store directly (never constructs a Server,
 // which would reconcile unrelated live lease rows) and never prints
@@ -590,6 +623,39 @@ func autoEnroll(relayURL, dataDir, tenant string) (string, int) {
 		return "", apperr.ExitInternal
 	}
 	if _, err := os.Stat(keyPath); err == nil {
+		// An existing key must be verified against the relay currently
+		// being configured. Silently reporting success for a key bound
+		// to a DIFFERENT relay would leave the operator with a key that
+		// cannot authenticate here. The key is never replaced; the
+		// conflict is reported so the operator can act.
+		_, cfgPath, _, cerr := agentFiles()
+		if cerr != nil {
+			fmt.Fprintln(os.Stderr, "error: cannot resolve agent config: "+cerr.Error())
+			return "", apperr.ExitInternal
+		}
+		recorded := readExistingRelayURL(cfgPath)
+		if recorded == "" {
+			// The config path is the agent data dir, not the default
+			// config dir; resolve both and prefer whichever has a
+			// relay_url. A key with no recorded relay anywhere cannot
+			// be verified against this relay.
+			if dir, derr := config.DataDir(); derr == nil {
+				alt := filepath.Join(dir, "config.toml")
+				if v := readExistingRelayURL(alt); v != "" {
+					recorded = v
+				}
+			}
+		}
+		if recorded == "" {
+			fmt.Fprintln(os.Stderr, "error: an agent key already exists but its config has no relay_url; cannot verify it belongs to this relay ("+cfgPath+")")
+			fmt.Fprintln(os.Stderr, "action: re-run with the correct relay or remove the stale key/config deliberately (never automatic)")
+			return "", apperr.ExitAuth
+		}
+		if !sameRelayAuthority(recorded, relayURL) {
+			fmt.Fprintf(os.Stderr, "error: existing agent key is enrolled with %s, not %s; refusing to reuse or replace it\n", recorded, relayURL)
+			fmt.Fprintln(os.Stderr, "action: keep the existing key for its relay, or remove it deliberately and re-run (never automatic)")
+			return "", apperr.ExitAuth
+		}
 		return "", apperr.ExitOK
 	}
 	code, err := mintSetupCode(dataDir, tenant)
