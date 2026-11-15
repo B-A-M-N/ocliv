@@ -895,3 +895,30 @@ only, must not be deployed).
 
 No files or production services were changed by the review; this pass changed
 only the candidate artifact, runbook/provenance, and this register.
+
+### 2026-11-14 release acceptance — obsolete promotion plan retired
+
+Independent release assessment accepted source `19d46d8` / candidate
+`1ceaaff4…`, closed the security-remediation review, and kept production
+promotion on hold pending operator pre-flight. One P1 documentation hazard
+was found and fixed in the same pass:
+
+- **P1 — obsolete promotion procedure: FIXED.** The old
+  `docs/qualification/PRODUCTION-PROMOTION-PLAN.md` (source `95cc66c`,
+  superseded binary `8041278…`) still instructed operators to restore the
+  old binary after `relay restore` — impossible after the V11 forward
+  migration and dangerous to follow. It is now marked
+  **SUPERSEDED — DO NOT EXECUTE** with an explicit pointer to
+  `PROMOTION-RUNBOOK-2026-11-14.md` as the current procedure; the obsolete
+  content is retained as historical context only.
+- **Operator pre-flight is strictly read-only** against PiInDaSky
+  (10.9.66.170): health/readiness, installed-binary digest, live DB schema
+  version + managed-client inventory via read-only Python `sqlite3` (uri
+  `mode=ro`; `store.Open` never called). **Hard stop before** any backup,
+  binary replacement, schema migration, or service restart — those remain
+  explicit operator decisions via the runbook gates.
+- Off-LAN public-edge baseline should be captured **before** promotion so a
+  pre-existing edge failure is not misattributed to the new binary.
+- Durable preservation of the qualified source and artifact is an operator
+  action before deployment; the local checkout and staging `/tmp` copies are
+  not a disaster-recovery plan.

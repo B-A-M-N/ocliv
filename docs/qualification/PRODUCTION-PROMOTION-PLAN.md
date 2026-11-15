@@ -1,5 +1,16 @@
 # Production promotion and rollback procedure — `95cc66c`
 
+> **SUPERSEDED — DO NOT EXECUTE.**
+> This procedure predates the composite-grant rollback-guard fix and the
+> forward-only recovery contract. It references source `95cc66c`, the
+> superseded binary `8041278…`, and a paired binary+database rollback the
+> current `relay restore` cannot perform (restore migrates the DB forward to
+> V11; the old binary then refuses it).
+> **Current procedure: `docs/qualification/PROMOTION-RUNBOOK-2026-11-14.md`**
+> (source `19d46d8`, candidate `1ceaaff4…`, roll-forward recovery).
+> Read this file only as historical context. Do not follow its rollback or
+> restore steps.
+
 **Status: PREPARED, NOT EXECUTED.** Execution is BLOCKED — the designated
 relay host (Raspberry Pi, `10.9.66.170`, tailnet `100.95.10.57`) is
 unreachable: no LAN path (ARP FAILED) and Tailscale reports it offline
