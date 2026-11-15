@@ -63,6 +63,84 @@ var runDaemonReload = func() error {
 	return runCmd("systemctl", "daemon-reload")
 }
 
+// ServiceState records whether a systemd unit was enabled and/or active
+// before setup changed it. Rollback reverses only transitions this run
+// actually performed and never stops a service that was already running.
+type ServiceState struct {
+	Enabled bool
+	Active  bool
+}
+
+var captureServiceState = func(unit string) ServiceState {
+	st := ServiceState{}
+	if err := runCmd("systemctl", "is-enabled", unit); err == nil {
+		st.Enabled = true
+	}
+	if err := runCmd("systemctl", "is-active", unit); err == nil {
+		st.Active = true
+	}
+	return st
+}
+
+var restoreServiceState = func(unit string, before ServiceState) error {
+	if !before.Enabled {
+		if err := runCmd("systemctl", "disable", unit); err != nil {
+			return err
+		}
+	}
+	if !before.Active {
+		if err := runCmd("systemctl", "stop", unit); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// startedUnits tracks which units this setup run actually transitioned
+// (enable/start). Only those are reversed on rollback; a service that was
+// already running stays running.
+var (
+	startedUnits = map[string]bool{}
+	preState     = map[string]ServiceState{}
+)
+
+// CaptureServiceState records the current enablement/activity of a unit.
+func CaptureServiceState(unit string) ServiceState { return captureServiceState(unit) }
+
+// RestoreService reverses the transitions this run performed on a unit.
+func RestoreService(unit string) error {
+	before, ok := preState[unit]
+	if !ok {
+		before = ServiceState{}
+	}
+	return restoreServiceState(unit, before)
+}
+
+// ResetStartedUnits clears the per-run transition tracker.
+func ResetStartedUnits() {
+	startedUnits = map[string]bool{}
+	preState = map[string]ServiceState{}
+}
+
+// MarkPreState seeds the tracker with the units' pre-setup state.
+func MarkPreState(m map[string]ServiceState) {
+	for k, v := range m {
+		preState[k] = v
+	}
+}
+
+// MarkStarted records that this run transitioned a unit (enable/start).
+func MarkStarted(unit string) { startedUnits[unit] = true }
+
+// StartedUnits reports which units this run transitioned (for tests).
+func StartedUnits() map[string]bool {
+	out := map[string]bool{}
+	for k, v := range startedUnits {
+		out[k] = v
+	}
+	return out
+}
+
 // runCaddyActivate enables and starts Caddy, then reloads the newly
 // installed Caddyfile. A clean host usually has Caddy installed but
 // not running; an upgraded host has it running with the old config.
@@ -505,6 +583,19 @@ func EnsureDataDir(dir, user string) error {
 // changed anything so the caller can reload what depends on it.
 func RollbackDataDir(dir string) (restored bool, err error) {
 	if _, serr := os.Stat(newFileSentinel(dir)); serr == nil {
+		// A newly created directory that has become nonempty (e.g. the
+		// relay wrote its SQLite database before a later step failed)
+		// contains generated authorization state. Never recursively
+		// delete it: preserve it and report the exact path so the
+		// operator can inspect and remove it deliberately.
+		entries, derr := os.ReadDir(dir)
+		if derr != nil {
+			return false, fmt.Errorf("rollback of %s cannot inspect contents: %w", dir, derr)
+		}
+		if len(entries) > 1 || (len(entries) == 1 && entries[0].Name() != filepath.Base(newFileSentinel(dir))) {
+			return false, fmt.Errorf(
+				"rollback of %s refused: the newly created directory is not empty (it contains generated relay state); preserve it and remove it manually after inspection", dir)
+		}
 		if rerr := os.Remove(dir); rerr != nil && !os.IsNotExist(rerr) {
 			return false, fmt.Errorf("rollback of %s cannot remove newly created directory: %w", dir, rerr)
 		}

@@ -418,6 +418,15 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir string) (
 		fmt.Printf("ACTION REQUIRED: edge provisioning blocked: %s\n", blockReason)
 		return apperr.ExitRelayTLS, false
 	}
+	// Record each unit's enablement/activity BEFORE setup changes it, so a
+	// failed run can reverse only what it actually did (a Caddy that was
+	// already running stays running; a clean host's relay gets stopped).
+	preState := map[string]setup.ServiceState{
+		"caddy":       setup.CaptureServiceState("caddy"),
+		"ocliv-relay": setup.CaptureServiceState("ocliv-relay"),
+	}
+	setup.ResetStartedUnits()
+	setup.MarkPreState(preState)
 	allAuto := true
 	for _, s := range steps {
 		if !s.Auto {
@@ -446,10 +455,16 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir string) (
 			err = setup.InstallCaddyfile(deployDir)
 		case "activate and reload Caddy":
 			err = setup.ActivateAndReloadCaddy()
+			if err == nil {
+				setup.MarkStarted("caddy")
+			}
 		case "install systemd unit":
 			err = setup.InstallUnit(deployDir)
 		case "enable and start relay":
 			err = setup.StartRelay()
+			if err == nil {
+				setup.MarkStarted("ocliv-relay")
+			}
 		case "enroll this machine":
 			keyID, exit := autoEnroll("https://"+hostname, dataDir, "home")
 			if exit != apperr.ExitOK {
@@ -473,8 +488,25 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir string) (
 			// binary and data directory roll back beside the
 			// managed files: a clean host whose env step failed
 			// must not keep a launcher-less binary behind.
+			// Service transitions this run actually performed are
+			// reversed FIRST (stop a relay we started, disable a
+			// unit we enabled) so a data dir the relay just
+			// populated can still be inspected/removed; a service
+			// that was already running/enabled before setup is
+			// never touched.
 			rollbackFailed := false
 			restoredAny := false
+			for _, unit := range []string{"ocliv-relay", "caddy"} {
+				if !setup.StartedUnits()[unit] {
+					continue
+				}
+				if rerr := setup.RestoreService(unit); rerr != nil {
+					fmt.Printf("rollback FAILED for service %s: %v\n", unit, rerr)
+					rollbackFailed = true
+				} else {
+					fmt.Printf("rolled back service %s to its pre-setup state\n", unit)
+				}
+			}
 			for _, dst := range setupManagedDestinations {
 				restored, rerr := setup.RollbackInstalled(dst)
 				if rerr != nil {
