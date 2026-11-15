@@ -233,6 +233,11 @@ func applyMigration(sqldb *sql.DB, version int, body string) error {
 // currentSchema is the newest version Open must reach.
 const currentSchema = 11
 
+// SchemaVersion is the exported current schema version for tools that must
+// refuse unknown/newer databases without opening (and thereby migrating)
+// them, such as the restore-time read-only preflight.
+const SchemaVersion = currentSchema
+
 // DB wraps the SQLite handle.
 type DB struct {
 	sql *sql.DB

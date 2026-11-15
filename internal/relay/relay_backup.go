@@ -645,17 +645,46 @@ func liveWriterActive(livePath string) (bool, error) {
 }
 
 // openRevocations reads the live revocation set, or nil when no live
-// database exists yet (fresh install: nothing to roll back).
+// database exists yet (fresh install: nothing to roll back). It NEVER calls
+// store.Open on the live database — that would forward-migrate it before
+// the rollback guard has decided whether the restore is acceptable. The
+// read-only path inspects the schema version and refuses unknown/newer
+// schemas instead of migrating.
 func openRevocations(livePath string) (*revocationSet, error) {
 	if _, err := os.Stat(livePath); os.IsNotExist(err) {
 		return nil, nil
 	}
-	db, err := store.Open(livePath)
+	db, err := openReadOnly(livePath)
 	if err != nil {
-		return nil, apperr.E(apperr.CodeStoreFault, "opening live database", err)
+		return nil, err
 	}
 	defer db.Close()
-	return readRevocations(db.SQL())
+	return readRevocations(db)
+}
+
+// openReadOnly opens an existing SQLite database in genuine read-only mode
+// (uri mode=ro, no create) and fails closed on unknown or newer schemas.
+// It never creates the database and never migrates it.
+func openReadOnly(path string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
+	if err != nil {
+		return nil, apperr.E(apperr.CodeStoreFault, "opening database read-only", err)
+	}
+	var v int
+	err = db.QueryRow(`SELECT MAX(v) FROM schema_version`).Scan(&v)
+	if err != nil {
+		db.Close()
+		return nil, apperr.E(apperr.CodeStoreFault, "reading schema version (not an ocliv database?)", err)
+	}
+	if v > store.SchemaVersion {
+		db.Close()
+		return nil, apperr.E(apperr.CodeStoreFault,
+			fmt.Sprintf("database schema version %d is newer than this binary knows (%d)", v, store.SchemaVersion), nil)
+	}
+	// Older schemas are readable as-is: readRevocations guards on table
+	// existence, so a V7 database simply has no managed-authorization
+	// tables to read. No migration, no writes.
+	return db, nil
 }
 
 // resetRestoredAuthority terminally revokes every key, lease, token,
