@@ -854,3 +854,44 @@ no production mutation.
   unrelated untracked `events.jsonl`, `guidance.md`, `lab-backup/` were left
   alone. The qualified binary is unchanged — this pass does not re-qualify
   transport/OAuth, only the recovery contract.
+
+### 2026-11-14 final artifact qualification — candidate realigned to 19d46d8
+
+The promotion review correctly noted the frozen binary `fe48fb96…` (f2d2bec)
+predated the composite-grant fix in `19d46d8`. This pass built a new artifact
+from the final source and re-ran the bounded qualification on the actual
+promotion binary. `f2d2bec`/`fe48fb96…` is now SUPERSEDED (kept for reference
+only, must not be deployed).
+
+- **New qualified artifact: `1ceaaff4173406f4b7bda5dbc897156273cfa2cd699fc57ae3932debc85912d7`**
+  from `19d46d8`, same build config (go1.26.10, `CGO_ENABLED=0 GOOS=linux
+  GOARCH=arm64 go build -trimpath -ldflags="-s -w"`, 13,500,578 bytes).
+  Provenance updated in `docs/qualification/pi-staging/PROVENANCE.txt`;
+  runbook §1/§2 re-pointed at the new digest.
+- **29/29 Pi staging checks: PASS on the new binary.** Full isolated
+  loopback re-run (fresh `relay-data`/`qual-home`, relay pre-started on
+  28080/28085, harmless upstream on 28099). Phase E rollback-guard reason now
+  emits the composite key (`authz-grant:t1/<route>/<client>`), confirming the
+  typed `authzGrantKey` fix is live in this artifact.
+- **Cross-route grant rollback (this binary): VERIFIED.** Live route-A grant
+  revoked + route-B active; backup reversed; `relay restore` refused
+  (`restore would resurrect 1 … authz-grant:t1/r-a/cli-x`), rc=8; live
+  route-A still revoked, route-B still active.
+- **Cross-version recovery (this binary): VERIFIED on disposable V7 state.**
+  Actual production binary (`0d47481f…`, `6472ff8`) creates V7 → candidate
+  opens and migrates to V11 and serves → old binary refuses V11
+  (`unknown state schema version`, fail-closed) → candidate guarded-restores
+  the V7 backup to V11 and the restored DB serves. Production `ocliv-relay`
+  stayed `active` throughout.
+- **Three runbook inconsistencies: FIXED.** (1) Step 3 "only the paired
+  rollback recovers" → forward-only roll-forward wording; (2) Step 4 `sudo
+  sqlite3` → read-only Python query (sqlite3 absent on the Pi); (3) Step 0
+  managed-client inventory now tolerates an absent `authz_clients` table
+  (pre-V8 schema). Recovery-point tradeoff recorded explicitly in §5.
+- **NOT VERIFIED (operator-gated, unchanged):** live production DB schema
+  read, off-LAN public-edge `tools/call`, ChatGPT/provider-IdP OAuth, legacy
+  managed-client re-registration. Promotion remains an explicit operator
+  decision via the runbook gates.
+
+No files or production services were changed by the review; this pass changed
+only the candidate artifact, runbook/provenance, and this register.

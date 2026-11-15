@@ -1,4 +1,4 @@
-# Production promotion runbook — qualified candidate `f2d2bec`
+# Production promotion runbook — qualified candidate `19d46d8`
 
 **Status: QUALIFIED IN ISOLATED PI STAGING, AWAITING OPERATOR APPROVAL.**
 This is the promotion package for the remediated Ocliv candidate. It rests on
@@ -12,24 +12,29 @@ an explicit operator gate. Do not execute until you choose to promote.
 
 | Field | Value |
 |---|---|
-| Source commit | `f2d2bec367ae3217f664628337a2d40900645666` |
+| Source commit | `19d46d82122734887bee1446e3cabd89652dc215` |
 | Branch | `master` |
 | Go toolchain | go1.26.10 linux/amd64 |
 | Build config | `CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w"` |
-| **ARM64 SHA-256** | **`fe48fb96a628f6c6e04eb5c53fd890c54a4d7485f2c91dca06b9dbd26e25a06b`** |
+| **ARM64 SHA-256** | **`1ceaaff4173406f4b7bda5dbc897156273cfa2cd699fc57ae3932debc85912d7`** |
 | Binary size | 13,500,578 bytes (static aarch64, stripped) |
 | Schema reached on open | **V11** (forward-only) |
 
-Build (off-Pi, on the build host, from a clean checkout of `f2d2bec`):
+This candidate supersedes `f2d2bec` / `fe48fb96…`: it adds the
+composite-grant rollback-guard fix (typed `authzGrantKey` =
+tenant/route/client tuple). The prior binary lacked that P1 fix and must not
+be deployed. Provenance: `docs/qualification/pi-staging/PROVENANCE.txt`.
+
+Build (off-Pi, on the build host, from a clean checkout of `19d46d8`):
 ```
-cd <clean clone at f2d2bec>
+cd <clean clone at 19d46d8>
 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o /tmp/ocliv-arm64 ./cmd/ocliv
-sha256sum /tmp/ocliv-arm64    # MUST equal fe48fb96... above
+sha256sum /tmp/ocliv-arm64    # MUST equal 1ceaaff4... above
 ```
 
 ---
 
-## 2. Isolated Pi qualification result — **29 PASS / 0 FAIL**
+## 2. Isolated Pi qualification result — **29 PASS / 0 FAIL** (re-run on the `19d46d8` / `1ceaaff4…` artifact)
 
 Executed on PiInDaSky against the real ARM64 binary, **loopback only**, in an
 owner-only staging dir (`~/ocliv-stage`, 0700), a **separate SQLite DB**, and
@@ -111,13 +116,20 @@ db.close()
 PYQ
 #   - If live schema < V11: the candidate migrates forward on first open. OK.
 #   - If live schema > V11 (impossible on prod today) or unreadable: STOP.
-# Inventory managed clients (identify legacy empty-tenant/route rows):
+# Inventory managed clients (identify legacy empty-tenant/route rows).
+# Tolerate an absent authz_clients table: the pre-V8 production binary (V7)
+# predates managed authorization, so there may be nothing to inventory.
 sudo python3 - <<'PYQ'
 import sqlite3
 db = sqlite3.connect("file:/var/lib/ocliv/ocliv.db?mode=ro", uri=True)
-for row in db.execute(
-        "SELECT id, tenant_id, route_id, revoked_at FROM authz_clients"):
-    print(row)
+tables = {r[0] for r in db.execute(
+    "SELECT name FROM sqlite_master WHERE type='table'")}
+if "authz_clients" in tables:
+    for row in db.execute(
+            "SELECT id, tenant_id, route_id, revoked_at FROM authz_clients"):
+        print(row)
+else:
+    print("authz_clients: absent (pre-managed-authorization schema)")
 db.close()
 PYQ
 ```
@@ -136,9 +148,9 @@ sudo chmod 600 /var/lib/ocliv/ocliv.db.bak-$TS*
 ### Step 2 — Build + stage the candidate (build host; digest MUST match §1)
 ```
 # already built; verify the digest before transfer:
-sha256sum /tmp/ocliv-arm64    # == fe48fb96...
+sha256sum /tmp/ocliv-arm64    # == 1ceaaff4...
 scp /tmp/ocliv-arm64 bamn@10.9.66.170:/tmp/ocliv-new
-ssh bamn@10.9.66.170 'sha256sum /tmp/ocliv-new'   # confirm fe48fb96... on the Pi
+ssh bamn@10.9.66.170 'sha256sum /tmp/ocliv-new'   # confirm 1ceaaff4... on the Pi
 ```
 
 ### Step 3 — Install + restart (**operator approval required** — point of no easy return)
@@ -147,20 +159,27 @@ TS=<same timestamp as Step 1>
 sudo cp -a /usr/local/bin/ocliv /usr/local/bin/ocliv.bak-$TS
 sudo sha256sum /usr/local/bin/ocliv.bak-$TS
 sudo install -o root -g root -m 0755 /tmp/ocliv-new /usr/local/bin/ocliv.new
-sudo sha256sum /usr/local/bin/ocliv.new        # == fe48fb96...
+sudo sha256sum /usr/local/bin/ocliv.new        # == 1ceaaff4...
 sudo mv /usr/local/bin/ocliv.new /usr/local/bin/ocliv
 sudo systemctl restart ocliv-relay
 sudo journalctl -u ocliv-relay -n 30 --no-pager
 ```
-The first open migrates the production DB **in place** to V11. From here, only
-the paired rollback (§5) recovers.
+The first open migrates the production DB **in place** to V11. From here the
+upgrade is **forward-only**: recovery is roll-forward with the candidate binary
+(§5) — there is no rollback to the old executable once the DB reaches V11.
 
 ### Step 4 — Post-deploy verification
 ```
 curl -fsS http://127.0.0.1:18080/health/live && echo     # ok
 curl -fsS http://127.0.0.1:18080/health/ready && echo    # ok
-sha256sum /usr/local/bin/ocliv                           # fe48fb96...
-sudo sqlite3 /var/lib/ocliv/ocliv.db 'SELECT MAX(v) FROM schema_version;'   # 11
+sha256sum /usr/local/bin/ocliv                           # 1ceaaff4...
+sudo python3 - <<'PYQ'
+import sqlite3
+db = sqlite3.connect("file:/var/lib/ocliv/ocliv.db?mode=ro", uri=True)
+print("schema_version:", db.execute(
+    "SELECT MAX(v) FROM schema_version").fetchone()[0])
+db.close()
+PYQ
 # live route still protected (expect 401 with resource_metadata challenge):
 curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
   -H 'Content-Type: application/json' \
@@ -204,11 +223,20 @@ curl -fsS http://127.0.0.1:18080/health/live && echo
   retires the managed signing key and revokes managed clients/grants, forcing
   re-registration).
 - If the candidate itself is corrupt, reinstall the known-good candidate
-  binary (`fe48fb96...`) over the bad one; the V11 DB stays valid. The only
+  binary (`1ceaaff4...`) over the bad one; the V11 DB stays valid. The only
   way back to the old binary is a full redeploy of the pre-upgrade image from
   backups taken in Step 1/Step 3 BEFORE the candidate ever opened the DB —
   and even then the guarded restore will refuse if post-backup revocations
   exist.
+
+**Recovery-point tradeoff (explicit):** forward recovery restores
+*availability*, not necessarily every post-backup change. The guard prevents
+known authority from rolling backward (revoked keys/leases/publications/
+managed clients/grants/tokens stay revoked), and `--reset-authority` is the
+fail-closed escape hatch — but **neither preserves grants, sessions,
+publications, or other state created after the backup**. Those are forward
+data loss by the operator's explicit choice of restore point. Plan the backup
+cadence accordingly.
 
 **Do not** reinstall the old binary after the DB has reached V11 (it will
 fail closed and the relay stays DOWN), and **never `cp -a` an older DB into
@@ -223,7 +251,7 @@ Promotion is **NOT authorized** until the operator confirms each gate:
 1. **Pre-flight recorded** (binary `0d47481f...`, health ok/ok, **live schema
    version confirmed ≤ V11**, managed-client inventory taken).
 2. **Backup taken + checksum sidecar written** (Step 1).
-3. **Candidate digest verified** as `fe48fb96...` on the Pi (Step 2).
+3. **Candidate digest verified** as `1ceaaff4...` on the Pi (Step 2).
 4. **Install + restart** (Step 3) — the operator runs this deliberately.
 5. **Post-deploy checks green** (Step 4), including a full authorized
    `tools/call` through the **real public edge from an off-LAN client**.
@@ -242,4 +270,4 @@ Promotion is **NOT authorized** until the operator confirms each gate:
 ---
 
 *Qualified 2026-11-14 on PiInDaSky (10.9.66.170), isolated loopback staging.*
-*Candidate `f2d2bec`, ARM64 `fe48fb96...`, 29/29 checks green.*
+*Candidate `19d46d8`, ARM64 `1ceaaff4...`, 29/29 checks green (re-qualified on the promotion artifact).*

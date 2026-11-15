@@ -1,7 +1,23 @@
 Ocliv ARM64 candidate — isolated Pi staging
-source commit : f2d2bec367ae3217f664628337a2d40900645666
-toolchain     : go1.26.10 linux/amd64
-build config  : CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w"
-binary sha256 : fe48fb96a628f6c6e04eb5c53fd890c54a4d7485f2c91dca06b9dbd26e25a06b
-built         : 2026-11-14T23:09:19Z
-production    : 0d47481f2e2b7cbff34df57a713f0e39849be92cd85deabd5f256be07a00d0b1 (running, NOT touched)
+============================================
+
+ACTIVE CANDIDATE (qualified 2026-11-14, supersedes f2d2bec/fe48fb96):
+  source commit : 19d46d82122734887bee1446e3cabd89652dc215
+  toolchain     : go1.26.10 linux/amd64
+  build config  : CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w"
+  binary sha256 : 1ceaaff4173406f4b7bda5dbc897156273cfa2cd699fc57ae3932debc85912d7
+  binary size   : 13500578 bytes (static aarch64, stripped)
+  built         : 2026-11-14T22:20:00Z
+
+  This candidate adds the composite-grant rollback-guard fix (typed
+  authzGrantKey = tenant/route/client tuple) on top of f2d2bec. It is the
+  artifact that matches the final source; fe48fb96 (f2d2bec) is superseded.
+
+SUPERSEDED (kept for reference only — do NOT deploy):
+  source commit : f2d2bec367ae3217f664628337a2d40900645666
+  binary sha256 : fe48fb96a628f6c6e04eb5c53fd890c54a4d7485f2c91dca06b9dbd26e25a06b
+  note          : lacks the composite-grant P1 fix present in 19d46d8.
+
+PRODUCTION (unchanged, NOT touched):
+  binary sha256 : 0d47481f2e2b7cbff34df57a713f0e39849be92cd85deabd5f256be07a00d0b1
+  source commit : 6472ff8 (2026-11-11 hardening build)
