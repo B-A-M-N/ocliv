@@ -15,6 +15,16 @@ Repo: `/home/bamn/ocliv` (AGENTS.md is the binding contract). Production Pi:
 `bamn@10.9.66.170` (LAN; Tailscale `100.95.10.57` only when LAN is down).
 Never mutate production without an explicit operator decision.
 
+## Current release behavior
+- `ocliv mcp PORT` defaults to managed OAuth; explicit `--auth` passes
+  through. `publish --stdio` is valid only as `--auth ocliv-managed`
+  through the bounded adapter; other stdio shapes are refused.
+- Single-host publishing does not require Tailscale (loopback relay +
+  Caddy TLS edge).
+- The old promotion plan (`PRODUCTION-PROMOTION-PLAN.md`) is SUPERSEDED —
+  do not execute; use `PROMOTION-RUNBOOK-2026-11-14.md`.
+- Public off-LAN authorized-MCP acceptance is NOT VERIFIED.
+
 ## Iron rules
 1. **Artifact must match source.** Never deploy a binary built from an older
    commit than the reviewed source. Build from the exact HEAD, record

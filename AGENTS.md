@@ -15,6 +15,23 @@ Related docs: [production spec](/home/bamn/ocliv/ocliv_production_spec_v1.md),
 [tailnet staging](/home/bamn/ocliv/docs/OPERATOR.md),
 [packaging](/home/bamn/ocliv/packaging/caddy/Caddyfile.single-host).
 
+## Current release behavior (authoritative)
+
+- `ocliv mcp PORT` defaults to managed OAuth (`--auth ocliv-managed`);
+  an explicit `--auth` value passes through untouched.
+- `ocliv mcp publish --stdio` is supported **only** as
+  `--auth ocliv-managed` through the bounded stdio adapter; other stdio
+  shapes are refused (docs/MCP-HOSTING.md).
+- Upstream OAuth is a separate mode (`--auth upstream-oauth`) and is not
+  managed by the relay.
+- Single-host publishing does not require Tailscale; the relay binds
+  loopback and Caddy terminates TLS.
+- Schema V11 is forward-only: recovery is roll-forward (guarded
+  `relay restore` migrates the backup to V11; an old binary then refuses
+  it). `docs/qualification/PRODUCTION-PROMOTION-PLAN.md` is SUPERSEDED —
+  see `PROMOTION-RUNBOOK-2026-11-14.md`.
+- Public off-LAN authorized-MCP acceptance is still NOT VERIFIED.
+
 ## Non-negotiables
 
 - The relay binds loopback only (`--listen 127.0.0.1:PORT`). A public
@@ -93,7 +110,9 @@ Publisher (machine running the MCP server, outbound only):
 ocliv login --relay https://<relay-host> --code-file -
 ocliv mcp publish --local http://127.0.0.1:8765/mcp \
   --name dev-tools --auth upstream-oauth     # native HTTP MCP server
-# NOTE: `publish --stdio` is disabled (bridge cannot enforce auth yet).
+# stdio MCP servers are supported in the managed-auth configuration only:
+#   ocliv mcp publish --stdio --auth ocliv-managed -- COMMAND [ARGS...]
+# other stdio shapes are refused (see docs/MCP-HOSTING.md).
 ```
 
 The server must serve exactly `/mcp`; there is no `--public` flag and
