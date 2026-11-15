@@ -70,3 +70,30 @@ Gates on the branch: `go build ./...`, `go vet ./...`, `gofmt -l internal/
 tests/` clean; `go test ./internal/... -count=1` green (19 packages);
 `go test -race` green for authz/cli/relay/setup/store; full integration
 suite green (252.8s, 420s cap).
+
+### 2026-11-15 rereview artifact qualification — candidate realigned to 2089516
+
+The release review accepted `2089516` as the next candidate's source with
+promotion on HOLD. This pass built the matching artifact and re-ran the
+bounded qualification on the actual promotion binary. Prior binaries
+(`1ceaaff4…` from `19d46d8`, `fe48fb96…` from `f2d2bec`) are SUPERSEDED for
+promotion.
+
+- **New qualified artifact: `65ed20b21eddb40b3cdf3fbb60388dc7deb81066fec6dda9c0142043727b8a53`**
+  from `2089516` (go1.26.10, same build config, 13,500,578 bytes). Digest
+  verified on the Pi. Runbook + provenance re-pointed.
+- **29/29 Pi staging checks: PASS** on the new binary (fresh clean slate;
+  Phase E guard emits the composite grant key).
+- **Rereview deltas exercised on the artifact:** `authz rotate-key` on an
+  empty table persists exactly one issuer row and the reported kid matches;
+  a second rotation replaces it (still one row); `authz list`/`pending` on a
+  database-less data dir fail closed without creating a database.
+- **Cross-version recovery re-proven with this binary:** production binary
+  (`0d47481f…`) creates V7 → candidate opens/migrates to V11 and serves →
+  old binary refuses V11 (`unknown state schema version`) → candidate
+  guarded-restores the V7 backup to V11 and it serves. Production
+  `ocliv-relay` stayed `active` throughout; no production mutation.
+- **P2-8 (backup interruption safety) remains DEFERRED** — the operator must
+  accept the existing recovery procedure as-is; the forward-only contract is
+  unchanged. Operator gates (root schema read, off-LAN baseline, explicit
+  approval) still outstanding.

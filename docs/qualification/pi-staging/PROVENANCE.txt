@@ -1,22 +1,24 @@
 Ocliv ARM64 candidate — isolated Pi staging
 ============================================
 
-ACTIVE CANDIDATE (qualified 2026-11-14, supersedes f2d2bec/fe48fb96):
-  source commit : 19d46d82122734887bee1446e3cabd89652dc215
+ACTIVE CANDIDATE (qualified 2026-11-15, supersedes 1ceaaff4/fe48fb96):
+  source commit : 2089516da0180dee0ee95b6c915335e6cdf572c4
   toolchain     : go1.26.10 linux/amd64
   build config  : CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w"
-  binary sha256 : 1ceaaff4173406f4b7bda5dbc897156273cfa2cd699fc57ae3932debc85912d7
+  binary sha256 : 65ed20b21eddb40b3cdf3fbb60388dc7deb81066fec6dda9c0142043727b8a53
   binary size   : 13500578 bytes (static aarch64, stripped)
-  built         : 2026-11-14T22:20:00Z
+  built         : 2026-11-15T10:03:00Z
 
-  This candidate adds the composite-grant rollback-guard fix (typed
-  authzGrantKey = tenant/route/client tuple) on top of f2d2bec. It is the
-  artifact that matches the final source; fe48fb96 (f2d2bec) is superseded.
+  This candidate adds the 2026-11-15 rereview corrections on top of
+  19d46d8: issuer rotation persists on an empty table (INSERT ON CONFLICT +
+  verification), strict authz flag parsing, read-only restore preflight
+  (never migrates the live DB), clean-host service rollback, autoEnroll
+  relay-identity verification, and read-only authz pending/list.
+  1ceaaff4 (19d46d8) and fe48fb96 (f2d2bec) are superseded — do NOT deploy.
 
-SUPERSEDED (kept for reference only — do NOT deploy):
-  source commit : f2d2bec367ae3217f664628337a2d40900645666
-  binary sha256 : fe48fb96a628f6c6e04eb5c53fd890c54a4d7485f2c91dca06b9dbd26e25a06b
-  note          : lacks the composite-grant P1 fix present in 19d46d8.
+SUPERSEDED (reference only):
+  f2d2bec / fe48fb96…  — lacks the composite-grant P1 fix.
+  19d46d8 / 1ceaaff4…  — lacks the 2026-11-15 rereview corrections.
 
 PRODUCTION (unchanged, NOT touched):
   binary sha256 : 0d47481f2e2b7cbff34df57a713f0e39849be92cd85deabd5f256be07a00d0b1

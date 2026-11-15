@@ -1,4 +1,4 @@
-# Production promotion runbook — qualified candidate `19d46d8`
+# Production promotion runbook — qualified candidate `2089516`
 
 **Status: QUALIFIED IN ISOLATED PI STAGING, AWAITING OPERATOR APPROVAL.**
 This is the promotion package for the remediated Ocliv candidate. It rests on
@@ -12,29 +12,31 @@ an explicit operator gate. Do not execute until you choose to promote.
 
 | Field | Value |
 |---|---|
-| Source commit | `19d46d82122734887bee1446e3cabd89652dc215` |
+| Source commit | `2089516da0180dee0ee95b6c915335e6cdf572c4` |
 | Branch | `master` |
 | Go toolchain | go1.26.10 linux/amd64 |
 | Build config | `CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w"` |
-| **ARM64 SHA-256** | **`1ceaaff4173406f4b7bda5dbc897156273cfa2cd699fc57ae3932debc85912d7`** |
+| **ARM64 SHA-256** | **`65ed20b21eddb40b3cdf3fbb60388dc7deb81066fec6dda9c0142043727b8a53`** |
 | Binary size | 13,500,578 bytes (static aarch64, stripped) |
 | Schema reached on open | **V11** (forward-only) |
 
-This candidate supersedes `f2d2bec` / `fe48fb96…`: it adds the
-composite-grant rollback-guard fix (typed `authzGrantKey` =
-tenant/route/client tuple). The prior binary lacked that P1 fix and must not
-be deployed. Provenance: `docs/qualification/pi-staging/PROVENANCE.txt`.
+This candidate supersedes `19d46d8` / `1ceaaff4…` and `f2d2bec` /
+`fe48fb96…`: it adds the 2026-11-15 rereview corrections (issuer rotation
+persistence, strict authz flag parsing, read-only restore preflight,
+clean-host service rollback, autoEnroll relay-identity verification,
+read-only inventory commands). Earlier binaries must not be deployed.
+Provenance: `docs/qualification/pi-staging/PROVENANCE.txt`.
 
 Build (off-Pi, on the build host, from a clean checkout of `19d46d8`):
 ```
 cd <clean clone at 19d46d8>
 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o /tmp/ocliv-arm64 ./cmd/ocliv
-sha256sum /tmp/ocliv-arm64    # MUST equal 1ceaaff4... above
+sha256sum /tmp/ocliv-arm64    # MUST equal 65ed20b2... above
 ```
 
 ---
 
-## 2. Isolated Pi qualification result — **29 PASS / 0 FAIL** (re-run on the `19d46d8` / `1ceaaff4…` artifact)
+## 2. Isolated Pi qualification result — **29 PASS / 0 FAIL** (re-run on the `2089516` / `65ed20b2…` artifact)
 
 Executed on PiInDaSky against the real ARM64 binary, **loopback only**, in an
 owner-only staging dir (`~/ocliv-stage`, 0700), a **separate SQLite DB**, and
@@ -148,9 +150,9 @@ sudo chmod 600 /var/lib/ocliv/ocliv.db.bak-$TS*
 ### Step 2 — Build + stage the candidate (build host; digest MUST match §1)
 ```
 # already built; verify the digest before transfer:
-sha256sum /tmp/ocliv-arm64    # == 1ceaaff4...
+sha256sum /tmp/ocliv-arm64    # == 65ed20b2...
 scp /tmp/ocliv-arm64 bamn@10.9.66.170:/tmp/ocliv-new
-ssh bamn@10.9.66.170 'sha256sum /tmp/ocliv-new'   # confirm 1ceaaff4... on the Pi
+ssh bamn@10.9.66.170 'sha256sum /tmp/ocliv-new'   # confirm 65ed20b2... on the Pi
 ```
 
 ### Step 3 — Install + restart (**operator approval required** — point of no easy return)
@@ -159,7 +161,7 @@ TS=<same timestamp as Step 1>
 sudo cp -a /usr/local/bin/ocliv /usr/local/bin/ocliv.bak-$TS
 sudo sha256sum /usr/local/bin/ocliv.bak-$TS
 sudo install -o root -g root -m 0755 /tmp/ocliv-new /usr/local/bin/ocliv.new
-sudo sha256sum /usr/local/bin/ocliv.new        # == 1ceaaff4...
+sudo sha256sum /usr/local/bin/ocliv.new        # == 65ed20b2...
 sudo mv /usr/local/bin/ocliv.new /usr/local/bin/ocliv
 sudo systemctl restart ocliv-relay
 sudo journalctl -u ocliv-relay -n 30 --no-pager
@@ -172,7 +174,7 @@ upgrade is **forward-only**: recovery is roll-forward with the candidate binary
 ```
 curl -fsS http://127.0.0.1:18080/health/live && echo     # ok
 curl -fsS http://127.0.0.1:18080/health/ready && echo    # ok
-sha256sum /usr/local/bin/ocliv                           # 1ceaaff4...
+sha256sum /usr/local/bin/ocliv                           # 65ed20b2...
 sudo python3 - <<'PYQ'
 import sqlite3
 db = sqlite3.connect("file:/var/lib/ocliv/ocliv.db?mode=ro", uri=True)
@@ -223,7 +225,7 @@ curl -fsS http://127.0.0.1:18080/health/live && echo
   retires the managed signing key and revokes managed clients/grants, forcing
   re-registration).
 - If the candidate itself is corrupt, reinstall the known-good candidate
-  binary (`1ceaaff4...`) over the bad one; the V11 DB stays valid. The only
+  binary (`65ed20b2...`) over the bad one; the V11 DB stays valid. The only
   way back to the old binary is a full redeploy of the pre-upgrade image from
   backups taken in Step 1/Step 3 BEFORE the candidate ever opened the DB —
   and even then the guarded restore will refuse if post-backup revocations
@@ -251,7 +253,7 @@ Promotion is **NOT authorized** until the operator confirms each gate:
 1. **Pre-flight recorded** (binary `0d47481f...`, health ok/ok, **live schema
    version confirmed ≤ V11**, managed-client inventory taken).
 2. **Backup taken + checksum sidecar written** (Step 1).
-3. **Candidate digest verified** as `1ceaaff4...` on the Pi (Step 2).
+3. **Candidate digest verified** as `65ed20b2...` on the Pi (Step 2).
 4. **Install + restart** (Step 3) — the operator runs this deliberately.
 5. **Post-deploy checks green** (Step 4), including a full authorized
    `tools/call` through the **real public edge from an off-LAN client**.
@@ -270,4 +272,4 @@ Promotion is **NOT authorized** until the operator confirms each gate:
 ---
 
 *Qualified 2026-11-14 on PiInDaSky (10.9.66.170), isolated loopback staging.*
-*Candidate `19d46d8`, ARM64 `1ceaaff4...`, 29/29 checks green (re-qualified on the promotion artifact).*
+*Candidate `2089516`, ARM64 `65ed20b2...`, 29/29 checks green (re-qualified on the promotion artifact; rereview deltas exercised).*
