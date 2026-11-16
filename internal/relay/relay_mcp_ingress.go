@@ -500,7 +500,7 @@ func (s *Server) admitPathRoute(r *http.Request) (*routeTarget, *Session, *http.
 // profiles, missing leases, and failed lease admission all fail closed
 // with wildcard-identical semantics (404 unknown/expired, 503 inactive).
 func (s *Server) resolveMCPRouteID(routeID string) (*routeTarget, *Session, IngressProfile, int) {
-	var rowHost, rowTenant, profileStr string
+	var rowHost, rowTenant, rowOwnerKey, profileStr string
 	// NULL-safe: revoked tombstones detached by lease reclaim carry a
 	// NULL active binding (P0-B); revocation is decided before the
 	// binding is dereferenced. verified_at NULL means the publication
@@ -508,8 +508,8 @@ func (s *Server) resolveMCPRouteID(routeID string) (*routeTarget, *Session, Ingr
 	var leaseID sql.NullString
 	var revoked, verified *string
 	err := s.db.SQL().QueryRow(
-		`SELECT external_host, lease_id, profile, revoked_at, verified_at, tenant_id FROM mcp_publications WHERE route_id=?`,
-		routeID).Scan(&rowHost, &leaseID, &profileStr, &revoked, &verified, &rowTenant)
+		`SELECT external_host, lease_id, profile, revoked_at, verified_at, tenant_id, owner_key_id FROM mcp_publications WHERE route_id=?`,
+		routeID).Scan(&rowHost, &leaseID, &profileStr, &revoked, &verified, &rowTenant, &rowOwnerKey)
 	if err != nil {
 		return s.denyMCPRoute("", "unknown route id", http.StatusNotFound)
 	}
@@ -533,13 +533,17 @@ func (s *Server) resolveMCPRouteID(routeID string) (*routeTarget, *Session, Ingr
 		return s.denyMCPRoute(bound, "unknown route profile", http.StatusNotFound)
 	}
 	var t routeTarget
+	var leaseTenant, leaseOwnerKey string
 	var state string
 	var expiresAt, reconnectUntil sql.NullString
 	err = s.db.SQL().QueryRow(
-		`SELECT id, label, hostname, port, access_mode, generation, token_generation, status, expires_at, reconnect_until FROM leases WHERE id=?`,
-		bound).Scan(&t.LeaseID, &t.Label, &t.Hostname, &t.Port, &t.AccessMode, &t.Generation, &t.TokenGen, &state, &expiresAt, &reconnectUntil)
+		`SELECT id, tenant_id, agent_key_id, label, hostname, port, access_mode, generation, token_generation, status, expires_at, reconnect_until FROM leases WHERE id=?`,
+		bound).Scan(&t.LeaseID, &leaseTenant, &leaseOwnerKey, &t.Label, &t.Hostname, &t.Port, &t.AccessMode, &t.Generation, &t.TokenGen, &state, &expiresAt, &reconnectUntil)
 	if err != nil {
 		return s.denyMCPRoute(bound, "route lease missing", http.StatusNotFound)
+	}
+	if leaseTenant != rowTenant || leaseOwnerKey != rowOwnerKey {
+		return s.denyMCPRoute(bound, "route lease ownership mismatch", http.StatusNotFound)
 	}
 	if !mcpModeBinding(profile, t.AccessMode) {
 		return s.denyMCPRoute(bound, "route profile/lease mode mismatch", http.StatusNotFound)

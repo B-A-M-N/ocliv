@@ -163,6 +163,10 @@ func (s *Server) handleAgentPublications(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "unknown route", http.StatusNotFound)
 		return
 	}
+	if r.Method == http.MethodGet {
+		s.serveKeyPublication(w, tenant, keyID, routeID)
+		return
+	}
 	if r.Method != http.MethodDelete {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -202,8 +206,158 @@ func (s *Server) handleAgentPublications(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
-// serveKeyPublications lists every publication owned by one key: identity
-// first, leases second. A row is a routing hint only.
+type agentPublicationView struct {
+	RouteID          string  `json:"route_id"`
+	Host             string  `json:"external_host,omitempty"`
+	URL              *string `json:"url"`
+	Profile          string  `json:"profile,omitempty"`
+	Name             string  `json:"pub_name,omitempty"`
+	LeaseID          *string `json:"lease_id"`
+	CreatedAt        string  `json:"created_at,omitempty"`
+	RevokedAt        *string `json:"revoked_at"`
+	VerifiedAt       *string `json:"verified_at"`
+	PublicationState string  `json:"publication_state"`
+	LeaseState       *string `json:"lease_state"`
+	SessionLive      bool    `json:"session_live"`
+	HostBinding      string  `json:"host_binding"`
+	Admission        string  `json:"admission"`
+	AdmissionReason  string  `json:"admission_reason"`
+}
+
+// enrichAgentPublication reports current route admission without invoking
+// resolveMCPRouteID, which can expire leases and evict sessions. This is a
+// side-effect-free diagnostic path available only after signed key auth.
+func (s *Server) enrichAgentPublication(tenant, keyID string, p *agentPublicationView) error {
+	if p.RevokedAt != nil {
+		p.PublicationState = "REVOKED"
+	} else if p.VerifiedAt == nil {
+		p.PublicationState = "PENDING"
+	} else {
+		p.PublicationState = "VERIFIED"
+	}
+	if s.mcpHost == "" {
+		p.HostBinding = "UNKNOWN"
+	} else if p.Host != s.mcpHost {
+		p.HostBinding = "MISMATCH"
+	} else {
+		p.HostBinding = "VALID"
+		u := s.mcpBaseURL() + "/r/" + p.RouteID + "/mcp"
+		p.URL = &u
+	}
+
+	reason := "READY"
+	switch {
+	case p.RevokedAt != nil:
+		reason = "PUBLICATION_REVOKED"
+	case p.HostBinding == "MISMATCH":
+		reason = "HOST_MISMATCH"
+	case p.HostBinding != "VALID":
+		reason = "HOST_MISMATCH"
+	case p.LeaseID == nil || *p.LeaseID == "":
+		reason = "PUBLICATION_UNBOUND"
+	}
+
+	var leaseStatus, leaseMode, leaseTenant, leaseKey string
+	var generation uint64
+	var expiresAt sql.NullString
+	leaseExists := false
+	if p.LeaseID != nil && *p.LeaseID != "" {
+		err := s.db.SQL().QueryRow(
+			`SELECT status, access_mode, tenant_id, agent_key_id, generation, expires_at FROM leases WHERE id=?`,
+			*p.LeaseID,
+		).Scan(&leaseStatus, &leaseMode, &leaseTenant, &leaseKey, &generation, &expiresAt)
+		switch {
+		case err == nil:
+			leaseExists = true
+			p.LeaseState = &leaseStatus
+			if session, live := s.liveSession(*p.LeaseID); live && session.Generation == generation {
+				p.SessionLive = true
+			}
+		case err == sql.ErrNoRows:
+			missing := "MISSING"
+			p.LeaseState = &missing
+		default:
+			return err
+		}
+	}
+
+	profile, profileOK := parseIngressProfile(p.Profile)
+	switch {
+	case reason != "READY":
+		// The earlier identity, tombstone, binding, and host checks are
+		// authoritative and must not be overwritten by lease details.
+	case !profileOK || profile == IngressInvalid:
+		reason = "PROFILE_MISMATCH"
+	case !leaseExists:
+		reason = "LEASE_MISSING"
+	case leaseTenant != tenant || leaseKey != keyID:
+		reason = "LEASE_OWNERSHIP_MISMATCH"
+	case !mcpModeBinding(profile, leaseMode):
+		reason = "PROFILE_MISMATCH"
+	case leaseStatus == lease.StateExpired:
+		reason = "LEASE_EXPIRED"
+	case expiresAt.Valid:
+		expires, err := time.Parse(time.RFC3339Nano, expiresAt.String)
+		if err != nil || !expires.After(time.Now().UTC()) {
+			reason = "LEASE_EXPIRED"
+		}
+	}
+	if reason == "READY" && leaseStatus != lease.StateActive {
+		reason = "LEASE_OFFLINE"
+	}
+	if reason == "READY" && !p.SessionLive {
+		reason = "LEASE_OFFLINE"
+	}
+	if reason == "READY" && p.VerifiedAt == nil {
+		reason = "PENDING_VERIFICATION"
+	}
+	p.AdmissionReason = reason
+	if reason == "READY" {
+		p.Admission = "READY"
+	} else {
+		p.Admission = "BLOCKED"
+	}
+	return nil
+}
+
+func (s *Server) readKeyPublication(tenant, keyID, routeID string) (*agentPublicationView, error) {
+	var p agentPublicationView
+	p.RouteID = routeID
+	err := s.db.SQL().QueryRow(
+		`SELECT external_host, profile, pub_name, lease_id, created_at, revoked_at, verified_at
+		 FROM mcp_publications WHERE route_id=? AND tenant_id=? AND owner_key_id=?`,
+		routeID, tenant, keyID,
+	).Scan(&p.Host, &p.Profile, &p.Name, &p.LeaseID, &p.CreatedAt, &p.RevokedAt, &p.VerifiedAt)
+	if err == sql.ErrNoRows {
+		p.PublicationState = "MISSING"
+		p.HostBinding = "UNKNOWN"
+		p.Admission = "BLOCKED"
+		p.AdmissionReason = "PUBLICATION_NOT_FOUND"
+		return &p, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := s.enrichAgentPublication(tenant, keyID, &p); err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// serveKeyPublication returns one owner's authenticated admission diagnosis.
+// Unknown and differently owned IDs share the same PUBLICATION_NOT_FOUND body.
+func (s *Server) serveKeyPublication(w http.ResponseWriter, tenant, keyID, routeID string) {
+	p, err := s.readKeyPublication(tenant, keyID, routeID)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+// serveKeyPublications lists every publication owned by one key with
+// durable state, live reachability, canonical URL availability, and a
+// precise authenticated admission diagnosis.
 func (s *Server) serveKeyPublications(w http.ResponseWriter, tenant, keyID string) {
 	rows, err := s.db.SQL().Query(
 		`SELECT route_id, external_host, profile, pub_name, lease_id, created_at, revoked_at, verified_at FROM mcp_publications WHERE tenant_id=? AND owner_key_id=? ORDER BY created_at`,
@@ -213,26 +367,9 @@ func (s *Server) serveKeyPublications(w http.ResponseWriter, tenant, keyID strin
 		return
 	}
 	defer rows.Close()
-	type pub struct {
-		RouteID    string  `json:"route_id"`
-		Host       string  `json:"external_host"`
-		Profile    string  `json:"profile"`
-		Name       string  `json:"pub_name"`
-		LeaseID    *string `json:"lease_id"`
-		CreatedAt  string  `json:"created_at"`
-		RevokedAt  *string `json:"revoked_at"`
-		VerifiedAt *string `json:"verified_at"`
-		// LeaseState is the durable lease row status (ACTIVE, EXPIRED,
-		// CLOSED, REVOKED, ...), nil when the row has no lease binding.
-		// SessionLive reports whether a live transport session for the
-		// current lease generation exists right now. Durable state and
-		// reachability are deliberately separate: active ≠ reachable.
-		LeaseState  *string `json:"lease_state"`
-		SessionLive bool    `json:"session_live"`
-	}
-	out := []pub{}
+	out := []agentPublicationView{}
 	for rows.Next() {
-		var p pub
+		var p agentPublicationView
 		if err := rows.Scan(&p.RouteID, &p.Host, &p.Profile, &p.Name, &p.LeaseID, &p.CreatedAt, &p.RevokedAt, &p.VerifiedAt); err != nil {
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
@@ -244,22 +381,9 @@ func (s *Server) serveKeyPublications(w http.ResponseWriter, tenant, keyID strin
 	// would self-deadlock the listing handler.
 	rows.Close()
 	for i := range out {
-		if out[i].LeaseID == nil {
-			continue
-		}
-		var status string
-		var generation uint64
-		switch err := s.db.SQL().QueryRow(
-			`SELECT status, generation FROM leases WHERE id=?`, *out[i].LeaseID,
-		).Scan(&status, &generation); {
-		case err == nil:
-			out[i].LeaseState = &status
-			if sess, live := s.liveSession(*out[i].LeaseID); live && sess.Generation == generation {
-				out[i].SessionLive = true
-			}
-		default:
-			unknown := "unknown"
-			out[i].LeaseState = &unknown
+		if err := s.enrichAgentPublication(tenant, keyID, &out[i]); err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -574,9 +698,11 @@ func (s *Server) serveMCPRouteDetach(w http.ResponseWriter, tenant, keyID, lease
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	res, err := s.db.SQL().Exec(
-		`UPDATE mcp_publications SET lease_id=NULL, verified_at=NULL, updated_at=?
+		`UPDATE mcp_publications SET lease_id=NULL,
+			verified_at=CASE WHEN profile=? THEN verified_at ELSE NULL END,
+			updated_at=?
 		 WHERE route_id=? AND tenant_id=? AND owner_key_id=? AND lease_id=? AND revoked_at IS NULL`,
-		now, routeID, tenant, keyID, leaseID)
+		ingressProfileManaged, now, routeID, tenant, keyID, leaseID)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return

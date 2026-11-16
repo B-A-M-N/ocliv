@@ -39,7 +39,7 @@ func TestSingleHostTemplateCarriesHeaderContract(t *testing.T) {
 	for _, want := range []string{
 		"reverse_proxy 127.0.0.1:8080",
 		"header_up X-Forwarded-For {remote_host}",
-		"header_up X-Forwarded-Proto {scheme}",
+		"header_up X-Forwarded-Proto https",
 		"header_up -X-Forwarded-Host",
 	} {
 		if !strings.Contains(s, want) {

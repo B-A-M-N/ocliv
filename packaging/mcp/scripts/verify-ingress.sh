@@ -214,7 +214,7 @@ TOKEN="$_saved"
 # 3. Negotiate the MCP protocol/session before issuing authenticated calls.
 # Stateless implementations may omit Mcp-Session-Id; stateful ones must
 # retain and echo it on subsequent requests.
-_split "$(_post "$ROUTE" '{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"ocliv-ingress-verifier","version":"1"}}}' yes)"
+_split "$(_post "$ROUTE" '{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ocliv-ingress-verifier","version":"1"}}}' yes)"
 [ "$_code" = "200" ] || fail "initialize -> HTTP $_code: $(short "$_body")"
 _check_rpc "$_body" "2" || fail "initialize returned bad JSON-RPC: $(short "$_body")"
 _protocol_version="$(_json "$_body" '.result.protocolVersion')"

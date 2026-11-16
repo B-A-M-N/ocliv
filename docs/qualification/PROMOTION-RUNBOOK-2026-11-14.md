@@ -7,6 +7,17 @@ read-only inventory, named-profile, managed-stdio session, lease-renewal, and
 ingress-verifier corrections. Production has not been changed. The root-only
 production database schema and route/identity records remain unread.
 
+**Source-state boundary (2026-11-16):** `d9ea67b` and the digest above are
+the last clean-source candidate with recorded Pi qualification. The current
+branch/worktree includes later documentation and source/test changes; those
+changes are not qualified by the `d9ea67b` result. The rereview recorded a
+later artifact from a dirty `f6ae69b` source snapshot, but it is not a
+promotion candidate because the complete source and untracked test fixtures
+were not frozen in one commit. Do not replace the artifact identity below
+with that snapshot's digest. Reconcile and commit the intended changes, then
+build from a clean detached checkout and repeat qualification before
+publishing a new candidate identity.
+
 ---
 
 ## 1. Qualified artifact (immutable)
@@ -147,6 +158,32 @@ else:
         print("unbound_clients:", count)
     else:
         print("client_binding_columns: PRE_V11")
+
+print("=== PUBLISHER IDENTITIES ===")
+if "agent_keys" not in tables:
+    print("agent_keys: absent")
+else:
+    cols = columns("agent_keys")
+    fields = [name for name in ("id", "tenant_id", "status", "revoked_at") if name in cols]
+    print("columns:", sorted(cols))
+    if fields:
+        for row in db.execute("SELECT " + ", ".join(fields) + " FROM agent_keys"):
+            print(dict(zip(fields, row)))
+    else:
+        print("agent_keys: no recognized identity/status columns")
+
+print("=== TENANTS ===")
+if "tenants" not in tables:
+    print("tenants: absent")
+else:
+    cols = columns("tenants")
+    fields = [name for name in ("id", "status", "suspended_at") if name in cols]
+    print("columns:", sorted(cols))
+    if fields:
+        for row in db.execute("SELECT " + ", ".join(fields) + " FROM tenants"):
+            print(dict(zip(fields, row)))
+    else:
+        print("tenants: no recognized identity/status columns")
 
 print("=== PUBLICATIONS ===")
 for table in ("mcp_publications", "mcp_routes"):

@@ -1,7 +1,9 @@
 /** Publisher controller tests: injected spawn, no real processes. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { unlinkSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { PublisherController, PublisherError, loadPublisherConfig, parseService, routeIdOf } from '../src/core/publisher.mjs';
 
@@ -33,6 +35,8 @@ test('config rejects remote URLs, bad names, relative paths', () => {
   assert.throws(() => parseService({ name: 'x', localUrl: 'http://127.0.0.1/mcp' }), { code: 'INVALID_SERVICE' }); // no port
   assert.throws(() => parseService({ name: '../evil', localUrl: 'http://127.0.0.1:8/mcp' }), { code: 'INVALID_SERVICE' });
   assert.throws(() => parseService({ name: 'ok', localUrl: 'http://127.0.0.1:8/mcp', resourceFile: 'relative/path' }), { code: 'INVALID_SERVICE' });
+  assert.throws(() => parseService({ name: 'managed', localUrl: 'http://127.0.0.1:8/mcp', auth: 'ocliv-managed', resourceFile: '/var/lib/resource' }), { code: 'INVALID_SERVICE' });
+  assert.throws(() => parseService({ name: 'managed', localUrl: 'http://127.0.0.1:8/mcp', auth: 'ocliv-managed', upstreamTokenFile: '/var/lib/token' }), { code: 'INVALID_SERVICE' });
   const ok = parseService({ name: 'ok-name_1', localUrl: 'http://127.0.0.1:18767/mcp', auth: 'ocliv-managed' });
   assert.equal(ok.localUrl, 'http://127.0.0.1:18767/mcp');
 });
@@ -74,7 +78,7 @@ test('publish single-flights; resumes when route known', async () => {
 test('operator stop retains route and resume reuses the same publication identity', async (t) => {
   const started = [];
   const c = new PublisherController(cfg({
-    OCLIV_SERVICES_JSON: JSON.stringify([{ ...SVC, auth: 'ocliv-managed' }]),
+    OCLIV_SERVICES_JSON: JSON.stringify([{ name: SVC.name, localUrl: SVC.localUrl, auth: 'ocliv-managed' }]),
   }), { spawnImpl: fakeSpawnFactory(t, (s) => started.push(s)) });
   const first = c.publish('lab', 'PUBLISH lab', { readyTimeoutMs: 5000, probe: false });
   await new Promise((r) => setTimeout(r, 20));
@@ -83,7 +87,7 @@ test('operator stop retains route and resume reuses the same publication identit
   const firstOut = await first;
   assert.deepEqual(started[0].args, [
     'mcp', 'publish', '--local', SVC.localUrl, '--auth', 'ocliv-managed',
-    '--name', 'lab', '--resource-file', SVC.resourceFile,
+    '--name', 'lab',
   ]);
   await assert.rejects(c.stop('lab', 'STOP wrong'), { code: 'CONFIRMATION_REQUIRED' });
   firstRec.child.once = (event, fn) => {
@@ -156,6 +160,42 @@ test('fragmented output across chunks still yields the route URL once', async (t
   rec.child.stderr.emit('data', '/mcp\ntail\n');
   const out = await p;
   assert.equal(out.routeUrl, 'https://edge.example/r/route-frag-1/mcp');
+});
+
+test('upstream credential is delivered only to its publisher child and never errors', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'ocliv-publisher-credential-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const credential = join(dir, 'upstream.token');
+  const secret = 'secret-token-that-must-not-leak';
+  writeFileSync(credential, secret, { mode: 0o600 });
+  chmodSync(credential, 0o600);
+  let seen;
+  const service = { ...SVC, upstreamTokenFile: credential };
+  const c = new PublisherController(loadPublisherConfig({
+    OCLIV_BIN: BIN, OCLIV_PUBLISHER_HOME: HOME, OCLIV_SERVICES_JSON: JSON.stringify([service]),
+  }), { spawnImpl: fakeSpawnFactory(t, (s) => { seen = s; }) });
+  const p = c.publish('lab', 'PUBLISH lab', { readyTimeoutMs: 5000, probe: false });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(seen.opts.env.OCLIV_UPSTREAM_MCP_TOKEN, secret);
+  assert.deepEqual(Object.keys(seen.opts.env).filter((k) => !['HOME','PATH','OCLIV_UPSTREAM_MCP_TOKEN'].includes(k)), []);
+  const rec = c.children.get('lab');
+  seen.child.stderr.emit('data', `publisher leaked ${secret} in its private stderr\n`);
+  seen.child.emit('exit', 1);
+  await assert.rejects(p, (err) => !err.message.includes(secret));
+  assert.ok(!JSON.stringify(rec.log).includes(secret));
+});
+
+test('credential files must be regular and owner-only', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ocliv-publisher-credential-mode-'));
+  try {
+    const credential = join(dir, 'token');
+    writeFileSync(credential, 'private-token', { mode: 0o644 });
+    const svc = { ...SVC, upstreamTokenFile: credential };
+    const c = new PublisherController(loadPublisherConfig({
+      OCLIV_BIN: BIN, OCLIV_PUBLISHER_HOME: HOME, OCLIV_SERVICES_JSON: JSON.stringify([svc]),
+    }), { spawnImpl: fakeSpawnFactory() });
+    await assert.rejects(c.publish('lab', 'PUBLISH lab'), { code: 'INVALID_CONFIG' });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('timeout terminates the child and clears the record', async (t) => {

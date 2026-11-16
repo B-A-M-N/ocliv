@@ -6,6 +6,8 @@ package store
 
 import (
 	"database/sql"
+	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -298,7 +300,62 @@ func lockDownFiles(path string) error {
 	return nil
 }
 
+// preflightSchema opens an existing database read-only before any migration
+// statements run. A newer binary must refuse a future schema without even
+// creating missing V1 tables or inserting the V1 marker into that database.
+func preflightSchema(path string) error {
+	if path == ":memory:" {
+		return nil
+	}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("inspect state database before migration: %w", err)
+	}
+
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	uri := (&url.URL{Scheme: "file", Path: absolute}).String() + "?mode=ro"
+	ro, err := sql.Open("sqlite", uri)
+	if err != nil {
+		return fmt.Errorf("open state database for schema preflight: %w", err)
+	}
+	defer ro.Close()
+	ro.SetMaxOpenConns(1)
+
+	var tableCount int
+	if err := ro.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`).Scan(&tableCount); err != nil {
+		return fmt.Errorf("inspect state database schema: %w", err)
+	}
+	if tableCount == 0 {
+		return nil // existing but empty SQLite file
+	}
+	var versionTable int
+	if err := ro.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_version'`).Scan(&versionTable); err != nil {
+		return fmt.Errorf("inspect state database version table: %w", err)
+	}
+	if versionTable != 1 {
+		return fmt.Errorf("state database has tables but no schema version; refusing migration")
+	}
+	var version sql.NullInt64
+	if err := ro.QueryRow(`SELECT MAX(v) FROM schema_version`).Scan(&version); err != nil {
+		return fmt.Errorf("read state database schema version: %w", err)
+	}
+	if !version.Valid || version.Int64 < 1 {
+		return fmt.Errorf("invalid state database schema version")
+	}
+	if version.Int64 > currentSchema {
+		return fmt.Errorf("unknown state schema version %d", version.Int64)
+	}
+	return nil
+}
+
 func Open(path string) (*DB, error) {
+	if err := preflightSchema(path); err != nil {
+		return nil, apperr.E(apperr.CodeStoreFault, "preflighting state database schema", err)
+	}
 	if err := ensurePrivateDir(filepath.Dir(path)); err != nil {
 		return nil, err
 	}

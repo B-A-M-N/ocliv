@@ -153,6 +153,55 @@ func TestOpenIdempotentAndDowngradeRefused(t *testing.T) {
 	}
 }
 
+// Open must inspect a future database before the V1 bootstrap can create
+// tables or insert a schema marker. Refusal is read-only even when the
+// future schema contains tables this binary does not know.
+func TestOpenFutureSchemaDoesNotWriteBootstrapSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "future.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE schema_version (v INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`,
+		`CREATE TABLE future_marker (value TEXT NOT NULL)`,
+		`INSERT INTO schema_version(v, applied_at) VALUES(12, 'future')`,
+		`INSERT INTO future_marker(value) VALUES('preserve')`,
+	} {
+		if _, err := raw.Exec(stmt); err != nil {
+			t.Fatalf("fixture %q: %v", stmt, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path); err == nil {
+		t.Fatal("future schema was accepted")
+	}
+
+	check, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	var tables, version, markers, v1Rows int
+	if err := check.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`).Scan(&tables); err != nil {
+		t.Fatal(err)
+	}
+	if err := check.QueryRow(`SELECT MAX(v) FROM schema_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := check.QueryRow(`SELECT COUNT(*) FROM future_marker WHERE value='preserve'`).Scan(&markers); err != nil {
+		t.Fatal(err)
+	}
+	if err := check.QueryRow(`SELECT COUNT(*) FROM schema_version WHERE v=1`).Scan(&v1Rows); err != nil {
+		t.Fatal(err)
+	}
+	if tables != 2 || version != 12 || markers != 1 || v1Rows != 0 {
+		t.Fatalf("future DB changed after refusal: tables=%d version=%d marker=%d v1=%d", tables, version, markers, v1Rows)
+	}
+}
+
 // A database written before P1-4 may hold duplicate route rows for one
 // logical publication (no uniqueness constraint existed). Migration must
 // collapse them to the earliest mapping and land the constraint, so a

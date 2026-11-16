@@ -10,19 +10,43 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"ocliv/internal/lease"
 	"ocliv/internal/limits"
 )
 
 func registerOn(t *testing.T, s *Server, routeID string) int {
+	return registerOnFrom(t, s, routeID, "192.0.2.10:1234")
+}
+
+func registerOnFrom(t *testing.T, s *Server, routeID, remote string) int {
 	t.Helper()
 	body := `{"client_name":"contention","redirect_uris":["https://client.example/cb"],"token_endpoint_auth_method":"none"}`
 	req := httptest.NewRequest(http.MethodPost, "/r/"+routeID+"/oauth/register", strings.NewReader(body))
 	req.Host = "public.example.org"
+	req.RemoteAddr = remote
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 	return rec.Code
+}
+
+func TestAuthzDCRThrottleScopesPerSourceIP(t *testing.T) {
+	s, db := newMCPServer(t)
+	priv := enrollTestKey(t, db.SQL(), "key-test", "tenant-test")
+	insertMCPLeaseRow(t, db, "lse-ip", "ip.t.example.test", AccessModeMCPManaged, lease.StateActive, 1, nil)
+	liveFabricatedSession(t, s, "lse-ip", 1)
+	routeID := publishRoute(t, s, priv, "key-test", "lse-ip", "managed-oauth")
+	s.preAuth = limits.NewThrottle(1, time.Minute)
+	if code := registerOnFrom(t, s, routeID, "192.0.2.10:1234"); code != http.StatusCreated {
+		t.Fatalf("first registration from ip A status=%d, want 201", code)
+	}
+	if code := registerOnFrom(t, s, routeID, "192.0.2.10:5678"); code != http.StatusTooManyRequests {
+		t.Fatalf("second registration from ip A status=%d, want 429", code)
+	}
+	if code := registerOnFrom(t, s, routeID, "192.0.2.11:1234"); code != http.StatusCreated {
+		t.Fatalf("registration from independent ip B contended with ip A: status=%d, want 201", code)
+	}
 }
 
 func TestAuthzThrottleScopesPerRoute(t *testing.T) {

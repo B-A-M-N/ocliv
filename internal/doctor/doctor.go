@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -93,6 +94,7 @@ func CheckAgent(in AgentInput) Result {
 		add(false, true, "staging CA", "cannot load "+in.CACertPath+": "+shortErr(err))
 	}
 	client := &http.Client{Timeout: 10 * time.Second}
+	externalProbeOK := false
 	if strings.HasPrefix(in.RelayURL, "https") {
 		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool}}
 	}
@@ -101,6 +103,7 @@ func CheckAgent(in AgentInput) Result {
 	switch {
 	case err == nil:
 		resp.Body.Close()
+		externalProbeOK = true
 		add(true, true, "relay reachability", "agent-protocol endpoint answered (HTTP "+resp.Status+")")
 		if strings.HasPrefix(in.RelayURL, "https") {
 			add(true, true, "relay TLS identity", "certificate trusted by the configured roots")
@@ -110,6 +113,50 @@ func CheckAgent(in AgentInput) Result {
 		add(false, false, "relay reachability", "unverified: TLS trust failed first")
 	default:
 		add(false, false, "relay reachability", "unverified from here ("+shortErr(err)+")")
+	}
+	// When this machine is also the self-hosted edge, compare the public
+	// relay URL with direct loopback and local Caddy/SNI probes. A public
+	// URL failure alongside a healthy local SNI edge is consistent with
+	// hairpin NAT or split-horizon DNS; it cannot establish off-LAN health.
+	if u, uerr := url.Parse(in.RelayURL); uerr == nil && u.Scheme == "https" && u.Hostname() != "" &&
+		(u.Port() == "" || u.Port() == "443") && (net.ParseIP(u.Hostname()) == nil || !net.ParseIP(u.Hostname()).IsLoopback()) {
+		localClient := &http.Client{Timeout: 4 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
+		loopResp, loopErr := localClient.Post("http://127.0.0.1:8080/v1/agent/challenge", "application/json", bytes.NewReader(challengeBody))
+		loopOK := loopErr == nil
+		if loopResp != nil {
+			loopResp.Body.Close()
+		}
+		if loopOK {
+			add(true, true, "self-hosted relay loopback", "127.0.0.1:8080 agent challenge answered (HTTP "+loopResp.Status+")")
+		} else {
+			add(false, false, "self-hosted relay loopback", "not verified on this host ("+shortErr(loopErr)+")")
+		}
+		localEdge := *client
+		localEdge.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool, ServerName: u.Hostname()},
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{Timeout: 4 * time.Second}).DialContext(ctx, "tcp", "127.0.0.1:443")
+			},
+		}
+		caddyResp, caddyErr := localEdge.Post("https://"+u.Host+"/v1/agent/challenge", "application/json", bytes.NewReader(challengeBody))
+		caddyOK := caddyErr == nil
+		if caddyResp != nil {
+			caddyResp.Body.Close()
+		}
+		if caddyOK {
+			add(true, true, "self-hosted Caddy SNI edge", u.Hostname()+" certificate and local :443 agent route answered (HTTP "+caddyResp.Status+")")
+		} else if isTrustFailure(caddyErr) {
+			add(false, true, "self-hosted Caddy SNI edge", "local :443 certificate is not trusted for "+u.Hostname()+": "+shortErr(caddyErr))
+		} else {
+			add(false, false, "self-hosted Caddy SNI edge", "local :443 not verified ("+shortErr(caddyErr)+")")
+		}
+		if !externalProbeOK && caddyOK {
+			add(false, false, "public edge path", "failed from this network while local Caddy/SNI works; possible hairpin NAT or split-horizon DNS — verify from off-LAN")
+		} else if externalProbeOK {
+			add(true, false, "public edge path", "relay answered from this host; off-LAN reachability remains unverified")
+		} else {
+			add(false, false, "public edge path", "unverified from this network; check local edge and verify from off-LAN")
+		}
 	}
 	// Local target: judged against the tunnel's recorded probe contract
 	// (Domain A), never a hardcoded GET /. A path the tunnel never

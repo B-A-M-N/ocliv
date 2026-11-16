@@ -133,13 +133,28 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 // Ctrl+C could never stop a connected agent (F10 graceful drain relies on
 // Run actually returning).
 func (rn *Runner) serve(ctx context.Context, ys *yamux.Session, att Attached) error {
+	// A session has its own cancellation lifetime. The runner's parent
+	// context survives reconnects, so passing it to stream handlers would
+	// leave upstream HTTP/SSE requests alive after this yamux session dies.
+	sessionCtx, cancelSession := context.WithCancel(ctx)
+	defer cancelSession()
+	watchDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ys.CloseChan():
+			cancelSession()
+		case <-sessionCtx.Done():
+		case <-watchDone:
+		}
+	}()
+	defer close(watchDone)
 	// P1-6: the cancellation watcher lives exactly as long as this
 	// session. AfterFunc disarms on serve return, so a naturally ended
 	// session leaves no goroutine parked on the parent context until
 	// the whole runner exits (previously one waiter per reconnect).
 	stop := context.AfterFunc(ctx, func() { ys.Close() })
 	defer stop()
-	renewCtx, stopRenewals := context.WithCancel(ctx)
+	renewCtx, stopRenewals := context.WithCancel(sessionCtx)
 	defer stopRenewals()
 	renewalErr := make(chan error, 1)
 	if rn.Cfg.TTLSeconds > 0 && rn.Cfg.RenewLease {
@@ -160,13 +175,19 @@ func (rn *Runner) serve(ctx context.Context, ys *yamux.Session, att Attached) er
 			}
 			return err // session over; reconnect loop decides (F09)
 		}
-		go rn.handleStream(ctx, stream, att)
+		go rn.handleStream(sessionCtx, stream, att)
 	}
 }
 
 // handleStream serves one request/response exchange with bounded buffers.
 func (rn *Runner) handleStream(ctx context.Context, stream net.Conn, att Attached) {
 	defer stream.Close()
+	// Closing the yamux session cancels ctx, but an outbound HTTP request may
+	// currently be blocked reading its streaming request body from this
+	// stream. Close the stream on cancellation as well so the body reader and
+	// any WebSocket operation unblock immediately.
+	stopClose := context.AfterFunc(ctx, func() { _ = stream.Close() })
+	defer stopClose()
 	ftype, payload, err := protocol.ReadFrame(stream)
 	if err != nil || ftype != protocol.FRequestHead {
 		return

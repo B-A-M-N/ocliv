@@ -4,7 +4,8 @@ import { useState } from 'react';
 
 type Publication = {
   id: string; label?: string; profile?: string; state?: string;
-  leaseState?: string | null; sessionLive?: boolean;
+  publicationState?: string; leaseState?: string | null; sessionLive?: boolean | null;
+  hostBinding?: string; admission?: string; admissionReason?: string;
   publicUrl?: string | null; leaseId?: string | null;
 };
 type ListOutput = {
@@ -27,7 +28,7 @@ export default function ListPublications() {
     <p className="metric">{pubs.length} endpoint(s) · durable publication state (not tunnel liveness)</p>
     {pubs.length === 0 && <p>No endpoints have been published.</p>}
     {pubs.map((p: Publication) => <div key={p.id} className="entry">
-      <strong>{p.label || p.id}</strong> <small>Status: {p.state} · ID: {p.id} · Lease: {p.leaseState ?? 'unknown'} · Session: {p.sessionLive ? 'live' : 'down'}</small>
+      <strong>{p.label || p.id}</strong> <small>Publication: {p.publicationState ?? p.state ?? 'unknown'} · Lease: {p.leaseState ?? 'unknown'} · Session: {p.sessionLive === true ? 'live' : p.sessionLive === false ? 'offline' : 'unknown'} · Host: {p.hostBinding ?? 'unknown'} · Admission: {p.admission ?? 'unknown'}{p.admissionReason ? ` (${p.admissionReason})` : ''} · ID: {p.id}</small>
       {p.publicUrl && <small>{p.publicUrl}</small>}
       <button type="button" disabled={isVerifying} onClick={async()=>{
         setMessage('Verifying…');

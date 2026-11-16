@@ -185,6 +185,53 @@ func TestFailedRebindPreservesPublicationAndGrant(t *testing.T) {
 	}
 }
 
+func TestManagedDetachRetainsVerificationAcrossRetry(t *testing.T) {
+	s, db := newMCPServer(t)
+	priv := enrollTestKey(t, db.SQL(), "key-test", "tenant-test")
+	insertMCPLeaseRow(t, db, "lse-managed-original", "managed-recover.t.example.test", AccessModeMCPManaged, lease.StateActive, 1, nil)
+	liveFabricatedSession(t, s, "lse-managed-original", 1)
+	routeID := publishRoute(t, s, priv, "key-test", "lse-managed-original", "managed-oauth")
+
+	var before sql.NullString
+	if err := db.SQL().QueryRow(`SELECT verified_at FROM mcp_publications WHERE route_id=?`, routeID).Scan(&before); err != nil || !before.Valid {
+		t.Fatalf("managed publication verification=%v err=%v; want verified", before, err)
+	}
+	if err := s.closeLeaseDurable("lse-managed-original"); err != nil {
+		t.Fatal(err)
+	}
+
+	insertMCPLeaseRow(t, db, "lse-managed-failed", "failed.t.example.test", AccessModeMCPManaged, lease.StateActive, 1, nil)
+	relabel(t, db, "lse-managed-failed", "managed-recover")
+	if code, body := postMCPRoute(t, s, priv, "key-test", "lse-managed-failed", "managed-oauth"); code != http.StatusOK {
+		t.Fatalf("managed replacement rebind: status=%d body=%s", code, body)
+	}
+	if code, body := postMCPRouteAction(t, s, priv, "key-test", "lse-managed-failed", routeID, "detach"); code != http.StatusOK {
+		t.Fatalf("managed failed-rebind detach: status=%d body=%s", code, body)
+	}
+	var detachedLease sql.NullString
+	var detachedVerified sql.NullString
+	if err := db.SQL().QueryRow(`SELECT lease_id,verified_at FROM mcp_publications WHERE route_id=?`, routeID).Scan(&detachedLease, &detachedVerified); err != nil {
+		t.Fatal(err)
+	}
+	if detachedLease.Valid || !detachedVerified.Valid {
+		t.Fatalf("after managed detach lease=%v verified=%v; want detached but verified", detachedLease, detachedVerified)
+	}
+
+	insertMCPLeaseRow(t, db, "lse-managed-retry", "retry.t.example.test", AccessModeMCPManaged, lease.StateActive, 1, nil)
+	relabel(t, db, "lse-managed-retry", "managed-recover")
+	if code, body := postMCPRoute(t, s, priv, "key-test", "lse-managed-retry", "managed-oauth"); code != http.StatusOK {
+		t.Fatalf("managed retry rebind: status=%d body=%s", code, body)
+	}
+	liveFabricatedSession(t, s, "lse-managed-retry", 1)
+	rec := doManagedTool(t, s, routeID, "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("managed retry route status=%d body=%s, want protected 401", rec.Code, rec.Body.String())
+	}
+	if err := db.SQL().QueryRow(`SELECT verified_at FROM mcp_publications WHERE route_id=?`, routeID).Scan(&detachedVerified); err != nil || !detachedVerified.Valid {
+		t.Fatalf("managed retry verification=%v err=%v; route must remain verified", detachedVerified, err)
+	}
+}
+
 // TestPublicationReclaimRebindsAutomatically: a named-lease reclaim
 // carries the live publication to the replacement lease in the same
 // transaction, so the public URL never changes across restarts.

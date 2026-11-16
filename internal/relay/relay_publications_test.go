@@ -34,6 +34,17 @@ func getKeyPublications(t *testing.T, s *Server, priv ed25519.PrivateKey, keyID 
 	return w.Code, w.Body.String()
 }
 
+func getKeyPublication(t *testing.T, s *Server, priv ed25519.PrivateKey, keyID, routeID string) (int, string) {
+	t.Helper()
+	path := "/v1/agent/mcp-routes/" + routeID
+	r := signedMgmtRequest(t, priv, keyID, http.MethodGet, path)
+	r.Host = "relay.example.test"
+	r.RequestURI = path
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	return w.Code, w.Body.String()
+}
+
 // deleteKeyPublication DELETEs one route through the full stack.
 func deleteKeyPublication(t *testing.T, s *Server, priv ed25519.PrivateKey, keyID, routeID string) (int, string) {
 	t.Helper()
@@ -78,6 +89,10 @@ func TestKeyPublicationsListAcrossLeases(t *testing.T) {
 	seen := map[string]bool{}
 	for _, p := range pubs {
 		id, _ := p["route_id"].(string)
+		publicURL, _ := p["url"].(string)
+		if want := s.mcpBaseURL() + "/r/" + id + "/mcp"; publicURL != want {
+			t.Fatalf("publication %q URL=%q, want canonical relay URL %q", id, publicURL, want)
+		}
 		seen[id] = true
 		if id != r1 && id != r2 {
 			t.Fatalf("list leaked unexpected route %q", id)
@@ -357,6 +372,61 @@ func TestKeyPublicationsCarryReachability(t *testing.T) {
 			t.Fatalf("live session for lse-a never surfaced: %v", m[r1])
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestAuthenticatedPublicationDiagnosticAndHostMismatch(t *testing.T) {
+	s, db := newMCPServer(t)
+	owner := enrollTestKey(t, db.SQL(), "key-test", "tenant-test")
+	other := enrollTestKey(t, db.SQL(), "key-other", "tenant-test")
+	insertMCPLeaseRow(t, db, "lse-diagnostic", "diag.t.example.test", AccessModeMCPManaged, lease.StateActive, 1, nil)
+	liveFabricatedSession(t, s, "lse-diagnostic", 1)
+	routeID := publishRoute(t, s, owner, "key-test", "lse-diagnostic", "managed-oauth")
+
+	code, body := getKeyPublication(t, s, owner, "key-test", routeID)
+	if code != http.StatusOK {
+		t.Fatalf("owned diagnostic: status=%d body=%s", code, body)
+	}
+	var ready map[string]any
+	if err := json.Unmarshal([]byte(body), &ready); err != nil {
+		t.Fatal(err)
+	}
+	if ready["publication_state"] != "VERIFIED" || ready["lease_state"] != lease.StateActive ||
+		ready["session_live"] != true || ready["host_binding"] != "VALID" ||
+		ready["admission"] != "READY" || ready["admission_reason"] != "READY" ||
+		ready["url"] != s.mcpBaseURL()+"/r/"+routeID+"/mcp" {
+		t.Fatalf("owned diagnostic fields incorrect: %s", body)
+	}
+
+	// A caller cannot distinguish another key's route from an absent route.
+	code, body = getKeyPublication(t, s, other, "key-other", routeID)
+	if code != http.StatusOK {
+		t.Fatalf("foreign diagnostic status=%d body=%s", code, body)
+	}
+	var missing map[string]any
+	if err := json.Unmarshal([]byte(body), &missing); err != nil {
+		t.Fatal(err)
+	}
+	if missing["admission_reason"] != "PUBLICATION_NOT_FOUND" || missing["url"] != nil {
+		t.Fatalf("foreign route disclosed or claimed usable: %s", body)
+	}
+
+	// Historical host binding must not be rendered as a usable URL on the
+	// relay's current ingress host.
+	if _, err := db.SQL().Exec(`UPDATE mcp_publications SET external_host='old.example.org' WHERE route_id=?`, routeID); err != nil {
+		t.Fatal(err)
+	}
+	code, body = getKeyPublication(t, s, owner, "key-test", routeID)
+	if code != http.StatusOK {
+		t.Fatalf("mismatched host diagnostic: status=%d body=%s", code, body)
+	}
+	var mismatch map[string]any
+	if err := json.Unmarshal([]byte(body), &mismatch); err != nil {
+		t.Fatal(err)
+	}
+	if mismatch["host_binding"] != "MISMATCH" || mismatch["admission"] != "BLOCKED" ||
+		mismatch["admission_reason"] != "HOST_MISMATCH" || mismatch["url"] != nil {
+		t.Fatalf("host mismatch advertised an unusable URL: %s", body)
 	}
 }
 

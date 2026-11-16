@@ -13,7 +13,7 @@ The Ocliv control adapter, publisher controller, approvals, and their tests run 
 | `get-ocliv-status` | Read actual Ocliv management status | `ocliv:read` |
 | `list-publications` | Read endpoint list, render an inline React view | `ocliv:read` |
 | `verify-publication` | Real MCP initialize, initialized, tools/list handshake; no fake green status | `ocliv:read` |
-| `request-approval` | Issue a single-use approval ID for publish, stop, or unpublish; the approval code stays in the operator-private channel | `ocliv:write` |
+| `request-approval` | Create an `AWAITING_OPERATOR` request; only the owner-only local approval socket can approve or deny it | `ocliv:write` |
 | `publish-service` | Publish or reattach an allowlisted loopback service | `ocliv:write` plus approval |
 | `resume-service` | Restart a stopped publisher and rebind its retained route identity | `ocliv:write` plus approval |
 | `stop-service` | Gracefully stop its publisher and retain the route offline | `ocliv:write` plus approval |
@@ -28,6 +28,13 @@ can select only one of those entries. `OCLIV_PROFILE` may select the named
 enrollment profile used by spawned publishers. A stop closes the lease and
 keeps the stable route offline; resume republishes the same owner/name
 identity. Unpublish is the separate destructive action.
+
+Write tools remain disabled unless `OCLIV_WRITE_ENABLED=true` and
+`OCLIV_APPROVAL_SOCKET` names a local Unix socket. Review requests with
+`node src/operator-approval-cli.mjs list`, then approve or deny the exact ID
+with the same CLI. The socket is mode `0600`; decisions and credentials never
+pass through MCP tool arguments. The MCP surface exposes request IDs and
+status only.
 
 ## Build and run on a hosted development environment
 
@@ -44,7 +51,7 @@ npm run dev                    # local DevTools; localhost:3000/mcp
 npm run deploy                 # Alpic CLI authorization + hosted deployment required
 ```
 
-Before running, set `SERVER_URL`, `OCLIV_OAUTH_ISSUER`, `OCLIV_OAUTH_AUDIENCE`, `OCLIV_ALLOWED_SUBJECTS`, `OCLIV_CONTROL_URL`, `OCLIV_CONTROL_TOKEN`, every `OCLIV_*_PATH`, and `OCLIV_PUBLIC_HOSTS`. Enable `OCLIV_WRITE_ENABLED=true` only after staging qualification. On Alpic, set these as **server-side environment secrets**, not frontend variables. **Never reuse the Ocliv management token as the public MCP probe token.**
+Before running, set `SERVER_URL` to the Skybridge app origin, `OCLIV_PUBLIC_RESOURCE_URL` and `OCLIV_OAUTH_AUDIENCE` to the exact published route URL, plus `OCLIV_OAUTH_ISSUER`, `OCLIV_ALLOWED_SUBJECTS`, `OCLIV_RELAY_URL`, and the publisher key settings. Enable `OCLIV_WRITE_ENABLED=true` only after staging qualification. On Alpic, set these as **server-side environment secrets**, not frontend variables. **Never reuse the Ocliv management key as a public MCP probe token.**
 
 Important: `OCLIV_CONTROL_URL` is the HTTPS origin of Ocliv's management API. It is **not** a published `/r/.../mcp` tool endpoint. That published endpoint is what `verify-publication` can probe, if returned by the management API and in the exact hostname allowlist.
 

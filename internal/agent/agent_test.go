@@ -324,6 +324,73 @@ func TestServeLeavesNoWaiterPerSession(t *testing.T) {
 	}
 }
 
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return fn(r) }
+
+func TestYamuxSessionCloseCancelsUpstreamHTTP(t *testing.T) {
+	started := make(chan struct{}, 1)
+	canceled := make(chan struct{}, 1)
+	rt := roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		started <- struct{}{}
+		<-r.Context().Done()
+		canceled <- struct{}{}
+		return nil, r.Context().Err()
+	})
+	rn := &Runner{
+		Target: "127.0.0.1:8765",
+		Cfg:    config.Agent{Port: 8765},
+		HTTP:   &http.Client{Transport: rt},
+	}
+	left, right := net.Pipe()
+	serverSession, err := yamux.Server(right, yamux.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientSession, err := yamux.Client(left, yamux.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientSession.Close()
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- rn.serve(context.Background(), serverSession, Attached{LeaseID: "lse-session", Generation: 7})
+	}()
+	stream, err := clientSession.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := protocol.MarshalJSON(protocol.RequestHead{
+		Type: "request_head", LeaseID: "lse-session", Generation: 7,
+		Method: http.MethodGet, Path: "/mcp", Headers: map[string]string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := protocol.WriteFrame(stream, protocol.FRequestHead, head); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("upstream request never started")
+	}
+	if err := clientSession.Close(); err != nil {
+		t.Fatalf("close relay yamux session: %v", err)
+	}
+	select {
+	case err := <-serveDone:
+		t.Logf("agent serve exited after relay disconnect: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("agent AcceptStream did not observe relay session close")
+	}
+	select {
+	case <-canceled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("yamux close did not cancel upstream HTTP request")
+	}
+}
+
 // Two independent tunnels under one account must not clobber each other:
 // saving lease B must leave lease A resumable by its own identity, and a
 // changed deployment identity (port, mode, relay) must not resume the

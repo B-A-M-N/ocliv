@@ -35,10 +35,19 @@
 	}
 
 	reverse_proxy 127.0.0.1:8080 {
+		# MCP Streamable HTTP may hold SSE responses open. Flush each
+		# upstream write and leave request/response bodies unbuffered.
+		flush_interval -1
+		transport http {
+			dial_timeout 10s
+			read_timeout 0s
+			write_timeout 0s
+		}
+		header_up Host {host}
 		# Overwrite: the relay treats the rightmost entry as the
 		# client IP only from a loopback peer.
 		header_up X-Forwarded-For {remote_host}
-		header_up X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-Proto https
 		# Strip anything the visitor smuggled in: routing reads r.Host,
 		# never a forwarded host label.
 		header_up -X-Forwarded-Host

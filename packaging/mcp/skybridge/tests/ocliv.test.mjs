@@ -147,5 +147,6 @@ test('PRM server-root form matches relay discovery contract',()=>{
   assert.deepEqual(doc.authorization_servers,['https://idp.example/']);
   assert.deepEqual(doc.scopes_supported,['ocliv:read','ocliv:write']);
   assert.throws(()=>buildPrMetadata({resource:'http://x/mcp',issuer:'https://idp.example/',scopes:['ocliv:read']}));
+  assert.throws(()=>buildPrMetadata({resource:'https://relay.example/mcp',issuer:'https://idp.example/',scopes:['ocliv:read']}));
   assert.throws(()=>buildPrMetadata({resource:'https://relay.example/r/abc/mcp',issuer:'https://idp.example/',scopes:[]}));
 });

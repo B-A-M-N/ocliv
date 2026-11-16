@@ -1,7 +1,7 @@
 # Management MCP: identity provider requirements ($0 path)
 
 Skybridge (`src/server.ts`) refuses to start without `OCLIV_OAUTH_ISSUER`,
-`OCLIV_OAUTH_AUDIENCE`, and `SERVER_URL` (all HTTPS). Token verification is
+`OCLIV_OAUTH_AUDIENCE`, `SERVER_URL`, and `OCLIV_PUBLIC_RESOURCE_URL` (all HTTPS). Token verification is
 JWKS-only (`node_modules/skybridge/dist/server/auth/verify.js` via
 `createJwksVerifier`). There is no password, static-token, or HS256 mode,
 and adding one would weaken the boundary the server exists to enforce.
@@ -22,7 +22,7 @@ and adding one would weaken the boundary the server exists to enforce.
 
 1. Public HTTPS issuer with OIDC/OAuth discovery serving `jwks_uri`.
 2. Asymmetric JWT signatures (RS256/ES256). No shared-secret mode exists.
-3. `aud` bindable to the Skybridge public URL (`OCLIV_OAUTH_AUDIENCE`).
+3. `aud` bindable to the exact Ocliv-published MCP route URL (`OCLIV_OAUTH_AUDIENCE`).
 4. Custom scopes mintable: `ocliv:read` and `ocliv:write` (scope-gated per
    tool in `src/core/ocliv.mjs:authorize`, unit-tested). Consumer-Google-style
    issuers that only mint their own scopes are incompatible without a code
@@ -85,11 +85,11 @@ and adding one would weaken the boundary the server exists to enforce.
 
 ## Then the publisher host does alone (no further operator steps)
 
-1. Set `OCLIV_OAUTH_ISSUER/AUDIENCE/SERVER_URL` (SERVER_URL placeholder OK).
+1. Set `OCLIV_OAUTH_ISSUER`, `SERVER_URL` (Skybridge app origin), and the exact route resource/audience after the publication URL is known.
 2. `ocliv mcp publish --local http://127.0.0.1:PORT/mcp --auth
    upstream-oauth --name ocliv-mgmt` → learn stable route URL (route IDs are
    stable per host/profile/name; republish keeps the ID).
-3. Set `SERVER_URL` to the route URL, restart Skybridge, republish.
+3. Set `OCLIV_PUBLIC_RESOURCE_URL` and `OCLIV_OAUTH_AUDIENCE` to the exact published route URL, restart Skybridge, then publish or rebind so strict discovery reads the updated metadata. `SERVER_URL` remains the Skybridge app/listener origin.
 4. Verify public discovery → JWKS → auth → initialize/tools/list/read-only
    calls; deliver the ChatGPT URL + Default `ocliv:read`, Base empty,
    `offline_access` only if refresh is wanted.

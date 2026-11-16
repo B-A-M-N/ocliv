@@ -21,7 +21,7 @@ import { createPrivateKey, createPublicKey, sign, randomBytes, createHash } from
 import { statSync, readFileSync } from 'node:fs';
 
 export class NativeError extends Error {
-  constructor(code, message) { super(message); this.code = code; }
+  constructor(code, message, diagnostics = null) { super(message); this.code = code; this.diagnostics = diagnostics; }
 }
 
 function required(name, env) {
@@ -222,32 +222,87 @@ export async function readCappedJson(response, what, cap = 65536) {
   try { return JSON.parse(text); } catch { throw new NativeError('DISCOVERY_MALFORMED', `${what} is not JSON`); }
 }
 
+async function readMcpRpc(response, expectedID, method) {
+  const type = (response.headers?.get?.('content-type') ?? '').split(';', 1)[0].trim().toLowerCase();
+  const raw = await readCappedBody(response, `${method} response`);
+  let docs;
+  if (type === 'application/json') {
+    try { docs = [JSON.parse(raw)]; } catch { throw new NativeError('MCP_CONTRACT', `${method}: response is not JSON`); }
+  } else if (type === 'text/event-stream') {
+    docs = [];
+    for (const event of raw.split(/\r?\n\r?\n/)) {
+      const data = event.split(/\r?\n/).filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trimStart()).join('\n');
+      if (!data || data === '[DONE]') continue;
+      try { docs.push(JSON.parse(data)); } catch { throw new NativeError('MCP_CONTRACT', `${method}: SSE event is not JSON`); }
+    }
+  } else {
+    throw new NativeError('MCP_CONTRACT', `${method}: unsupported response content type`);
+  }
+  const doc = docs.find((item) => item && item.id === expectedID);
+  if (!doc) throw new NativeError('MCP_CONTRACT', `${method}: response has no matching JSON-RPC id`);
+  return doc;
+}
+
 function cleanPublication(p) {
   if (!p || typeof p !== 'object') throw new NativeError('UPSTREAM_CONTRACT', 'Invalid publication record from relay');
   const id = p.route_id;
   if (typeof id !== 'string' || !ROUTE_ID.test(id)) throw new NativeError('UPSTREAM_CONTRACT', 'Invalid route_id from relay');
-  // The publication's own external_host is authoritative for the public
-  // URL: the relay control hostname and the MCP ingress hostname may
-  // differ (--mcp-host). Never substitute the control host.
+  if (!Object.hasOwn(p, 'url')) {
+    throw new NativeError('RELAY_UPGRADE_REQUIRED', 'Relay publication inventory lacks canonical URL and admission diagnostics');
+  }
+  // The relay supplies the canonical URL, including a configured
+  // nonstandard ingress port. Never reconstruct it from the control host.
   const host = p.external_host;
   if (typeof host !== 'string' || !/^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/.test(host)) {
     throw new NativeError('UPSTREAM_CONTRACT', 'Invalid external_host from relay');
   }
-  let state = 'active';
-  if (p.revoked_at != null) state = 'revoked';
-  else if (p.verified_at == null) state = 'pending';
+  let publicUrl = null;
+  if (typeof p.url === 'string' && p.url !== '') {
+    let route;
+    try { route = new URL(p.url); } catch { throw new NativeError('UPSTREAM_CONTRACT', 'Invalid canonical publication URL from relay'); }
+    if (route.protocol !== 'https:' || route.username || route.password || route.search || route.hash ||
+        route.pathname !== `/r/${id}/mcp` || route.hostname !== host.toLowerCase()) {
+      throw new NativeError('UPSTREAM_CONTRACT', 'Canonical publication URL does not match its route identity');
+    }
+    publicUrl = route.toString();
+  } else if (p.host_binding !== 'MISMATCH' && p.admission_reason !== 'PUBLICATION_NOT_FOUND') {
+    throw new NativeError('UPSTREAM_CONTRACT', 'Relay omitted a URL without reporting a host mismatch');
+  }
+  let state = 'unknown';
+  if (p.publication_state === 'VERIFIED') state = 'active';
+  else if (p.publication_state === 'PENDING') state = 'pending';
+  else if (p.publication_state === 'REVOKED') state = 'revoked';
+  else if (p.publication_state === 'MISSING') state = 'missing';
   return {
     id,
     label: typeof p.pub_name === 'string' ? p.pub_name.slice(0, 120) : '',
     profile: typeof p.profile === 'string' ? p.profile.slice(0, 48) : 'unknown',
     state, // durable publication state, NOT tunnel liveness
-    // Lease/session reachability is relay-observed and deliberately
-    // separate from durable state: active ≠ reachable. Absent fields
-    // (older relays) surface as null, never as healthy.
+    publicationState: typeof p.publication_state === 'string' ? p.publication_state : 'UNKNOWN',
     leaseState: typeof p.lease_state === 'string' ? p.lease_state.slice(0, 32) : null,
-    sessionLive: p.session_live === true,
-    publicUrl: `https://${host}/r/${id}/mcp`,
+    sessionLive: typeof p.session_live === 'boolean' ? p.session_live : null,
+    hostBinding: typeof p.host_binding === 'string' ? p.host_binding : 'UNKNOWN',
+    admission: typeof p.admission === 'string' ? p.admission : 'UNKNOWN',
+    admissionReason: typeof p.admission_reason === 'string' ? p.admission_reason : 'UNKNOWN',
+    publicUrl,
     leaseId: typeof p.lease_id === 'string' ? p.lease_id : null,
+  };
+}
+
+function legacyPublicationDiagnostic(p) {
+  const id = typeof p?.route_id === 'string' && ROUTE_ID.test(p.route_id) ? p.route_id : null;
+  const state = p?.revoked_at != null ? 'REVOKED' : p?.verified_at != null ? 'VERIFIED' : 'UNKNOWN';
+  return {
+    id,
+    label: typeof p?.pub_name === 'string' ? p.pub_name.slice(0, 120) : '',
+    profile: typeof p?.profile === 'string' ? p.profile.slice(0, 48) : 'unknown',
+    publicationState: state,
+    leaseState: typeof p?.lease_state === 'string' ? p.lease_state.slice(0, 32) : null,
+    sessionLive: typeof p?.session_live === 'boolean' ? p.session_live : null,
+    hostBinding: typeof p?.host_binding === 'string' ? p.host_binding : 'UNKNOWN',
+    admission: 'UNKNOWN',
+    admissionReason: 'RELAY_UPGRADE_REQUIRED',
+    publicUrl: null,
   };
 }
 
@@ -277,6 +332,9 @@ export class NativeOclivClient {
       throw new NativeError('UPSTREAM_UNAVAILABLE', 'Relay management endpoint is unreachable');
     }
     if (response.status >= 300 && response.status < 400) throw new NativeError('UPSTREAM_REDIRECT', 'Relay redirected unexpectedly');
+    if (response.status === 405 && method === 'GET' && path !== '/v1/agent/mcp-routes') {
+      throw new NativeError('RELAY_UPGRADE_REQUIRED', 'Relay does not support authenticated publication diagnostics');
+    }
     if (response.status === 401 || response.status === 403) throw new NativeError('UPSTREAM_AUTH', 'Relay rejected the agent key (revoked, suspended, or unknown)');
     if (!response.ok) throw new NativeError('UPSTREAM_FAILURE', `Relay management returned HTTP ${response.status}`);
     const text = await readCappedBody(response, 'Relay management response', 262144, 'UPSTREAM_CONTRACT');
@@ -287,16 +345,27 @@ export class NativeOclivClient {
   async list() {
     const body = await this.request('GET', '/v1/agent/mcp-routes');
     if (!body || !Array.isArray(body.publications)) throw new NativeError('UPSTREAM_CONTRACT', 'Expected {publications:[...]} from relay');
+    if (body.publications.some((p) => !p || typeof p !== 'object' || typeof p.route_id !== 'string' || !ROUTE_ID.test(p.route_id))) {
+      throw new NativeError('UPSTREAM_CONTRACT', 'Invalid publication identity in relay inventory');
+    }
+    const requiredDiagnostics = ['url', 'publication_state', 'lease_state', 'session_live', 'host_binding', 'admission', 'admission_reason'];
+    if (body.publications.some((p) => requiredDiagnostics.some((field) => !Object.hasOwn(p, field)))) {
+      throw new NativeError(
+        'RELAY_UPGRADE_REQUIRED',
+        'Relay needs an upgrade to report canonical URLs and authenticated admission diagnostics',
+        body.publications.slice(0, 1000).map(legacyPublicationDiagnostic),
+      );
+    }
     return body.publications.map((p) => cleanPublication(p));
   }
 
-  /** Get one publication by exact route ID (filter of the owned list). */
+  /** Get one publication by exact route ID with authenticated admission state. */
   async get(id) {
     if (!ROUTE_ID.test(id)) throw new NativeError('INVALID_ID', 'Unknown publication id');
-    const pubs = await this.list();
-    const found = pubs.find((p) => p.id === id);
-    if (!found) throw new NativeError('NOT_FOUND', 'No owned publication with that id');
-    return found;
+    const publications = await this.list();
+    const publication = publications.find((p) => p.id === id);
+    if (!publication) throw new NativeError('NOT_FOUND', 'Publication not found in this publisher identity');
+    return publication;
   }
 
   /** Read-only status: relay reachability + durable publication states.
@@ -309,10 +378,14 @@ export class NativeOclivClient {
     } catch { relayReachable = false; }
     let publications = [];
     let listError = null;
-    try { publications = await this.list(); } catch (e) { listError = e.code || 'LIST_FAILED'; }
+    let listDiagnostics = null;
+    try { publications = await this.list(); } catch (e) {
+      listError = e.code || 'LIST_FAILED';
+      listDiagnostics = Array.isArray(e.diagnostics) ? e.diagnostics : null;
+    }
     const byState = {};
     for (const p of publications) byState[p.state] = (byState[p.state] || 0) + 1;
-    return { relay: this.c.relay, relayReachable, publications: byState, listError };
+    return { relay: this.c.relay, relayReachable, publications: byState, listError, listDiagnostics };
   }
 
   /** Verify a publication's public OAuth+MCP surface with the real
@@ -384,7 +457,7 @@ export class NativeOclivClient {
     try {
       const r = await this.fetch(pub.publicUrl, {
         method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(8000),
-        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
       });
       if (r.status !== 401) return fail('AUTH_BYPASS', `Unauthenticated tools/list answered HTTP ${r.status} (want 401)`);
@@ -403,13 +476,27 @@ export class NativeOclivClient {
     // Authenticated proof with a provisioned token: initialize →
     // notifications/initialized → tools/list, each JSON-RPC-validated
     // (exact id echo, result XOR error, correct envelope version).
-    const post = async (body, useToken) => {
-      const headers = { 'content-type': 'application/json', accept: 'application/json' };
+    let sessionID = null;
+    let protocolVersion = null;
+    const post = async (body, useToken, { initialize = false } = {}) => {
+      const headers = { 'content-type': 'application/json', accept: 'application/json, text/event-stream' };
       if (useToken) headers.authorization = `Bearer ${verifyToken}`;
+      if (!initialize && sessionID) headers['Mcp-Session-Id'] = sessionID;
+      if (!initialize && protocolVersion) headers['Mcp-Protocol-Version'] = protocolVersion;
       const r = await this.fetch(pub.publicUrl, {
         method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(8000), headers,
         body: JSON.stringify(body),
       });
+      const responseSession = r.headers?.get?.('Mcp-Session-Id') ?? null;
+      const responseProtocol = r.headers?.get?.('Mcp-Protocol-Version') ?? null;
+      if (initialize) {
+        sessionID = responseSession;
+      } else if (responseSession && responseSession !== sessionID) {
+        throw new NativeError('MCP_CONTRACT', 'MCP session identity changed during verification');
+      }
+      if (protocolVersion && responseProtocol && responseProtocol !== protocolVersion) {
+        throw new NativeError('MCP_CONTRACT', 'MCP protocol version changed during verification');
+      }
       return r;
     };
     const checkRpc = (doc, id, method) => {
@@ -427,19 +514,22 @@ export class NativeOclivClient {
       return doc.result;
     };
     try {
-      const rInit = await post({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2026-07-28', capabilities: {}, clientInfo: { name: 'ocliv-verify', version: '1' } } }, true);
+      const rInit = await post({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'ocliv-verify', version: '1' } } }, true, { initialize: true });
       if (rInit.status !== 200) throw new NativeError('MCP_DENIED', `Authenticated initialize answered HTTP ${rInit.status}`);
-      const initRes = checkRpc(await readCappedJson(rInit, 'initialize response'), 1, 'initialize');
+      const initRes = checkRpc(await readMcpRpc(rInit, 1, 'initialize'), 1, 'initialize');
       if (!initRes || typeof initRes.protocolVersion !== 'string') {
         throw new NativeError('MCP_CONTRACT', 'initialize did not negotiate a protocol version');
       }
+      protocolVersion = initRes.protocolVersion;
+      const initHeaderProtocol = rInit.headers?.get?.('Mcp-Protocol-Version') ?? null;
+      if (initHeaderProtocol && initHeaderProtocol !== protocolVersion) throw new NativeError('MCP_CONTRACT', 'initialize protocol header does not match negotiated version');
       const rNot = await post({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} }, true);
       if (![200, 202, 204].includes(rNot.status)) {
         throw new NativeError('MCP_CONTRACT', `notifications/initialized answered HTTP ${rNot.status} (want 200/202/204)`);
       }
       const rList = await post({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }, true);
       if (rList.status !== 200) throw new NativeError('MCP_DENIED', `Authenticated tools/list answered HTTP ${rList.status}`);
-      const listRes = checkRpc(await readCappedJson(rList, 'tools/list response'), 2, 'tools/list');
+      const listRes = checkRpc(await readMcpRpc(rList, 2, 'tools/list'), 2, 'tools/list');
       const tools = listRes && Array.isArray(listRes.tools) ? listRes.tools : null;
       if (!tools) throw new NativeError('MCP_CONTRACT', 'tools/list returned no tool array');
       return { id, publicUrl: pub.publicUrl, verified: true, protocolVersion: initRes.protocolVersion, tools: tools.map((t) => t.name) };

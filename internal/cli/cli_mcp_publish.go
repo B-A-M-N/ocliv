@@ -185,6 +185,57 @@ func proveRouteReady(cfg mcpPublishConfig, verify func() error, activate func() 
 	return false, nil
 }
 
+// publicationRecovery re-verifies a durable publication whenever the relay
+// reclaims its named lease onto a new attachment. Same-lease resumptions do
+// not clear verification; a changed lease must prove readiness and activate
+// before its stable route can serve again.
+type publicationRecovery struct {
+	relayURL   string
+	k          *identity.KeyPair
+	keyID      string
+	cfg        mcpPublishConfig
+	routeID    string
+	routeURL   string
+	boundLease string
+}
+
+func (r *publicationRecovery) onReattach(ra agent.Attached) {
+	if ra.LeaseID == "" || ra.LeaseID == r.boundLease {
+		return
+	}
+	verify := func() error {
+		if r.cfg.auth == "ocliv-managed" {
+			return nil // relay-managed OAuth has no upstream discovery document
+		}
+		durl, err := mcpRouteDiscoveryURL(r.routeURL, r.routeID)
+		if err != nil {
+			return err
+		}
+		client, err := mgmtHTTPClient(15 * time.Second)
+		if err != nil {
+			return fmt.Errorf("%w: unreadable OCLIV_CACERT bundle: %v", errDiscoveryUnreachable, err)
+		}
+		if err := validateMCPResourceMetadata(client, durl, r.routeURL); err != nil {
+			return err
+		}
+		aurl, err := mcpRouteASDiscoveryURL(r.routeURL, r.routeID)
+		if err != nil {
+			return err
+		}
+		expectIssuer := strings.TrimSuffix(r.routeURL, "/mcp") + "/oauth"
+		return validateMCPASMetadata(client, aurl, expectIssuer)
+	}
+	_, err := proveRouteReady(r.cfg, verify, func() (int, string) {
+		return activatePublishedRoute(r.relayURL, r.k, r.keyID, ra.LeaseID, r.routeID)
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: publication re-activation on lease %s failed; stable route remains unverified: %v\n", ra.LeaseID, err)
+		return
+	}
+	r.boundLease = ra.LeaseID
+	fmt.Fprintf(os.Stderr, "✓ Re-activated publication %s on reclaimed lease %s\n", r.routeID, ra.LeaseID)
+}
+
 // discoveryFailureFatal reports whether a discovery error must abort
 // publication (P0-B): invalid bindings always abort; unreachable
 // discovery aborts by default, where an unproven binding must never
@@ -727,35 +778,78 @@ func cmdMCPList(argv []string) int {
 	}
 	var list struct {
 		Publications []struct {
-			RouteID   string  `json:"route_id"`
-			Host      string  `json:"external_host"`
-			Profile   string  `json:"profile"`
-			Name      string  `json:"pub_name"`
-			LeaseID   *string `json:"lease_id"`
-			CreatedAt string  `json:"created_at"`
-			RevokedAt *string `json:"revoked_at"`
+			RouteID          string  `json:"route_id"`
+			Host             string  `json:"external_host"`
+			URL              *string `json:"url"`
+			Profile          string  `json:"profile"`
+			Name             string  `json:"pub_name"`
+			LeaseID          *string `json:"lease_id"`
+			CreatedAt        string  `json:"created_at"`
+			RevokedAt        *string `json:"revoked_at"`
+			VerifiedAt       *string `json:"verified_at"`
+			PublicationState string  `json:"publication_state"`
+			LeaseState       *string `json:"lease_state"`
+			SessionLive      *bool   `json:"session_live"`
+			HostBinding      string  `json:"host_binding"`
+			Admission        string  `json:"admission"`
+			AdmissionReason  string  `json:"admission_reason"`
 		} `json:"publications"`
 	}
 	if err := json.Unmarshal(body, &list); err != nil || list.Publications == nil {
 		fmt.Fprintln(os.Stderr, "mcp list: relay reply unparseable")
 		return apperr.ExitInternal
 	}
+	fmt.Printf("%-24s %-14s %-12s %-10s %-8s %-9s %-10s %-26s %s\n", "ROUTE ID", "PROFILE", "NAME", "PUBLICATION", "LEASE", "SESSION", "HOST", "ADMISSION", "URL")
 	shown := 0
 	for _, p := range list.Publications {
 		if name != "" && p.Name != name {
 			continue
 		}
-		state := "active"
-		if p.RevokedAt != nil {
-			state = "revoked"
+		pubState := p.PublicationState
+		if pubState == "" {
+			// An older relay does not provide the state fields required
+			// to distinguish publication health. Do not infer success.
+			pubState = "UNKNOWN"
+		}
+		lease := "UNKNOWN"
+		if p.LeaseState != nil {
+			lease = *p.LeaseState
 		} else if p.LeaseID == nil {
-			state = "unbound"
+			lease = "MISSING"
 		}
-		lease := "-"
-		if p.LeaseID != nil {
-			lease = *p.LeaseID
+		session := "UNKNOWN"
+		if p.SessionLive != nil {
+			if *p.SessionLive {
+				session = "ONLINE"
+			} else {
+				session = "OFFLINE"
+			}
 		}
-		fmt.Printf("%-24s %-12s %-16s %-10s %s\n", p.RouteID, p.Profile, p.Name, state, lease)
+		hostBinding := p.HostBinding
+		if hostBinding == "" {
+			hostBinding = "UNKNOWN"
+		}
+		admission := p.AdmissionReason
+		if p.Admission != "" && p.Admission != "READY" {
+			admission = p.Admission + ":" + admission
+		}
+		if admission == "" {
+			admission = "UNKNOWN"
+		}
+		publicURL := "unavailable"
+		if p.URL != nil && *p.URL != "" {
+			publicURL = *p.URL
+		}
+		if p.PublicationState == "" || p.HostBinding == "" {
+			fmt.Fprintf(os.Stderr, "mcp list: relay upgrade required for authoritative publication and admission state; row %s is diagnostic only\n", p.RouteID)
+		}
+		if p.LeaseID == nil {
+			lease = "MISSING"
+		} else if p.LeaseState == nil && p.PublicationState != "" {
+			lease = "UNKNOWN"
+		}
+		fmt.Printf("%-24s %-14s %-12s %-10s %-8s %-9s %-10s %-26s %s\n",
+			p.RouteID, p.Profile, p.Name, pubState, lease, session, hostBinding, admission, publicURL)
 		shown++
 	}
 	if shown == 0 {
@@ -819,6 +913,46 @@ func cmdMCPUnpublish(argv []string) int {
 		return apperr.ExitAuth
 	}
 	relayURL := agentRelayURL()
+	// A stable publication name is resolved from the authenticated durable
+	// inventory, not the local lease cache: shutdown deliberately removes
+	// that cache while retaining the publication for a later resume/revoke.
+	if routeID == "" && name != "" && leaseID == "" {
+		lstatus, lbody, lerr := mgmtCall(relayURL, k, keyID, http.MethodGet, "/v1/agent/mcp-routes")
+		if lerr != nil {
+			fmt.Fprintf(os.Stderr, "mcp revoke: publication lookup failed: %v\n", lerr)
+			return apperr.ExitRelayTLS
+		}
+		if lstatus != http.StatusOK {
+			fmt.Fprintf(os.Stderr, "mcp revoke: publication lookup failed (relay status %d): %s\n", lstatus, shortDetail(string(lbody)))
+			return apperr.ExitAuth
+		}
+		var inventory struct {
+			Publications []struct {
+				RouteID string `json:"route_id"`
+				Name    string `json:"pub_name"`
+			} `json:"publications"`
+		}
+		if err := json.Unmarshal(lbody, &inventory); err != nil || inventory.Publications == nil {
+			fmt.Fprintln(os.Stderr, "mcp revoke: publication inventory unparseable")
+			return apperr.ExitInternal
+		}
+		var matches []string
+		for _, p := range inventory.Publications {
+			if p.Name == name && p.RouteID != "" {
+				matches = append(matches, p.RouteID)
+			}
+		}
+		if len(matches) == 0 {
+			fmt.Fprintf(os.Stderr, "mcp revoke: no publication named %q belongs to this key\n", name)
+			return apperr.ExitCLIValidation
+		}
+		if len(matches) != 1 {
+			fmt.Fprintf(os.Stderr, "mcp revoke: publication name %q is ambiguous across %d routes; use --publication-id ID\n", name, len(matches))
+			return apperr.ExitCLIValidation
+		}
+		routeID = matches[0]
+		name = "" // now operating on the exact durable publication ID
+	}
 	// Publication-identity path (P0-D): revoke exactly one owned
 	// publication by route ID. No lease resolution, no lease close —
 	// the publication outlives leases by design, and sibling
@@ -1267,7 +1401,21 @@ func runMCPPublish(argv []string, serve bool) int {
 	// attempted here; permanent removal is explicit via
 	// `ocliv mcp unpublish`. The exit code reflects unconfirmed
 	// remote cleanup (P1-8).
-	a, scode := runSteadyState(ctx, ready, live, a)
+	var recovery *publicationRecovery
+	var onReattach func(agent.Attached)
+	if routeID != "" {
+		recovery = &publicationRecovery{
+			relayURL: relayURL, k: k, keyID: keyID, cfg: cfg,
+			routeID: routeID, routeURL: routeURL, boundLease: routeLeaseID,
+		}
+		onReattach = func(ra agent.Attached) {
+			recovery.onReattach(ra)
+			if recovery.boundLease == ra.LeaseID {
+				routeLeaseID = ra.LeaseID
+			}
+		}
+	}
+	a, scode := runSteadyState(ctx, ready, live, a, onReattach)
 	res := CleanupResult{RouteDeleteStatus: -1}
 	if !serve && routeID != "" {
 		fmt.Printf("publication retained (offline until republished): %s\n", routeURL)
@@ -1531,6 +1679,41 @@ func cmdMCPDoctor(argv []string) int {
 	out := runMCPProbe(target, st.AccessMode)
 	fmt.Printf("mcp protocol: %s\n", out.Summary)
 	fmt.Printf("mcp auth: %s\n", doctorAuthLine(st.AccessMode, out.Auth))
+	publicOK := true
+	if routesOK {
+		for _, route := range rl.Routes {
+			if route.State != "active" {
+				continue
+			}
+			if st.Status != "ACTIVE" || !st.RouteLive {
+				fmt.Printf("public MCP route %s: offline (relay lease/session is not active)\n", route.RouteID)
+				publicOK = false
+				continue
+			}
+			if route.URL == "" {
+				fmt.Printf("public MCP route %s: unknown (relay did not report a canonical URL)\n", route.RouteID)
+				publicOK = false
+				continue
+			}
+			discoveryURL, derr := mcpRouteDiscoveryURL(route.URL, route.RouteID)
+			if derr == nil {
+				var publicClient *http.Client
+				publicClient, derr = mgmtHTTPClient(8 * time.Second)
+				if derr == nil {
+					derr = validateMCPResourceMetadata(publicClient, discoveryURL, route.URL)
+				}
+			}
+			if derr != nil {
+				fmt.Printf("public MCP route %s: not verified from this network (%v); if local Caddy works, check hairpin NAT and verify from off-LAN\n", route.RouteID, derr)
+				publicOK = false
+			} else {
+				fmt.Printf("public MCP route %s: verified_at present; lease ACTIVE/live; protected-resource metadata matches %s\n", route.RouteID, route.URL)
+			}
+		}
+	}
 	fmt.Println("chatgpt registration: EXTERNAL_UNVERIFIED (register the exact public URL in ChatGPT after external qualification)")
+	if !publicOK {
+		return apperr.ExitRelayTLS
+	}
 	return doctorProtocolExit(st.AccessMode, out.Verified)
 }

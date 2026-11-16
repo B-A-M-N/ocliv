@@ -47,11 +47,20 @@ Copy the resulting `ocliv-chatgpt-plugin.zip` to
 
 ## Registering in ChatGPT (operator browser action)
 
+The `/r/<route-id>/mcp` URL is an MCP protocol endpoint, not a web page.
+Opening it in a browser or asking ChatGPT to browse to it does not register
+or test an MCP connection; a browser's website/error page is not connector
+acceptance. Register it only through ChatGPT's custom MCP server flow, after
+the public route has passed the ingress and off-LAN checks above.
+
+Current plan availability is documented in
+[ChatGPT custom MCP availability and permissions](https://help.openai.com/en/articles/12584461-connecting-custom-mcp-servers-in-chatgpt): Business and Enterprise/Edu support custom MCP creation with the required workspace permissions; Pro is limited to read/fetch; Plus/personal accounts do not have custom MCP server creation. This account/workspace permission block is separate from Ocliv endpoint health.
+
 Custom MCP creation requires a Business or Enterprise/Edu workspace
 with admin/owner rights (Plus/personal accounts have no such option —
-that is a permission block, not an Ocliv defect). Settings depend on
-which route you register — the two live routes use different
-authorization servers and scopes (verified live 2026-11-02):
+that is a permission block, not an Ocliv defect). The examples below are
+historical lab routes, not current production endpoints; their distinct
+authorization settings were verified live on 2026-11-02:
 
 **Fixture route** (`.../r/ZyTjyKtv8cWzCILrqcaaVg/mcp`, lab OAuth test
 server): OAuth, Default scopes `mcp:tools`, check `offline_access`,

@@ -10,7 +10,7 @@
  * revocation as UNKNOWN — never as success.
  */
 import { spawn } from 'node:child_process';
-import { constants as fsConstants, accessSync, chmodSync, readFileSync, writeFileSync, renameSync, unlinkSync, mkdirSync } from 'node:fs';
+import { constants as fsConstants, accessSync, chmodSync, lstatSync, readFileSync, writeFileSync, renameSync, unlinkSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 
@@ -46,7 +46,27 @@ export function parseService(raw) {
   if (raw.auth !== 'upstream-oauth' && raw.auth !== 'ocliv-managed') {
     throw new PublisherError('INVALID_SERVICE', 'Service auth must explicitly be upstream-oauth or ocliv-managed');
   }
-  return { name: raw.name, localUrl: `${u.protocol}//${u.host}/mcp`, resourceFile: raw.resourceFile, auth: raw.auth };
+  if (raw.auth === 'ocliv-managed' && (raw.resourceFile !== undefined || raw.upstreamTokenFile !== undefined)) {
+    throw new PublisherError('INVALID_SERVICE', 'resourceFile and upstreamTokenFile are only valid with upstream-oauth');
+  }
+  if (raw.upstreamTokenFile !== undefined &&
+      (typeof raw.upstreamTokenFile !== 'string' || !raw.upstreamTokenFile.startsWith('/') || raw.upstreamTokenFile.includes('\0'))) {
+    throw new PublisherError('INVALID_SERVICE', 'upstreamTokenFile must be an absolute local path');
+  }
+  return { name: raw.name, localUrl: `${u.protocol}//${u.host}/mcp`, resourceFile: raw.resourceFile, upstreamTokenFile: raw.upstreamTokenFile, auth: raw.auth };
+}
+
+function readUpstreamToken(path) {
+  if (!path) return null;
+  let st;
+  try { st = lstatSync(path); } catch { throw new PublisherError('INVALID_CONFIG', 'Configured upstream credential is unavailable'); }
+  if (!st.isFile() || (st.mode & 0o077) !== 0) {
+    throw new PublisherError('INVALID_CONFIG', 'Configured upstream credential must be a regular owner-only file');
+  }
+  let token;
+  try { token = readFileSync(path, 'utf8').trim(); } catch { throw new PublisherError('INVALID_CONFIG', 'Configured upstream credential is unavailable'); }
+  if (!token || /[\r\n]/.test(token)) throw new PublisherError('INVALID_CONFIG', 'Configured upstream credential is empty or malformed');
+  return token;
 }
 
 export function loadPublisherConfig(env = process.env) {
@@ -115,7 +135,7 @@ export class PublisherController extends EventEmitter {
     try {
       r = await this.fetchImpl(routeUrl, {
         method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(timeoutMs),
-        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
       });
     } catch {
@@ -298,8 +318,10 @@ export class PublisherController extends EventEmitter {
       // Stale attachment retired; continue to fresh publish.
     }
     const args = ['mcp', 'publish', '--local', svc.localUrl, '--auth', svc.auth, '--name', name];
-    if (svc.resourceFile) args.push('--resource-file', svc.resourceFile);
+    if (svc.auth === 'upstream-oauth' && svc.resourceFile) args.push('--resource-file', svc.resourceFile);
     const childEnv = { HOME: this.c.home, PATH: '/usr/bin:/bin' };
+    const upstreamToken = svc.auth === 'upstream-oauth' ? readUpstreamToken(svc.upstreamTokenFile) : null;
+    if (upstreamToken) childEnv.OCLIV_UPSTREAM_MCP_TOKEN = upstreamToken;
     if (process.env.OCLIV_CACERT) childEnv.OCLIV_CACERT = process.env.OCLIV_CACERT;
     if (process.env.OCLIV_PROFILE) childEnv.OCLIV_PROFILE = process.env.OCLIV_PROFILE;
     const child = this.spawnImpl(this.c.bin, args, { env: childEnv, cwd: this.c.home, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -312,8 +334,9 @@ export class PublisherController extends EventEmitter {
     // complete lines are scanned so a route URL split across two writes
     // is still observed exactly once.
     const scan = (line) => {
-      if (rec.log.push(line) > 200) rec.log.shift();
-      const m = line.match(ROUTE_URL);
+      const safeLine = upstreamToken ? line.split(upstreamToken).join('[redacted]') : line;
+      if (rec.log.push(safeLine) > 200) rec.log.shift();
+      const m = safeLine.match(ROUTE_URL);
       // Adopt only a structurally exact route URL: userinfo, query,
       // fragment, or non-https output never becomes the route.
       if (m && !rec.routeUrl) {

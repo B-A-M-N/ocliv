@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"ocliv/internal/agent"
 	"ocliv/internal/apperr"
 	"ocliv/internal/config"
 	"ocliv/internal/identity"
@@ -323,6 +324,67 @@ func TestMCPPublishFullCycleRetainsRouteAndClosesLease(t *testing.T) {
 	}
 	if bound != flowLeaseID(t, db, "flowtest.t.example.test") {
 		t.Fatalf("retained publication bound to %q, want the closed lease", bound)
+	}
+}
+
+// Lease expiry recovery rebinds a retained managed route to the replacement
+// lease and explicitly re-activates it before the publisher reports recovery.
+func TestMCPPublishRecoversAfterLeaseReclaim(t *testing.T) {
+	home := t.TempDir()
+	db, relayURL := publishFlowRelay(t, "mcp.example.test")
+	k, keyID, err := publishFlowKey(t, home, relayURL, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := time.Now().UTC().Format(time.RFC3339Nano)
+	insertLease := func(id string) {
+		t.Helper()
+		_, err := db.SQL().Exec(`INSERT INTO leases(id,tenant_id,agent_key_id,hostname,label,port,access_mode,generation,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+			id, "tenant-test", keyID, id+".t.example.test", "reclaim-flow", 8765, mcpAccessMode("upstream-oauth"), 1, "ACTIVE", created)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertLease("lse-reclaim-old")
+	status, body, err := mgmtCall(relayURL, k, keyID, http.MethodPost, "/v1/agent/lease/lse-reclaim-old/mcp-route/upstream-oauth")
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("initial register status=%d err=%v body=%s", status, err, body)
+	}
+	var route struct {
+		RouteID string `json:"route_id"`
+		URL     string `json:"url"`
+	}
+	if err := json.Unmarshal(body, &route); err != nil || route.RouteID == "" {
+		t.Fatalf("initial route reply=%s err=%v", body, err)
+	}
+	if _, err := db.SQL().Exec(`UPDATE leases SET status='EXPIRED' WHERE id='lse-reclaim-old'`); err != nil {
+		t.Fatal(err)
+	}
+	insertLease("lse-reclaim-new")
+	status, body, err = mgmtCall(relayURL, k, keyID, http.MethodPost, "/v1/agent/lease/lse-reclaim-new/mcp-route/upstream-oauth")
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("rebind status=%d err=%v body=%s", status, err, body)
+	}
+	var rebound struct {
+		RouteID string `json:"route_id"`
+		Created bool   `json:"created"`
+	}
+	if err := json.Unmarshal(body, &rebound); err != nil || rebound.RouteID != route.RouteID || rebound.Created {
+		t.Fatalf("rebind=%s err=%v; want same existing route", body, err)
+	}
+	var verified *string
+	if err := db.SQL().QueryRow(`SELECT verified_at FROM mcp_publications WHERE route_id=?`, route.RouteID).Scan(&verified); err != nil || verified != nil {
+		t.Fatalf("rebind must clear verified_at pending publisher recovery: verified=%v err=%v", verified, err)
+	}
+	recovery := &publicationRecovery{relayURL: relayURL, k: k, keyID: keyID,
+		cfg: mcpPublishConfig{auth: "upstream-oauth", devAllowUnverified: true}, routeID: route.RouteID, routeURL: route.URL, boundLease: "lse-reclaim-old"}
+	recovery.onReattach(agent.Attached{LeaseID: "lse-reclaim-new"})
+	var bound string
+	if err := db.SQL().QueryRow(`SELECT lease_id, verified_at FROM mcp_publications WHERE route_id=?`, route.RouteID).Scan(&bound, &verified); err != nil {
+		t.Fatal(err)
+	}
+	if bound != "lse-reclaim-new" || verified == nil {
+		t.Fatalf("recovery left route unready: lease=%q verified=%v", bound, verified)
 	}
 }
 
@@ -772,8 +834,13 @@ func TestMCPUnpublishByPublicationIDIsolatesSiblings(t *testing.T) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	if code := cmdMCPList(nil); code != apperr.ExitOK {
+	var listCode int
+	listOutput := captureOutput(t, func() { listCode = cmdMCPList(nil) })
+	if code := listCode; code != apperr.ExitOK {
 		t.Fatalf("mcp list exit=%d, want 0", code)
+	}
+	if !strings.Contains(listOutput, "https://mcp.example.test/r/") || !strings.Contains(listOutput, "/mcp") {
+		t.Fatalf("mcp list omitted canonical publication URL: %q", listOutput)
 	}
 	if code := cmdMCPList([]string{"--name", "siba"}); code != apperr.ExitOK {
 		t.Fatalf("mcp list --name siba exit=%d, want 0", code)

@@ -17,13 +17,9 @@ The assistant can turn an instruction such as "show my published MCP servers and
 - `list-publications` (read-only; `list-publications.tsx` view)
 - `get-publication` (read-only, exact route ID)
 - `verify-publication` (read-only, public network contact)
-- `request-approval` / `list-approvals` (single-use human-approval grants; metadata only in listings, never codes)
-- `publish-service` / `unpublish-service` (require redeemed approval + OCLIV_WRITE_ENABLED=true; disabled by default)
-- Approval trust note: the code is returned in the tool result, which the
-  model can read — so the gate is operator visibility in the chat transcript
-  (human sees each request and can stop it) plus single-use action binding,
-  scope gating, allowlist, and default-off writes. It is an audit/consent
-  trail, not out-of-band human consent.
+- `request-approval` (creates an AWAITING_OPERATOR request; owner-only local Unix socket lists and decides; no decision secret or approval code is model-visible)
+- `publish-service` / `resume-service` / `stop-service` / `unpublish-service` (require matching redeemed approval + `OCLIV_WRITE_ENABLED=true`; disabled by default)
+- Approval trust note: local operator socket status is REQUESTED/AWAITING_OPERATOR, APPROVED, DENIED, EXPIRED, or REDEEMED. Write tools accept only the request ID; the model cannot approve it. Writes require both OCLIV_WRITE_ENABLED=true and OCLIV_APPROVAL_SOCKET.
 
 ## Security / authority boundaries
 1. MCP caller → OAuth JWT with issuer, audience, scopes, **operator subject allowlist**. No anonymous management tools.
@@ -44,7 +40,7 @@ relay through the public Funnel edge (2026-11-02).
 | Operation | HTTP method | Required response |
 |---|---|---|
 | Status | local composition (relay reachability + list) | `{ relay, relayReachable, publications: {active,pending,revoked}, listError }` — never tunnel liveness |
-| List | `GET /v1/agent/mcp-routes` (signed) | `{ publications: [{ route_id, external_host, profile, pub_name, lease_id, created_at, revoked_at, verified_at, lease_state, session_live }] }` → `{ id, label, profile, state, leaseState, sessionLive, publicUrl, leaseId }` (durable state and relay-observed reachability are separate fields; active ≠ reachable) |
+| List | `GET /v1/agent/mcp-routes` (signed) | `{ publications: [{ route_id, external_host, url, profile, pub_name, lease_id, created_at, revoked_at, verified_at, lease_state, session_live }] }` → `{ id, label, profile, state, leaseState, sessionLive, publicUrl, leaseId }` (`url` is the relay's canonical ingress URL including any nonstandard port; durable state and relay-observed reachability are separate fields; active ≠ reachable) |
 | Get | filter of owned list by exact route ID | Single typed publication; `NOT_FOUND` otherwise |
 | Verify | public OAuth+MCP handshake (no relay key used) | discovery + 401-on-anonymous required; the registration endpoint is advertised but never exercised by verify (DCR is onboarding-only, not part of verification); with a resource-bound `OCLIV_VERIFY_TOKEN` (JWT aud = publication URL), authenticated initialize + notifications/initialized + tools/list; without a bound token, `OAUTH_REQUIRED`, never verified, and no authenticated probe is sent |
 | Unpublish | `DELETE /v1/agent/mcp-routes/{id}` (signed, one-time nonce) | `{ status: "deleted" }` + re-list must not contain the id (`UNCONFIRMED` otherwise) |
@@ -59,7 +55,7 @@ needs a live local publisher lifecycle, not a management call.
 - [x] TypeScript compilation (`tsc --noEmit` clean) and `skybridge build` (server)
 - [x] Public OAuth/MCP handshake against the live Funnel edge with real JWT (2026-11-02: PRM 200 exact resource, anon 401, `tools/call ping` → `pong:ocliv-oauth-lab-1`, revoked JWT → 401)
 - [ ] Signed list/status/verify through the Skybridge connector against the real relay — reported 2026-11-02 but no dated, redacted evidence on file: UNVERIFIED until re-demonstrated
-- [ ] React view bundle (`skybridge/vite` subpath missing from installed skybridge 2.1.0 — scaffold/SDK skew, view optional)
+- [x] React view bundle (`npm run check` emitted the `list-publications` view asset with Skybridge 2.1.0)
 - [ ] OAuth provider configured for the hosted app, unauthorized MCP request returns 401
 - [ ] Live unpublish approval test in an isolated staging service (adapter implemented + unit-tested, never run live)
 - [ ] Deploy with server-only secrets; inspect logs and `/mcp` and playground

@@ -35,7 +35,7 @@ var manageTools = []string{"ocliv_status", "ocliv_share", "ocliv_revoke"}
 
 func cmdMCP(argv []string) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ocliv mcp expose|manage|publish|serve|doctor|list|unpublish ...")
+		fmt.Fprintln(os.Stderr, "usage: ocliv mcp expose|manage|publish|serve|doctor|list|unpublish|revoke ...")
 		return apperr.ExitCLIValidation
 	}
 	switch argv[0] {
@@ -52,6 +52,8 @@ func cmdMCP(argv []string) int {
 	case "list":
 		return cmdMCPList(argv[1:])
 	case "unpublish":
+		return cmdMCPUnpublish(argv[1:])
+	case "revoke":
 		return cmdMCPUnpublish(argv[1:])
 	default:
 		// `ocliv mcp 3000` is a thin alias for publishing the local MCP

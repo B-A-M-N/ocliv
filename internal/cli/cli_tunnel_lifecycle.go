@@ -182,7 +182,7 @@ func cmdTunnel(argv []string) int {
 		return code
 	}
 	renderTunnelAttached(ready, a)
-	a, code = runSteadyState(ctx, ready, live, a)
+	a, code = runSteadyState(ctx, ready, live, a, nil)
 	return closeTunnel(ready, a, code)
 }
 
@@ -343,7 +343,7 @@ func renderTunnelAttached(ready tunnelReady, a agent.Attached) {
 // (P1-01). Machine-readable output stays stable: only the first attachment
 // prints. A runner that exits on its own is a terminal failure, not a
 // clean shutdown (P1-02).
-func runSteadyState(ctx context.Context, ready tunnelReady, live *tunnelLive, a agent.Attached) (agent.Attached, int) {
+func runSteadyState(ctx context.Context, ready tunnelReady, live *tunnelLive, a agent.Attached, onReattach func(agent.Attached)) (agent.Attached, int) {
 	showJSON := ready.opts.showJSON
 	exitCode := apperr.ExitCleanShutdown
 steady:
@@ -352,6 +352,9 @@ steady:
 			// Keep the latest authoritative attachment: shutdown must
 			// close the live lease even when its file never persisted.
 			a = ra
+			if onReattach != nil {
+				onReattach(ra)
+			}
 			if !showJSON {
 				fmt.Fprintf(os.Stderr, "✓ Re-attached (generation %d) %s\n", ra.Generation, ra.URL)
 			}

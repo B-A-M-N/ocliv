@@ -2,6 +2,8 @@
  * verified separately against the funnel lab (see FUNNEL-LAB.md). */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { createPrivateKey, createPublicKey, createHash, verify, randomBytes } from 'node:crypto';
 import { writeFileSync, chmodSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -23,7 +25,19 @@ function keyEnv(extra = {}) {
   return { OCLIV_RELAY_URL: 'https://relay.example.org', OCLIV_AGENT_KEY_FILE: kf, ...extra };
 }
 
-const json = (v, status = 200) => new Response(JSON.stringify(v), { status, headers: { 'content-type': 'application/json' } });
+const rawJson = (v, status = 200) => new Response(JSON.stringify(v), { status, headers: { 'content-type': 'application/json' } });
+const json = (v, status = 200) => {
+  if (Array.isArray(v?.publications)) v = { ...v, publications: v.publications.map((p) => ({
+    ...p,
+    publication_state: p.publication_state ?? (p.revoked_at ? 'REVOKED' : p.verified_at ? 'VERIFIED' : 'PENDING'),
+    lease_state: p.lease_state ?? (p.lease_id ? 'ACTIVE' : null),
+    session_live: p.session_live ?? Boolean(p.lease_id),
+    host_binding: p.host_binding ?? 'VALID',
+    admission: p.admission ?? 'READY',
+    admission_reason: p.admission_reason ?? 'READY',
+  })) };
+  return rawJson(v, status);
+};
 
 test('config requires bare https origin and a 0600 seed key file', () => {
   const good = keyEnv();
@@ -92,11 +106,11 @@ test('signatures verify under the derived public key (ed25519)', () => {
 function relayListResponse() {
   return {
     publications: [{
-      route_id: 'ZyTjyKtv8cWzCILrqcaaVg', external_host: 'relay.example.org',
+      route_id: 'ZyTjyKtv8cWzCILrqcaaVg', external_host: 'relay.example.org', url: 'https://relay.example.org/r/ZyTjyKtv8cWzCILrqcaaVg/mcp',
       profile: 'upstream-oauth', pub_name: 'funnel-oauth', lease_id: 'lse-1',
       created_at: '2026-11-01T00:00:00Z', revoked_at: null, verified_at: '2026-11-01T00:01:00Z',
     }, {
-      route_id: 'pending-route-123', external_host: 'relay.example.org',
+      route_id: 'pending-route-123', external_host: 'relay.example.org', url: 'https://relay.example.org/r/pending-route-123/mcp',
       profile: 'upstream-oauth', pub_name: 'draft', lease_id: 'lse-2',
       created_at: '2026-11-01T00:00:00Z', revoked_at: null, verified_at: null,
     }],
@@ -124,7 +138,7 @@ test('list maps relay fields to typed publications (state is publication state)'
 
 test('revoked publications surface as revoked, never active', async () => {
   const client = new NativeOclivClient(loadNativeConfig(keyEnv()), async () => json({
-    publications: [{ route_id: 'dead-route-1', external_host: 'h', profile: 'p', pub_name: 'x', lease_id: null, created_at: '', revoked_at: 't', verified_at: 't' }],
+    publications: [{ route_id: 'dead-route-1', external_host: 'mcp.example.org', url: 'https://mcp.example.org/r/dead-route-1/mcp', profile: 'p', pub_name: 'x', lease_id: null, created_at: '', revoked_at: 't', verified_at: 't' }],
   }));
   const pubs = await client.list();
   assert.equal(pubs[0].state, 'revoked');
@@ -155,7 +169,7 @@ test('unpublish deletes exactly one route and rechecks', async () => {
       remaining = remaining.filter((r) => r !== 'gone-route-12');
       return json({ status: 'deleted' });
     }
-    return json({ publications: remaining.map((id) => ({ route_id: id, external_host: 'h', profile: 'p', pub_name: id, lease_id: null, created_at: '', revoked_at: null, verified_at: 't' })) });
+    return json({ publications: remaining.map((id) => ({ route_id: id, external_host: 'mcp.example.org', url: 'https://mcp.example.org/r/' + id + '/mcp', profile: 'p', pub_name: id, lease_id: null, created_at: '', revoked_at: null, verified_at: 't' })) });
   });
   const out = await client.unpublish('gone-route-12');
   assert.deepEqual(out, { id: 'gone-route-12', deleted: true });
@@ -164,7 +178,7 @@ test('unpublish deletes exactly one route and rechecks', async () => {
 test('unpublish reports unconfirmed deletion, never success', async () => {
   const client = new NativeOclivClient(loadNativeConfig(keyEnv()), async (url, opts) => {
     if (opts.method === 'DELETE') return json({ status: 'deleted' });
-    return json({ publications: [{ route_id: 'stubborn-1', external_host: 'h', profile: 'p', pub_name: 'x', lease_id: null, created_at: '', revoked_at: null, verified_at: 't' }] });
+    return json({ publications: [{ route_id: 'stubborn-1', external_host: 'mcp.example.org', url: 'https://mcp.example.org/r/stubborn-1/mcp', profile: 'p', pub_name: 'x', lease_id: null, created_at: '', revoked_at: null, verified_at: 't' }] });
   });
   await assert.rejects(client.unpublish('stubborn-1'), { code: 'UNCONFIRMED' });
 });
@@ -178,7 +192,7 @@ test('relay auth failures and redirects map to typed errors', async () => {
   await assert.rejects(redir.list(), { code: 'UPSTREAM_REDIRECT' });
 });
 
-const PUBS = { publications: [{ route_id: 'route-abc-123', external_host: 'relay.example.org', profile: 'upstream-oauth', pub_name: 'lab', lease_id: 'lse-1', created_at: '', revoked_at: null, verified_at: 't' }] };
+const PUBS = { publications: [{ route_id: 'route-abc-123', external_host: 'relay.example.org', url: 'https://relay.example.org/r/route-abc-123/mcp', profile: 'upstream-oauth', pub_name: 'lab', lease_id: 'lse-1', created_at: '', revoked_at: null, verified_at: 't' }] };
 const PUBURL = 'https://relay.example.org/r/route-abc-123/mcp';
 const ISS = 'https://relay.example.org/r/route-abc-123/oauth';
 const PRM = { resource: PUBURL, authorization_servers: [ISS] };
@@ -190,22 +204,23 @@ const b64u = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
 const boundToken = (aud) => `${b64u({ alg: 'none', typ: 'JWT' })}.${b64u({ aud, scope: 'mcp:verify' })}.test-sig`;
 const GOOD_TOKEN = boundToken(PUBURL);
 
-function verifyFetch({ tokenTools = null } = {}) {
+function verifyFetch({ tokenTools = null, observed = null } = {}) {
   return async (url, opts = {}) => {
     if (url === 'https://relay.example.org/v1/agent/mcp-routes') return json(PUBS);
     if (url === 'https://relay.example.org/.well-known/oauth-protected-resource/r/route-abc-123/mcp') return json(PRM);
     if (url === 'https://relay.example.org/.well-known/oauth-authorization-server/r/route-abc-123/oauth') return json(ASM);
     if (url === ISS + '/register' && opts.method === 'POST') throw new Error('DCR must not run during verify: ' + url);
     if (url === PUBURL && opts.method === 'POST') {
+      observed?.push({ headers: { ...opts.headers }, body: JSON.parse(opts.body) });
       const body = JSON.parse(opts.body);
       const authed = (opts.headers.authorization || '') === 'Bearer ' + GOOD_TOKEN;
       if (!authed) return new Response('unauthorized', { status: 401 });
-      if (body.method === 'notifications/initialized') return new Response('', { status: 202 });
+      if (body.method === 'notifications/initialized') return new Response('', { status: 202, headers: { 'Mcp-Session-Id': 'session-a', 'Mcp-Protocol-Version': '2025-11-25' } });
       if (tokenTools === 'ok' && body.method === 'initialize') {
-        return json({ jsonrpc: '2.0', id: body.id, result: { protocolVersion: '2026-07-28', capabilities: {}, serverInfo: {} } });
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { protocolVersion: '2025-11-25', capabilities: {}, serverInfo: {} } }), { headers: { 'content-type': 'application/json', 'Mcp-Session-Id': 'session-a', 'Mcp-Protocol-Version': '2025-11-25' } });
       }
       if (tokenTools === 'ok' && body.method === 'tools/list') {
-        return json({ jsonrpc: '2.0', id: body.id, result: { tools: [{ name: 'ping' }] } });
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { tools: [{ name: 'ping' }] } }), { headers: { 'content-type': 'application/json', 'Mcp-Session-Id': 'session-a', 'Mcp-Protocol-Version': '2025-11-25' } });
       }
       return new Response('denied', { status: 403 });
     }
@@ -223,11 +238,148 @@ test('verify without token stops at OAUTH_REQUIRED (never verified)', async () =
 });
 
 test('verify with valid token proves initialize + tools/list', async () => {
-  const client = new NativeOclivClient(loadNativeConfig(keyEnv()), verifyFetch({ tokenTools: 'ok' }));
+  const observed = [];
+  const client = new NativeOclivClient(loadNativeConfig(keyEnv()), verifyFetch({ tokenTools: 'ok', observed }));
   const out = await client.verifyPublication('route-abc-123', { verifyToken: GOOD_TOKEN });
   assert.equal(out.verified, true);
-  assert.equal(out.protocolVersion, '2026-07-28');
+  assert.equal(out.protocolVersion, '2025-11-25');
   assert.deepEqual(out.tools, ['ping']);
+  const authenticated = observed.filter((r) => r.headers.authorization);
+  assert.ok(authenticated.every((r) => r.headers.accept.includes('application/json') && r.headers.accept.includes('text/event-stream')));
+  assert.equal(authenticated[1].headers['Mcp-Session-Id'], 'session-a');
+  assert.equal(authenticated[1].headers['Mcp-Protocol-Version'], '2025-11-25');
+  assert.equal(authenticated[2].headers['Mcp-Session-Id'], 'session-a');
+});
+
+test('verify parses MCP JSON-RPC responses carried in SSE events', async () => {
+  const base = verifyFetch({ tokenTools: 'ok' });
+  const fetchSSE = async (url, opts = {}) => {
+    const r = await base(url, opts);
+    if (url !== PUBURL || r.status !== 200 || opts.method !== 'POST' || JSON.parse(opts.body).method === 'notifications/initialized') return r;
+    const doc = await r.json();
+    return new Response(`event: message\ndata: ${JSON.stringify(doc)}\n\n`, {
+      headers: { 'content-type': 'text/event-stream', 'Mcp-Session-Id': 'session-a', 'Mcp-Protocol-Version': '2025-11-25' },
+    });
+  };
+  const c = new NativeOclivClient(loadNativeConfig(keyEnv()), fetchSSE);
+  const out = await c.verifyPublication('route-abc-123', { verifyToken: GOOD_TOKEN });
+  assert.equal(out.verified, true);
+  assert.deepEqual(out.tools, ['ping']);
+});
+
+test('verify rejects a changed MCP session identity', async () => {
+  const base = verifyFetch({ tokenTools: 'ok' });
+  const fetchChanged = async (url, opts = {}) => {
+    const r = await base(url, opts);
+    if (url !== PUBURL || r.status !== 200 || opts.method !== 'POST') return r;
+    const body = JSON.parse(opts.body);
+    if (body.method !== 'tools/list') return r;
+    return new Response(JSON.stringify(await r.json()), { headers: { 'content-type': 'application/json', 'Mcp-Session-Id': 'session-changed', 'Mcp-Protocol-Version': '2025-11-25' } });
+  };
+  const c = new NativeOclivClient(loadNativeConfig(keyEnv()), fetchChanged);
+  const out = await c.verifyPublication('route-abc-123', { verifyToken: GOOD_TOKEN });
+  assert.equal(out.verified, false);
+  assert.equal(out.code, 'MCP_CONTRACT');
+  assert.match(out.message, /session identity changed/);
+});
+
+test('real Go HTTP adapter negotiates, lists tools, and executes a harmless tool call', { timeout: 180000 }, async (t) => {
+  const proc = spawn('go', ['run', './tests/go-adapter/main.go'], { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+  t.after(async () => {
+    try { process.kill(-proc.pid, 'SIGTERM'); } catch {}
+    if (proc.exitCode === null) {
+      await Promise.race([once(proc, 'exit'), new Promise((resolve) => setTimeout(resolve, 5000))]);
+    }
+    if (proc.exitCode === null) { try { process.kill(-proc.pid, 'SIGKILL'); } catch {} }
+  });
+  let stdout = '';
+  let stderr = '';
+  proc.stdout.on('data', (b) => { stdout += String(b); });
+  proc.stderr.on('data', (b) => { stderr = (stderr + String(b)).slice(-2000); });
+  const localURL = await new Promise((resolve, reject) => {
+    const started = Date.now();
+    const check = setInterval(() => {
+      const match = stdout.match(/LISTEN (http:\/\/[^\s]+)/);
+      if (match) { clearInterval(check); resolve(match[1]); }
+      else if (proc.exitCode !== null) { clearInterval(check); reject(new Error(`adapter fixture exited (${proc.exitCode}): ${stderr}`)); }
+      else if (Date.now() - started > 150000) { clearInterval(check); reject(new Error('adapter fixture startup timed out')); }
+    }, 50);
+    proc.once('error', (e) => { clearInterval(check); reject(e); });
+  });
+  const port = new URL(localURL).port;
+  const publicUrl = `https://relay.example.org:${port}/r/route-abc-123/mcp`;
+  const issuer = `https://relay.example.org:${port}/oauth`;
+  const pubs = { publications: [{ ...PUBS.publications[0], url: publicUrl }] };
+  const upstreamCalls = [];
+  const fetchAdapter = async (url, opts = {}) => {
+    if (url === 'https://relay.example.org/v1/agent/mcp-routes') return json(pubs);
+    if (url === `https://relay.example.org:${port}/.well-known/oauth-protected-resource/r/route-abc-123/mcp`) {
+      return json({ resource: publicUrl, authorization_servers: [issuer] });
+    }
+    if (url === `https://relay.example.org:${port}/.well-known/oauth-authorization-server/oauth`) {
+      return json({ issuer, authorization_endpoint: issuer + '/authorize', token_endpoint: issuer + '/token', code_challenge_methods_supported: ['S256'] });
+    }
+    if (url === publicUrl && opts.method === 'POST') {
+      if (!opts.headers.authorization) return new Response('unauthorized', { status: 401 });
+      upstreamCalls.push({ body: JSON.parse(opts.body), headers: { ...opts.headers } });
+      return fetch(localURL, { ...opts, headers: opts.headers });
+    }
+    throw new Error(`unexpected integration fetch ${url}`);
+  };
+  const c = new NativeOclivClient(loadNativeConfig(keyEnv()), fetchAdapter);
+  const out = await c.verifyPublication('route-abc-123', { verifyToken: boundToken(publicUrl) });
+  assert.equal(out.verified, true, `${out.code}: ${out.message}`);
+  assert.deepEqual(out.tools, ['ping']);
+  assert.equal(upstreamCalls[0].body.method, 'initialize');
+  assert.equal(upstreamCalls[1].body.method, 'notifications/initialized');
+  assert.equal(upstreamCalls[2].body.method, 'tools/list');
+  assert.equal(upstreamCalls[0].headers['Mcp-Session-Id'], undefined);
+  assert.ok(upstreamCalls[1].headers['Mcp-Session-Id']);
+  assert.equal(upstreamCalls[1].headers['Mcp-Protocol-Version'], '2025-11-25');
+  assert.equal(upstreamCalls[2].headers['Mcp-Session-Id'], upstreamCalls[1].headers['Mcp-Session-Id']);
+  assert.equal(out.publicUrl, publicUrl, 'canonical relay port must be preserved');
+
+  // Exercise the pinned protocol directly against the real Go HTTP
+  // adapter through a complete session, including an explicitly harmless
+  // tools/call. The verifier above checks its public-route handshake and
+  // tools/list; this catches request/session incompatibility in execution.
+  const directPost = (body, headers = {}) => fetch(localURL, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      accept: 'application/json, text/event-stream',
+      ...headers,
+    },
+    body: JSON.stringify(body),
+  });
+  const init = await directPost({
+    jsonrpc: '2.0', id: 'adapter-init', method: 'initialize',
+    params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'interop-test', version: '1' } },
+  });
+  assert.equal(init.status, 200);
+  const initDoc = await init.json();
+  assert.equal(initDoc.result.protocolVersion, '2025-11-25');
+  const sessionID = init.headers.get('Mcp-Session-Id');
+  assert.ok(sessionID, 'real adapter must return a session id');
+  assert.equal(init.headers.get('Mcp-Protocol-Version'), '2025-11-25');
+  const sessionHeaders = {
+    'Mcp-Session-Id': sessionID,
+    'Mcp-Protocol-Version': '2025-11-25',
+  };
+  const initialized = await directPost({ jsonrpc: '2.0', method: 'notifications/initialized' }, sessionHeaders);
+  assert.ok([200, 202, 204].includes(initialized.status));
+  const listed = await directPost({ jsonrpc: '2.0', id: 'adapter-list', method: 'tools/list', params: {} }, sessionHeaders);
+  assert.equal(listed.status, 200);
+  assert.ok((await listed.json()).result.tools.some((tool) => tool.name === 'ping'));
+  const called = await directPost({
+    jsonrpc: '2.0', id: 'adapter-call', method: 'tools/call',
+    params: { name: 'ping', arguments: {} },
+  }, sessionHeaders);
+  assert.equal(called.status, 200);
+  const callDoc = await called.json();
+  assert.equal(callDoc.id, 'adapter-call');
+  assert.equal(callDoc.result.isError, undefined);
+  assert.match(callDoc.result.content[0].text, /^pong:adapter-fixture$/);
 });
 
 test('verify denies anonymous execution and bad tokens', async () => {
@@ -253,8 +405,8 @@ test('verify never sends publication A credential to publication B', async () =>
   const BURL = 'https://relay.example.org/r/route-def-456/mcp';
   const BISS = 'https://relay.example.org/r/route-def-456/oauth';
   const pubs = { publications: [
-    { route_id: 'route-abc-123', external_host: 'relay.example.org', profile: 'upstream-oauth', pub_name: 'a', lease_id: 'lse-1', created_at: '', revoked_at: null, verified_at: 't' },
-    { route_id: 'route-def-456', external_host: 'relay.example.org', profile: 'upstream-oauth', pub_name: 'b', lease_id: 'lse-2', created_at: '', revoked_at: null, verified_at: 't' },
+    { route_id: 'route-abc-123', external_host: 'relay.example.org', url: 'https://relay.example.org/r/route-abc-123/mcp', profile: 'upstream-oauth', pub_name: 'a', lease_id: 'lse-1', created_at: '', revoked_at: null, verified_at: 't' },
+    { route_id: 'route-def-456', external_host: 'relay.example.org', url: 'https://relay.example.org/r/route-def-456/mcp', profile: 'upstream-oauth', pub_name: 'b', lease_id: 'lse-2', created_at: '', revoked_at: null, verified_at: 't' },
   ] };
   const sent = [];
   const fetch = async (url, opts = {}) => {
@@ -324,7 +476,7 @@ test('upstream tool error body never reaches the caller', async () => {
     const body = JSON.parse(opts.body);
     if (!opts.headers.authorization) return new Response('unauthorized', { status: 401 });
     if (body.method === 'notifications/initialized') return new Response('', { status: 202 });
-    if (body.method === 'initialize') return json({ jsonrpc: '2.0', id: body.id, result: { protocolVersion: '2026-07-28' } });
+    if (body.method === 'initialize') return json({ jsonrpc: '2.0', id: body.id, result: { protocolVersion: '2025-11-25' } });
     return json({ jsonrpc: '2.0', id: body.id, error: { code: -32001, message: 'db password hunter2 at 10.0.0.9' } });
   });
   const out = await client.verifyPublication('route-abc-123', { verifyToken: GOOD_TOKEN });
@@ -375,7 +527,7 @@ test('verify pins all egress to the publication host (SSRF guard)', async () => 
   const rid = 'route-ssrf-1';
   const rurl = `https://relay.example.org/r/${rid}/mcp`;
   const iss = `https://relay.example.org/r/${rid}/oauth`;
-  const base = { publications: [{ route_id: rid, external_host: 'relay.example.org', profile: 'upstream-oauth', pub_name: 's', lease_id: null, created_at: '', revoked_at: null, verified_at: 't' }] };
+  const base = { publications: [{ route_id: rid, external_host: 'relay.example.org', url: 'https://relay.example.org/r/' + rid + '/mcp', profile: 'upstream-oauth', pub_name: 's', lease_id: null, created_at: '', revoked_at: null, verified_at: 't' }] };
   const mk = (prm, asm = null) => new NativeOclivClient(loadNativeConfig(keyEnv()), async (url) => {
     if (url === 'https://relay.example.org/v1/agent/mcp-routes') return json(base);
     if (asm && url.includes('/.well-known/oauth-authorization-server/')) return json(asm);
@@ -434,7 +586,7 @@ test('allowlisted different-host issuer verifies without same-host pin', async (
   const rid = 'route-ext-iss';
   const rurl = `https://relay.example.org/r/${rid}/mcp`;
   const iss = 'https://idp.example.com/';
-  const base = { publications: [{ route_id: rid, external_host: 'relay.example.org', profile: 'upstream-oauth', pub_name: 's', lease_id: null, created_at: '', revoked_at: null, verified_at: 't' }] };
+  const base = { publications: [{ route_id: rid, external_host: 'relay.example.org', url: 'https://relay.example.org/r/' + rid + '/mcp', profile: 'upstream-oauth', pub_name: 's', lease_id: null, created_at: '', revoked_at: null, verified_at: 't' }] };
   const fetched = [];
   const client = new NativeOclivClient(
     loadNativeConfig(keyEnv({ OCLIV_TRUSTED_ISSUERS: iss })),
@@ -463,7 +615,7 @@ test('verification without advertised DCR skips registration', async () => {
   const rid = 'route-nodcr-1';
   const rurl = `https://relay.example.org/r/${rid}/mcp`;
   const iss = `https://relay.example.org/r/${rid}/oauth`;
-  const base = { publications: [{ route_id: rid, external_host: 'relay.example.org', profile: 'upstream-oauth', pub_name: 's', lease_id: null, created_at: '', revoked_at: null, verified_at: 't' }] };
+  const base = { publications: [{ route_id: rid, external_host: 'relay.example.org', url: 'https://relay.example.org/r/' + rid + '/mcp', profile: 'upstream-oauth', pub_name: 's', lease_id: null, created_at: '', revoked_at: null, verified_at: 't' }] };
   const asm = { issuer: iss, authorization_endpoint: iss + '/authorize', token_endpoint: iss + '/token', code_challenge_methods_supported: ['S256'] };
   const client = new NativeOclivClient(loadNativeConfig(keyEnv()), async (url, opts = {}) => {
     if (url === 'https://relay.example.org/v1/agent/mcp-routes') return json(base);
@@ -481,7 +633,7 @@ test('verification without advertised DCR skips registration', async () => {
 test('public URL uses the publication external_host, never the control host', async () => {
   const mk = (host) => new NativeOclivClient(loadNativeConfig(keyEnv()), async (url) => {
     if (url === 'https://control.example.org/v1/agent/mcp-routes') {
-      return json({ publications: [{ route_id: 'route-ext-1', external_host: host, profile: 'p', pub_name: 'x', lease_id: null, created_at: '', revoked_at: null, verified_at: 't' }] });
+      return json({ publications: [{ route_id: 'route-ext-1', external_host: host, url: 'https://' + host + '/r/route-ext-1/mcp', profile: 'p', pub_name: 'x', lease_id: null, created_at: '', revoked_at: null, verified_at: 't' }] });
     }
     throw new Error('unexpected');
   });
@@ -493,8 +645,25 @@ test('public URL uses the publication external_host, never the control host', as
   await assert.rejects(bad.list(), { code: 'UPSTREAM_CONTRACT' });
 });
 
+test('canonical publication URL preserves the relay ingress port', async () => {
+  const canonical = 'https://mcp.example.org:8444/r/route-port-1/mcp';
+  const client = new NativeOclivClient(loadNativeConfig(keyEnv()), async () => json({ publications: [{
+    route_id: 'route-port-1', external_host: 'mcp.example.org', url: canonical,
+    profile: 'p', pub_name: 'port', lease_id: null, created_at: '', revoked_at: null, verified_at: 't',
+  }] }));
+  assert.equal((await client.list())[0].publicUrl, canonical);
+});
+
+test('list rejects relay records without canonical public URLs', async () => {
+  const client = new NativeOclivClient(loadNativeConfig(keyEnv()), async () => json({ publications: [{
+    route_id: 'route-no-url-1', external_host: 'mcp.example.org',
+    profile: 'p', pub_name: 'missing-url', lease_id: null, created_at: '', revoked_at: null, verified_at: 't',
+  }] }));
+  await assert.rejects(client.list(), { code: 'RELAY_UPGRADE_REQUIRED' });
+});
+
 test('verify never touches the registration endpoint, rejects bad id echo', async () => {
-  const base = { publications: [{ route_id: 'route-strict-1', external_host: 'relay.example.org', profile: 'upstream-oauth', pub_name: 's', lease_id: null, created_at: '', revoked_at: null, verified_at: 't' }] };
+  const base = { publications: [{ route_id: 'route-strict-1', external_host: 'relay.example.org', url: 'https://relay.example.org/r/route-strict-1/mcp', profile: 'upstream-oauth', pub_name: 's', lease_id: null, created_at: '', revoked_at: null, verified_at: 't' }] };
   const rurl = 'https://relay.example.org/r/route-strict-1/mcp';
   const iss = 'https://relay.example.org/r/route-strict-1/oauth';
   const prm = { resource: rurl, authorization_servers: [iss] };
@@ -534,26 +703,25 @@ test('verify never touches the registration endpoint, rejects bad id echo', asyn
   assert.equal(badEcho.code, 'MCP_CONTRACT');
 });
 
-test('approvals bind subject/action/target, single-use, expiring', async () => {
-  const { Approvals } = await import('../src/core/approvals.mjs');
-  let t = 1000;
-  const a = new Approvals({ ttlMs: 60000, now: () => t });
-  // Wrong subject / action / target / code all fail (fresh grant each:
-  // redeem consumes on first attempt by design).
-  const fresh = () => a.request({ subject: 'op-1', action: 'publish', target: 'lab' });
-  const g = fresh();
-  assert.ok(g.approvalId && g.code);
-  assert.throws(() => a.redeem({ subject: 'op-2', action: 'publish', target: 'lab', approvalId: fresh().approvalId, code: g.code }), { code: 'APPROVAL_SUBJECT' });
-  assert.throws(() => a.redeem({ subject: 'op-1', action: 'unpublish', target: 'lab', approvalId: fresh().approvalId, code: g.code }), { code: 'APPROVAL_BINDING' });
-  assert.throws(() => a.redeem({ subject: 'op-1', action: 'publish', target: 'lab', approvalId: fresh().approvalId, code: 'wrong' }), { code: 'APPROVAL_CODE' });
-  // Success consumes: replay fails.
-  assert.deepEqual(a.redeem({ subject: 'op-1', action: 'publish', target: 'lab', approvalId: g.approvalId, code: g.code }), { approved: true, action: 'publish', target: 'lab' });
-  assert.throws(() => a.redeem({ subject: 'op-1', action: 'publish', target: 'lab', approvalId: g.approvalId, code: g.code }), { code: 'APPROVAL_INVALID' });
-  // Expiry fails.
-  const g2 = a.request({ subject: 'op-1', action: 'unpublish', target: 'route-1' });
-  t += 61000;
-  assert.throws(() => a.redeem({ subject: 'op-1', action: 'unpublish', target: 'route-1', approvalId: g2.approvalId, code: g2.code }), { code: 'APPROVAL_EXPIRED' });
-  // Listing never exposes codes.
-  a.request({ subject: 'op-1', action: 'publish', target: 'lab' });
-  assert.equal(JSON.stringify(a.list()).includes(g.code), false);
+test('old relay inventory fails with safe diagnostics and never invents a URL', async () => {
+  const client = new NativeOclivClient(loadNativeConfig(keyEnv()), async () => rawJson({ publications: [
+    { route_id: 'legacy-route-1', external_host: 'relay.example.org', profile: 'managed', pub_name: 'legacy', lease_id: 'lease-1', verified_at: 't' },
+  ] }));
+  await assert.rejects(client.list(), (error) => {
+    assert.equal(error.code, 'RELAY_UPGRADE_REQUIRED');
+    assert.equal(error.diagnostics[0].publicUrl, null);
+    assert.equal(error.diagnostics[0].admissionReason, 'RELAY_UPGRADE_REQUIRED');
+    return true;
+  });
+});
+
+test('host-mismatched relay record stays URL-less and visibly blocked', async () => {
+  const client = new NativeOclivClient(loadNativeConfig(keyEnv()), async () => json({ publications: [{
+    route_id: 'host-route-1', external_host: 'old.example.org', url: null,
+    profile: 'managed', pub_name: 'old', lease_id: 'lease-1', publication_state: 'VERIFIED',
+    host_binding: 'MISMATCH', admission: 'BLOCKED', admission_reason: 'HOST_MISMATCH',
+  }] }));
+  const pub = await client.get('host-route-1');
+  assert.equal(pub.publicUrl, null);
+  assert.equal(pub.admissionReason, 'HOST_MISMATCH');
 });

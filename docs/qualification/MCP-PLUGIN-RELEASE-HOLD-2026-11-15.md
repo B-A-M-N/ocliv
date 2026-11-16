@@ -44,6 +44,17 @@ The schema-aware SQLite query still could not run because `sudo -n` returned
 `sudo: a password is required`. No password was requested or supplied; the
 database was not opened.
 
+The connected ChatGPT `OclivMCP` tool was also exercised read-only on
+2026-11-16. Its configured MCP URL is the retired Tailscale route
+`https://pop-os.tail8d285a.ts.net/r/oadEddDa1TGACd9aW-762w/mcp`; status,
+publication-list, and publication-get all failed at connection setup with
+`McpServerError: Connection failed`. This identifies why that connected
+tool reports the site down: it is still pointed at the old lab edge, not
+`bamnlabs.dynv6.net`. This does not establish the production route's database
+state or qualify a replacement URL. Do not use direct browser navigation as
+an MCP connection test, and do not repoint the connector until a production
+route passes the release gates below.
+
 No current public endpoint has been qualified. Release packaging is on HOLD
 until `scripts/verify-ingress.sh` produces a fresh receipt proving protected
 resource metadata, the exact authorization-server issuer, missing and invalid

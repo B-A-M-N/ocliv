@@ -88,6 +88,8 @@ func TestPublisherUnitsShareSupervisionContract(t *testing.T) {
 			"RestartSec=30",
 			"stays registered",
 			"mcp unpublish",
+			"OCLIV_STRICT and OCLIV_RESOURCE_FILE are only valid with upstream-oauth",
+			"unsupported OCLIV_AUTH",
 		} {
 			if !strings.Contains(unit, want) {
 				t.Errorf("%s lacks shared publisher contract field %q", path, want)
@@ -139,6 +141,9 @@ func TestPublisherUnitsShareSupervisionContract(t *testing.T) {
 		if !strings.Contains(string(env), want) {
 			t.Errorf("publisher environment example lacks %q", want)
 		}
+	}
+	if !strings.Contains(string(env), "OCLIV_AUTH=ocliv-managed") || !strings.Contains(string(env), "OCLIV_STRICT=\n") {
+		t.Fatal("managed-OAuth example must select managed auth and leave upstream-only discovery flags unset")
 	}
 	duplicateEnv, err := os.ReadFile(filepath.Join(root, "..", "mcp", "config", "publisher.env.example"))
 	if err != nil {
