@@ -301,6 +301,24 @@ func parseMCPRouteASMetadataPath(escapedPath string) (string, string, bool) {
 	return seg, mcpASWellKnownUpstreamPath, true
 }
 
+// parseMCPRouteAppendedASMetadataPath supports clients that append
+// /.well-known/oauth-authorization-server or /.well-known/openid-configuration
+// to the route-scoped issuer (/r/<route-id>/oauth).
+func parseMCPRouteAppendedASMetadataPath(escapedPath string) (string, string, bool) {
+	rest, ok := strings.CutPrefix(escapedPath, routePathPrefix)
+	if !ok {
+		return "", "", false
+	}
+	seg, after, ok := strings.Cut(rest, "/")
+	if !ok || !validRouteID(seg) {
+		return "", "", false
+	}
+	if after != "oauth/.well-known/oauth-authorization-server" && after != "oauth/.well-known/openid-configuration" {
+		return "", "", false
+	}
+	return seg, mcpASWellKnownUpstreamPath, true
+}
+
 // createMCPRoute binds a route ID to a live lease for the exact external
 // host (test helper; production uses the publication create-or-rebind
 // path in relay_mgmt_routes.go). It validates everything the resolver
@@ -464,6 +482,8 @@ func (s *Server) admitPathRoute(r *http.Request) (*routeTarget, *Session, *http.
 	} else if id, fwd, ok := parseMCPRouteOAuthPath(escaped); ok {
 		routeID, forwardPath = id, fwd
 	} else if id, fwd, ok := parseMCPRouteASMetadataPath(escaped); ok {
+		routeID, forwardPath = id, fwd
+	} else if id, fwd, ok := parseMCPRouteAppendedASMetadataPath(escaped); ok {
 		routeID, forwardPath = id, fwd
 	} else {
 		return nil, nil, nil, 0

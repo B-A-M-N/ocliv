@@ -130,6 +130,17 @@ func (s *Server) handlePublic(w http.ResponseWriter, r *http.Request) {
 
 	t, sess, failCode := s.route(r.Host)
 	if s.mcpHost != "" && canonicalHost(r.Host) == s.mcpHost {
+		// Allow browser-based MCP clients (e.g. Gemini WebUI / MCP Inspector)
+		// to complete CORS preflight and read WWW-Authenticate / Mcp-Session-Id.
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, Mcp-Session-Id, Mcp-Protocol-Version")
+		w.Header().Set("Access-Control-Expose-Headers", "Mcp-Session-Id, WWW-Authenticate")
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Max-Age", "3600")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		// Tool and discovery route shapes share one admission point
 		// (admitPathRoute): the mount prefix is stripped exactly once,
 		// after admission, and the request is aimed at the matching
