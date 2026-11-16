@@ -14,7 +14,8 @@ const userPublisherUnitTemplate = `# User-level Ocliv service publisher (%i).
 # Provisioned automatically by ` + "`ocliv service start`" + `.
 [Unit]
 Description=Ocliv user service publisher (%i)
-After=network-online.target
+After=network-online.target ocliv-backend@%i.service
+Wants=ocliv-backend@%i.service
 
 [Service]
 Type=simple

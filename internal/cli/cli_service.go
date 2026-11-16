@@ -486,7 +486,19 @@ func cmdServiceStart(argv []string, ops serviceOps) int {
 			fmt.Fprintln(os.Stderr, err)
 			return apperr.ExitCLIValidation
 		}
-		if perr := ops.probeLoc(target, 3*time.Second); perr != nil {
+		var perr error
+		attempts := 1
+		if rec.BackendMode == config.BackendManaged {
+			attempts = 20
+		}
+		for i := 0; i < attempts; i++ {
+			perr = ops.probeLoc(target, 2*time.Second)
+			if perr == nil {
+				break
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		if perr != nil {
 			fmt.Fprintf(os.Stderr, "service start: local backend unreachable at %s: %v\n", target, perr)
 			return apperr.ExitLocalTarget
 		}
