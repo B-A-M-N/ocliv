@@ -11,9 +11,9 @@ Group=ocliv
 # Explicit opt-in: without this env file the service fails instead of
 # guessing. OCLIV_DNS_HOST is the zone the relay serves.
 EnvironmentFile=/etc/ocliv/dns-refresh.env
-# Credential comes from a restricted file (0600, owned by ocliv),
-# never from the process command line.
-ExecStart=/usr/local/bin/ocliv setup --refresh-dns --hostname=${OCLIV_DNS_HOST} --token-file=/etc/ocliv/dynv6.token
+# Credential path points into the relay data directory: 0600, owned by
+# ocliv. The token itself is never placed in an environment or argv.
+ExecStart=/usr/local/bin/ocliv setup --refresh-dns --hostname=${OCLIV_DNS_HOST} --token-file=${OCLIV_DNS_TOKEN_FILE}
 # DNS-only: never touches Caddy or the relay. One attempt per trigger;
 # the timer re-triggers on its schedule.
 TimeoutStartSec=90

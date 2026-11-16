@@ -41,6 +41,7 @@ func TestPlanBootstrapCoversFullCleanHostArtifactSet(t *testing.T) {
 		"install systemd unit",
 		"enable and start relay",
 		"enroll this machine",
+		"install and enable dynv6 refresh timer",
 	}
 	if len(steps) != len(want) {
 		t.Fatalf("planned %d steps, want %d: %v", len(steps), len(want), titles(steps))
@@ -69,8 +70,8 @@ func TestPlanBootstrapNonRootNamesEveryArtifact(t *testing.T) {
 	if reason != "" {
 		t.Fatalf("viable path blocked: %q", reason)
 	}
-	if len(steps) != 10 {
-		t.Fatalf("non-root plan has %d steps, want 10: %v", len(steps), titles(steps))
+	if len(steps) != 11 {
+		t.Fatalf("non-root plan has %d steps, want 11: %v", len(steps), titles(steps))
 	}
 	for _, s := range steps {
 		if s.Auto {
@@ -79,6 +80,72 @@ func TestPlanBootstrapNonRootNamesEveryArtifact(t *testing.T) {
 		if s.Manual == "" {
 			t.Errorf("non-root step %q has no manual command", s.Title)
 		}
+	}
+}
+
+func TestInstallDynv6RefreshKeepsTokenOutOfUnitsAndJournalsToken(t *testing.T) {
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "data")
+	envPath := filepath.Join(root, "etc", "ocliv", "dns-refresh.env")
+	servicePath := filepath.Join(root, "systemd", "ocliv-dns-refresh.service")
+	timerPath := filepath.Join(root, "systemd", "ocliv-dns-refresh.timer")
+	oldChown, oldReload := chownDynv6Token, runDaemonReload
+	chownDynv6Token = func(string) error { return nil }
+	runDaemonReload = func() error { return nil }
+	defer func() { chownDynv6Token, runDaemonReload = oldChown, oldReload }()
+
+	if err := InstallDynv6RefreshTo("Lab.Dynv6.net.", "secret-token", dataDir, envPath, servicePath, timerPath); err != nil {
+		t.Fatal(err)
+	}
+	tokenPath := filepath.Join(dataDir, "dynv6.token")
+	info, err := os.Stat(tokenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("token mode=%o, want 0600", info.Mode().Perm())
+	}
+	for _, path := range []string{envPath, servicePath, timerPath} {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(body), "secret-token") {
+			t.Fatalf("secret leaked into %s", path)
+		}
+	}
+	env, err := os.ReadFile(envPath)
+	if err != nil || !strings.Contains(string(env), "OCLIV_DNS_HOST=lab.dynv6.net") || !strings.Contains(string(env), tokenPath) {
+		t.Fatalf("unexpected refresh env %q: %v", env, err)
+	}
+	timer, err := os.ReadFile(timerPath)
+	if err != nil || !strings.Contains(string(timer), "OnUnitActiveSec=5min") {
+		t.Fatalf("timer is not configured for five minutes: %q: %v", timer, err)
+	}
+	if err := RollbackDynv6Token(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(tokenPath); !os.IsNotExist(err) {
+		t.Fatalf("rollback left newly created token: %v", err)
+	}
+}
+
+func TestInstallDynv6RefreshRefusesDifferentExistingToken(t *testing.T) {
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "data")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dataDir, "dynv6.token")
+	if err := os.WriteFile(path, []byte("old-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := installDynv6Token(path, "new-token"); err == nil {
+		t.Fatal("different existing token was silently replaced")
+	}
+	body, err := os.ReadFile(path)
+	if err != nil || string(body) != "old-token\n" {
+		t.Fatalf("existing token changed: %q, %v", body, err)
 	}
 }
 

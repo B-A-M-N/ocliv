@@ -37,8 +37,11 @@ import (
 var setupManagedDestinations = []string{
 	"/etc/caddy/Caddyfile",
 	"/etc/ocliv/relay.env",
+	"/etc/ocliv/dns-refresh.env",
 	"/usr/local/bin/ocliv-relay-launch.sh",
 	"/etc/systemd/system/ocliv-relay.service",
+	"/etc/systemd/system/ocliv-dns-refresh.service",
+	"/etc/systemd/system/ocliv-dns-refresh.timer",
 }
 
 // Default echo endpoints observe the egress address per family. They
@@ -266,15 +269,15 @@ func runSetupDNS(ctx context.Context, d setup.Detection, hostname, tokenFile, ac
 	if acmeEmail == "" {
 		return apperr.ExitOK
 	}
-	return runSetupRender(ctx, d, hostname, acmeEmail, outDir, dataDir, edge)
+	return runSetupRender(ctx, d, hostname, token, acmeEmail, outDir, dataDir, edge)
 }
 
-// runSetupRender generates the reviewable single-host deployment for
-// the dynv6 hostname, self-checks it, confirms the name resolves to
-// the observed egress, and only then persists relay_url. Caddy,
-// systemd, and enrollment stay manual until the next slice automates
-// them; this function activates nothing.
-func runSetupRender(ctx context.Context, d setup.Detection, hostname, acmeEmail, outDir, dataDir, edge string) int {
+// runSetupRender generates the reviewable deployment for the hostname,
+// self-checks it, confirms DNS resolution against observed egress, and
+// then runs the root-only bootstrap. For dynv6 zones that bootstrap also
+// installs and enables the DNS refresh timer using the validated token;
+// non-root runs print the required operator actions instead.
+func runSetupRender(ctx context.Context, d setup.Detection, hostname, dnsToken, acmeEmail, outDir, dataDir, edge string) int {
 	dir, _, _, err := agentFiles()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
@@ -336,7 +339,7 @@ func runSetupRender(ctx context.Context, d setup.Detection, hostname, acmeEmail,
 	// never on DNS verification alone, which proves nothing about
 	// Caddy, relay startup, or enrollment.
 	fmt.Printf("deployment rendered to %s (candidate; active relay_url unchanged: %s)\n", outDir, nonEmpty(existing))
-	code, completed := runSetupBootstrap(d, hostname, outDir, dataDir)
+	code, completed := runSetupBootstrap(d, hostname, outDir, dataDir, dnsToken)
 	if code == apperr.ExitOK && completed && shouldPersistRelayURL(existing, relayURL, completed) {
 		if err := mergeRelayURL(cfgPath, relayURL); err != nil {
 			fmt.Fprintln(os.Stderr, "error: "+err.Error())
@@ -403,7 +406,7 @@ func wildcardAAAASuffix(v6 string) string {
 // completed: manual-only plans and hard blocks report ACTION_REQUIRED
 // (ExitRelayTLS), never success, so callers never treat a printed
 // plan as a functioning tunnel.
-func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir string) (int, bool) {
+func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir, dnsToken string) (int, bool) {
 	_, caddyErr := exec.LookPath("caddy")
 	env := setup.BootstrapEnv{
 		AsRoot:       os.Geteuid() == 0,
@@ -423,8 +426,9 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir string) (
 	// failed run can reverse only what it actually did (a Caddy that was
 	// already running stays running; a clean host's relay gets stopped).
 	preState := map[string]setup.ServiceState{
-		"caddy":       setup.CaptureServiceState("caddy"),
-		"ocliv-relay": setup.CaptureServiceState("ocliv-relay"),
+		"caddy":                   setup.CaptureServiceState("caddy"),
+		"ocliv-relay":             setup.CaptureServiceState("ocliv-relay"),
+		"ocliv-dns-refresh.timer": setup.CaptureServiceState("ocliv-dns-refresh.timer"),
 	}
 	setup.ResetStartedUnits()
 	setup.MarkPreState(preState)
@@ -475,6 +479,16 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir string) (
 			} else {
 				fmt.Printf("already enrolled, key untouched ")
 			}
+		case "install and enable dynv6 refresh timer":
+			err = setup.InstallDynv6Refresh(hostname, dnsToken, dataDir)
+			if err == nil {
+				err = setup.EnableDynv6RefreshTimer()
+				before := preState["ocliv-dns-refresh.timer"]
+				after := setup.CaptureServiceState("ocliv-dns-refresh.timer")
+				if before.Enabled != after.Enabled || before.Active != after.Active {
+					setup.MarkStarted("ocliv-dns-refresh.timer")
+				}
+			}
 		default:
 			err = fmt.Errorf("unknown step %q", s.Title)
 		}
@@ -497,7 +511,7 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir string) (
 			// never touched.
 			rollbackFailed := false
 			restoredAny := false
-			for _, unit := range []string{"ocliv-relay", "caddy"} {
+			for _, unit := range []string{"ocliv-relay", "ocliv-dns-refresh.timer", "caddy"} {
 				if !setup.StartedUnits()[unit] {
 					continue
 				}
@@ -515,6 +529,10 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir string) (
 					rollbackFailed = true
 				}
 				restoredAny = restoredAny || restored
+			}
+			if rerr := setup.RollbackDynv6Token(dataDir); rerr != nil {
+				fmt.Printf("rollback FAILED for dynv6 token in %s: %v\n", dataDir, rerr)
+				rollbackFailed = true
 			}
 			restored, rerr := setup.RollbackBinary(setup.DefaultCleanHostArtifacts.Binary)
 			if rerr != nil {
@@ -562,6 +580,7 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir string) (
 	for _, dst := range setupManagedDestinations {
 		setup.CleanInstallBackup(dst)
 	}
+	setup.CleanDynv6TokenJournal(dataDir)
 	fmt.Printf("verify externally: from another network, curl -v https://%s/v1/agent/challenge (no -k)\n", hostname)
 	return apperr.ExitOK, true
 }

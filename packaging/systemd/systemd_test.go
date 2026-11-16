@@ -49,7 +49,7 @@ func TestDNSRefreshUnits(t *testing.T) {
 	assertRefreshService(t, svc)
 	timer := RefreshTimer()
 	for _, want := range []string{
-		"OnUnitActiveSec=",
+		"OnUnitActiveSec=5min",
 		"WantedBy=timers.target",
 	} {
 		if !strings.Contains(timer, want) {

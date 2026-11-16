@@ -1,6 +1,7 @@
 package setup
 
 import (
+	"crypto/subtle"
 	"fmt"
 	"os"
 	"os/exec"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"ocliv/packaging/systemd"
 )
@@ -266,7 +268,180 @@ func PlanBootstrap(env BootstrapEnv) (steps []Step, blockReason string) {
 		mk("enroll this machine",
 			fmt.Sprintf("ocliv relay issue-enroll --data %s --tenant home && ocliv login --relay https://%s --code-file -", dataDir, env.Hostname)),
 	}
+	if strings.HasSuffix(strings.ToLower(strings.TrimSuffix(env.Hostname, ".")), ".dynv6.net") {
+		steps = append(steps, mk("install and enable dynv6 refresh timer",
+			"install the Ocliv DNS refresh service and timer, store the dynv6 token in the ocliv data directory with mode 0600, then run systemctl enable --now ocliv-dns-refresh.timer"))
+	}
 	return steps, ""
+}
+
+// InstallDynv6Refresh installs the DNS-only refresh units and their
+// non-secret host/token-path environment. The token is stored separately
+// under the relay data directory, owned by the ocliv service account, and
+// never appears in a unit or environment file. An existing token is kept
+// only when it exactly matches the token used for this setup run.
+func InstallDynv6Refresh(hostname, token, dataDir string) error {
+	return InstallDynv6RefreshTo(hostname, token, dataDir,
+		"/etc/ocliv/dns-refresh.env",
+		"/etc/systemd/system/ocliv-dns-refresh.service",
+		"/etc/systemd/system/ocliv-dns-refresh.timer")
+}
+
+// InstallDynv6RefreshTo installs the refresh config at explicit paths. The
+// explicit destinations keep the filesystem transaction testable without
+// touching host system directories.
+func InstallDynv6RefreshTo(hostname, token, dataDir, envPath, servicePath, timerPath string) error {
+	hostname = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(hostname), "."))
+	if !validDynv6Zone(hostname) {
+		return fmt.Errorf("dynv6 refresh requires a <label>.dynv6.net hostname")
+	}
+	if strings.TrimSpace(token) == "" {
+		return fmt.Errorf("dynv6 refresh token is empty")
+	}
+	if dataDir == "" || strings.ContainsAny(dataDir, "\r\n\t ") {
+		return fmt.Errorf("dynv6 refresh requires an absolute data directory without whitespace")
+	}
+	if !filepath.IsAbs(dataDir) {
+		return fmt.Errorf("dynv6 refresh data directory must be absolute")
+	}
+	if err := installDynv6Token(filepath.Join(dataDir, "dynv6.token"), token); err != nil {
+		return err
+	}
+
+	env := ManagedMarker + " (dynv6 refresh configuration)\n" +
+		"OCLIV_DNS_HOST=" + hostname + "\n" +
+		"OCLIV_DNS_TOKEN_FILE=" + filepath.Join(dataDir, "dynv6.token") + "\n"
+	if err := os.MkdirAll(filepath.Dir(envPath), 0o700); err != nil {
+		return fmt.Errorf("create DNS refresh config directory: %w", err)
+	}
+	if err := installManagedFileMode(envPath, []byte(env), 0o600, nil); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(servicePath), 0o755); err != nil {
+		return fmt.Errorf("create systemd unit directory: %w", err)
+	}
+	for _, item := range []struct{ dst, contents string }{
+		{servicePath, systemd.RefreshService()},
+		{timerPath, systemd.RefreshTimer()},
+	} {
+		dst, contents := item.dst, item.contents
+		contents = markUnit(contents, "dynv6 refresh")
+		if err := installManagedFile(dst, []byte(contents), nil); err != nil {
+			return err
+		}
+	}
+	return runDaemonReload()
+}
+
+func markUnit(contents, label string) string {
+	return ManagedMarker + " (" + label + ")\n" + contents
+}
+
+func installDynv6Token(path, token string) error {
+	if raw, err := os.ReadFile(path); err == nil {
+		if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(string(raw))), []byte(strings.TrimSpace(token))) != 1 {
+			return fmt.Errorf("existing dynv6 token at %s differs; rotate it explicitly before enabling refresh", path)
+		}
+		fi, err := os.Lstat(path)
+		if err != nil {
+			return fmt.Errorf("inspect existing dynv6 token: %w", err)
+		}
+		if !fi.Mode().IsRegular() || fi.Mode().Perm() != 0o600 {
+			return fmt.Errorf("existing dynv6 token at %s must be a regular file with mode 0600", path)
+		}
+		serviceUser, err := user.Lookup(RelayUser)
+		if err != nil {
+			return fmt.Errorf("lookup %s service account: %w", RelayUser, err)
+		}
+		uid, err := strconv.Atoi(serviceUser.Uid)
+		if err != nil {
+			return fmt.Errorf("parse %s uid: %w", RelayUser, err)
+		}
+		gid, err := strconv.Atoi(serviceUser.Gid)
+		if err != nil {
+			return fmt.Errorf("parse %s gid: %w", RelayUser, err)
+		}
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		if !ok || int(st.Uid) != uid || int(st.Gid) != gid {
+			return fmt.Errorf("existing dynv6 token at %s must be owned by %s:%s; refusing to change existing ownership", path, RelayUser, RelayUser)
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect dynv6 token: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create token directory: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("create dynv6 token: %w", err)
+	}
+	if _, err = f.WriteString(strings.TrimSpace(token) + "\n"); err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = chownDynv6Token(path)
+	}
+	if err != nil {
+		_ = os.Remove(path)
+		return fmt.Errorf("write dynv6 token: %w", err)
+	}
+	if err := os.WriteFile(path+".ocliv-new", nil, 0o600); err != nil {
+		_ = os.Remove(path)
+		return fmt.Errorf("journal new dynv6 token: %w", err)
+	}
+	return nil
+}
+
+func chownServiceFile(path string) error {
+	u, err := user.Lookup(RelayUser)
+	if err != nil {
+		return fmt.Errorf("lookup %s service account: %w", RelayUser, err)
+	}
+	uid, err := strconv.Atoi(u.Uid)
+	if err != nil {
+		return fmt.Errorf("parse %s uid: %w", RelayUser, err)
+	}
+	gid, err := strconv.Atoi(u.Gid)
+	if err != nil {
+		return fmt.Errorf("parse %s gid: %w", RelayUser, err)
+	}
+	if err := os.Chown(path, uid, gid); err != nil {
+		return fmt.Errorf("set %s ownership: %w", path, err)
+	}
+	return nil
+}
+
+var chownDynv6Token = chownServiceFile
+
+// EnableDynv6RefreshTimer activates only the timer; the oneshot service is
+// never started directly by setup.
+func EnableDynv6RefreshTimer() error {
+	return runCmd("systemctl", "enable", "--now", "ocliv-dns-refresh.timer")
+}
+
+// RollbackDynv6Token removes only a token created by this setup run.
+func RollbackDynv6Token(dataDir string) error {
+	path := filepath.Join(dataDir, "dynv6.token")
+	if _, err := os.Stat(path + ".ocliv-new"); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return os.Remove(path + ".ocliv-new")
+}
+
+// CleanDynv6TokenJournal removes the creation journal after successful setup.
+func CleanDynv6TokenJournal(dataDir string) {
+	_ = os.Remove(filepath.Join(dataDir, "dynv6.token.ocliv-new"))
 }
 
 // runCmd executes a system command for the live executors below.
