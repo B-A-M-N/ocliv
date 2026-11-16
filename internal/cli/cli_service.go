@@ -115,6 +115,10 @@ func cmdService(argv []string) int {
 		return cmdServiceList(argv[1:], ops)
 	case "remove":
 		return cmdServiceRemove(argv[1:], ops)
+	case "pending":
+		return cmdServicePending(argv[1:], ops)
+	case "approve":
+		return cmdServiceApprove(argv[1:], ops)
 	case "run-publisher":
 		return cmdServiceRunPublisher(argv[1:])
 	default:
@@ -876,4 +880,169 @@ func localTargetFromURL(raw string) (string, bool, error) {
 		return "[::1]:" + p, true, nil
 	}
 	return "127.0.0.1:" + p, false, nil
+}
+
+func cmdServicePending(argv []string, ops serviceOps) int {
+	if len(argv) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: ocliv service pending NAME [--json]")
+		return apperr.ExitCLIValidation
+	}
+	name := argv[0]
+	jsonOut := false
+	for _, a := range argv[1:] {
+		if a == "--json" {
+			jsonOut = true
+		} else {
+			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
+			return apperr.ExitCLIValidation
+		}
+	}
+	store, err := openServices()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return apperr.ExitInternal
+	}
+	rec, ok, err := store.Get(name)
+	if err != nil || !ok {
+		fmt.Fprintf(os.Stderr, "unknown service %q\n", name)
+		return apperr.ExitCLIValidation
+	}
+	k, keyID, err := loadKeyForProfile(rec.Profile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "not enrolled in profile %q: run `ocliv login` first\n", rec.Profile)
+		return apperr.ExitAuth
+	}
+	relayURL := rec.RelayURL
+	if relayURL == "" {
+		relayURL = agentRelayURLForProfile(rec.Profile)
+	}
+	pubID := rec.PublicationID
+	if pubID == "" {
+		foundID, _, found, rerr := resolveRelayPublication(relayURL, k, keyID, rec, ops)
+		if rerr != nil || !found {
+			fmt.Fprintf(os.Stderr, "service pending: no publication found for %q (%v)\n", name, rerr)
+			return apperr.ExitInternal
+		}
+		pubID = foundID
+	}
+	st, body, callErr := ops.mgmtCall(relayURL, k, keyID, http.MethodGet, "/v1/agent/mcp-routes/"+pubID+"/authz/pending")
+	if callErr != nil {
+		fmt.Fprintf(os.Stderr, "service pending: %v\n", callErr)
+		return apperr.ExitRelayTLS
+	}
+	if st != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "service pending: relay returned %d: %s\n", st, strings.TrimSpace(string(body)))
+		return apperr.ExitAuth
+	}
+	if jsonOut {
+		fmt.Println(string(body))
+		return apperr.ExitOK
+	}
+	var out struct {
+		Pending []struct {
+			ClientID     string `json:"client_id"`
+			Name         string `json:"name"`
+			RedirectURIs string `json:"redirect_uris"`
+			Status       string `json:"status"`
+		} `json:"pending"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		fmt.Fprintln(os.Stderr, "invalid relay response")
+		return apperr.ExitInternal
+	}
+	if len(out.Pending) == 0 {
+		fmt.Println("no pending client approvals")
+		return apperr.ExitOK
+	}
+	for _, p := range out.Pending {
+		fmt.Printf("%s  name=%q status=%s redirects=%s\n", p.ClientID, p.Name, p.Status, p.RedirectURIs)
+	}
+	return apperr.ExitOK
+}
+
+func cmdServiceApprove(argv []string, ops serviceOps) int {
+	if len(argv) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: ocliv service approve NAME [--client CLIENT_ID]")
+		return apperr.ExitCLIValidation
+	}
+	name := argv[0]
+	var clientID string
+	for i := 1; i < len(argv); i++ {
+		if argv[i] == "--client" || strings.HasPrefix(argv[i], "--client=") {
+			v, ok := mcpFlagValue(argv, &i, "client")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			clientID = v
+		} else {
+			fmt.Fprintf(os.Stderr, "unknown flag %q\n", argv[i])
+			return apperr.ExitCLIValidation
+		}
+	}
+	store, err := openServices()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return apperr.ExitInternal
+	}
+	rec, ok, err := store.Get(name)
+	if err != nil || !ok {
+		fmt.Fprintf(os.Stderr, "unknown service %q\n", name)
+		return apperr.ExitCLIValidation
+	}
+	k, keyID, err := loadKeyForProfile(rec.Profile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "not enrolled in profile %q: run `ocliv login` first\n", rec.Profile)
+		return apperr.ExitAuth
+	}
+	relayURL := rec.RelayURL
+	if relayURL == "" {
+		relayURL = agentRelayURLForProfile(rec.Profile)
+	}
+	pubID := rec.PublicationID
+	if pubID == "" {
+		foundID, _, found, rerr := resolveRelayPublication(relayURL, k, keyID, rec, ops)
+		if rerr != nil || !found {
+			fmt.Fprintf(os.Stderr, "service approve: no publication found for %q (%v)\n", name, rerr)
+			return apperr.ExitInternal
+		}
+		pubID = foundID
+	}
+	if clientID == "" {
+		st, body, callErr := ops.mgmtCall(relayURL, k, keyID, http.MethodGet, "/v1/agent/mcp-routes/"+pubID+"/authz/pending")
+		if callErr != nil || st != http.StatusOK {
+			fmt.Fprintf(os.Stderr, "service approve: could not list pending clients (specify --client)\n")
+			return apperr.ExitRelayTLS
+		}
+		var out struct {
+			Pending []struct {
+				ClientID string `json:"client_id"`
+				Name     string `json:"name"`
+			} `json:"pending"`
+		}
+		if json.Unmarshal(body, &out) != nil || len(out.Pending) != 1 {
+			fmt.Fprintf(os.Stderr, "service approve: %d pending clients; specify --client <id>\n", len(out.Pending))
+			return apperr.ExitCLIValidation
+		}
+		clientID = out.Pending[0].ClientID
+	}
+	st, body, callErr := ops.mgmtCall(relayURL, k, keyID, http.MethodPost, "/v1/agent/mcp-routes/"+pubID+"/authz/approve/"+clientID)
+	if callErr != nil {
+		fmt.Fprintf(os.Stderr, "service approve: %v\n", callErr)
+		return apperr.ExitRelayTLS
+	}
+	if st != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "service approve: relay returned %d: %s\n", st, strings.TrimSpace(string(body)))
+		return apperr.ExitAuth
+	}
+	var res struct {
+		ClientID      string `json:"client_id"`
+		PairingSecret string `json:"pairing_secret"`
+	}
+	if err := json.Unmarshal(body, &res); err != nil || res.PairingSecret == "" {
+		fmt.Fprintln(os.Stderr, "invalid relay approve response")
+		return apperr.ExitInternal
+	}
+	fmt.Printf("✓ approved client %s for %s (route=%s)\n", res.ClientID, name, pubID)
+	fmt.Printf("Pairing secret (single-use; enter in consent form):\n%s\n", res.PairingSecret)
+	return apperr.ExitOK
 }

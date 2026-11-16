@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"ocliv/internal/authz"
 	"ocliv/internal/identity"
 	"ocliv/internal/lease"
 )
@@ -163,6 +164,12 @@ func (s *Server) handleAgentPublications(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "unknown route", http.StatusNotFound)
 		return
 	}
+	if r.Method == http.MethodGet {
+		if routeID, ok := strings.CutSuffix(rest, "/authz/pending"); ok && validRouteID(routeID) {
+			s.serveKeyPublicationAuthzPending(w, tenant, keyID, routeID)
+			return
+		}
+	}
 	if r.Method == http.MethodPost {
 		if routeID, ok := strings.CutSuffix(rest, "/disable"); ok && validRouteID(routeID) {
 			s.serveKeyPublicationDesiredState(w, tenant, keyID, routeID, false)
@@ -171,6 +178,14 @@ func (s *Server) handleAgentPublications(w http.ResponseWriter, r *http.Request)
 		if routeID, ok := strings.CutSuffix(rest, "/enable"); ok && validRouteID(routeID) {
 			s.serveKeyPublicationDesiredState(w, tenant, keyID, routeID, true)
 			return
+		}
+		if idx := strings.Index(rest, "/authz/approve/"); idx > 0 {
+			routeID := rest[:idx]
+			clientID := rest[idx+len("/authz/approve/"):]
+			if validRouteID(routeID) && clientID != "" && !strings.Contains(clientID, "/") {
+				s.serveKeyPublicationAuthzApprove(w, tenant, keyID, routeID, clientID)
+				return
+			}
 		}
 	}
 	routeID := rest
@@ -500,6 +515,91 @@ func (s *Server) serveKeyPublicationDesiredState(w http.ResponseWriter, tenant, 
 		"desired_enabled":  enabled,
 		"state_generation": stateGen,
 		"session_live":     sessionLive,
+	})
+}
+
+func (s *Server) serveKeyPublicationAuthzPending(w http.ResponseWriter, tenant, keyID, routeID string) {
+	var exists int
+	if err := s.db.SQL().QueryRow(
+		`SELECT 1 FROM mcp_publications WHERE route_id=? AND tenant_id=? AND owner_key_id=? AND revoked_at IS NULL`,
+		routeID, tenant, keyID,
+	).Scan(&exists); err != nil {
+		http.Error(w, "unknown route", http.StatusNotFound)
+		return
+	}
+	type pendingClient struct {
+		ClientID     string `json:"client_id"`
+		Name         string `json:"name"`
+		RedirectURIs string `json:"redirect_uris"`
+		Status       string `json:"status"`
+		CreatedAt    string `json:"created_at"`
+	}
+	out := []pendingClient{}
+	if s.authz != nil {
+		rows, err := s.db.SQL().Query(
+			`SELECT c.id, c.name, c.redirect_uris, COALESCE(g.status, 'pending'), c.created_at
+			 FROM authz_clients c
+			 LEFT JOIN authz_grants g ON g.client_id=c.id AND g.tenant_id=c.tenant_id AND g.route_id=c.route_id
+			 WHERE c.tenant_id=? AND c.route_id=? AND c.revoked_at IS NULL
+			   AND (g.status IS NULL OR g.status='pending')
+			 ORDER BY c.created_at DESC`,
+			tenant, routeID,
+		)
+		if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var p pendingClient
+			if err := rows.Scan(&p.ClientID, &p.Name, &p.RedirectURIs, &p.Status, &p.CreatedAt); err != nil {
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+			out = append(out, p)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"route_id":  routeID,
+		"tenant_id": tenant,
+		"pending":   out,
+	})
+}
+
+func (s *Server) serveKeyPublicationAuthzApprove(w http.ResponseWriter, tenant, keyID, routeID, clientID string) {
+	if s.authz == nil {
+		http.Error(w, "managed authz unavailable", http.StatusConflict)
+		return
+	}
+	var exists int
+	if err := s.db.SQL().QueryRow(
+		`SELECT 1 FROM mcp_publications WHERE route_id=? AND tenant_id=? AND owner_key_id=? AND revoked_at IS NULL`,
+		routeID, tenant, keyID,
+	).Scan(&exists); err != nil {
+		http.Error(w, "unknown route", http.StatusNotFound)
+		return
+	}
+	c, err := s.authz.Store().GetClient(clientID)
+	if err != nil || c == nil || c.RevokedAt != nil || c.Tenant != tenant || c.Route != routeID {
+		http.Error(w, "unknown client", http.StatusNotFound)
+		return
+	}
+	secret, err := authz.MintPairingSecret()
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if err := s.authz.Store().ApproveGrantWithPairingSecret(clientID, tenant, routeID, secret, authz.DefaultPairingTTL); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	s.db.AuditKey("agent", tenant, keyID, "", "authz-approve", "ok", "client "+clientID+" route "+routeID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"route_id":       routeID,
+		"tenant_id":      tenant,
+		"client_id":      clientID,
+		"pairing_secret": secret,
+		"status":         "approved",
 	})
 }
 
