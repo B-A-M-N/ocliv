@@ -92,56 +92,105 @@ owner-only staging dir (`~/ocliv-stage`, 0700), a **separate SQLite DB**, and
 
 ## 4. Promotion procedure (operator-gated at each privileged step)
 
-### Step 0 — Read-only pre-flight + **confirm live schema version (HARD GATE)**
+### Step 0 — Read-only pre-flight + production inventory (HARD GATE)
 ```
 ssh bamn@10.9.66.170
 sudo systemctl status ocliv-relay --no-pager
 curl -fsS http://127.0.0.1:18080/health/live && echo
 curl -fsS http://127.0.0.1:18080/health/ready && echo
 sha256sum /usr/local/bin/ocliv        # expect 0d47481f... (pre-remediation)
-# HARD GATE — live DB schema. `relay doctor` does NOT report schema version
-# and `sqlite3` is not installed on the Pi, so use a genuinely read-only
-# Python query (uri mode=ro; store.Open is NEVER called, so no migration):
+
+# Read-only schema-aware inventory. Does not call store.Open or migrate.
 sudo python3 - <<'PYQ'
 import sqlite3
-db = sqlite3.connect("file:/var/lib/ocliv/ocliv.db?mode=ro", uri=True)
-print("schema_version:", db.execute(
-    "SELECT MAX(v) FROM schema_version").fetchone()[0])
-tables = {r[0] for r in db.execute(
+
+path = "file:/var/lib/ocliv/ocliv.db?mode=ro"
+db = sqlite3.connect(path, uri=True)
+db.execute("PRAGMA query_only=ON")
+
+def columns(table):
+    return {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+
+tables = {row[0] for row in db.execute(
     "SELECT name FROM sqlite_master WHERE type='table'")}
-if "authz_clients" in tables:
-    cols = {r[1] for r in db.execute("PRAGMA table_info(authz_clients)")}
-    if {"tenant_id", "route_id"} <= cols:
-        n = db.execute(
-            "SELECT COUNT(*) FROM authz_clients "
-            "WHERE tenant_id='' OR route_id=''").fetchone()[0]
-        print("unbound_managed_clients:", n)
-    else:
-        print("managed_client_scope_columns: absent")
-db.close()
-PYQ
-#   - If live schema < V11: the candidate migrates forward on first open. OK.
-#   - If live schema > V11 (impossible on prod today) or unreadable: STOP.
-# Inventory managed clients (identify legacy empty-tenant/route rows).
-# Tolerate an absent authz_clients table: the pre-V8 production binary (V7)
-# predates managed authorization, so there may be nothing to inventory.
-sudo python3 - <<'PYQ'
-import sqlite3
-db = sqlite3.connect("file:/var/lib/ocliv/ocliv.db?mode=ro", uri=True)
-tables = {r[0] for r in db.execute(
-    "SELECT name FROM sqlite_master WHERE type='table'")}
-if "authz_clients" in tables:
-    for row in db.execute(
-            "SELECT id, tenant_id, route_id, revoked_at FROM authz_clients"):
-        print(row)
+
+print("=== SCHEMA ===")
+if "schema_version" not in tables:
+    raise SystemExit("STOP: schema_version table missing")
+version = db.execute("SELECT MAX(v) FROM schema_version").fetchone()[0]
+print("schema_version:", version)
+if version is None or version > 11:
+    raise SystemExit("STOP: unsupported schema")
+
+print("=== MANAGED CLIENTS ===")
+if "authz_clients" not in tables:
+    print("authz_clients: absent")
 else:
-    print("authz_clients: absent (pre-managed-authorization schema)")
+    cols = columns("authz_clients")
+    print("columns:", sorted(cols))
+    fields = [
+        name for name in ("id", "tenant_id", "route_id", "revoked_at")
+        if name in cols
+    ]
+    if fields:
+        for row in db.execute("SELECT " + ", ".join(fields) + " FROM authz_clients"):
+            print(dict(zip(fields, row)))
+    else:
+        print("authz_clients: no recognized columns")
+    if {"tenant_id", "route_id"} <= cols:
+        query = (
+            "SELECT COUNT(*) FROM authz_clients "
+            "WHERE tenant_id='' OR tenant_id IS NULL "
+            "OR route_id='' OR route_id IS NULL"
+        )
+        count = db.execute(query).fetchone()[0]
+        print("unbound_clients:", count)
+    else:
+        print("client_binding_columns: PRE_V11")
+
+print("=== PUBLICATIONS ===")
+for table in ("mcp_publications", "mcp_routes"):
+    if table not in tables:
+        print(table, "absent")
+        continue
+    cols = columns(table)
+    fields = [
+        name for name in (
+            "route_id", "tenant_id", "owner_key_id", "external_host",
+            "profile", "pub_name", "lease_id", "verified_at", "revoked_at",
+        ) if name in cols
+    ]
+    print(table, "columns:", sorted(cols))
+    if fields:
+        for row in db.execute("SELECT " + ", ".join(fields) + " FROM " + table):
+            print(dict(zip(fields, row)))
+    else:
+        print(table, "no recognized columns")
+
+print("=== LEASES ===")
+if "leases" in tables:
+    cols = columns("leases")
+    fields = [
+        name for name in (
+            "id", "tenant_id", "agent_key_id", "hostname", "status",
+            "expires_at",
+        ) if name in cols
+    ]
+    if fields:
+        for row in db.execute("SELECT " + ", ".join(fields) + " FROM leases"):
+            print(dict(zip(fields, row)))
+    else:
+        print("leases: no recognized columns")
 db.close()
 PYQ
 ```
-**Record every value. If the recorded binary differs from `0d47481f...`, STOP
-and reconcile first.** Legacy managed clients (empty tenant/route) must be
-noted for post-upgrade re-registration.
+
+The query handles pre-V11 `authz_clients` layouts and absent publication or
+managed-auth tables. It prints identity and ownership metadata only; it does
+not select signing keys, password hashes, bearer credentials, enrollment
+verifiers, or pairing credentials. Record the full output. If the schema is
+unreadable, newer than V11, or the known route ownership is ambiguous, STOP.
+Do not delete historical publication records based on an HTTP 404.
 
 ### Step 1 — WAL-safe backup (operator, root)
 ```
@@ -256,21 +305,46 @@ managed clients/grants/tokens.
 
 ---
 
-## 6. Operator approval gates (explicit)
+## 6. Separate operator decisions (explicit)
 
-Promotion is **NOT authorized** until the operator confirms each gate:
+These approvals are independent; one does not imply the other.
+
+| Decision | Required authorization |
+|---|---|
+| Advance production DB to V11 | Explicit operator approval after Step 0 inventory, validated Step 1 backup, exact candidate digest check, and acceptance of forward-only recovery and possible post-backup state loss. |
+| Establish or restore public MCP publication | Separate approval naming the intended service/upstream and public exposure. Preserve an eligible existing route ID and owner; do not infer approval from migration approval. |
+
+Do not issue a production enrollment code, install a publisher unit, bind a
+new route, or expose a service until the publication decision is approved.
+
+## 7. V11 migration approval gates (explicit)
+
+The V11 migration is **NOT authorized** until the operator confirms each gate:
 1. **Pre-flight recorded** (binary `0d47481f...`, health ok/ok, **live schema
-   version confirmed ≤ V11**, managed-client inventory taken).
+   version confirmed ≤ V11**, managed-client and publication/lease ownership
+   inventory taken).
 2. **Backup taken + checksum sidecar written** (Step 1).
 3. **Candidate digest verified** as `7f438b63...` on the Pi (Step 2).
-4. **Install + restart** (Step 3) — the operator runs this deliberately.
-5. **Post-deploy checks green** (Step 4), including a full authorized
-   `tools/call` through the **real public edge from an off-LAN client**.
-6. **Recovery path rehearsed** and understood (§5: forward-only, roll-forward with the candidate binary — no old-binary rollback is possible once the DB reaches V11).
+4. **Explicit migration approval** after reviewing the inventory, backup
+   recovery point, and forward-only V11 consequences.
+5. **Install + restart** (Step 3) — the operator runs this deliberately.
+6. **Post-deploy health/schema checks green** (Step 4).
+7. **Recovery path understood** (§5: forward-only, roll-forward with the
+   candidate binary — no old-binary rollback is possible once the DB reaches
+   V11).
 
----
+## 8. Separate publication approval (not granted)
 
-## 7. NOT VERIFIED (out of isolated-loopback scope)
+Migration approval does not authorize publisher enrollment, publisher-unit
+installation, route rebinding, or public MCP exposure. Before those actions,
+the operator must separately name and approve the intended service/upstream,
+publisher host/account, and public route. First use the Step 0 inventory to
+decide whether to recover the known route ID or create a new publication.
+Verify only the intended publisher unit is installed for that service; do not
+enable both unit variants for the same publication. Keep this approval separate
+from the V11 migration decision.
+
+## 9. NOT VERIFIED (out of isolated-loopback scope)
 
 - **Public-edge / off-LAN reachability** and a real `tools/call` through the
   public HTTPS edge — loopback/tailnet staging cannot prove this; it is a

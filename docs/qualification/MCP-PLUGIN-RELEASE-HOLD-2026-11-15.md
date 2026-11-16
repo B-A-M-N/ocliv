@@ -26,6 +26,24 @@ both with its stored relay and when directed to
 **unavailable**, not proven empty. The root-only database inventory was not
 read. No production file, service, publication, or database was changed.
 
+## Publisher unit and root-preflight recheck — 2026-11-16
+
+The system manager lists `ocliv-relay.service` as the only Ocliv system
+service; it is enabled and active. The user manager has
+`ocliv-mcp-publish.service` installed but disabled and inactive.
+`ocliv-staging-publish.service` and `ocliv-staging-upstream.service` are also
+disabled and inactive, and port 18767 has no listener. Do not enable the
+legacy publisher as part of promotion. A publisher should run on the machine
+hosting the specifically approved MCP service, under a dedicated production
+identity, after the separate publication decision is approved.
+
+The root-only preflight was retried on 2026-11-16. Relay and Caddy remained
+active, both health endpoints returned `ok`, and the installed binary hash
+remained `0d47481f2e2b7cbff34df57a713f0e39849be92cd85deabd5f256be07a00d0b1`.
+The schema-aware SQLite query still could not run because `sudo -n` returned
+`sudo: a password is required`. No password was requested or supplied; the
+database was not opened.
+
 No current public endpoint has been qualified. Release packaging is on HOLD
 until `scripts/verify-ingress.sh` produces a fresh receipt proving protected
 resource metadata, the exact authorization-server issuer, missing and invalid

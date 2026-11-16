@@ -1,25 +1,38 @@
 Ocliv ARM64 candidate — isolated Pi staging
 ============================================
 
-ACTIVE CANDIDATE (qualified 2026-11-15, supersedes 1ceaaff4/fe48fb96):
-  source commit : 2089516da0180dee0ee95b6c915335e6cdf572c4
+ACTIVE CANDIDATE (qualified 2026-11-15; clean source):
+  source commit : d9ea67b8578ded3b3af25e296acdd1d7d0e0e126
+  source branch : fix/production-review-2026-11-15
   toolchain     : go1.26.10 linux/amd64
-  build config  : CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w"
-  binary sha256 : 65ed20b21eddb40b3cdf3fbb60388dc7deb81066fec6dda9c0142043727b8a53
-  binary size   : 13500578 bytes (static aarch64, stripped)
-  built         : 2026-11-15T10:03:00Z
+  build config  : CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -buildvcs=false -trimpath -ldflags="-s -w"
+  binary sha256 : 7f438b63dd083f34831b133b169707f4d5f479e6aaef7f7894cb4b25e4afc695
+  binary size   : 13631650 bytes (static aarch64, stripped)
+  build output  : /home/bamn/ocliv-stage/ocliv-d9ea67b-20261115/ocliv-arm64
+  qualification : 29 PASS / 0 FAIL, fresh isolated DB and publisher identity
+  Pi test log   : /home/bamn/ocliv-stage/stage-d9ea67b-20261115/qualification.log
 
-  This candidate adds the 2026-11-15 rereview corrections on top of
-  19d46d8: issuer rotation persists on an empty table (INSERT ON CONFLICT +
-  verification), strict authz flag parsing, read-only restore preflight
-  (never migrates the live DB), clean-host service rollback, autoEnroll
-  relay-identity verification, and read-only authz pending/list.
-  1ceaaff4 (19d46d8) and fe48fb96 (f2d2bec) are superseded — do NOT deploy.
+  The clean detached source worktree was
+  /home/bamn/ocliv-stage/source-d9ea67b-20261115. Go's default VCS metadata
+  probe incorrectly ran `git status` from /home/bamn rather than the detached
+  worktree, so the reproducible build disables only VCS stamping; the exact
+  clean source revision is recorded above and in the adjacent provenance file.
+  The local ARM64 artifact and Pi copy were SHA-256 verified against the value
+  above.
 
-SUPERSEDED (reference only):
-  f2d2bec / fe48fb96…  — lacks the composite-grant P1 fix.
-  19d46d8 / 1ceaaff4…  — lacks the 2026-11-15 rereview corrections.
+SUPERSEDED (reference only; do NOT promote):
+  2089516 / 65ed20b21eddb40b3cdf3fbb60388dc7deb81066fec6dda9c0142043727b8a53
+    Earlier qualified source, superseded by the clean-source review candidate.
+  19d46d8 / 1ceaaff4…
+    Superseded by rereview corrections.
+  f2d2bec / fe48fb96…
+    Lacks the composite-grant P1 fix.
 
 PRODUCTION (unchanged, NOT touched):
   binary sha256 : 0d47481f2e2b7cbff34df57a713f0e39849be92cd85deabd5f256be07a00d0b1
   source commit : 6472ff8 (2026-11-11 hardening build)
+
+Production promotion remains HOLD pending the schema-aware root-only
+preflight, validated WAL-safe backup, explicit V11 migration approval, and
+separate public-publication approval. Public OAuth/tool execution, off-LAN
+access, and ChatGPT acceptance remain NOT VERIFIED.
