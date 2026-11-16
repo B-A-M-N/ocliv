@@ -158,3 +158,24 @@ log is retained under
 Production is still HOLD: root-only schema/identity preflight, explicit
 promotion approval, off-LAN acceptance, and live ChatGPT acceptance remain
 outstanding. No production mutation was performed.
+
+### 2026-11-16 isolated Pi qualification — current candidate `efe3a8e`
+
+The later isolated qualification supersedes the `d9ea67b` candidate above.
+Clean commit `efe3a8e972d48d7f9b1a111da31325a0e3a7842a` produced ARM64
+artifact `aef41e6acb06273f56e812d8785f148c29bcedb095e9e2b38aadba167246d08c`
+(13,697,186 bytes), qualified 29/29 on a fresh isolated Pi relay/database.
+The current `fc44a0b` tip adds only the qualification result document; its
+separate build was verified byte-identical. The promotion runbook and
+`docs/qualification/pi-staging/PROVENANCE.txt` now name the exact qualified
+artifact and stage it under `/home/bamn/ocliv-stage`, not `/tmp`.
+
+The result proves isolated loopback behavior only. Clean-host installation,
+off-LAN access, ChatGPT acceptance, and a 24-hour soak remain NOT VERIFIED.
+The production schema and owner inventory and explicit migration/publication
+approvals remain outstanding; no production mutation was performed.
+
+The current uncommitted source includes DCR eviction and qualification-script
+corrections made after that artifact was qualified. The `efe3a8e` artifact is
+therefore the last qualified binary, not a release of the current worktree;
+freeze, rebuild, and requalify before promotion.

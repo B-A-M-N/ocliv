@@ -74,19 +74,24 @@ external-client, and hosted-assistant qualification remain separate gates.
 No public URL is qualified, so no plugin ZIP or ChatGPT endpoint is ready
 for use.
 
-## Clean-source staging candidate — 2026-11-15
+## Latest isolated ARM64 candidate — 2026-11-16
 
-The review fixes are now committed in source revision
-`d9ea67b8578ded3b3af25e296acdd1d7d0e0e126`. Its clean ARM64 candidate has
-SHA-256
-`7f438b63dd083f34831b133b169707f4d5f479e6aaef7f7894cb4b25e4afc695` and
-passed 29/29 isolated Pi staging checks using a fresh database and publisher
-identity. The exact command and staging record are in
-`PROMOTION-RUNBOOK-2026-11-14.md`.
+The current qualified candidate was built from clean source commit
+`efe3a8e972d48d7f9b1a111da31325a0e3a7842a`. Its ARM64 SHA-256 is
+`aef41e6acb06273f56e812d8785f148c29bcedb095e9e2b38aadba167246d08c`; it
+passed 29/29 isolated Pi loopback checks using a fresh database and publisher
+identity. The current `fc44a0b` repository tip adds only the result document,
+and its separately built ARM64 artifact was checked byte-identical. See
+`PI-ISOLATED-RESULT-2026-11-16.md`, `pi-staging/PROVENANCE.txt`, and the
+updated `PROMOTION-RUNBOOK-2026-11-14.md` for the artifact digest and exact
+operator steps. Subsequent DCR LRU and qualification-script changes in the
+current working tree are not in that artifact and require a fresh build and
+qualification before it can be treated as current.
 
 This qualifies the candidate for production preflight review only. The
 production DB schema and publication owner are still unknown because the
 root-only read has not completed; the installed production binary remains
 `0d47481f…`. No production service, database, credential, or publication was
-changed. Public OAuth/tool execution, off-LAN access, and ChatGPT acceptance
-remain unverified, so plugin release remains on HOLD.
+changed. Public OAuth/tool execution, off-LAN access, clean-host installation,
+24-hour soak, and ChatGPT acceptance remain unverified, so promotion and
+plugin release remain on HOLD.

@@ -1,4 +1,4 @@
-# Production promotion runbook — qualified candidate `d9ea67b`
+# Production promotion runbook — qualified candidate `efe3a8e`
 
 **Status: HOLD — production schema/identity preflight and explicit operator approval are still required.**
 This runbook now names the clean-source ARM64 candidate that passed the
@@ -7,16 +7,15 @@ read-only inventory, named-profile, managed-stdio session, lease-renewal, and
 ingress-verifier corrections. Production has not been changed. The root-only
 production database schema and route/identity records remain unread.
 
-**Source-state boundary (2026-11-16):** `d9ea67b` and the digest above are
-the last clean-source candidate with recorded Pi qualification. The current
-branch/worktree includes later documentation and source/test changes; those
-changes are not qualified by the `d9ea67b` result. The rereview recorded a
-later artifact from a dirty `f6ae69b` source snapshot, but it is not a
-promotion candidate because the complete source and untracked test fixtures
-were not frozen in one commit. Do not replace the artifact identity below
-with that snapshot's digest. Reconcile and commit the intended changes, then
-build from a clean detached checkout and repeat qualification before
-publishing a new candidate identity.
+**Source-state boundary (2026-11-16):** the exact ARM64 artifact qualified on
+PiInDaSky was built from clean commit `efe3a8e` and has the digest below.
+Commit `fc44a0b` adds only the isolated qualification result document; its
+ARM64 build was independently checked byte-identical. The current working
+tree has subsequent DCR LRU and qualification-script fixes that are NOT in
+that artifact. Treat this as the last qualified artifact, not a binary for
+the current source snapshot. Freeze those changes, rebuild, and requalify
+before promotion; do not install the artifact below until the current-source
+candidate is requalified and its digest is recorded here.
 
 ---
 
@@ -24,40 +23,40 @@ publishing a new candidate identity.
 
 | Field | Value |
 |---|---|
-| Source commit | `d9ea67b8578ded3b3af25e296acdd1d7d0e0e126` |
+| Source commit | `efe3a8e972d48d7f9b1a111da31325a0e3a7842a` (`test: enumerate staged routes from SQLite`) |
 | Branch | `fix/production-review-2026-11-15` |
 | Go toolchain | go1.26.10 linux/amd64 |
 | Build config | `CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -buildvcs=false -trimpath -ldflags="-s -w"` |
-| **ARM64 SHA-256** | **`7f438b63dd083f34831b133b169707f4d5f479e6aaef7f7894cb4b25e4afc695`** |
-| Binary size | 13,631,650 bytes (static aarch64, stripped) |
+| **ARM64 SHA-256** | **`aef41e6acb06273f56e812d8785f148c29bcedb095e9e2b38aadba167246d08c`** |
+| Binary size | 13,697,186 bytes (static aarch64, stripped) |
 | Schema reached on open | **V11** (forward-only) |
 
-This candidate supersedes `19d46d8` / `1ceaaff4…`, `f2d2bec` /
-`fe48fb96…`, and the intermediate `2089516` / `65ed20b2…` artifact.
-It includes the rereview fixes plus safe failed-rebind cleanup, read-only key
-inventory, named enrollment profiles, isolated managed-stdio sessions, lease
-renewal, hardened ingress qualification, and operator-facing publisher flow.
-Earlier binaries must not be deployed. Provenance:
-`/home/bamn/ocliv-stage/ocliv-d9ea67b-20261115/provenance.txt`.
+This candidate includes the publication-recovery, OAuth, doctor, stream
+cancellation, systemd, Caddy, and setup changes in its source history. It
+supersedes `d9ea67b` / `7f438b63…`, `2089516` / `65ed20b2…`, `19d46d8` /
+`1ceaaff4…`, and `f2d2bec` / `fe48fb96…`. Earlier binaries must not be
+deployed. Exact build and Pi qualification evidence:
+`docs/qualification/PI-ISOLATED-RESULT-2026-11-16.md` and
+`docs/qualification/pi-staging/PROVENANCE.txt`.
 
 Build (off-Pi, on the build host, from a clean checkout of the exact qualified source commit):
 ```
-cd <clean clone at d9ea67b8578ded3b3af25e296acdd1d7d0e0e126>
-RELEASE_DIR="$HOME/releases/ocliv/d9ea67b"
+cd <clean clone at efe3a8e972d48d7f9b1a111da31325a0e3a7842a>
+RELEASE_DIR="$HOME/releases/ocliv/efe3a8e"
 mkdir -p "$RELEASE_DIR"
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -buildvcs=false -trimpath -ldflags="-s -w" -o "$RELEASE_DIR/ocliv-arm64" ./cmd/ocliv
-printf '%s  %s\n' '7f438b63dd083f34831b133b169707f4d5f479e6aaef7f7894cb4b25e4afc695' "$RELEASE_DIR/ocliv-arm64" | sha256sum --check
+printf '%s  %s\n' 'aef41e6acb06273f56e812d8785f148c29bcedb095e9e2b38aadba167246d08c' "$RELEASE_DIR/ocliv-arm64" | sha256sum --check
 ```
 
 ---
 
-## 2. Isolated Pi qualification result — **29 PASS / 0 FAIL** on the clean-source `d9ea67b` / `7f438b63…` artifact
+## 2. Isolated Pi qualification result — **29 PASS / 0 FAIL** on the clean-source `efe3a8e` / `aef41e6…` artifact
 
 Executed on PiInDaSky against the real ARM64 binary, **loopback only**, in an
 owner-only staging dir (`~/ocliv-stage`, 0700), a **separate SQLite DB**, and
 **independently allocated loopback ports** (28080 relay / 28085 health /
 28099 harmless MCP upstream). Production untouched. Reproduce with
-`~/ocliv-stage/stage-d9ea67b-20261115/qualify.py`.
+`/home/bamn/ocliv-stage/stage-efe3a8e-20261116/qualify-pi-isolated.py`.
 
 | Area | Checks | Result |
 |---|---|---|
@@ -245,9 +244,10 @@ has succeeded. Preserve both the database snapshot and Ocliv-generated sidecar.
 ### Step 2 — Build + stage the candidate (build host; digest MUST match §1)
 ```
 # already built; verify the digest before transfer:
-sha256sum "$RELEASE_DIR/ocliv-arm64"    # == 7f438b63...
-scp "$RELEASE_DIR/ocliv-arm64" bamn@10.9.66.170:/tmp/ocliv-new
-ssh bamn@10.9.66.170 'sha256sum /tmp/ocliv-new'   # confirm 7f438b63... on the Pi
+sha256sum "$RELEASE_DIR/ocliv-arm64"    # == aef41e6acb06273f56e812d8785f148c29bcedb095e9e2b38aadba167246d08c
+ssh bamn@10.9.66.170 'install -d -m 0700 /home/bamn/ocliv-stage/candidates/efe3a8e'
+scp "$RELEASE_DIR/ocliv-arm64" bamn@10.9.66.170:/home/bamn/ocliv-stage/candidates/efe3a8e/ocliv-arm64
+ssh bamn@10.9.66.170 'chmod 0600 /home/bamn/ocliv-stage/candidates/efe3a8e/ocliv-arm64 && sha256sum /home/bamn/ocliv-stage/candidates/efe3a8e/ocliv-arm64'
 ```
 
 ### Step 3 — Install + restart (**operator approval required** — point of no easy return)
@@ -255,8 +255,8 @@ ssh bamn@10.9.66.170 'sha256sum /tmp/ocliv-new'   # confirm 7f438b63... on the P
 TS=<same timestamp as Step 1>
 sudo cp -a /usr/local/bin/ocliv /usr/local/bin/ocliv.bak-$TS
 sudo sha256sum /usr/local/bin/ocliv.bak-$TS
-sudo install -o root -g root -m 0755 /tmp/ocliv-new /usr/local/bin/ocliv.new
-sudo sha256sum /usr/local/bin/ocliv.new        # == 7f438b63...
+sudo install -o root -g root -m 0755 /home/bamn/ocliv-stage/candidates/efe3a8e/ocliv-arm64 /usr/local/bin/ocliv.new
+sudo sha256sum /usr/local/bin/ocliv.new        # == aef41e6acb06273f56e812d8785f148c29bcedb095e9e2b38aadba167246d08c
 sudo mv /usr/local/bin/ocliv.new /usr/local/bin/ocliv
 sudo systemctl restart ocliv-relay
 sudo journalctl -u ocliv-relay -n 30 --no-pager
@@ -269,7 +269,7 @@ upgrade is **forward-only**: recovery is roll-forward with the candidate binary
 ```
 curl -fsS http://127.0.0.1:18080/health/live && echo     # ok
 curl -fsS http://127.0.0.1:18080/health/ready && echo    # ok
-sha256sum /usr/local/bin/ocliv                           # 7f438b63...
+sha256sum /usr/local/bin/ocliv                           # aef41e6acb06273f56e812d8785f148c29bcedb095e9e2b38aadba167246d08c
 sudo python3 - <<'PYQ'
 import sqlite3
 db = sqlite3.connect("file:/var/lib/ocliv/ocliv.db?mode=ro", uri=True)
@@ -320,7 +320,7 @@ curl -fsS http://127.0.0.1:18080/health/live && echo
   retires the managed signing key and revokes managed clients/grants, forcing
   re-registration).
 - If the candidate itself is corrupt, reinstall the known-good candidate
-  binary (`7f438b63...`) over the bad one; the V11 DB stays valid. The only
+  binary (`aef41e6…`) over the bad one; the V11 DB stays valid. The only
   way back to the old binary is a full redeploy of the pre-upgrade image from
   backups taken in Step 1/Step 3 BEFORE the candidate ever opened the DB —
   and even then the guarded restore will refuse if post-backup revocations
@@ -361,7 +361,7 @@ The V11 migration is **NOT authorized** until the operator confirms each gate:
    version confirmed ≤ V11**, managed-client and publication/lease ownership
    inventory taken).
 2. **Backup taken + checksum sidecar written** (Step 1).
-3. **Candidate digest verified** as `7f438b63...` on the Pi (Step 2).
+3. **Candidate digest verified** as `aef41e6acb06273f56e812d8785f148c29bcedb095e9e2b38aadba167246d08c` on the Pi (Step 2).
 4. **Explicit migration approval** after reviewing the inventory, backup
    recovery point, and forward-only V11 consequences.
 5. **Install + restart** (Step 3) — the operator runs this deliberately.
@@ -391,5 +391,5 @@ from the V11 migration decision.
 
 ---
 
-*Qualified 2026-11-14 on PiInDaSky (10.9.66.170), isolated loopback staging.*
-*Candidate `d9ea67b`, ARM64 `7f438b63...`, 29/29 isolated Pi checks green. Production remains HOLD pending root-only preflight and explicit promotion approval.*
+*Qualified 2026-11-16 on PiInDaSky (10.9.66.170), isolated loopback staging.*
+*Candidate `efe3a8e`, ARM64 `aef41e6acb06273f56e812d8785f148c29bcedb095e9e2b38aadba167246d08c`, 29/29 isolated Pi checks green. Production remains HOLD pending root-only preflight and explicit promotion approval.*
