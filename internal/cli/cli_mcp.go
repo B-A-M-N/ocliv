@@ -234,13 +234,17 @@ func runMCPManage(in io.Reader, out io.Writer) int {
 		switch req.Method {
 		case "initialize":
 			rpcResult(out, req.ID, map[string]any{
-				"protocolVersion": "2026-07-28",
+				"protocolVersion": "2025-03-26",
+				"capabilities":    map[string]any{"tools": map[string]any{}},
 				"serverInfo":      map[string]any{"name": "ocliv-manage", "version": "1.0.0"},
 			})
 		case "tools/list":
 			tools := make([]any, 0, len(manageTools))
 			for _, name := range manageTools {
-				tools = append(tools, map[string]any{"name": name})
+				tools = append(tools, map[string]any{
+					"name":        name,
+					"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+				})
 			}
 			rpcResult(out, req.ID, map[string]any{"tools": tools})
 		case "tools/call":
