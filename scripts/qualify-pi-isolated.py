@@ -208,7 +208,7 @@ st,b,_=http("POST","/r/"+ra+"/mcp",json.dumps({"jsonrpc":"2.0","id":1,"method":"
 check("B: tools/list with token",st==200 and "ping" in b,"st="+str(st))
 e0=tally()["execs"];st,_b=tools(ra,at);e1=tally()["execs"]
 check("B: tools/call executes once",st==200 and e1==e0+1,"execs %s->%s"%(e0,e1))
-ta=tally();check("B: relay-minted identity, bearer stripped",ta.get("last_auth") in (None,"") and ta.get("last_sub")==cidA and ta.get("last_route")==ra,"sub="+str(ta.get("last_sub")))
+ta=tally();check("B: relay-minted identity, bearer stripped",ta.get("last_auth_present") is False and ta.get("last_sub")==cidA and ta.get("last_route")==ra,"sub="+str(ta.get("last_sub")))
 
 print("== Phase C: refresh rotation ==")
 st,t2=token(ra,{"grant_type":"refresh_token","refresh_token":rt,"client_id":cidA,"resource":RES+"/r/"+ra+"/mcp"})

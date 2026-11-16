@@ -27,7 +27,7 @@ directory. The path and its contents are owned by `bamn`; no `sudo` is used.
 STAGE=/home/bamn/ocliv-stage/stage-<commit>-<date>
 install -d -m 0700 "$STAGE"
 install -m 0755 ocliv-arm64 "$STAGE/ocliv-arm64"
-install -m 0600 mcp_upstream.py "$STAGE/mcp_upstream.py"
+install -m 0600 qualify-pi-upstream.py "$STAGE/mcp_upstream.py"
 install -m 0600 qualify-pi-isolated.py "$STAGE/qualify-pi-isolated.py"
 sha256sum "$STAGE/ocliv-arm64"
 python3 "$STAGE/qualify-pi-isolated.py"
