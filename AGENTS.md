@@ -138,3 +138,23 @@ promotion.
   accept the existing recovery procedure as-is; the forward-only contract is
   unchanged. Operator gates (root schema read, off-LAN baseline, explicit
   approval) still outstanding.
+
+### 2026-11-15 clean-source candidate qualification — `d9ea67b`
+
+The post-rereview publishing and qualification fixes are committed in
+`599996a` and `d9ea67b`. A clean detached checkout of
+`d9ea67b8578ded3b3af25e296acdd1d7d0e0e126` produced the ARM64 staging
+candidate `7f438b63dd083f34831b133b169707f4d5f479e6aaef7f7894cb4b25e4afc695`
+(13,631,650 bytes). Go VCS stamping was disabled because the Go probe ran
+`git status` from `/home/bamn` instead of the detached worktree; the clean
+source commit and exact build command are in the promotion runbook and
+artifact provenance.
+
+The matching Pi artifact passed **29/29 isolated staging checks** with a
+fresh staging DB and identity. The relay restart, managed OAuth/tool path,
+security boundaries, and guarded restore rehearsal passed. The qualification
+log is retained under
+`/home/bamn/ocliv-stage/stage-d9ea67b-20261115/qualification.log`.
+Production is still HOLD: root-only schema/identity preflight, explicit
+promotion approval, off-LAN acceptance, and live ChatGPT acceptance remain
+outstanding. No production mutation was performed.

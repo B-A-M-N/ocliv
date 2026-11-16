@@ -44,3 +44,20 @@ identity despite the adapter's ephemeral port. Production route,
 external-client, and hosted-assistant qualification remain separate gates.
 No public URL is qualified, so no plugin ZIP or ChatGPT endpoint is ready
 for use.
+
+## Clean-source staging candidate — 2026-11-15
+
+The review fixes are now committed in source revision
+`d9ea67b8578ded3b3af25e296acdd1d7d0e0e126`. Its clean ARM64 candidate has
+SHA-256
+`7f438b63dd083f34831b133b169707f4d5f479e6aaef7f7894cb4b25e4afc695` and
+passed 29/29 isolated Pi staging checks using a fresh database and publisher
+identity. The exact command and staging record are in
+`PROMOTION-RUNBOOK-2026-11-14.md`.
+
+This qualifies the candidate for production preflight review only. The
+production DB schema and publication owner are still unknown because the
+root-only read has not completed; the installed production binary remains
+`0d47481f…`. No production service, database, credential, or publication was
+changed. Public OAuth/tool execution, off-LAN access, and ChatGPT acceptance
+remain unverified, so plugin release remains on HOLD.
