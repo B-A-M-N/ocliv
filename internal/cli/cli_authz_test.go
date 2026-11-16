@@ -284,3 +284,20 @@ func TestAuthzReadOnlyDoesNotChangeDatabaseBytes(t *testing.T) {
 		t.Fatal("authz list changed the database bytes")
 	}
 }
+
+func TestAuthzBareJSONFlagAndNoSwallow(t *testing.T) {
+	spec := authzSpecFor("json")
+	f, err := parseAuthzFlags([]string{"--data", "/tmp/d", "--json"}, spec)
+	if err != nil {
+		t.Fatalf("expected bare --json to parse, got error: %v", err)
+	}
+	if !f.asJSON || f.dataDir != "/tmp/d" {
+		t.Fatalf("unexpected parsed flags: %+v", f)
+	}
+	if _, err := parseAuthzFlags([]string{"--data", "--json"}, spec); err == nil {
+		t.Fatal("expected --data --json without value to fail rather than swallowing --json")
+	}
+	if _, err := parseAuthzFlags([]string{"--json=true"}, spec); err == nil {
+		t.Fatal("expected --json=true to be rejected")
+	}
+}

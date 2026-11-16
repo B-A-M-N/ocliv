@@ -39,28 +39,6 @@ const (
 	HealthFailed   = "FAILED"
 )
 
-// ServiceStatusReport is the structured diagnostic output for `ocliv service status --json`.
-type ServiceStatusReport struct {
-	Name               string `json:"name"`
-	Type               string `json:"type"`
-	DesiredState       string `json:"desired_state"`
-	State              string `json:"state"`
-	Health             string `json:"health"`
-	ProcessState       string `json:"process_state"`
-	RelayState         string `json:"relay_state"`
-	PublicationID      string `json:"publication_id,omitempty"`
-	LeaseID            string `json:"lease_id,omitempty"`
-	PublicURL          string `json:"public_url,omitempty"`
-	AuthProfile        string `json:"auth_profile"`
-	BackendAvailable   bool   `json:"backend_available"`
-	BackendDetail      string `json:"backend_detail,omitempty"`
-	IngressReady       bool   `json:"ingress_ready"`
-	IngressDetail      string `json:"ingress_detail,omitempty"`
-	LastVerifiedAt     string `json:"last_verified_at,omitempty"`
-	LastFailure        string `json:"last_failure,omitempty"`
-	LastRecoveryAction string `json:"last_recovery_action,omitempty"`
-}
-
 type serviceStopResult struct {
 	Name          string `json:"name"`
 	Stopped       bool   `json:"stopped"`
@@ -70,23 +48,26 @@ type serviceStopResult struct {
 	Detail        string `json:"detail,omitempty"`
 }
 
-// serviceOps isolates external interactions (systemd, relay mgmt, probes)
+// serviceOps isolates external interactions (systemd --user, relay mgmt, probes)
 // so both production and hermetic unit/integration tests use the same logic.
 type serviceOps struct {
 	systemctl func(args ...string) (string, error)
 	mgmtCall  func(relayURL string, k *identity.KeyPair, keyID, method, path string) (int, []byte, error)
 	probeLoc  func(target string, timeout time.Duration) error
 	probePub  func(publicURL string, timeout time.Duration) (int, error)
+	provision func(rec config.ServiceRecord, ops serviceOps) error
 }
 
 func defaultServiceOps() serviceOps {
 	return serviceOps{
 		systemctl: func(args ...string) (string, error) {
-			out, err := exec.Command("systemctl", args...).CombinedOutput()
+			uargs := append([]string{"--user"}, args...)
+			out, err := exec.Command("systemctl", uargs...).CombinedOutput()
 			return strings.TrimSpace(string(out)), err
 		},
-		mgmtCall: mgmtCall,
-		probeLoc: agent.ProbeLocal,
+		mgmtCall:  mgmtCall,
+		probeLoc:  agent.ProbeLocal,
+		provision: provisionUserSupervisor,
 		probePub: func(publicURL string, timeout time.Duration) (int, error) {
 			c, err := mgmtHTTPClient(timeout)
 			if err != nil {
@@ -111,19 +92,21 @@ func defaultServiceOps() serviceOps {
 
 func cmdService(argv []string) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ocliv service add|update|start|stop|restart|status|list|remove ...")
+		fmt.Fprintln(os.Stderr, "usage: ocliv service add|update|start|stop|disable|restart|status|list|remove ...")
 		return apperr.ExitCLIValidation
 	}
 	ops := defaultServiceOps()
 	switch argv[0] {
 	case "add":
-		return cmdServiceAdd(argv[1:])
+		return cmdServiceAdd(argv[1:], ops)
 	case "update":
 		return cmdServiceUpdate(argv[1:])
 	case "start":
 		return cmdServiceStart(argv[1:], ops)
 	case "stop":
 		return cmdServiceStop(argv[1:], ops)
+	case "disable":
+		return cmdServiceDisable(argv[1:], ops)
 	case "restart":
 		return cmdServiceRestart(argv[1:], ops)
 	case "status":
@@ -132,23 +115,29 @@ func cmdService(argv []string) int {
 		return cmdServiceList(argv[1:], ops)
 	case "remove":
 		return cmdServiceRemove(argv[1:], ops)
+	case "run-publisher":
+		return cmdServiceRunPublisher(argv[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown service command %q\n", argv[0])
 		return apperr.ExitCLIValidation
 	}
 }
 
-func openServices() (*config.ServiceStore, error) {
-	dir, err := config.DataDir()
+func openServicesForProfile(profile string) (*config.ServiceStore, error) {
+	dir, err := config.DataDirForProfile(profile)
 	if err != nil {
 		return nil, err
 	}
 	return config.OpenServiceStore(dir), nil
 }
 
-func cmdServiceAdd(argv []string) int {
+func openServices() (*config.ServiceStore, error) {
+	return openServicesForProfile(config.ActiveProfile())
+}
+
+func cmdServiceAdd(argv []string, ops serviceOps) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ocliv service add NAME --type mcp|http (--local URL | --stdio -- CMD [ARGS...]) [--auth MODE] [--relay URL] [--unit UNIT]")
+		fmt.Fprintln(os.Stderr, "usage: ocliv service add NAME [--type mcp|http] (--attach URL | --local URL | --manage --local URL --exec BIN | --stdio -- CMD...) [--auth MODE] [--relay URL]")
 		return apperr.ExitCLIValidation
 	}
 	name := argv[0]
@@ -156,17 +145,23 @@ func cmdServiceAdd(argv []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return apperr.ExitCLIValidation
 	}
-	var svcType, localURL, auth, relayURL, unit string
-	var stdio bool
-	var stdioCmd []string
+	var svcType, localURL, auth, relayURL, unit, execBin string
+	var manage, stdio bool
+	var stdioCmd, execArgs []string
 	for i := 1; i < len(argv); i++ {
 		a := argv[i]
 		switch {
 		case a == "--":
-			stdioCmd = argv[i+1:]
+			if manage {
+				execArgs = argv[i+1:]
+			} else {
+				stdioCmd = argv[i+1:]
+			}
 			i = len(argv)
 		case a == "--stdio":
 			stdio = true
+		case a == "--manage":
+			manage = true
 		case a == "--type" || strings.HasPrefix(a, "--type="):
 			v, ok := mcpFlagValue(argv, &i, "type")
 			if !ok {
@@ -179,6 +174,18 @@ func cmdServiceAdd(argv []string) int {
 				return apperr.ExitCLIValidation
 			}
 			localURL = v
+		case a == "--attach" || strings.HasPrefix(a, "--attach="):
+			v, ok := mcpFlagValue(argv, &i, "attach")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			localURL = v
+		case a == "--exec" || strings.HasPrefix(a, "--exec="):
+			v, ok := mcpFlagValue(argv, &i, "exec")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			execBin = v
 		case a == "--auth" || strings.HasPrefix(a, "--auth="):
 			v, ok := mcpFlagValue(argv, &i, "auth")
 			if !ok {
@@ -209,6 +216,18 @@ func cmdServiceAdd(argv []string) int {
 		fmt.Fprintf(os.Stderr, "invalid --type %q (want mcp or http)\n", svcType)
 		return apperr.ExitCLIValidation
 	}
+	backendMode := config.BackendAttached
+	if manage {
+		backendMode = config.BackendManaged
+		if execBin == "" {
+			fmt.Fprintln(os.Stderr, "--manage requires --exec BIN")
+			return apperr.ExitCLIValidation
+		}
+		if localURL == "" {
+			fmt.Fprintln(os.Stderr, "--manage requires --local URL")
+			return apperr.ExitCLIValidation
+		}
+	}
 	if stdio {
 		if svcType != "mcp" || len(stdioCmd) == 0 {
 			fmt.Fprintln(os.Stderr, "--stdio requires --type mcp and -- COMMAND [ARGS...]")
@@ -223,7 +242,7 @@ func cmdServiceAdd(argv []string) int {
 		}
 	} else {
 		if localURL == "" {
-			fmt.Fprintln(os.Stderr, "--local URL or --stdio is required")
+			fmt.Fprintln(os.Stderr, "--attach/--local URL or --stdio is required")
 			return apperr.ExitCLIValidation
 		}
 		if err := config.ValidateServiceLocalURL(localURL); err != nil {
@@ -248,15 +267,16 @@ func cmdServiceAdd(argv []string) int {
 			return apperr.ExitCLIValidation
 		}
 	}
+	prof := config.ActiveProfile()
 	if relayURL != "" {
 		if _, err := validateRelayTarget(relayURL); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return apperr.ExitCLIValidation
 		}
 	} else {
-		relayURL = agentRelayURL()
+		relayURL = agentRelayURLForProfile(prof)
 	}
-	store, err := openServices()
+	store, err := openServicesForProfile(prof)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return apperr.ExitInternal
@@ -271,22 +291,42 @@ func cmdServiceAdd(argv []string) int {
 	if unit == "" {
 		unit = "ocliv-publisher@" + name + ".service"
 	}
+	backendUnit := ""
+	if backendMode == config.BackendManaged {
+		backendUnit = "ocliv-backend@" + name + ".service"
+	}
 	rec := config.ServiceRecord{
 		Name:         name,
 		Type:         svcType,
+		BackendMode:  backendMode,
+		BackendExec:  execBin,
+		BackendArgs:  execArgs,
 		LocalURL:     localURL,
 		StdioCmd:     stdioCmd,
 		Auth:         auth,
 		RelayURL:     relayURL,
-		Profile:      config.ActiveProfile(),
+		Profile:      prof,
 		DesiredState: config.DesiredConfigured,
 		SystemdUnit:  unit,
+		BackendUnit:  backendUnit,
 	}
 	if err := store.Put(rec); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return apperr.ExitInternal
 	}
-	fmt.Printf("✓ registered service %s (%s, auth=%s, desired=%s)\n", rec.Name, rec.Type, rec.Auth, rec.DesiredState)
+	backendStatus := "not running"
+	if target, _, err := localTargetFromURL(rec.LocalURL); err == nil {
+		if ops.probeLoc(target, 500*time.Millisecond) == nil {
+			backendStatus = "reachable"
+		}
+	} else if len(rec.StdioCmd) > 0 {
+		backendStatus = "stdio configured"
+	}
+	fmt.Printf("Service %s configured (profile=%s, mode=%s).\n", rec.Name, rec.Profile, rec.BackendMode)
+	fmt.Printf("Backend: %s\n", backendStatus)
+	fmt.Printf("Publisher: not installed\n")
+	fmt.Printf("Public URL: not yet allocated\n")
+	fmt.Printf("Next: ocliv service start %s\n", rec.Name)
 	return apperr.ExitOK
 }
 
@@ -306,6 +346,7 @@ func cmdServiceUpdate(argv []string) int {
 		fmt.Fprintf(os.Stderr, "unknown service %q\n", name)
 		return apperr.ExitCLIValidation
 	}
+	var newLocal, newRelay string
 	for i := 1; i < len(argv); i++ {
 		a := argv[i]
 		switch {
@@ -318,7 +359,7 @@ func cmdServiceUpdate(argv []string) int {
 				fmt.Fprintln(os.Stderr, err)
 				return apperr.ExitCLIValidation
 			}
-			rec.LocalURL = v
+			newLocal = v
 		case a == "--relay" || strings.HasPrefix(a, "--relay="):
 			v, ok := mcpFlagValue(argv, &i, "relay")
 			if !ok {
@@ -328,17 +369,26 @@ func cmdServiceUpdate(argv []string) int {
 				fmt.Fprintln(os.Stderr, err)
 				return apperr.ExitCLIValidation
 			}
-			rec.RelayURL = v
+			newRelay = v
 		default:
 			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
 			return apperr.ExitCLIValidation
 		}
 	}
-	if err := store.Put(rec); err != nil {
+	updated, err := store.UpdateCAS(name, rec.Revision, func(r *config.ServiceRecord) error {
+		if newLocal != "" {
+			r.LocalURL = newLocal
+		}
+		if newRelay != "" {
+			r.RelayURL = newRelay
+		}
+		return nil
+	})
+	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return apperr.ExitInternal
 	}
-	fmt.Printf("✓ updated service %s (local=%s; permanent identity unchanged)\n", rec.Name, rec.LocalURL)
+	fmt.Printf("✓ updated service %s (local=%s; permanent identity unchanged)\n", updated.Name, updated.LocalURL)
 	return apperr.ExitOK
 }
 
@@ -367,17 +417,83 @@ func cmdServiceStart(argv []string, ops serviceOps) int {
 		fmt.Fprintf(os.Stderr, "unknown service %q\n", name)
 		return apperr.ExitCLIValidation
 	}
-	k, keyID, err := loadKey()
+	// Bind credentials strictly to the profile the service was created with.
+	prof := rec.Profile
+	if prof == "" {
+		prof = "default"
+	}
+	k, keyID, err := loadKeyForProfile(prof)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "not enrolled: run `ocliv login` first")
+		fmt.Fprintf(os.Stderr, "not enrolled in profile %q: run `ocliv login` first\n", prof)
 		return apperr.ExitAuth
 	}
 	relayURL := rec.RelayURL
 	if relayURL == "" {
-		relayURL = agentRelayURL()
+		relayURL = agentRelayURLForProfile(prof)
 	}
-	// If this service already has a publication on the relay, explicitly
-	// enable desired_enabled=1 before starting the publisher.
+	if _, rerr := validateRelayTarget(relayURL); rerr != nil {
+		fmt.Fprintf(os.Stderr, "service start: %v\n", rerr)
+		return apperr.ExitCLIValidation
+	}
+
+	if foreground {
+		if rec.PublicationID != "" {
+			st, body, callErr := ops.mgmtCall(relayURL, k, keyID, http.MethodPost, "/v1/agent/mcp-routes/"+rec.PublicationID+"/enable")
+			if callErr != nil {
+				fmt.Fprintf(os.Stderr, "service start: relay enable failed: %v\n", callErr)
+				return apperr.ExitRelayTLS
+			}
+			if st != http.StatusOK && st != http.StatusNotFound {
+				fmt.Fprintf(os.Stderr, "service start: relay enable returned %d: %s\n", st, strings.TrimSpace(string(body)))
+				return apperr.ExitAuth
+			}
+		}
+		if _, err := store.UpdateCAS(rec.Name, rec.Revision, func(r *config.ServiceRecord) error {
+			r.DesiredState = config.DesiredEnabled
+			r.LastRecoveryAction = ""
+			return nil
+		}); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return apperr.ExitInternal
+		}
+		return startServiceForeground(rec)
+	}
+
+	// 1. Provision user-level supervisor units & 0600 env file.
+	if ops.provision != nil {
+		if perr := ops.provision(rec, ops); perr != nil {
+			_, _ = store.UpdateCAS(rec.Name, 0, func(r *config.ServiceRecord) error {
+				r.LastFailure = perr.Error()
+				return nil
+			})
+			fmt.Fprintf(os.Stderr, "service start: supervisor provisioning failed: %v\n", perr)
+			return apperr.ExitInternal
+		}
+	}
+
+	// 2. If managed backend, start it before enabling/publishing.
+	if rec.BackendMode == config.BackendManaged && rec.BackendUnit != "" {
+		if out, berr := ops.systemctl("start", rec.BackendUnit); berr != nil {
+			fmt.Fprintf(os.Stderr, "service start: managed backend %s failed: %v (%s)\n", rec.BackendUnit, berr, out)
+			return apperr.ExitLocalTarget
+		}
+	}
+
+	// 3. Validate local backend reachability before mutating relay state.
+	if len(rec.StdioCmd) == 0 {
+		target, _, err := localTargetFromURL(rec.LocalURL)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return apperr.ExitCLIValidation
+		}
+		if perr := ops.probeLoc(target, 3*time.Second); perr != nil {
+			fmt.Fprintf(os.Stderr, "service start: local backend unreachable at %s: %v\n", target, perr)
+			return apperr.ExitLocalTarget
+		}
+	}
+
+	// 4. Enable publication on relay if it already exists.
+	prevDesired := rec.DesiredState
 	if rec.PublicationID != "" {
 		st, body, callErr := ops.mgmtCall(relayURL, k, keyID, http.MethodPost, "/v1/agent/mcp-routes/"+rec.PublicationID+"/enable")
 		if callErr != nil {
@@ -389,34 +505,61 @@ func cmdServiceStart(argv []string, ops serviceOps) int {
 			return apperr.ExitAuth
 		}
 	}
-	rec.DesiredState = config.DesiredEnabled
-	rec.LastRecoveryAction = ""
-	if err := store.Put(rec); err != nil {
+
+	updated, err := store.UpdateCAS(rec.Name, rec.Revision, func(r *config.ServiceRecord) error {
+		r.DesiredState = config.DesiredEnabled
+		r.LastRecoveryAction = ""
+		return nil
+	})
+	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return apperr.ExitInternal
 	}
-	if foreground {
-		return startServiceForeground(rec)
-	}
+	rec = updated
+
+	// 5. Start the publisher unit; on failure roll back desired state.
 	if out, err := ops.systemctl("start", rec.SystemdUnit); err != nil {
-		rec.LastFailure = fmt.Sprintf("systemd start %s failed: %v (%s)", rec.SystemdUnit, err, out)
-		rec.LastRecoveryAction = "run `ocliv service start " + name + " --foreground` or check `systemctl status " + rec.SystemdUnit + "`"
-		_ = store.Put(rec)
-		fmt.Fprintln(os.Stderr, rec.LastFailure)
+		if prevDesired != config.DesiredEnabled && rec.PublicationID != "" {
+			_, _, _ = ops.mgmtCall(relayURL, k, keyID, http.MethodPost, "/v1/agent/mcp-routes/"+rec.PublicationID+"/disable")
+		}
+		_, _ = store.UpdateCAS(rec.Name, 0, func(r *config.ServiceRecord) error {
+			if prevDesired != config.DesiredEnabled {
+				r.DesiredState = config.DesiredDisabled
+			}
+			r.LastFailure = fmt.Sprintf("systemd start %s failed: %v (%s)", rec.SystemdUnit, err, out)
+			r.LastRecoveryAction = "run `ocliv service start " + name + " --foreground` or check `systemctl --user status " + rec.SystemdUnit + "`"
+			return nil
+		})
+		fmt.Fprintf(os.Stderr, "service start: %s\n", rec.LastFailure)
 		return apperr.ExitInternal
 	}
-	rep := inspectServiceStatus(rec, k, keyID, ops)
-	if rep.PublicationID != "" {
-		rec.PublicationID = rep.PublicationID
+
+	// 6. Verify readiness (bounded poll so unit has time to register).
+	var rep ServiceStatusReport
+	for attempt := 0; attempt < 15; attempt++ {
+		rep = inspectServiceStatus(rec, k, keyID, ops)
+		if rep.State == ServiceStateServing || rep.State == ServiceStateFaulted || rep.State == ServiceStateRevoked {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
-	if rep.PublicURL != "" {
-		rec.PublicURL = rep.PublicURL
-	}
-	if rep.State == ServiceStateServing {
-		rec.LastVerifiedAt = time.Now().UTC().Format(time.RFC3339Nano)
-		rec.LastFailure = ""
-	}
-	_ = store.Put(rec)
+	_, _ = store.UpdateCAS(rec.Name, 0, func(r *config.ServiceRecord) error {
+		if rep.PublicationID != "" {
+			r.PublicationID = rep.PublicationID
+		}
+		if rep.PublicURL != "" {
+			r.PublicURL = rep.PublicURL
+		}
+		if rep.StateGeneration > 0 {
+			r.StateGeneration = rep.StateGeneration
+		}
+		if rep.State == ServiceStateServing {
+			r.LastVerifiedAt = time.Now().UTC().Format(time.RFC3339Nano)
+			r.LastFailure = ""
+		}
+		return nil
+	})
+
 	fmt.Printf("✓ service %s state=%s health=%s", rec.Name, rep.State, rep.Health)
 	if rep.PublicURL != "" {
 		fmt.Printf(" url=%s", rep.PublicURL)
@@ -429,6 +572,9 @@ func cmdServiceStart(argv []string, ops serviceOps) int {
 }
 
 func startServiceForeground(rec config.ServiceRecord) int {
+	if rec.Profile != "" && rec.Profile != "default" {
+		_ = os.Setenv("OCLIV_PROFILE", rec.Profile)
+	}
 	if rec.Type == "mcp" {
 		args := []string{"--auth", rec.Auth, "--name", rec.Name}
 		if rec.RelayURL != "" {
@@ -442,7 +588,6 @@ func startServiceForeground(rec config.ServiceRecord) int {
 		}
 		return runMCPPublish(args, false)
 	}
-	// Generic HTTP tunnel sharing the same service record identity.
 	target, _, err := localTargetFromURL(rec.LocalURL)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -453,6 +598,38 @@ func startServiceForeground(rec config.ServiceRecord) int {
 		args = append(args, "--public")
 	}
 	return cmdTunnel(args)
+}
+
+func cmdServiceRunPublisher(argv []string) int {
+	var name string
+	for i := 0; i < len(argv); i++ {
+		if argv[i] == "--name" || strings.HasPrefix(argv[i], "--name=") {
+			v, ok := mcpFlagValue(argv, &i, "name")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			name = v
+		}
+	}
+	if name == "" {
+		fmt.Fprintln(os.Stderr, "usage: ocliv service run-publisher --name NAME")
+		return apperr.ExitCLIValidation
+	}
+	store, err := openServices()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return apperr.ExitInternal
+	}
+	rec, ok, err := store.Get(name)
+	if err != nil || !ok {
+		fmt.Fprintf(os.Stderr, "unknown service %q\n", name)
+		return apperr.ExitCLIValidation
+	}
+	if rec.DesiredState == config.DesiredDisabled {
+		fmt.Fprintf(os.Stderr, "service %q is administratively disabled; refusing to publish\n", name)
+		return apperr.ExitAuth
+	}
+	return startServiceForeground(rec)
 }
 
 func cmdServiceStop(argv []string, ops serviceOps) int {
@@ -480,9 +657,9 @@ func cmdServiceStop(argv []string, ops serviceOps) int {
 		fmt.Fprintf(os.Stderr, "unknown service %q\n", name)
 		return apperr.ExitCLIValidation
 	}
-	k, keyID, err := loadKey()
+	k, keyID, err := loadKeyForProfile(rec.Profile)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "not enrolled: run `ocliv login` first")
+		fmt.Fprintf(os.Stderr, "not enrolled in profile %q: run `ocliv login` first\n", rec.Profile)
 		return apperr.ExitAuth
 	}
 	res := stopServiceAuthoritatively(store, rec, k, keyID, ops)
@@ -500,118 +677,10 @@ func cmdServiceStop(argv []string, ops serviceOps) int {
 	return apperr.ExitOK
 }
 
-// stopServiceAuthoritatively enforces the 7-step stop contract (Section 4).
-// It never deletes/unpublishes the route and never converts uncertainty into success.
-func stopServiceAuthoritatively(store *config.ServiceStore, rec config.ServiceRecord, k *identity.KeyPair, keyID string, ops serviceOps) serviceStopResult {
-	res := serviceStopResult{
-		Name:          rec.Name,
-		PublicationID: rec.PublicationID,
-		RetainedURL:   rec.PublicURL,
-	}
-	// 1-2. Record desired disabled state durably before stopping.
-	rec.DesiredState = config.DesiredDisabled
-	if err := store.Put(rec); err != nil {
-		res.State = ServiceStateUnknown
-		res.Detail = "failed to persist desired disabled state: " + err.Error()
-		return res
-	}
-	// 3-4. Request supervisor termination and verify process is inactive.
-	if rec.SystemdUnit != "" {
-		if out, err := ops.systemctl("stop", rec.SystemdUnit); err != nil {
-			// If the unit is not loaded/inactive, check is-active before failing.
-			act, _ := ops.systemctl("is-active", rec.SystemdUnit)
-			if act == "active" || act == "activating" || act == "deactivating" {
-				res.State = "STOP_UNCONFIRMED"
-				res.Detail = fmt.Sprintf("systemd stop failed: %v (%s)", err, out)
-				return res
-			}
-		}
-		if act, _ := ops.systemctl("is-active", rec.SystemdUnit); act == "active" || act == "activating" {
-			res.State = "STOP_UNCONFIRMED"
-			res.Detail = "publisher unit still active after stop"
-			return res
-		}
-	}
-	// 5. Confirm relay disable & lease/session teardown.
-	relayURL := rec.RelayURL
-	if relayURL == "" {
-		relayURL = agentRelayURL()
-	}
-	pubID := rec.PublicationID
-	if pubID == "" {
-		// Look up by service name in relay inventory.
-		st, body, callErr := ops.mgmtCall(relayURL, k, keyID, http.MethodGet, "/v1/agent/mcp-routes")
-		if callErr != nil {
-			res.State = ServiceStateUnknown
-			res.Detail = "relay unreachable during stop confirmation: " + callErr.Error()
-			return res
-		}
-		if st == http.StatusOK {
-			var inv struct {
-				Publications []struct {
-					RouteID string  `json:"route_id"`
-					Name    string  `json:"pub_name"`
-					URL     *string `json:"url"`
-				} `json:"publications"`
-			}
-			if json.Unmarshal(body, &inv) == nil {
-				for _, p := range inv.Publications {
-					if p.Name == rec.Name {
-						pubID = p.RouteID
-						if p.URL != nil {
-							res.RetainedURL = *p.URL
-							rec.PublicURL = *p.URL
-						}
-						rec.PublicationID = pubID
-						_ = store.Put(rec)
-						break
-					}
-				}
-			}
-		}
-	}
-	if pubID != "" {
-		st, body, callErr := ops.mgmtCall(relayURL, k, keyID, http.MethodPost, "/v1/agent/mcp-routes/"+pubID+"/disable")
-		if callErr != nil {
-			res.State = ServiceStateUnknown
-			res.Detail = "relay unreachable during disable confirmation: " + callErr.Error()
-			return res
-		}
-		if st != http.StatusOK && st != http.StatusNotFound {
-			res.State = "STOP_UNCONFIRMED"
-			res.Detail = fmt.Sprintf("relay disable returned %d: %s", st, strings.TrimSpace(string(body)))
-			return res
-		}
-		if st == http.StatusOK {
-			var dis struct {
-				DesiredEnabled bool `json:"desired_enabled"`
-				SessionLive    bool `json:"session_live"`
-			}
-			if err := json.Unmarshal(body, &dis); err != nil || dis.DesiredEnabled || dis.SessionLive {
-				res.State = "STOP_UNCONFIRMED"
-				res.Detail = "relay did not confirm session teardown"
-				return res
-			}
-		}
-	}
-	// 6. Confirm public-route admission is denied (404/503, never 200/401).
-	if res.RetainedURL != "" {
-		code, err := ops.probePub(res.RetainedURL, 5*time.Second)
-		if err != nil {
-			res.State = ServiceStateUnknown
-			res.Detail = "public route denial probe failed: " + err.Error()
-			return res
-		}
-		if code != http.StatusNotFound && code != http.StatusServiceUnavailable {
-			res.State = "STOP_UNCONFIRMED"
-			res.Detail = fmt.Sprintf("public route still answered HTTP %d after stop", code)
-			return res
-		}
-	}
-	// 7. Stop contract satisfied.
-	res.Stopped = true
-	res.State = ServiceStateDisabled
-	return res
+// cmdServiceDisable is the emergency remote-first disable path that revokes
+// public forwarding without depending on a functioning local supervisor.
+func cmdServiceDisable(argv []string, ops serviceOps) int {
+	return cmdServiceStop(argv, ops)
 }
 
 func cmdServiceRestart(argv []string, ops serviceOps) int {
@@ -650,9 +719,9 @@ func cmdServiceStatus(argv []string, ops serviceOps) int {
 		fmt.Fprintf(os.Stderr, "unknown service %q\n", name)
 		return apperr.ExitCLIValidation
 	}
-	k, keyID, err := loadKey()
+	k, keyID, err := loadKeyForProfile(rec.Profile)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "not enrolled: run `ocliv login` first")
+		fmt.Fprintf(os.Stderr, "not enrolled in profile %q: run `ocliv login` first\n", rec.Profile)
 		return apperr.ExitAuth
 	}
 	rep := inspectServiceStatus(rec, k, keyID, ops)
@@ -660,14 +729,14 @@ func cmdServiceStatus(argv []string, ops serviceOps) int {
 		b, _ := json.MarshalIndent(rep, "", "  ")
 		fmt.Println(string(b))
 	} else {
-		fmt.Printf("service: %s (%s)\n", rep.Name, rep.Type)
+		fmt.Printf("service: %s (%s, profile=%s, mode=%s)\n", rep.Name, rep.Type, rep.Profile, rep.BackendMode)
 		fmt.Printf("  desired: %s | state: %s | health: %s\n", rep.DesiredState, rep.State, rep.Health)
 		fmt.Printf("  process: %s | relay: %s\n", rep.ProcessState, rep.RelayState)
 		if rep.PublicURL != "" {
 			fmt.Printf("  url:     %s (id=%s)\n", rep.PublicURL, rep.PublicationID)
 		}
 		fmt.Printf("  backend: %v (%s)\n", rep.BackendAvailable, rep.BackendDetail)
-		fmt.Printf("  ingress: %v (%s)\n", rep.IngressReady, rep.IngressDetail)
+		fmt.Printf("  ingress: transport=%v verified=%v (%s)\n", rep.PublicTransport, rep.PublicVerified, rep.IngressDetail)
 		if rep.LastFailure != "" {
 			fmt.Printf("  failure: %s\n", rep.LastFailure)
 		}
@@ -685,175 +754,6 @@ func cmdServiceStatus(argv []string, ops serviceOps) int {
 	default:
 		return apperr.ExitOK
 	}
-}
-
-func inspectServiceStatus(rec config.ServiceRecord, k *identity.KeyPair, keyID string, ops serviceOps) ServiceStatusReport {
-	rep := ServiceStatusReport{
-		Name:               rec.Name,
-		Type:               rec.Type,
-		DesiredState:       rec.DesiredState,
-		State:              ServiceStateConfigured,
-		Health:             HealthUnknown,
-		ProcessState:       "unknown",
-		RelayState:         "unknown",
-		PublicationID:      rec.PublicationID,
-		PublicURL:          rec.PublicURL,
-		AuthProfile:        rec.Auth,
-		LastVerifiedAt:     rec.LastVerifiedAt,
-		LastFailure:        rec.LastFailure,
-		LastRecoveryAction: rec.LastRecoveryAction,
-	}
-	// 1. Supervisor process state.
-	if rec.SystemdUnit != "" {
-		act, err := ops.systemctl("is-active", rec.SystemdUnit)
-		if act != "" {
-			rep.ProcessState = act
-		} else if err != nil {
-			rep.ProcessState = "inactive"
-		}
-	}
-	// 2. Local backend availability.
-	if len(rec.StdioCmd) > 0 {
-		rep.BackendAvailable = true
-		rep.BackendDetail = "stdio subprocess configured"
-	} else if target, _, err := localTargetFromURL(rec.LocalURL); err != nil {
-		rep.BackendDetail = err.Error()
-	} else if perr := ops.probeLoc(target, 2*time.Second); perr != nil {
-		rep.BackendDetail = perr.Error()
-	} else {
-		rep.BackendAvailable = true
-		rep.BackendDetail = "reachable"
-	}
-	// 3. Authenticated relay inventory.
-	relayURL := rec.RelayURL
-	if relayURL == "" {
-		relayURL = agentRelayURL()
-	}
-	st, body, callErr := ops.mgmtCall(relayURL, k, keyID, http.MethodGet, "/v1/agent/mcp-routes")
-	if callErr != nil {
-		rep.State = ServiceStateUnknown
-		rep.Health = HealthUnknown
-		rep.RelayState = "unreachable"
-		rep.IngressDetail = callErr.Error()
-		return rep
-	}
-	if st != http.StatusOK {
-		rep.State = ServiceStateUnknown
-		rep.Health = HealthUnknown
-		rep.RelayState = fmt.Sprintf("http_%d", st)
-		return rep
-	}
-	var inv struct {
-		Publications []struct {
-			RouteID          string  `json:"route_id"`
-			Name             string  `json:"pub_name"`
-			URL              *string `json:"url"`
-			LeaseID          *string `json:"lease_id"`
-			PublicationState string  `json:"publication_state"`
-			DesiredEnabled   bool    `json:"desired_enabled"`
-			SessionLive      bool    `json:"session_live"`
-			Admission        string  `json:"admission"`
-			AdmissionReason  string  `json:"admission_reason"`
-		} `json:"publications"`
-	}
-	if err := json.Unmarshal(body, &inv); err != nil {
-		rep.State = ServiceStateUnknown
-		rep.Health = HealthUnknown
-		rep.RelayState = "invalid_json"
-		return rep
-	}
-	var matched bool
-	var pubState, admission, admissionReason string
-	var relayDesired, sessionLive bool
-	for _, p := range inv.Publications {
-		if (rec.PublicationID != "" && p.RouteID == rec.PublicationID) || p.Name == rec.Name {
-			matched = true
-			rep.PublicationID = p.RouteID
-			if p.URL != nil {
-				rep.PublicURL = *p.URL
-			}
-			if p.LeaseID != nil {
-				rep.LeaseID = *p.LeaseID
-			}
-			pubState = p.PublicationState
-			relayDesired = p.DesiredEnabled
-			sessionLive = p.SessionLive
-			admission = p.Admission
-			admissionReason = p.AdmissionReason
-			break
-		}
-	}
-	if !matched {
-		rep.RelayState = "not_registered"
-		if rec.DesiredState == config.DesiredDisabled {
-			rep.State = ServiceStateDisabled
-			rep.Health = HealthReady
-		} else if rec.DesiredState == config.DesiredConfigured {
-			rep.State = ServiceStateConfigured
-			rep.Health = HealthReady
-		} else if rep.ProcessState == "activating" {
-			rep.State = ServiceStateStarting
-			rep.Health = HealthDegraded
-		} else {
-			rep.State = ServiceStateOffline
-			rep.Health = HealthFailed
-		}
-		return rep
-	}
-	rep.RelayState = pubState
-	if pubState == "REVOKED" {
-		rep.State = ServiceStateRevoked
-		rep.Health = HealthBlocked
-		rep.IngressDetail = "publication revoked"
-		return rep
-	}
-	if rec.DesiredState == config.DesiredDisabled || !relayDesired {
-		rep.State = ServiceStateDisabled
-		if sessionLive {
-			rep.Health = HealthDegraded
-			rep.IngressDetail = "disabled but session still live"
-		} else {
-			rep.Health = HealthReady
-			rep.IngressDetail = "disabled (404)"
-		}
-		return rep
-	}
-	// Desired enabled:
-	if admission == "READY" && sessionLive && rep.BackendAvailable {
-		if rep.PublicURL != "" {
-			code, err := ops.probePub(rep.PublicURL, 3*time.Second)
-			if err == nil && (code == http.StatusUnauthorized || code == http.StatusOK) {
-				rep.IngressReady = true
-				rep.IngressDetail = fmt.Sprintf("HTTP %d", code)
-				rep.State = ServiceStateServing
-				rep.Health = HealthReady
-				return rep
-			}
-			rep.IngressDetail = fmt.Sprintf("probe code=%d err=%v", code, err)
-			rep.State = ServiceStateOffline
-			rep.Health = HealthDegraded
-			return rep
-		}
-		rep.State = ServiceStateServing
-		rep.Health = HealthReady
-		return rep
-	}
-	if rep.ProcessState == "failed" {
-		rep.State = ServiceStateFaulted
-		rep.Health = HealthFailed
-		rep.IngressDetail = admissionReason
-		return rep
-	}
-	if rep.ProcessState == "activating" {
-		rep.State = ServiceStateStarting
-		rep.Health = HealthDegraded
-		rep.IngressDetail = admissionReason
-		return rep
-	}
-	rep.State = ServiceStateOffline
-	rep.Health = HealthFailed
-	rep.IngressDetail = admissionReason
-	return rep
 }
 
 func cmdServiceList(argv []string, ops serviceOps) int {
@@ -882,9 +782,13 @@ func cmdServiceList(argv []string, ops serviceOps) int {
 		fmt.Println("no configured services")
 		return apperr.ExitOK
 	}
-	fmt.Printf("%-18s %-5s %-15s %-11s %s\n", "NAME", "TYPE", "AUTH", "DESIRED", "PUBLIC URL")
+	fmt.Printf("%-18s %-5s %-15s %-11s %-10s %s\n", "NAME", "TYPE", "AUTH", "DESIRED", "PROFILE", "PUBLIC URL")
 	for _, r := range recs {
-		fmt.Printf("%-18s %-5s %-15s %-11s %s\n", r.Name, r.Type, r.Auth, r.DesiredState, r.PublicURL)
+		prof := r.Profile
+		if prof == "" {
+			prof = "default"
+		}
+		fmt.Printf("%-18s %-5s %-15s %-11s %-10s %s\n", r.Name, r.Type, r.Auth, r.DesiredState, prof, r.PublicURL)
 	}
 	return apperr.ExitOK
 }
@@ -922,34 +826,21 @@ func cmdServiceRemove(argv []string, ops serviceOps) int {
 		fmt.Fprintf(os.Stderr, "unknown service %q\n", name)
 		return apperr.ExitCLIValidation
 	}
-	k, keyID, err := loadKey()
+	k, keyID, err := loadKeyForProfile(rec.Profile)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "not enrolled: run `ocliv login` first")
+		fmt.Fprintf(os.Stderr, "not enrolled in profile %q: run `ocliv login` first\n", rec.Profile)
 		return apperr.ExitAuth
 	}
-	if rec.SystemdUnit != "" {
-		_, _ = ops.systemctl("stop", rec.SystemdUnit)
+	pubID, err := removeServiceAuthoritatively(store, rec, k, keyID, ops)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "service remove: %v\n", err)
+		return apperr.ExitRelayTLS
 	}
-	if rec.PublicationID != "" {
-		relayURL := rec.RelayURL
-		if relayURL == "" {
-			relayURL = agentRelayURL()
-		}
-		st, body, callErr := ops.mgmtCall(relayURL, k, keyID, http.MethodDelete, "/v1/agent/mcp-routes/"+rec.PublicationID)
-		if callErr != nil {
-			fmt.Fprintf(os.Stderr, "service remove: relay delete failed: %v\n", callErr)
-			return apperr.ExitRelayTLS
-		}
-		if st != http.StatusOK && st != http.StatusNotFound {
-			fmt.Fprintf(os.Stderr, "service remove: relay delete returned %d: %s\n", st, strings.TrimSpace(string(body)))
-			return apperr.ExitInternal
-		}
+	if pubID != "" {
+		fmt.Printf("✓ permanently removed service %s (publication %s revoked)\n", name, pubID)
+	} else {
+		fmt.Printf("✓ permanently removed service %s\n", name)
 	}
-	if _, err := store.Delete(name); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return apperr.ExitInternal
-	}
-	fmt.Printf("✓ permanently removed service %s\n", name)
 	return apperr.ExitOK
 }
 

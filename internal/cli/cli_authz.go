@@ -110,8 +110,19 @@ func parseAuthzFlags(argv []string, spec authzFlagSpec) (*authzFlags, error) {
 		if !spec.allowed[name] {
 			return nil, fmt.Errorf("unknown flag --%s", name)
 		}
+		if name == "json" {
+			if hasVal {
+				return nil, fmt.Errorf("--json does not take a value")
+			}
+			if f.asJSON {
+				return nil, fmt.Errorf("--json given twice")
+			}
+			f.asJSON = true
+			seen[name] = "true"
+			continue
+		}
 		if !hasVal {
-			if i+1 >= len(argv) {
+			if i+1 >= len(argv) || strings.HasPrefix(argv[i+1], "-") {
 				return nil, fmt.Errorf("--%s requires a value", name)
 			}
 			i++
@@ -133,13 +144,6 @@ func parseAuthzFlags(argv []string, spec authzFlagSpec) (*authzFlags, error) {
 			f.route = val
 		case "client":
 			f.client = val
-		case "json":
-			if !hasVal {
-				// bare --json: boolean flag, value form not supported
-				f.asJSON = true
-				continue
-			}
-			return nil, fmt.Errorf("--json does not take a value")
 		}
 	}
 	for name := range spec.required {

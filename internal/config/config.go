@@ -134,6 +134,41 @@ func DataDir() (string, error) {
 	return dir, nil
 }
 
+// DataDirForProfile resolves the configuration directory for an explicit
+// profile name ("default" or "" selects the root ~/.config/ocliv dir),
+// ignoring OCLIV_PROFILE/active-profile so a service stays bound to the
+// profile it was created with.
+func DataDirForProfile(profile string) (string, error) {
+	if override := strings.TrimSpace(os.Getenv("OCLIV_CONFIG_DIR")); override != "" {
+		if err := os.MkdirAll(override, 0o700); err != nil {
+			return "", err
+		}
+		return override, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "", fmt.Errorf("cannot locate home directory")
+	}
+	root := filepath.Join(home, ".config", "ocliv")
+	p := strings.TrimSpace(profile)
+	dir := root
+	if p != "" && p != "default" {
+		if !ValidProfileName(p) {
+			return "", fmt.Errorf("invalid Ocliv profile name %q", p)
+		}
+		dir = filepath.Join(root, "profiles", p)
+		if _, statErr := os.Stat(dir); os.IsNotExist(statErr) {
+			return "", fmt.Errorf("Ocliv profile %q does not exist; create it with `ocliv profile create %s`", p, p)
+		} else if statErr != nil {
+			return "", statErr
+		}
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
 // ActiveProfile returns the resolved profile name ("default" when unset).
 func ActiveProfile() string {
 	profile := strings.TrimSpace(os.Getenv("OCLIV_PROFILE"))

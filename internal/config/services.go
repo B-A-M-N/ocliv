@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -21,11 +22,21 @@ const (
 	DesiredDisabled   = "disabled"
 )
 
+// Backend ownership modes.
+const (
+	BackendAttached = "attached" // external process listens on LocalURL
+	BackendManaged  = "managed"  // Ocliv supervises BackendExec -> LocalURL
+)
+
 // ServiceRecord is the durable operator-configured service definition.
-// Publication identity is bound to Name (never derived from a local TCP port).
+// Publication identity is bound to Name (never derived from a local TCP port)
+// and Profile/RelayURL (never silently switched by active-profile changes).
 type ServiceRecord struct {
 	Name               string   `json:"name"`
-	Type               string   `json:"type"` // "mcp" | "http"
+	Type               string   `json:"type"`                   // "mcp" | "http"
+	BackendMode        string   `json:"backend_mode,omitempty"` // "attached" | "managed"
+	BackendExec        string   `json:"backend_exec,omitempty"`
+	BackendArgs        []string `json:"backend_args,omitempty"`
 	LocalURL           string   `json:"local_url,omitempty"`
 	StdioCmd           []string `json:"stdio_cmd,omitempty"`
 	StdioDir           string   `json:"stdio_dir,omitempty"`
@@ -34,9 +45,13 @@ type ServiceRecord struct {
 	RelayURL           string   `json:"relay_url,omitempty"`
 	Profile            string   `json:"profile,omitempty"`
 	DesiredState       string   `json:"desired_state"`
+	Revision           int64    `json:"revision"`
+	StateGeneration    int64    `json:"state_generation,omitempty"`
 	PublicationID      string   `json:"publication_id,omitempty"`
 	PublicURL          string   `json:"public_url,omitempty"`
+	PublicVerified     bool     `json:"public_verified,omitempty"`
 	SystemdUnit        string   `json:"systemd_unit,omitempty"`
+	BackendUnit        string   `json:"backend_unit,omitempty"`
 	LastVerifiedAt     string   `json:"last_verified_at,omitempty"`
 	LastFailure        string   `json:"last_failure,omitempty"`
 	LastRecoveryAction string   `json:"last_recovery_action,omitempty"`
@@ -81,14 +96,35 @@ func ValidateServiceLocalURL(raw string) error {
 	}
 }
 
-// ServiceStore manages owner-only (0600) durable service records in services.json.
+// ServiceStore manages owner-only (0600) durable service records in
+// services.json with interprocess file locking (flock) and monotonic revisions.
 type ServiceStore struct {
-	path string
+	path     string
+	lockPath string
 }
 
 // OpenServiceStore returns a ServiceStore backed by <dir>/services.json.
 func OpenServiceStore(dir string) *ServiceStore {
-	return &ServiceStore{path: filepath.Join(dir, "services.json")}
+	return &ServiceStore{
+		path:     filepath.Join(dir, "services.json"),
+		lockPath: filepath.Join(dir, "services.lock"),
+	}
+}
+
+func (s *ServiceStore) withLock(fn func() error) error {
+	if err := os.MkdirAll(filepath.Dir(s.lockPath), 0o700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(s.lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	return fn()
 }
 
 func (s *ServiceStore) loadMap() (map[string]ServiceRecord, error) {
@@ -139,56 +175,108 @@ func (s *ServiceStore) saveMap(m map[string]ServiceRecord) error {
 }
 
 func (s *ServiceStore) List() ([]ServiceRecord, error) {
-	m, err := s.loadMap()
-	if err != nil {
-		return nil, err
-	}
-	out := make([]ServiceRecord, 0, len(m))
-	for _, r := range m {
-		out = append(out, r)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out, nil
+	var out []ServiceRecord
+	err := s.withLock(func() error {
+		m, err := s.loadMap()
+		if err != nil {
+			return err
+		}
+		out = make([]ServiceRecord, 0, len(m))
+		for _, r := range m {
+			out = append(out, r)
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+		return nil
+	})
+	return out, err
 }
 
 func (s *ServiceStore) Get(name string) (ServiceRecord, bool, error) {
-	m, err := s.loadMap()
-	if err != nil {
-		return ServiceRecord{}, false, err
-	}
-	r, ok := m[name]
-	return r, ok, nil
+	var rec ServiceRecord
+	var ok bool
+	err := s.withLock(func() error {
+		m, err := s.loadMap()
+		if err != nil {
+			return err
+		}
+		rec, ok = m[name]
+		return nil
+	})
+	return rec, ok, err
 }
 
+// Put writes rec under flock, incrementing Revision monotonically.
 func (s *ServiceStore) Put(rec ServiceRecord) error {
 	if err := ValidateServiceName(rec.Name); err != nil {
 		return err
 	}
-	m, err := s.loadMap()
-	if err != nil {
-		return err
-	}
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if rec.CreatedAt == "" {
-		if prev, ok := m[rec.Name]; ok && prev.CreatedAt != "" {
-			rec.CreatedAt = prev.CreatedAt
-		} else {
-			rec.CreatedAt = now
+	return s.withLock(func() error {
+		m, err := s.loadMap()
+		if err != nil {
+			return err
 		}
-	}
-	rec.UpdatedAt = now
-	m[rec.Name] = rec
-	return s.saveMap(m)
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		if prev, ok := m[rec.Name]; ok {
+			if rec.CreatedAt == "" && prev.CreatedAt != "" {
+				rec.CreatedAt = prev.CreatedAt
+			}
+			if prev.Revision >= rec.Revision {
+				rec.Revision = prev.Revision + 1
+			}
+		} else {
+			if rec.CreatedAt == "" {
+				rec.CreatedAt = now
+			}
+			if rec.Revision <= 0 {
+				rec.Revision = 1
+			}
+		}
+		rec.UpdatedAt = now
+		m[rec.Name] = rec
+		return s.saveMap(m)
+	})
+}
+
+// UpdateCAS atomically mutates an existing record if its Revision matches expectedRev.
+func (s *ServiceStore) UpdateCAS(name string, expectedRev int64, fn func(*ServiceRecord) error) (ServiceRecord, error) {
+	var updated ServiceRecord
+	err := s.withLock(func() error {
+		m, err := s.loadMap()
+		if err != nil {
+			return err
+		}
+		rec, ok := m[name]
+		if !ok {
+			return fmt.Errorf("unknown service %q", name)
+		}
+		if expectedRev > 0 && rec.Revision != expectedRev {
+			return fmt.Errorf("concurrent modification on service %q (revision %d != %d)", name, rec.Revision, expectedRev)
+		}
+		if err := fn(&rec); err != nil {
+			return err
+		}
+		rec.Revision++
+		rec.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		m[name] = rec
+		updated = rec
+		return s.saveMap(m)
+	})
+	return updated, err
 }
 
 func (s *ServiceStore) Delete(name string) (bool, error) {
-	m, err := s.loadMap()
-	if err != nil {
-		return false, err
-	}
-	if _, ok := m[name]; !ok {
-		return false, nil
-	}
-	delete(m, name)
-	return true, s.saveMap(m)
+	var deleted bool
+	err := s.withLock(func() error {
+		m, err := s.loadMap()
+		if err != nil {
+			return err
+		}
+		if _, ok := m[name]; !ok {
+			return nil
+		}
+		delete(m, name)
+		deleted = true
+		return s.saveMap(m)
+	})
+	return deleted, err
 }

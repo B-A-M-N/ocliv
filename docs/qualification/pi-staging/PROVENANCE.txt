@@ -1,33 +1,33 @@
 Ocliv ARM64 candidate — isolated Pi staging
 ============================================
 
-LATEST QUALIFIED CANDIDATE (2026-11-16):
-  source commit : 7674c4b4881b2824f6dc204206f51a46d4ff6ec4
+LATEST QUALIFIED CANDIDATE (2026-11-16, Schema V12):
+  source commit : 1c26a8f0e5d6a48ec48d6fdda241fd871d97c090 (Pi test updated in 14f2741)
   source branch : fix/production-review-2026-11-15
-  toolchain     : go1.26.10 linux/amd64
+  toolchain     : go1.26.11 linux/amd64
   build config  : CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -buildvcs=false -trimpath -ldflags="-s -w"
-  binary sha256 : e5cd410b52a66641dfdec65d23405f99d21e8978a9e5d49652e507bd61cf63f5
-  binary size   : 13697186 bytes (static aarch64, stripped)
-  build output  : /home/bamn/ocliv-stage/candidates/7674c4b-20261116/ocliv-arm64
-  qualification : 29 PASS / 0 FAIL, fresh isolated DB and publisher identity
-  Pi artifact   : /home/bamn/ocliv-stage/stage-7674c4b-20261116-recorded/ocliv-arm64
-  Pi test log   : /home/bamn/ocliv-stage/stage-7674c4b-20261116-recorded/qualification.log
+  binary sha256 : 6a180d5658e6f9d2c1a1aac24ae84905d23d35bc83a952a31c8acdade3b4659c
+  binary size   : 13762722 bytes (static aarch64, stripped)
+  build output  : /home/bamn/ocliv-stage/candidates/1c26a8f-20261116/ocliv-arm64
+  qualification : 29 PASS / 0 FAIL, fresh isolated V12 DB and publisher identity
+  Pi artifact   : /home/bamn/ocliv-stage/stage-1c26a8f-20261116-clean/ocliv-arm64
+  Pi test log   : /home/bamn/ocliv-stage/stage-1c26a8f-20261116-clean/qualification.log
 
-The exact candidate digest was checked on the build host and Pi. Source gates
-passed: `go test ./... -count=1`, `go test -race ./internal/... -count=1`,
-`go vet ./...`, and Skybridge `npm test` (86/86). See
-`docs/qualification/PI-ISOLATED-RESULT-2026-11-16.md` for scope and test detail.
+Note: Subsequent CLI-side service lifecycle commits on this branch do not alter
+the relay Schema V12 contract, but a new ARM64 candidate must be rebuilt and
+re-qualified before any future relay promotion.
 
 SUPERSEDED (reference only; do NOT promote):
-  efe3a8e / aef41e6acb06273f56e812d8785f148c29bcedb095e9e2b38aadba167246d08c
-  d9ea67b / 7f438b63dd083f34831b133b169707f4d5f479e6aaef7f7894cb4b25e4afc695
-  2089516 / 65ed20b21eddb40b3cdf3fbb60388dc7deb81066fec6dda9c0142043727b8a53
+  7674c4b / e5cd410b52a66641dfdec65d23405f99d21e8978a9e5d49652e507bd61cf63f5 (V11)
+  efe3a8e / aef41e6acb06273f56e812d8785f148c29bcedb095e9e2b38aadba167246d08c (V11)
+  d9ea67b / 7f438b63dd083f34831b133b169707f4d5f479e6aaef7f7894cb4b25e4afc695 (V11)
+  2089516 / 65ed20b21eddb40b3cdf3fbb60388dc7deb81066fec6dda9c0142043727b8a53 (V11)
   19d46d8 / 1ceaaff4…
   f2d2bec / fe48fb96…
 
-PRODUCTION (unchanged, NOT touched):
-  binary sha256 : 0d47481f2e2b7cbff34df57a713f0e39849be92cd85deabd5f256be07a00d0b1
-  source commit : 6472ff8 (2026-11-11 hardening build)
+PRODUCTION (PiInDaSky, promoted 2026-11-16, V7 -> V12):
+  binary sha256 : 6a180d5658e6f9d2c1a1aac24ae84905d23d35bc83a952a31c8acdade3b4659c
+  backup        : /var/lib/ocliv/backup-pre-v12.db (pre-migration V7)
 
 Production promotion remains HOLD pending the schema-aware root-only
 preflight, validated WAL-safe backup, explicit V11 migration approval, and
