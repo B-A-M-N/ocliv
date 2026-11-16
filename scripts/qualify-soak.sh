@@ -48,6 +48,7 @@ if token_path.stat().st_mode & 0o077:
     raise SystemExit("bearer file must be owner-only (mode 0600)")
 tool = os.environ["OCLIV_SOAK_TOOL"]
 args = json.loads(os.environ["OCLIV_SOAK_ARGS_JSON"])
+token = token_path.read_text().strip()
 duration = int(os.environ["OCLIV_SOAK_DURATION_SECONDS"])
 interval = int(os.environ["OCLIV_SOAK_INTERVAL_SECONDS"])
 drop_every = int(os.environ["OCLIV_SOAK_DROP_EVERY_SECONDS"])
@@ -86,6 +87,8 @@ def request(method, params=None, notification=False):
     req = urllib.request.Request(url, data=json.dumps(msg).encode(), headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
+            if notification and resp.status in (200, 202, 204):
+                return None
             if resp.status != 200:
                 raise RuntimeError("HTTP " + str(resp.status))
             session = resp.headers.get("Mcp-Session-Id", session)

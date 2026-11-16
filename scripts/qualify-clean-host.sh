@@ -27,15 +27,28 @@ for path in sys.argv[1:]:
 PY
 
 work="$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/ocliv-clean-qual.XXXXXX")"
-publisher_pid=""
+unit="ocliv-clean-host-${BASHPID}.service"
+unit_dir="$HOME/.config/systemd/user"
+unit_file="$unit_dir/$unit"
+wrapper="$work/publisher.sh"
+publisher_log="$work/publisher.log"
+unit_installed=0
 cleanup() {
-  if [[ -n "$publisher_pid" ]] && kill -0 "$publisher_pid" 2>/dev/null; then
-    kill -TERM "$publisher_pid" 2>/dev/null || true
-    wait "$publisher_pid" 2>/dev/null || true
+  if (( unit_installed )); then
+    systemctl --user stop "$unit" >/dev/null 2>&1 || true
+    systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
+    rm -f "$unit_file"
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
   fi
   rm -rf "$work"
 }
 trap cleanup EXIT INT TERM
+
+command -v systemctl >/dev/null || { echo "systemctl is required for lifecycle qualification" >&2; exit 2; }
+systemctl --user show-environment >/dev/null 2>&1 || {
+  echo "a running systemd user manager is required; run this on the disposable host's logged-in qualification account" >&2
+  exit 2
+}
 
 mkdir -p "$HOME/.local/bin"
 if [[ -n "${OCLIV_QUALIFY_OCLIV_BIN:-}" ]]; then
@@ -51,19 +64,45 @@ export PATH="$HOME/.local/bin:$PATH"
 command -v ocliv >/dev/null || { echo "ocliv is not installed; set OCLIV_QUALIFY_OCLIV_BIN" >&2; exit 2; }
 command -v caddy >/dev/null || { echo "Caddy is not installed; set OCLIV_QUALIFY_CADDY_BIN" >&2; exit 2; }
 command -v agentgateway >/dev/null || { echo "agentgateway is not installed; set OCLIV_QUALIFY_AGENTGATEWAY_BIN" >&2; exit 2; }
+ocliv_bin="$(command -v ocliv)"
 [[ -r "$OCLIV_QUALIFY_PUBLIC_TOKEN_FILE" && -r "$OCLIV_QUALIFY_UPSTREAM_TOKEN_FILE" ]]
 
 ocliv setup --check
 cat "$OCLIV_QUALIFY_ENROLL_CODE_FILE" | ocliv login --relay "$OCLIV_QUALIFY_RELAY" --code-file -
 
 name="${OCLIV_QUALIFY_PUBLICATION_NAME:-clean-host-canary}"
-start_publisher() {
-  OCLIV_UPSTREAM_MCP_TOKEN="$(cat "$OCLIV_QUALIFY_UPSTREAM_TOKEN_FILE")" \
-    ocliv mcp publish --local "$OCLIV_QUALIFY_LOCAL_MCP_URL" --auth upstream-oauth --name "$name" \
-      --resource-file "$OCLIV_QUALIFY_RESOURCE_FILE" --strict-discovery \
-    >"$work/publisher.log" 2>&1 &
-  publisher_pid=$!
-}
+[[ ! -e "$unit_file" ]] || { echo "refusing to replace existing unit: $unit_file" >&2; exit 2; }
+python3 - "$wrapper" "$unit_file" "$unit" "$ocliv_bin" "$OCLIV_QUALIFY_LOCAL_MCP_URL" "$name" "$OCLIV_QUALIFY_RESOURCE_FILE" "$OCLIV_QUALIFY_UPSTREAM_TOKEN_FILE" "$publisher_log" <<'PY'
+import pathlib, shlex, sys
+wrapper, unit_file, unit, binary, local_url, name, resource, token_file, log = sys.argv[1:]
+q = shlex.quote
+script = "#!/bin/sh\nset -eu\n"
+script += "token=$(cat " + q(token_file) + ")\n"
+script += "exec env OCLIV_UPSTREAM_MCP_TOKEN=\"$token\" " + q(binary) + " mcp publish --local=" + q(local_url)
+script += " --auth=upstream-oauth --name=" + q(name) + " --resource-file=" + q(resource)
+script += " --strict-discovery >>" + q(log) + " 2>&1\n"
+pathlib.Path(wrapper).write_text(script)
+pathlib.Path(wrapper).chmod(0o700)
+service = """[Unit]
+Description=Disposable Ocliv clean-host qualification publisher
+
+[Service]
+Type=simple
+ExecStart=%s
+Restart=no
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target
+""" % q(wrapper)
+pathlib.Path(unit_file).parent.mkdir(parents=True, exist_ok=True)
+pathlib.Path(unit_file).write_text(service)
+pathlib.Path(unit_file).chmod(0o600)
+PY
+unit_installed=1
+systemctl --user daemon-reload
+start_publisher() { systemctl --user start "$unit"; }
 wait_for_url() {
   for _ in $(seq 1 120); do
     route="$(python3 - "$work/publisher.log" <<'PY'
@@ -74,7 +113,7 @@ print(matches[-1] if matches else "")
 PY
 )"
     [[ -n "$route" ]] && { printf '%s\n' "$route"; return 0; }
-    if ! kill -0 "$publisher_pid" 2>/dev/null; then
+    if ! systemctl --user is-active --quiet "$unit"; then
       cat "$work/publisher.log" >&2
       echo "publisher exited before publishing" >&2
       return 1
@@ -114,9 +153,11 @@ def post(method, params=None, notification=False):
             sid = resp.headers.get("Mcp-Session-Id", sid)
     except urllib.error.HTTPError as e:
         status, raw, ctype = e.code, e.read(1024).decode(errors="replace"), ""
+    if notification and status in (200, 202, 204):
+        return None
     if status != want:
         raise SystemExit("expected HTTP %d, got %d: %s" % (want, status, raw[:300]))
-    if status != 200 or notification: return None
+    if status != 200: return None
     if "text/event-stream" in ctype:
         values = [line[6:].strip() for line in raw.splitlines() if line.startswith("data: ")]
         for value in reversed(values):
@@ -150,9 +191,7 @@ route="$(wait_for_url)"
 probe 200 "$route"
 echo "published: $route"
 
-kill -TERM "$publisher_pid"
-wait "$publisher_pid" || true
-publisher_pid=""
+systemctl --user stop "$unit"
 probe 503 "$route"
 echo "pause: same route returns 503"
 
@@ -164,7 +203,5 @@ echo "resume: same route returned to HTTP 200"
 
 ocliv mcp revoke --name "$name"
 probe 404 "$route"
-kill -TERM "$publisher_pid" 2>/dev/null || true
-wait "$publisher_pid" 2>/dev/null || true
-publisher_pid=""
+systemctl --user stop "$unit" 2>/dev/null || true
 echo "CLEAN-HOST PASS: publish, pause, same-URL resume, and permanent revoke verified"
