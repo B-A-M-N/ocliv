@@ -407,11 +407,13 @@ func (s *Server) serveMCPRouteList(w http.ResponseWriter, leaseID string) {
 	}
 	defer rows.Close()
 	type routeInfo struct {
-		RouteID   string `json:"route_id"`
-		Auth      string `json:"auth"`
-		URL       string `json:"url"`
-		CreatedAt string `json:"created_at"`
-		State     string `json:"state"`
+		RouteID    string  `json:"route_id"`
+		Auth       string  `json:"auth"`
+		URL        string  `json:"url"`
+		LeaseID    string  `json:"lease_id"`
+		VerifiedAt *string `json:"verified_at"`
+		CreatedAt  string  `json:"created_at"`
+		State      string  `json:"state"`
 	}
 	out := []routeInfo{}
 	for rows.Next() {
@@ -431,7 +433,8 @@ func (s *Server) serveMCPRouteList(w http.ResponseWriter, leaseID string) {
 		if s.mcpHost != "" {
 			url = s.mcpBaseURL() + "/r/" + id + "/mcp"
 		}
-		out = append(out, routeInfo{RouteID: id, Auth: profile, URL: url, CreatedAt: created, State: state})
+		out = append(out, routeInfo{RouteID: id, Auth: profile, URL: url, LeaseID: leaseID,
+			VerifiedAt: verified, CreatedAt: created, State: state})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"lease_id": leaseID, "routes": out})
 }

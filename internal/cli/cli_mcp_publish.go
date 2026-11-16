@@ -1618,10 +1618,12 @@ func cmdMCPDoctor(argv []string) int {
 	}
 	var rl struct {
 		Routes []struct {
-			RouteID string `json:"route_id"`
-			Auth    string `json:"auth"`
-			URL     string `json:"url"`
-			State   string `json:"state"`
+			RouteID    string  `json:"route_id"`
+			Auth       string  `json:"auth"`
+			URL        string  `json:"url"`
+			LeaseID    string  `json:"lease_id"`
+			VerifiedAt *string `json:"verified_at"`
+			State      string  `json:"state"`
 		} `json:"routes"`
 	}
 	routesOK := false
@@ -1683,6 +1685,18 @@ func cmdMCPDoctor(argv []string) int {
 	if routesOK {
 		for _, route := range rl.Routes {
 			if route.State != "active" {
+				fmt.Printf("public MCP route %s: not serving (publication state %s)\n", route.RouteID, route.State)
+				publicOK = false
+				continue
+			}
+			if route.VerifiedAt == nil || *route.VerifiedAt == "" {
+				fmt.Printf("public MCP route %s: not verified (relay publication has no verified_at)\n", route.RouteID)
+				publicOK = false
+				continue
+			}
+			if route.LeaseID != leaseID {
+				fmt.Printf("public MCP route %s: bound to lease %s, selected lease is %s\n", route.RouteID, route.LeaseID, leaseID)
+				publicOK = false
 				continue
 			}
 			if st.Status != "ACTIVE" || !st.RouteLive {

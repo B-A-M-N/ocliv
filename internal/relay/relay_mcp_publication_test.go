@@ -101,6 +101,45 @@ func TestPublicationStableAcrossLeases(t *testing.T) {
 	}
 }
 
+func TestMCPRouteListExposesVerificationAndLeaseBinding(t *testing.T) {
+	s, db := newMCPServer(t)
+	priv := enrollTestKey(t, db.SQL(), "key-test", "tenant-test")
+	insertMCPLeaseRow(t, db, "lse-doctor", "doctor.t.example.test", AccessModeMCPUpstreamOAuth, lease.StateActive, 1, nil)
+	routeID := publishRoute(t, s, priv, "key-test", "lse-doctor", "upstream-oauth")
+	if code, body := postMCPRouteAction(t, s, priv, "key-test", "lse-doctor", routeID, "activate"); code != http.StatusOK {
+		t.Fatalf("activate route: status=%d body=%s", code, body)
+	}
+
+	path := "/v1/agent/lease/lse-doctor/mcp-route"
+	r := signedMgmtRequest(t, priv, "key-test", http.MethodGet, path)
+	r.Host = "relay.example.test"
+	r.RequestURI = path
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("route list: status=%d body=%s", w.Code, w.Body.String())
+	}
+	var got struct {
+		LeaseID string `json:"lease_id"`
+		Routes  []struct {
+			RouteID    string  `json:"route_id"`
+			LeaseID    string  `json:"lease_id"`
+			VerifiedAt *string `json:"verified_at"`
+			State      string  `json:"state"`
+		} `json:"routes"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.LeaseID != "lse-doctor" || len(got.Routes) != 1 {
+		t.Fatalf("route list binding=%q routes=%+v", got.LeaseID, got.Routes)
+	}
+	route := got.Routes[0]
+	if route.RouteID != routeID || route.LeaseID != got.LeaseID || route.VerifiedAt == nil || route.State != "active" {
+		t.Fatalf("doctor route evidence=%+v, want verified active route bound to selected lease", route)
+	}
+}
+
 // A failed replacement publisher must detach only its own lease, preserving
 // the durable route ID and existing grants. A later publisher reuses that
 // same identity, and a stale cleanup cannot detach the newer successful bind.
