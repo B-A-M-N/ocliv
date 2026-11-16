@@ -117,13 +117,20 @@ export function routeIdOf(routeUrl) {
 }
 
 export class PublisherController extends EventEmitter {
-  constructor(config, { spawnImpl = spawn, now = Date.now, fetchImpl = fetch } = {}) {
+  /**
+   * @param {ReturnType<typeof loadPublisherConfig>} config
+   * @param {{ spawnImpl?: typeof spawn, now?: typeof Date.now, fetchImpl?: typeof fetch, inventoryClient?: { list(): Promise<any[]> } | null, relayOrigin?: string | null, ownerKeyId?: string | null }} [opts]
+   */
+  constructor(config, { spawnImpl = spawn, now = Date.now, fetchImpl = fetch, inventoryClient = null, relayOrigin = null, ownerKeyId = null } = {}) {
     super();
     this.c = config;
     this.spawnImpl = spawnImpl;
     this.now = now;
     this.fetchImpl = fetchImpl;
-    this.children = new Map(); // name -> { child, routeUrl, startedAt, log: [], exited }
+    this.inventoryClient = inventoryClient;
+    this.relayOrigin = relayOrigin ? new URL(relayOrigin).origin : null;
+    this.ownerKeyId = ownerKeyId ?? null;
+    this.children = new Map(); // name -> { child, routeUrl, publicationId, leaseId, readyEvent, startedAt, log: [], exited }
   }
 
   /** Boundary probe: an unauthenticated tools/list must be denied with
@@ -317,7 +324,9 @@ export class PublisherController extends EventEmitter {
       }
       // Stale attachment retired; continue to fresh publish.
     }
-    const args = ['mcp', 'publish', '--local', svc.localUrl, '--auth', svc.auth, '--name', name];
+    const args = ['mcp', 'publish', '--local', svc.localUrl, '--auth', svc.auth, '--name', name, '--json-events'];
+    if (this.relayOrigin) args.push('--relay', this.relayOrigin);
+    if (this.ownerKeyId) args.push('--owner-key', this.ownerKeyId);
     if (svc.auth === 'upstream-oauth' && svc.resourceFile) args.push('--resource-file', svc.resourceFile);
     const childEnv = { HOME: this.c.home, PATH: '/usr/bin:/bin' };
     const upstreamToken = svc.auth === 'upstream-oauth' ? readUpstreamToken(svc.upstreamTokenFile) : null;
@@ -328,20 +337,78 @@ export class PublisherController extends EventEmitter {
     if (!child || !child.stdout || !child.stderr || typeof child.pid !== 'number') {
       throw new PublisherError('SPAWN_FAILED', 'Publisher process failed to start');
     }
-    const rec = { child, routeUrl: null, startedAt: this.now(), log: [], exited: false, exitCode: null, exitedAt: null };
+    const rec = { child, routeUrl: null, publicationId: null, leaseId: null, readyEvent: null, failedReason: null, startedAt: this.now(), log: [], exited: false, exitCode: null, exitedAt: null };
     this.children.set(name, rec);
+    const validateReadyEvent = (ev) => {
+      if (ev.service_name && ev.service_name !== name) {
+        return `Service name mismatch: ${ev.service_name} != ${name}`;
+      }
+      if (this.ownerKeyId && ev.owner_key_id && ev.owner_key_id !== this.ownerKeyId) {
+        return `Owner key mismatch: ${ev.owner_key_id} != ${this.ownerKeyId}`;
+      }
+      if (ev.auth_mode && ev.auth_mode !== svc.auth) {
+        return `Auth mode mismatch: ${ev.auth_mode} != ${svc.auth}`;
+      }
+      if (this.relayOrigin && ev.relay_url) {
+        try {
+          if (new URL(ev.relay_url).origin !== this.relayOrigin) {
+            return `Relay origin mismatch: ${ev.relay_url}`;
+          }
+        } catch {
+          return `Invalid relay_url in event`;
+        }
+      }
+      const parsed = parseRouteUrl(ev.public_url);
+      if (!parsed) return 'Invalid public_url in ready event';
+      if (ev.publication_id && parsed.id !== ev.publication_id) {
+        return 'Publication ID mismatch with public_url';
+      }
+      return parsed;
+    };
     // Line-buffer each stream: chunks can split or merge lines; only
-    // complete lines are scanned so a route URL split across two writes
-    // is still observed exactly once.
+    // complete lines are scanned so a route URL or JSON event split
+    // across two writes is still observed exactly once.
     const scan = (line) => {
       const safeLine = upstreamToken ? line.split(upstreamToken).join('[redacted]') : line;
       if (rec.log.push(safeLine) > 200) rec.log.shift();
+      const trimmed = safeLine.trim();
+      if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+        try {
+          const ev = JSON.parse(trimmed);
+          if (ev && typeof ev.event === 'string') {
+            this.emit('lifecycle', { name, ...ev });
+            if (ev.event === 'publication_failed') {
+              rec.failedReason = ev.error || ev.reason || 'publication_failed';
+              return;
+            }
+            if (ev.event === 'publication_registered' || ev.event === 'publication_ready') {
+              const res = validateReadyEvent(ev);
+              if (typeof res === 'string') {
+                rec.failedReason = res;
+                return;
+              }
+              if (ev.event === 'publication_ready') {
+                rec.readyEvent = ev;
+                rec.publicationId = res.id;
+                rec.leaseId = ev.lease_id ?? null;
+                if (!rec.routeUrl) {
+                  rec.routeUrl = res.url;
+                  this.persistState();
+                  this.emit('route', { name, routeUrl: rec.routeUrl });
+                }
+              }
+              return;
+            }
+            return;
+          }
+        } catch { /* fall through to plain-text URL check */ }
+      }
       const m = safeLine.match(ROUTE_URL);
       // Adopt only a structurally exact route URL: userinfo, query,
       // fragment, or non-https output never becomes the route.
       if (m && !rec.routeUrl) {
         const parsed = parseRouteUrl(m[0]);
-        if (parsed) { rec.routeUrl = parsed.url; this.persistState(); this.emit('route', { name, routeUrl: rec.routeUrl }); }
+        if (parsed) { rec.routeUrl = parsed.url; rec.publicationId = parsed.id; this.persistState(); this.emit('route', { name, routeUrl: rec.routeUrl }); }
       }
     };
     const buffers = new Map();
@@ -371,7 +438,23 @@ export class PublisherController extends EventEmitter {
     let probed = false;
     let readiness = null;
     for (;;) {
-      if (rec.routeUrl && (!probe || probed)) return { name, routeUrl: rec.routeUrl, resumed: false, probed: probe, readiness };
+      if (rec.failedReason) {
+        const reason = rec.failedReason;
+        cleanup();
+        throw new PublisherError('PUBLISH_FAILED', reason);
+      }
+      if (rec.routeUrl && (!probe || probed)) {
+        if (this.inventoryClient) {
+          const pubId = rec.publicationId ?? routeIdOf(rec.routeUrl);
+          const items = await this.inventoryClient.list();
+          const match = Array.isArray(items) ? items.find((p) => (p.id ?? p.route_id) === pubId) : null;
+          if (!match || match.state === 'revoked' || (match.public_url && match.public_url !== rec.routeUrl)) {
+            cleanup();
+            throw new PublisherError('PUBLISH_FAILED', 'Relay inventory did not confirm published route identity');
+          }
+        }
+        return { name, routeUrl: rec.routeUrl, publicationId: rec.publicationId ?? routeIdOf(rec.routeUrl), leaseId: rec.leaseId, readyEvent: rec.readyEvent, resumed: false, probed: probe, readiness };
+      }
       if (rec.routeUrl && probe && !probed) {
         try {
           readiness = await this.probeRoute(rec.routeUrl);
@@ -409,14 +492,32 @@ export class PublisherController extends EventEmitter {
     if (!svc) throw new PublisherError('UNKNOWN_SERVICE', `No allowlisted service: ${name}`);
     if (confirmation !== `STOP ${name}`) throw new PublisherError('CONFIRMATION_REQUIRED', 'Stop requires the exact confirmation `STOP <name>`');
     const rec = this.children.get(name);
-    if (!rec || rec.exited) return { name, stopped: false, retainedRoute: this.loadPersisted()[name]?.routeUrl ?? rec?.routeUrl ?? null };
+    const retainedRoute = this.loadPersisted()[name]?.routeUrl ?? rec?.routeUrl ?? null;
+    if (!rec || rec.exited) {
+      return { name, stopped: false, state: 'UNKNOWN', retainedRoute };
+    }
     await new Promise((resolve) => {
       const timer = setTimeout(() => { try { rec.child.kill('SIGKILL'); } catch { /* already gone */ } resolve(); }, 5000);
       rec.child.once('exit', () => { clearTimeout(timer); resolve(); });
       try { rec.child.kill('SIGTERM'); } catch { clearTimeout(timer); resolve(); }
     });
     this.persistState();
-    return { name, stopped: true, retainedRoute: rec.routeUrl };
+    if (!rec.exited) {
+      return { name, stopped: false, state: 'STOP_UNCONFIRMED', retainedRoute };
+    }
+    if (this.inventoryClient && retainedRoute) {
+      const pubId = routeIdOf(retainedRoute);
+      try {
+        const items = await this.inventoryClient.list();
+        const match = Array.isArray(items) ? items.find((p) => (p.id ?? p.route_id) === pubId) : null;
+        if (match && match.session_live === true) {
+          return { name, stopped: false, state: 'STOP_UNCONFIRMED', retainedRoute };
+        }
+      } catch {
+        return { name, stopped: false, state: 'UNKNOWN', retainedRoute };
+      }
+    }
+    return { name, stopped: true, state: 'DISABLED', retainedRoute };
   }
 
   /** Stop the supervised child for a service. Revocation of the public

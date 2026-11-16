@@ -100,6 +100,12 @@ type mcpPublishConfig struct {
 	// BOTH the relay management API calls and the agent tunnel, so the
 	// two halves of a publication can never target different relays.
 	relay string
+	// jsonEvents emits deterministic newline-delimited JSON lifecycle
+	// events on stdout and routes human-readable status to stderr.
+	jsonEvents bool
+	// expectedOwnerKey pins the enrolled key ID when invoked by a
+	// controller so a mismatched enrollment fails closed.
+	expectedOwnerKey string
 }
 
 // writeResourceBinding atomically publishes the canonical route URL to
@@ -322,6 +328,14 @@ func parseMCPPublish(argv []string, serve bool) (mcpPublishConfig, int) {
 			c.strictDiscovery = true
 		} else if !seenDashDash && a == "--fresh-publication" {
 			c.freshPublication = true
+		} else if !seenDashDash && a == "--json-events" {
+			c.jsonEvents = true
+		} else if !seenDashDash && (a == "--owner-key" || strings.HasPrefix(a, "--owner-key=")) {
+			v, ok := mcpFlagValue(argv, &i, "owner-key")
+			if !ok {
+				return bad()
+			}
+			c.expectedOwnerKey = v
 		} else if !seenDashDash && a == "--dev-allow-unverified-discovery" {
 			c.devAllowUnverified = true
 		} else if !seenDashDash && a == "--accept-unverified-upstream-auth" {
@@ -1057,7 +1071,49 @@ func runMCPPublish(argv []string, serve bool) int {
 		fmt.Fprintln(os.Stderr, "not enrolled: run `ocliv login` first")
 		return apperr.ExitAuth
 	}
+	if cfg.expectedOwnerKey != "" && keyID != cfg.expectedOwnerKey {
+		fmt.Fprintf(os.Stderr, "mcp publish: enrolled owner key %q does not match expected %q\n", keyID, cfg.expectedOwnerKey)
+		return apperr.ExitAuth
+	}
 	relayURL := resolveMCPRelay(cfg.relay)
+	relayOrigin, rerr := validateRelayTarget(relayURL)
+	if rerr != nil {
+		fmt.Fprintf(os.Stderr, "mcp publish: %v\n", rerr)
+		return apperr.ExitCLIValidation
+	}
+	humanOut := os.Stdout
+	if cfg.jsonEvents {
+		humanOut = os.Stderr
+	}
+	resolvedName := cfg.name
+	if resolvedName == "" && !cfg.stdio {
+		if p, _, perr := parseMCPLocalURL(cfg.localURL); perr == nil {
+			resolvedName = defaultPublicationName(p, cfg.localURL, cfg.auth)
+			if cfg.freshPublication {
+				resolvedName = freshPublicationName(resolvedName)
+			}
+		}
+	}
+	localDesc := cfg.localURL
+	if cfg.stdio {
+		localDesc = "stdio:" + strings.Join(cfg.cmd, " ")
+	}
+	pubCtx := PublicationContext{
+		RelayURL:       relayURL,
+		RelayOrigin:    relayOrigin,
+		Profile:        config.ActiveProfile(),
+		OwnerKeyID:     keyID,
+		ServiceName:    resolvedName,
+		AuthMode:       cfg.auth,
+		IngressProfile: mcpIngressProfile(cfg.auth),
+		LocalBackend:   localDesc,
+	}
+	emitter := eventEmitter{enabled: cfg.jsonEvents, ctx: pubCtx}
+	emitter.emit(EventPublicationStarting, "", "", "", false, false, "", "")
+	failExit := func(code int, reason string) int {
+		emitter.emit(EventPublicationFailed, "", "", "", false, false, reason, reason)
+		return code
+	}
 
 	// 1. Local source: validate and start before any tunnel or route, so
 	// a bad local target fails with nothing registered remotely.
@@ -1108,7 +1164,7 @@ func runMCPPublish(argv []string, serve bool) int {
 	target := config.LoopbackTarget(port, v6)
 	if perr := agent.ProbeLocal(target, 3*time.Second); perr != nil {
 		fmt.Fprintf(os.Stderr, "local MCP unreachable at %s: %v\n", target, perr)
-		return apperr.ExitLocalTarget
+		return failExit(apperr.ExitLocalTarget, "local MCP unreachable")
 	}
 	var upstreamBearer string
 	if cfg.auth == "upstream-oauth" {
@@ -1124,27 +1180,27 @@ func runMCPPublish(argv []string, serve bool) int {
 		if cfg.auth == "upstream-oauth" && pout.Auth == "AUTH_REQUIRED" {
 			fmt.Fprintln(os.Stderr, "set OCLIV_UPSTREAM_MCP_TOKEN to a valid local upstream bearer so publish can verify tools/list")
 		}
-		return apperr.ExitLocalTarget
+		return failExit(apperr.ExitLocalTarget, "local MCP protocol check failed")
 	}
 	if pout.Verified && cfg.auth == "upstream-oauth" {
 		pout.AuthEnforced = verifyUpstreamAuthEnforcement(target)
 		if !publishLocalProbeOK(pout, cfg.auth, cfg.acceptUnverifiedUpstreamAuth) {
 			fmt.Fprintln(os.Stderr, "local MCP protocol is valid, but upstream OAuth enforcement is UNVERIFIED: the server did not reject both missing and invalid bearer credentials")
 			fmt.Fprintln(os.Stderr, "fix upstream bearer enforcement or explicitly pass --accept-unverified-upstream-auth; this route will remain marked NOT VERIFIED")
-			return apperr.ExitLocalTarget
+			return failExit(apperr.ExitLocalTarget, "upstream bearer enforcement unverified")
 		}
 		upstreamAuthUnverified = !pout.AuthEnforced
 	}
-	fmt.Printf("local MCP: %s\n", pout.Summary)
+	fmt.Fprintf(humanOut, "local MCP: %s\n", pout.Summary)
 
 	// 2. Tunnel in the requested mode.
 	opts, tcode := mcpTunnelOptions(port, v6, cfg)
 	if tcode != 0 {
-		return tcode
+		return failExit(tcode, "invalid tunnel options")
 	}
 	ready, pcode := prepareTunnel(opts)
 	if pcode != 0 {
-		return pcode
+		return failExit(pcode, "tunnel preparation failed")
 	}
 	// MCP publish supervises a durable route and renews its lease. Ordinary
 	// tunnels retain terminal TTL semantics, including --ttl expiry.
@@ -1155,14 +1211,16 @@ func runMCPPublish(argv []string, serve bool) int {
 	defer stop()
 	a, live, rcode, ok := runTunnel(ctx, ready)
 	if !ok {
-		return rcode
+		return failExit(rcode, "tunnel attach failed")
 	}
 	if a.AccessMode != mcpAccessMode(cfg.auth) {
 		fmt.Fprintf(os.Stderr, "mcp publish: relay allocated mode %q, want %q; refusing to publish\n",
 			a.AccessMode, mcpAccessMode(cfg.auth))
-		return closeTunnel(ready, a, apperr.ExitAuth)
+		return failExit(closeTunnel(ready, a, apperr.ExitAuth), "relay access mode mismatch")
 	}
-	renderTunnelAttached(ready, a)
+	if !cfg.jsonEvents {
+		renderTunnelAttached(ready, a)
+	}
 
 	// 3. Route registration (publish only): after attachment, so the
 	// printed endpoint is live, never speculative.
@@ -1182,7 +1240,7 @@ func runMCPPublish(argv []string, serve bool) int {
 			"/v1/agent/lease/"+routeLeaseID+"/mcp-route/"+profile)
 		if callErr != nil {
 			fmt.Fprintf(os.Stderr, "mcp publish: route registration transport failed (relay %s): %v\n", relayURL, callErr)
-			return closeTunnel(ready, a, apperr.ExitRelayTLS)
+			return failExit(closeTunnel(ready, a, apperr.ExitRelayTLS), "route registration transport failed")
 		}
 		if rstatus != http.StatusOK {
 			// Name the relay that was tried: with several relays in
@@ -1191,7 +1249,7 @@ func runMCPPublish(argv []string, serve bool) int {
 			// unable to tell WHICH relay answered or refused.
 			fmt.Fprintf(os.Stderr, "mcp publish: route registration failed (relay %s status %d): %s\n",
 				relayURL, rstatus, strings.TrimSpace(string(rbody)))
-			return closeTunnel(ready, a, apperr.ExitAuth)
+			return failExit(closeTunnel(ready, a, apperr.ExitAuth), "route registration failed")
 		}
 		var rr struct {
 			RouteID string `json:"route_id"`
@@ -1201,10 +1259,23 @@ func runMCPPublish(argv []string, serve bool) int {
 		}
 		if jerr := json.Unmarshal(rbody, &rr); jerr != nil || rr.RouteID == "" || rr.URL == "" {
 			fmt.Fprintln(os.Stderr, "mcp publish: relay route reply unparseable")
-			return closeTunnel(ready, a, apperr.ExitInternal)
+			return failExit(closeTunnel(ready, a, apperr.ExitInternal), "relay route reply unparseable")
+		}
+		if verr := pubCtx.validateRegistrationResponse(rr.RouteID, rr.URL, rr.Auth); verr != nil {
+			fmt.Fprintf(os.Stderr, "mcp publish: invalid relay registration response: %v\n", verr)
+			del := func(method, path string) (int, string) {
+				st, body, err := mgmtCall(relayURL, k, keyID, method, path)
+				if err != nil {
+					return 0, "transport failure: " + err.Error()
+				}
+				return st, string(body)
+			}
+			abandonPublishedRoute(del, routeLeaseID, rr.RouteID, rr.Created)
+			return failExit(closeTunnel(ready, a, apperr.ExitAuth), verr.Error())
 		}
 		routeID, routeURL, routeCreated = rr.RouteID, rr.URL, rr.Created
 		ready.runner.SetRenewalPublication(routeID)
+		emitter.emit(EventPublicationRegistered, routeID, routeURL, routeLeaseID, false, routeCreated, "", "")
 		// No URL is printed yet (P0-B item 3): registration is not
 		// readiness. The URL is advertised only after the required
 		// security checks complete below.
@@ -1288,10 +1359,12 @@ func runMCPPublish(argv []string, serve bool) int {
 			// no upstream discovery document to match. The route is live as
 			// soon as it is registered; access is gated by operator approval
 			// at admission, never by an unauthenticated fallback.
-			fmt.Println("✓ route registered (managed authorization: the relay is the Authorization Server)")
-			fmt.Println("  clients register via OAuth DCR, then an operator approves them:")
-			fmt.Println("    ocliv authz pending --data <relay-data>")
-			fmt.Println("    ocliv authz approve --data <relay-data> --client <id> --tenant <t> --route " + routeID)
+			fmt.Fprintf(humanOut, "✓ route registered (managed authorization: the relay is the Authorization Server)\n")
+			fmt.Fprintf(humanOut, "  clients register via OAuth DCR, then an operator approves them:\n")
+			fmt.Fprintf(humanOut, "    ocliv authz pending --data <relay-data>\n")
+			fmt.Fprintf(humanOut, "    ocliv authz approve --data <relay-data> --client <id> --tenant <t> --route %s\n", routeID)
+			fmt.Fprintf(humanOut, "\n✓ MCP route ready (auth: %s)\n%s\n", rr.Auth, routeURL)
+			emitter.emit(EventPublicationReady, routeID, routeURL, routeLeaseID, true, routeCreated, "", "")
 		} else if cfg.auth == "upstream-oauth" {
 			durl, derr := mcpRouteDiscoveryURL(routeURL, routeID)
 			if derr != nil {
@@ -1384,11 +1457,13 @@ func runMCPPublish(argv []string, serve bool) int {
 				if upstreamAuthUnverified {
 					status += " upstream authorization"
 				}
-				fmt.Printf("\n⚠ MCP route active — %s (do NOT register this URL with ChatGPT; auth: %s):\n%s\n", status, rr.Auth, routeURL)
+				fmt.Fprintf(humanOut, "\n⚠ MCP route active — %s (do NOT register this URL with ChatGPT; auth: %s):\n%s\n", status, rr.Auth, routeURL)
+				emitter.emit(EventPublicationReady, routeID, routeURL, routeLeaseID, false, routeCreated, status, "")
 			} else {
-				fmt.Println("✓ OAuth discovery verified (resource matches published URL)")
-				fmt.Printf("\n✓ MCP route ready (auth: %s)\n", rr.Auth)
-				fmt.Println(routeURL)
+				fmt.Fprintln(humanOut, "✓ OAuth discovery verified (resource matches published URL)")
+				fmt.Fprintf(humanOut, "\n✓ MCP route ready (auth: %s)\n", rr.Auth)
+				fmt.Fprintln(humanOut, routeURL)
+				emitter.emit(EventPublicationReady, routeID, routeURL, routeLeaseID, true, routeCreated, "", "")
 			}
 		}
 	}
@@ -1416,10 +1491,13 @@ func runMCPPublish(argv []string, serve bool) int {
 		}
 	}
 	a, scode := runSteadyState(ctx, ready, live, a, onReattach)
+	if scode != apperr.ExitCleanShutdown && scode != apperr.ExitOK {
+		emitter.emit(EventPublicationOffline, routeID, routeURL, routeLeaseID, false, routeCreated, "tunnel disconnected", "")
+	}
 	res := CleanupResult{RouteDeleteStatus: -1}
 	if !serve && routeID != "" {
-		fmt.Printf("publication retained (offline until republished): %s\n", routeURL)
-		fmt.Printf("permanent removal: ocliv mcp unpublish --lease %s\n", routeLeaseID)
+		fmt.Fprintf(humanOut, "publication retained (offline until republished): %s\n", routeURL)
+		fmt.Fprintf(humanOut, "permanent removal: ocliv mcp unpublish --lease %s\n", routeLeaseID)
 	}
 	leaseID := a.LeaseID
 	if leaseID == "" {
@@ -1438,7 +1516,13 @@ func runMCPPublish(argv []string, serve bool) int {
 	if msg := res.Report(); msg != "" {
 		fmt.Fprint(os.Stderr, msg)
 	}
-	return res.ExitCode(scode)
+	exitCode := res.ExitCode(scode)
+	if exitCode == apperr.ExitOK || exitCode == apperr.ExitCleanShutdown {
+		emitter.emit(EventPublicationStopped, routeID, routeURL, routeLeaseID, false, routeCreated, "shutdown", "")
+	} else {
+		emitter.emit(EventPublicationFailed, routeID, routeURL, routeLeaseID, false, routeCreated, res.LeaseDetail, res.LeaseDetail)
+	}
+	return exitCode
 }
 
 // selectDoctorLeaseID resolves explicit --lease, named selection, and

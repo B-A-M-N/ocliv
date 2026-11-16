@@ -49,7 +49,7 @@ func TestDNSRefreshUnits(t *testing.T) {
 	assertRefreshService(t, svc)
 	timer := RefreshTimer()
 	for _, want := range []string{
-		"OnUnitActiveSec=5min",
+		"OnUnitActiveSec=15min",
 		"WantedBy=timers.target",
 	} {
 		if !strings.Contains(timer, want) {
@@ -69,9 +69,10 @@ func TestPublisherUnitsShareSupervisionContract(t *testing.T) {
 	root := filepath.Dir(source)
 	units := []string{
 		filepath.Join(root, "ocliv-mcp-publisher.service"),
+		filepath.Join(root, "ocliv-publisher@.service"),
 		filepath.Join(root, "..", "mcp", "systemd", "ocliv-publisher.service"),
 	}
-	for i, path := range units {
+	for _, path := range units {
 		raw, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatalf("read publisher unit %s: %v", path, err)
@@ -109,15 +110,21 @@ func TestPublisherUnitsShareSupervisionContract(t *testing.T) {
 				t.Errorf("%s permanently unpublishes during supervised startup", path)
 			}
 		}
-		homeStore := "/home/ocliv/.config/ocliv"
-		if i == 1 {
-			homeStore = "/home/ocliv-publisher/.config/ocliv"
+		if !strings.Contains(unit, "User=ocliv-publisher") || !strings.Contains(unit, "Group=ocliv-publisher") {
+			t.Errorf("%s must run as unprivileged ocliv-publisher user/group", path)
 		}
+		if !strings.Contains(unit, "InaccessiblePaths=/var/lib/ocliv") {
+			t.Errorf("%s must mark /var/lib/ocliv inaccessible", path)
+		}
+		homeStore := "/home/ocliv-publisher/.config/ocliv"
 		hasHomeWrite := false
 		for _, line := range strings.Split(unit, "\n") {
 			if paths, ok := strings.CutPrefix(line, "ReadWritePaths="); ok {
-				for _, path := range strings.Fields(paths) {
-					if path == homeStore {
+				for _, p := range strings.Fields(paths) {
+					if p == "/var/lib/ocliv" {
+						t.Errorf("%s must NOT grant ReadWritePaths to relay state /var/lib/ocliv", path)
+					}
+					if p == homeStore {
 						hasHomeWrite = true
 					}
 				}
@@ -126,10 +133,8 @@ func TestPublisherUnitsShareSupervisionContract(t *testing.T) {
 		if strings.Contains(unit, "ProtectHome=true") || !hasHomeWrite {
 			t.Errorf("%s blocks the home-scoped enrollment store required by the publisher", path)
 		}
-		if i == 1 {
-			if !strings.Contains(unit, "StateDirectory=ocliv-publisher") {
-				t.Errorf("%s does not provision its resource-file state directory", path)
-			}
+		if strings.Contains(path, "ocliv-publisher") && !strings.Contains(unit, "StateDirectory=ocliv-publisher") {
+			t.Errorf("%s does not provision its resource-file state directory", path)
 		}
 	}
 	envPath := filepath.Join(root, "ocliv-mcp-publisher.env.example")

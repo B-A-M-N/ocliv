@@ -357,6 +357,53 @@ func TestResourceParameterMustMatchRoute(t *testing.T) {
 	}
 }
 
+func TestDuplicateResourceParametersRejected(t *testing.T) {
+	s, _, _ := newTestServer(t)
+	foreign := "https://relay.test/r/other/mcp"
+
+	q := url.Values{}
+	q.Set("client_id", "client")
+	q.Set("redirect_uri", "https://client.example/cb")
+	q.Set("response_type", "code")
+	q.Set("code_challenge", CodeChallengeS256(pkceTestVerifier))
+	q.Set("code_challenge_method", "S256")
+	q.Add("resource", s.RouteURL)
+	q.Add("resource", foreign)
+	rec := httptest.NewRecorder()
+	s.ServeAuthorize(rec, httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+q.Encode(), nil))
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid_target") {
+		t.Fatalf("authorize accepted ambiguous resource parameters: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	consent := url.Values{}
+	consent.Add("resource", s.RouteURL)
+	consent.Add("resource", foreign)
+	rec = httptest.NewRecorder()
+	consentReq := httptest.NewRequest(http.MethodPost, "/oauth/consent", strings.NewReader(consent.Encode()))
+	consentReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	s.ServeConsent(rec, consentReq)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid_target") {
+		t.Fatalf("consent accepted ambiguous resource parameters: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	for _, grantType := range []string{"authorization_code", "refresh_token"} {
+		form := url.Values{}
+		form.Set("grant_type", grantType)
+		form.Set("code", "not-a-code")
+		form.Set("client_id", "client")
+		form.Set("refresh_token", "not-a-token")
+		form.Add("resource", s.RouteURL)
+		form.Add("resource", foreign)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		s.ServeToken(rec, req)
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid_target") {
+			t.Errorf("%s token grant accepted ambiguous resource parameters: status=%d body=%s", grantType, rec.Code, rec.Body.String())
+		}
+	}
+}
+
 func extractChallenge(t *testing.T, page string) string {
 	t.Helper()
 	// The consent form carries <input type="hidden" name="challenge" value="...">.

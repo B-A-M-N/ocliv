@@ -231,7 +231,7 @@ func (rn *Runner) localClient() *http.Client {
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				d := &net.Dialer{Timeout: limits.UpstreamTimeout}
-				return d.DialContext(ctx, "tcp", target)
+				return dialLocalTarget(ctx, d, target)
 			},
 			Proxy:               nil,
 			MaxIdleConnsPerHost: 8,

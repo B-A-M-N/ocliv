@@ -53,7 +53,7 @@ test('publish requires exact confirmation and argv allowlist', async (t) => {
   await assert.rejects(c.publish('nosuch', 'PUBLISH nosuch'), { code: 'UNKNOWN_SERVICE' });
   const p = c.publish('lab', 'PUBLISH lab', { readyTimeoutMs: 5000, probe: false });
   await new Promise((r) => setTimeout(r, 50));
-  assert.deepEqual(seen.args, ['mcp', 'publish', '--local', 'http://127.0.0.1:18767/mcp', '--auth', 'upstream-oauth', '--name', 'lab', '--resource-file', '/tmp/ocliv-pub-test/resource.url']);
+  assert.deepEqual(seen.args, ['mcp', 'publish', '--local', 'http://127.0.0.1:18767/mcp', '--auth', 'upstream-oauth', '--name', 'lab', '--json-events', '--resource-file', '/tmp/ocliv-pub-test/resource.url']);
   assert.equal(seen.bin, BIN);
   assert.equal(seen.opts.cwd, HOME);
   assert.equal(seen.opts.env.HOME, HOME);
@@ -87,7 +87,7 @@ test('operator stop retains route and resume reuses the same publication identit
   const firstOut = await first;
   assert.deepEqual(started[0].args, [
     'mcp', 'publish', '--local', SVC.localUrl, '--auth', 'ocliv-managed',
-    '--name', 'lab',
+    '--name', 'lab', '--json-events',
   ]);
   await assert.rejects(c.stop('lab', 'STOP wrong'), { code: 'CONFIRMATION_REQUIRED' });
   firstRec.child.once = (event, fn) => {

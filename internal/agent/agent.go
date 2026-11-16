@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -119,6 +120,15 @@ func ValidateProbePath(path string) error {
 	return nil
 }
 
+// dialLocalTarget connects to either a loopback TCP host:port or a local
+// Unix-domain socket ("unix:/path/to/socket").
+func dialLocalTarget(ctx context.Context, d *net.Dialer, target string) (net.Conn, error) {
+	if sock, ok := strings.CutPrefix(target, "unix:"); ok {
+		return d.DialContext(ctx, "unix", sock)
+	}
+	return d.DialContext(ctx, "tcp", target)
+}
+
 // ProbeLocalPath verifies a responsive local HTTP service at path,
 // requiring wantStatus when non-zero (0 keeps the any-response-counts
 // policy). Path validation happens before any network use.
@@ -141,7 +151,16 @@ func ProbeLocalPath(target, path string, wantStatus int, timeout time.Duration) 
 			return http.ErrUseLastResponse
 		},
 	}
-	resp, err := c.Get("http://" + target + path)
+	reqURL := "http://" + target + path
+	if strings.HasPrefix(target, "unix:") {
+		c.Transport = &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialLocalTarget(ctx, &net.Dialer{Timeout: timeout}, target)
+			},
+		}
+		reqURL = "http://localhost" + path
+	}
+	resp, err := c.Get(reqURL)
 	if err != nil {
 		return err
 	}

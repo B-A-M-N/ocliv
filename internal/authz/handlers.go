@@ -20,6 +20,14 @@ const (
 	DefaultConsentTTL = 15 * time.Minute
 )
 
+// hasExactResource enforces RFC 8707 binding without accepting ambiguous
+// repeated form/query parameters. url.Values.Get silently chooses the first
+// value, which could let intermediaries and the authorization server
+// interpret a multi-resource request differently.
+func hasExactResource(values []string, routeURL string) bool {
+	return len(values) == 1 && values[0] != "" && values[0] == routeURL
+}
+
 // Bounded-input limits for the public OAuth endpoints (2026-11-14 review
 // P2). Registration writes durable rows, so its request body and every
 // metadata field are individually capped. The form endpoints (authorize,
@@ -374,7 +382,7 @@ func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 	state := q.Get("state")
 	challenge := q.Get("code_challenge")
 	challengeMethod := q.Get("code_challenge_method")
-	resource := q.Get("resource")
+	resource := q["resource"]
 
 	if responseType != "code" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported_response_type"})
@@ -383,7 +391,7 @@ func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 	// MCP authorization spec + RFC 8707: the canonical resource is required
 	// and must be this route exactly. A token for another resource is never
 	// issued for this route.
-	if resource != s.RouteURL {
+	if !hasExactResource(resource, s.RouteURL) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_target",
 			"error_description": "resource must be this route's canonical URL"})
 		return
@@ -467,7 +475,7 @@ func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 		RedirectURI:   redirectURI,
 		CodeChallenge: challenge,
 		State:         state,
-		Resource:      resource,
+		Resource:      resource[0],
 		ExpiresAt:     time.Now().Add(s.consentTTL()),
 	}); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -480,7 +488,7 @@ func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 		RedirectURI:   redirectURI,
 		CodeChallenge: challenge,
 		State:         state,
-		Resource:      resource,
+		Resource:      resource[0],
 		ConsentURL:    s.consentURL(),
 	})
 }
@@ -561,14 +569,15 @@ func (s *Server) ServeConsent(w http.ResponseWriter, r *http.Request) {
 	redirectURI := r.Form.Get("redirect_uri")
 	challenge := r.Form.Get("code_challenge")
 	state := r.Form.Get("state")
-	resource := r.Form.Get("resource")
+	resourceValues := r.Form["resource"]
 	pairing := r.Form.Get("pairing_secret")
 
-	if resource != s.RouteURL {
+	if !hasExactResource(resourceValues, s.RouteURL) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_target",
 			"error_description": "resource must be this route's canonical URL"})
 		return
 	}
+	resource := resourceValues[0]
 	// Consume the challenge first: it is one-time, expiring, and bound to the
 	// transaction. Replay, expiry, and transaction mismatch all fail here.
 	cons, err := s.Store.ConsumeConsent(challengeID)
@@ -663,11 +672,11 @@ func (s *Server) serveCodeGrant(w http.ResponseWriter, r *http.Request) {
 	clientID := r.Form.Get("client_id")
 	redirectURI := r.Form.Get("redirect_uri")
 	verifier := r.Form.Get("code_verifier")
-	resource := r.Form.Get("resource")
+	resourceValues := r.Form["resource"]
 
 	// RFC 8707: the token request's resource must be this route, so the
 	// issued token's audience is bound exactly.
-	if resource != s.RouteURL {
+	if !hasExactResource(resourceValues, s.RouteURL) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_target",
 			"error_description": "resource must be this route's canonical URL"})
 		return
@@ -757,12 +766,12 @@ func (s *Server) serveCodeGrant(w http.ResponseWriter, r *http.Request) {
 func (s *Server) serveRefreshGrant(w http.ResponseWriter, r *http.Request) {
 	clientID := r.Form.Get("client_id")
 	refreshStr := r.Form.Get("refresh_token")
-	resource := r.Form.Get("resource")
+	resourceValues := r.Form["resource"]
 	if clientID == "" || refreshStr == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
 		return
 	}
-	if resource != s.RouteURL {
+	if !hasExactResource(resourceValues, s.RouteURL) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_target",
 			"error_description": "resource must be this route's canonical URL"})
 		return

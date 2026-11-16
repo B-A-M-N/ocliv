@@ -134,6 +134,22 @@ func DataDir() (string, error) {
 	return dir, nil
 }
 
+// ActiveProfile returns the resolved profile name ("default" when unset).
+func ActiveProfile() string {
+	profile := strings.TrimSpace(os.Getenv("OCLIV_PROFILE"))
+	if profile == "" {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			if b, readErr := os.ReadFile(filepath.Join(home, ".config", "ocliv", "active-profile")); readErr == nil {
+				profile = strings.TrimSpace(string(b))
+			}
+		}
+	}
+	if profile == "" {
+		return "default"
+	}
+	return profile
+}
+
 // ValidProfileName accepts a short, path-safe profile identifier.
 func ValidProfileName(name string) bool {
 	if len(name) == 0 || len(name) > 32 || name == "default" {

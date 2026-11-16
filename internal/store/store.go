@@ -209,6 +209,17 @@ ALTER TABLE authz_clients ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE authz_clients ADD COLUMN route_id TEXT NOT NULL DEFAULT '';
 `
 
+// schemaV12 adds durable administrative desired_enabled state and a
+// monotonic state_generation CAS counter to mcp_publications so
+// operator disablement is distinct from unexpected outage, survives
+// restarts, and cannot be overridden by a stale publisher reconnect.
+// Forward-only; existing rows default to desired_enabled=1 and keep
+// all authorization grants and route identities intact.
+const schemaV12 = `
+ALTER TABLE mcp_publications ADD COLUMN desired_enabled INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE mcp_publications ADD COLUMN state_generation INTEGER NOT NULL DEFAULT 1;
+`
+
 // applyMigration runs one versioned migration body and its version
 // stamp in a single transaction: a failure anywhere rolls back the
 // body, so a version is never recorded for half-applied work (P1-2).
@@ -233,7 +244,7 @@ func applyMigration(sqldb *sql.DB, version int, body string) error {
 }
 
 // currentSchema is the newest version Open must reach.
-const currentSchema = 11
+const currentSchema = 12
 
 // SchemaVersion is the exported current schema version for tools that must
 // refuse unknown/newer databases without opening (and thereby migrating)
@@ -404,6 +415,7 @@ func Open(path string) (*DB, error) {
 		{9, schemaV9},
 		{10, schemaV10},
 		{11, schemaV11},
+		{12, schemaV12},
 	}
 	for _, m := range migrations {
 		var v int

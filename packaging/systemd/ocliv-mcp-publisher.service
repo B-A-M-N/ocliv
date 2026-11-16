@@ -39,19 +39,18 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ocliv
-Group=ocliv
+User=ocliv-publisher
+Group=ocliv-publisher
 # All publication parameters come from the env file (root-owned, 0600;
 # see ocliv-mcp-publisher.env.example). A per-instance override may be
 # dropped at /etc/ocliv/publisher-<instance>.env when this unit is
 # started as an instance; the "-" prefix makes it optional.
 EnvironmentFile=/etc/ocliv/publisher.env
 EnvironmentFile=-/etc/ocliv/publisher-%i.env
-# Lease/record state lives in ~ocliv/.config/ocliv (enrollment store);
+# Lease/record state lives in ~ocliv-publisher/.config/ocliv (enrollment store);
 # WorkingDirectory only sets the process cwd. StateDirectory provides a
-# root-owned backing dir for the optional OCLIV_RESOURCE_FILE handoff
-# (default path below lives under it).
-WorkingDirectory=/var/lib/ocliv
+# publisher-owned backing dir for the optional OCLIV_RESOURCE_FILE handoff.
+WorkingDirectory=/var/lib/ocliv-publisher
 StateDirectory=ocliv-mcp-publisher
 # Foreground publish: explicit flags only, no defaults smuggled in.
 # $$ escapes$-expansion so the SHELL (not systemd) reads the env file
@@ -92,11 +91,12 @@ SuccessExitStatus=0
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
+InaccessiblePaths=/var/lib/ocliv
 # ProtectHome=false is required because enrollment keys and the lease store
-# live in ~ocliv/.config/ocliv (config.DataDir). Set OCLIV_CONFIG_DIR to
+# live in ~ocliv-publisher/.config/ocliv (config.DataDir). Set OCLIV_CONFIG_DIR to
 # relocate that state.
 ProtectHome=false
-ReadWritePaths=/var/lib/ocliv-mcp-publisher /var/lib/ocliv /home/ocliv/.config/ocliv
+ReadWritePaths=/var/lib/ocliv-mcp-publisher /home/ocliv-publisher/.config/ocliv
 
 [Install]
 WantedBy=multi-user.target

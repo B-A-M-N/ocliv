@@ -158,8 +158,23 @@ func (s *Server) handleAgentPublications(w http.ResponseWriter, r *http.Request)
 		s.serveKeyPublications(w, tenant, keyID)
 		return
 	}
-	routeID, ok := strings.CutPrefix(r.URL.Path, "/v1/agent/mcp-routes/")
-	if !ok || !validRouteID(routeID) || strings.Contains(routeID, "/") {
+	rest, ok := strings.CutPrefix(r.URL.Path, "/v1/agent/mcp-routes/")
+	if !ok || rest == "" {
+		http.Error(w, "unknown route", http.StatusNotFound)
+		return
+	}
+	if r.Method == http.MethodPost {
+		if routeID, ok := strings.CutSuffix(rest, "/disable"); ok && validRouteID(routeID) {
+			s.serveKeyPublicationDesiredState(w, tenant, keyID, routeID, false)
+			return
+		}
+		if routeID, ok := strings.CutSuffix(rest, "/enable"); ok && validRouteID(routeID) {
+			s.serveKeyPublicationDesiredState(w, tenant, keyID, routeID, true)
+			return
+		}
+	}
+	routeID := rest
+	if !validRouteID(routeID) || strings.Contains(routeID, "/") {
 		http.Error(w, "unknown route", http.StatusNotFound)
 		return
 	}
@@ -217,6 +232,8 @@ type agentPublicationView struct {
 	RevokedAt        *string `json:"revoked_at"`
 	VerifiedAt       *string `json:"verified_at"`
 	PublicationState string  `json:"publication_state"`
+	DesiredEnabled   bool    `json:"desired_enabled"`
+	StateGeneration  int64   `json:"state_generation"`
 	LeaseState       *string `json:"lease_state"`
 	SessionLive      bool    `json:"session_live"`
 	HostBinding      string  `json:"host_binding"`
@@ -230,6 +247,8 @@ type agentPublicationView struct {
 func (s *Server) enrichAgentPublication(tenant, keyID string, p *agentPublicationView) error {
 	if p.RevokedAt != nil {
 		p.PublicationState = "REVOKED"
+	} else if !p.DesiredEnabled {
+		p.PublicationState = "DISABLED"
 	} else if p.VerifiedAt == nil {
 		p.PublicationState = "PENDING"
 	} else {
@@ -249,6 +268,8 @@ func (s *Server) enrichAgentPublication(tenant, keyID string, p *agentPublicatio
 	switch {
 	case p.RevokedAt != nil:
 		reason = "PUBLICATION_REVOKED"
+	case !p.DesiredEnabled:
+		reason = "PUBLICATION_DISABLED"
 	case p.HostBinding == "MISMATCH":
 		reason = "HOST_MISMATCH"
 	case p.HostBinding != "VALID":
@@ -322,12 +343,14 @@ func (s *Server) enrichAgentPublication(tenant, keyID string, p *agentPublicatio
 
 func (s *Server) readKeyPublication(tenant, keyID, routeID string) (*agentPublicationView, error) {
 	var p agentPublicationView
+	var desiredInt int
 	p.RouteID = routeID
 	err := s.db.SQL().QueryRow(
-		`SELECT external_host, profile, pub_name, lease_id, created_at, revoked_at, verified_at
+		`SELECT external_host, profile, pub_name, lease_id, created_at, revoked_at, verified_at, desired_enabled, state_generation
 		 FROM mcp_publications WHERE route_id=? AND tenant_id=? AND owner_key_id=?`,
 		routeID, tenant, keyID,
-	).Scan(&p.Host, &p.Profile, &p.Name, &p.LeaseID, &p.CreatedAt, &p.RevokedAt, &p.VerifiedAt)
+	).Scan(&p.Host, &p.Profile, &p.Name, &p.LeaseID, &p.CreatedAt, &p.RevokedAt, &p.VerifiedAt, &desiredInt, &p.StateGeneration)
+	p.DesiredEnabled = desiredInt != 0
 	if err == sql.ErrNoRows {
 		p.PublicationState = "MISSING"
 		p.HostBinding = "UNKNOWN"
@@ -360,7 +383,7 @@ func (s *Server) serveKeyPublication(w http.ResponseWriter, tenant, keyID, route
 // precise authenticated admission diagnosis.
 func (s *Server) serveKeyPublications(w http.ResponseWriter, tenant, keyID string) {
 	rows, err := s.db.SQL().Query(
-		`SELECT route_id, external_host, profile, pub_name, lease_id, created_at, revoked_at, verified_at FROM mcp_publications WHERE tenant_id=? AND owner_key_id=? ORDER BY created_at`,
+		`SELECT route_id, external_host, profile, pub_name, lease_id, created_at, revoked_at, verified_at, desired_enabled, state_generation FROM mcp_publications WHERE tenant_id=? AND owner_key_id=? ORDER BY created_at`,
 		tenant, keyID)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -370,10 +393,12 @@ func (s *Server) serveKeyPublications(w http.ResponseWriter, tenant, keyID strin
 	out := []agentPublicationView{}
 	for rows.Next() {
 		var p agentPublicationView
-		if err := rows.Scan(&p.RouteID, &p.Host, &p.Profile, &p.Name, &p.LeaseID, &p.CreatedAt, &p.RevokedAt, &p.VerifiedAt); err != nil {
+		var desiredInt int
+		if err := rows.Scan(&p.RouteID, &p.Host, &p.Profile, &p.Name, &p.LeaseID, &p.CreatedAt, &p.RevokedAt, &p.VerifiedAt, &desiredInt, &p.StateGeneration); err != nil {
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
+		p.DesiredEnabled = desiredInt != 0
 		out = append(out, p)
 	}
 	// Enrich after the cursor is closed: the store allows a single
@@ -391,6 +416,91 @@ func (s *Server) serveKeyPublications(w http.ResponseWriter, tenant, keyID strin
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"publications": out})
+}
+
+// serveKeyPublicationDesiredState atomically updates desired_enabled with a
+// monotonic state_generation increment. When disabling, any bound lease is
+// closed and its live session is evicted immediately so forwarding ceases
+// even before the publisher exits.
+func (s *Server) serveKeyPublicationDesiredState(w http.ResponseWriter, tenant, keyID, routeID string, enabled bool) {
+	desiredInt := 0
+	if enabled {
+		desiredInt = 1
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	var boundLease sql.NullString
+	var stateGen int64
+	var notFound, revoked bool
+	err := withTx(s.db.SQL(), func(tx *sql.Tx) error {
+		var rev *string
+		err := tx.QueryRow(
+			`SELECT lease_id, revoked_at, state_generation FROM mcp_publications WHERE route_id=? AND tenant_id=? AND owner_key_id=?`,
+			routeID, tenant, keyID,
+		).Scan(&boundLease, &rev, &stateGen)
+		if err == sql.ErrNoRows {
+			notFound = true
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if rev != nil {
+			revoked = true
+			return nil
+		}
+		res, err := tx.Exec(
+			`UPDATE mcp_publications SET desired_enabled=?, state_generation=state_generation+1, updated_at=?
+			 WHERE route_id=? AND tenant_id=? AND owner_key_id=? AND revoked_at IS NULL AND state_generation=?`,
+			desiredInt, now, routeID, tenant, keyID, stateGen,
+		)
+		if err != nil {
+			return err
+		}
+		n, _ := res.RowsAffected()
+		if n != 1 {
+			return fmt.Errorf("concurrent state update")
+		}
+		stateGen++
+		if !enabled && boundLease.Valid && boundLease.String != "" {
+			if _, err := tx.Exec(
+				`UPDATE leases SET status=?, expires_at=COALESCE(expires_at, ?) WHERE id=? AND tenant_id=? AND agent_key_id=? AND status=?`,
+				lease.StateClosed, now, boundLease.String, tenant, keyID, lease.StateActive,
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if notFound {
+		http.Error(w, "unknown route", http.StatusNotFound)
+		return
+	}
+	if revoked {
+		http.Error(w, "publication revoked", http.StatusConflict)
+		return
+	}
+	if !enabled && boundLease.Valid && boundLease.String != "" {
+		s.evictLease(boundLease.String)
+	}
+	action := "mcp-route-disable"
+	if enabled {
+		action = "mcp-route-enable"
+	}
+	s.db.AuditKey("agent", tenant, keyID, boundLease.String, action, "ok", "route "+routeID)
+	sessionLive := false
+	if boundLease.Valid && boundLease.String != "" {
+		_, sessionLive = s.liveSession(boundLease.String)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"route_id":         routeID,
+		"desired_enabled":  enabled,
+		"state_generation": stateGen,
+		"session_live":     sessionLive,
+	})
 }
 
 // serveMCPRouteList reports the lease's path-route publications
@@ -534,12 +644,17 @@ func (s *Server) serveMCPRouteMutation(w http.ResponseWriter, r *http.Request, t
 			// check below runs before any binding comparison.
 			var boundLease sql.NullString
 			var revoked *string
+			var desiredInt int
 			err := s.db.SQL().QueryRow(
-				`SELECT route_id, lease_id, revoked_at FROM mcp_publications WHERE tenant_id=? AND owner_key_id=? AND external_host=? AND profile=? AND pub_name=?`,
-				tenant, keyID, s.mcpHost, rest, label).Scan(&routeID, &boundLease, &revoked)
+				`SELECT route_id, lease_id, revoked_at, desired_enabled FROM mcp_publications WHERE tenant_id=? AND owner_key_id=? AND external_host=? AND profile=? AND pub_name=?`,
+				tenant, keyID, s.mcpHost, rest, label).Scan(&routeID, &boundLease, &revoked, &desiredInt)
 			if err == nil {
 				if revoked != nil {
 					http.Error(w, "publication revoked; publish under a fresh name", http.StatusConflict)
+					return
+				}
+				if desiredInt == 0 {
+					http.Error(w, "publication disabled; enable it before publishing", http.StatusConflict)
 					return
 				}
 				if !boundLease.Valid || boundLease.String != leaseID {

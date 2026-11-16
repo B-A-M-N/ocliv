@@ -33,7 +33,8 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=false
-ReadWritePaths=/var/lib/ocliv-publisher /var/lib/ocliv
+InaccessiblePaths=/var/lib/ocliv
+ReadWritePaths=/var/lib/ocliv-publisher
 # Enrollment and lease state are owned by the service user under its home.
 ReadWritePaths=/home/ocliv-publisher/.config/ocliv
 

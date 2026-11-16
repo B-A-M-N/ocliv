@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -165,7 +166,7 @@ func TestOpenFutureSchemaDoesNotWriteBootstrapSchema(t *testing.T) {
 	for _, stmt := range []string{
 		`CREATE TABLE schema_version (v INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`,
 		`CREATE TABLE future_marker (value TEXT NOT NULL)`,
-		`INSERT INTO schema_version(v, applied_at) VALUES(12, 'future')`,
+		fmt.Sprintf(`INSERT INTO schema_version(v, applied_at) VALUES(%d, 'future')`, currentSchema+1),
 		`INSERT INTO future_marker(value) VALUES('preserve')`,
 	} {
 		if _, err := raw.Exec(stmt); err != nil {
@@ -197,7 +198,7 @@ func TestOpenFutureSchemaDoesNotWriteBootstrapSchema(t *testing.T) {
 	if err := check.QueryRow(`SELECT COUNT(*) FROM schema_version WHERE v=1`).Scan(&v1Rows); err != nil {
 		t.Fatal(err)
 	}
-	if tables != 2 || version != 12 || markers != 1 || v1Rows != 0 {
+	if tables != 2 || version != currentSchema+1 || markers != 1 || v1Rows != 0 {
 		t.Fatalf("future DB changed after refusal: tables=%d version=%d marker=%d v1=%d", tables, version, markers, v1Rows)
 	}
 }

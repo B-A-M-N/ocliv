@@ -119,8 +119,8 @@ func TestInstallDynv6RefreshKeepsTokenOutOfUnitsAndJournalsToken(t *testing.T) {
 		t.Fatalf("unexpected refresh env %q: %v", env, err)
 	}
 	timer, err := os.ReadFile(timerPath)
-	if err != nil || !strings.Contains(string(timer), "OnUnitActiveSec=5min") {
-		t.Fatalf("timer is not configured for five minutes: %q: %v", timer, err)
+	if err != nil || !strings.Contains(string(timer), "OnUnitActiveSec=15min") {
+		t.Fatalf("timer is not configured for fifteen minutes: %q: %v", timer, err)
 	}
 	if err := RollbackDynv6Token(dataDir); err != nil {
 		t.Fatal(err)

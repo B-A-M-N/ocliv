@@ -507,9 +507,10 @@ func (s *Server) resolveMCPRouteID(routeID string) (*routeTarget, *Session, Ingr
 	// has not completed discovery verification and activation (P0-A).
 	var leaseID sql.NullString
 	var revoked, verified *string
+	var desiredEnabled int
 	err := s.db.SQL().QueryRow(
-		`SELECT external_host, lease_id, profile, revoked_at, verified_at, tenant_id, owner_key_id FROM mcp_publications WHERE route_id=?`,
-		routeID).Scan(&rowHost, &leaseID, &profileStr, &revoked, &verified, &rowTenant, &rowOwnerKey)
+		`SELECT external_host, lease_id, profile, revoked_at, verified_at, tenant_id, owner_key_id, desired_enabled FROM mcp_publications WHERE route_id=?`,
+		routeID).Scan(&rowHost, &leaseID, &profileStr, &revoked, &verified, &rowTenant, &rowOwnerKey, &desiredEnabled)
 	if err != nil {
 		return s.denyMCPRoute("", "unknown route id", http.StatusNotFound)
 	}
@@ -517,6 +518,11 @@ func (s *Server) resolveMCPRouteID(routeID string) (*routeTarget, *Session, Ingr
 	// allocating a new lease must never revive it (P1-A).
 	if revoked != nil {
 		return s.denyMCPRoute(leaseID.String, "publication revoked", http.StatusNotFound)
+	}
+	// Administratively disabled routes return a non-revealing 404 with
+	// no forwarding or active discovery, distinct from unexpected outages (503).
+	if desiredEnabled == 0 {
+		return s.denyMCPRoute(leaseID.String, "publication disabled", http.StatusNotFound)
 	}
 	// Past revocation, a live publication must have a bound lease: a
 	// NULL binding here violates the reclaim invariant — fail closed

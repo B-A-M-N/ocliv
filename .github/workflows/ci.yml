@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, "fix/**" ]
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Formatting
+        run: |
+          unformatted=$(gofmt -l cmd internal packaging tests)
+          if [ -n "$unformatted" ]; then
+            echo "Unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: Build and Vet
+        run: |
+          go build ./...
+          go vet ./...
+      - name: Unit, Packaging, and Integration Tests
+        run: go test ./... -count=1 -timeout=420s
+      - name: Race Detector (Core Packages)
+        run: go test -race ./internal/agent ./internal/authz ./internal/cli ./internal/mcp ./internal/relay ./internal/store -count=1
+
+  skybridge:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packaging/mcp/skybridge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Dependencies
+        run: npm ci
+      - name: Typecheck, Tests, and Production Bundle
+        run: npm run check

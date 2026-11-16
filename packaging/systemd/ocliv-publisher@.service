@@ -1,0 +1,48 @@
+# Canonical templated Ocliv service publisher unit.
+# Managed by `ocliv service start|stop|restart|status <name>`.
+# SIGTERM closes the lease while the publication stays registered and
+# offline for stable republish; permanent removal uses `mcp unpublish` or
+# `ocliv service remove`.
+# Runs under dedicated unprivileged identity `ocliv-publisher` with zero
+# access to relay SQLite state or signing keys (/var/lib/ocliv).
+
+[Unit]
+Description=Ocliv service publisher (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ocliv-publisher
+Group=ocliv-publisher
+EnvironmentFile=/etc/ocliv/publisher.env
+EnvironmentFile=-/etc/ocliv/publisher-%i.env
+WorkingDirectory=/var/lib/ocliv-publisher
+StateDirectory=ocliv-publisher
+ExecStart=/bin/sh -c '\
+[ -n "$${OCLIV_LOCAL_URL:-}" ] || { echo "ocliv-publisher@%i: OCLIV_LOCAL_URL is unset" >&2; exit 2; }; \
+[ -n "$${OCLIV_AUTH:-}" ] && auth="$${OCLIV_AUTH}" || auth=ocliv-managed; \
+case "$$auth" in upstream-oauth) ;; ocliv-managed) \
+  [ -z "$${OCLIV_STRICT:-}" ] && [ -z "$${OCLIV_RESOURCE_FILE:-}" ] || { echo "ocliv-publisher@%i: OCLIV_STRICT and OCLIV_RESOURCE_FILE are only valid with upstream-oauth" >&2; exit 2; } ;; \
+  *) echo "ocliv-publisher@%i: unsupported OCLIV_AUTH (use upstream-oauth or ocliv-managed)" >&2; exit 2 ;; esac; \
+[ -n "$${OCLIV_PROFILE:-}" ] && export OCLIV_PROFILE; \
+set -- mcp publish --local="$${OCLIV_LOCAL_URL}" --auth="$$auth" --name="$${OCLIV_NAME:-%i}"; \
+[ -n "$${OCLIV_TTL:-}" ] && set -- "$$@" --ttl="$${OCLIV_TTL}"; \
+[ -n "$${OCLIV_STRICT:-}" ] && set -- "$$@" --strict-discovery; \
+[ -n "$${OCLIV_RESOURCE_FILE:-}" ] && set -- "$$@" --resource-file="$${OCLIV_RESOURCE_FILE}"; \
+exec $${OCLIV_BIN:-/usr/local/bin/ocliv} "$$@"'
+Restart=on-failure
+RestartPreventExitStatus=2 4 6 7
+RestartSec=30
+KillSignal=SIGTERM
+TimeoutStopSec=60
+SuccessExitStatus=0
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=false
+InaccessiblePaths=/var/lib/ocliv
+ReadWritePaths=/var/lib/ocliv-publisher /home/ocliv-publisher/.config/ocliv
+
+[Install]
+WantedBy=multi-user.target

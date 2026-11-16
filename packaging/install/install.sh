@@ -16,9 +16,11 @@ SRC_DIR="${SRC_DIR:-/opt/ocliv}"
 BIN="${OCLIV_INSTALL_BIN:-/usr/local/bin/ocliv}"
 LAUNCHER="${OCLIV_INSTALL_LAUNCHER:-/usr/local/bin/ocliv-relay-launch.sh}"
 DATA_DIR="${OCLIV_INSTALL_DATA_DIR:-/var/lib/ocliv}"
+PUB_DATA_DIR="${OCLIV_INSTALL_PUB_DATA_DIR:-$(dirname "$DATA_DIR")/ocliv-publisher}"
 ENV_DIR="${OCLIV_INSTALL_ENV_DIR:-/etc/ocliv}"
 ENV_FILE="${OCLIV_INSTALL_ENV_FILE:-$ENV_DIR/relay.env}"
 UNIT_FILE="${OCLIV_INSTALL_UNIT_FILE:-/etc/systemd/system/ocliv-relay.service}"
+PUB_UNIT_FILE="${OCLIV_INSTALL_PUB_UNIT_FILE:-$(dirname "$UNIT_FILE")/ocliv-publisher@.service}"
 CADDY_FILE="${OCLIV_INSTALL_CADDY_FILE:-/etc/caddy/Caddyfile}"
 DOMAIN="${DOMAIN:-}"
 MCP_HOST="${MCP_HOST:-}"
@@ -106,6 +108,7 @@ cleanup_backups() {
   rm -f "$ENV_FILE.ocliv-bak" "$ENV_FILE.ocliv-bak.had"
   rm -f "$LAUNCHER.ocliv-bak" "$LAUNCHER.ocliv-bak.had"
   rm -f "$UNIT_FILE.ocliv-bak" "$UNIT_FILE.ocliv-bak.had"
+  rm -f "$PUB_UNIT_FILE.ocliv-bak" "$PUB_UNIT_FILE.ocliv-bak.had"
 }
 
 cd "$SRC_DIR"
@@ -120,8 +123,9 @@ STAGED_LAUNCHER="$LAUNCHER.new.$$"
 # staged unit lives under a temp dir with its proper unit name.
 STAGE_DIR="$(dirname "$UNIT_FILE")/.ocliv-stage.$$"
 STAGED_UNIT="$STAGE_DIR/ocliv-relay.service"
+STAGED_PUB_UNIT="$STAGE_DIR/ocliv-publisher@.service"
 cleanup_staged() {
-  rm -f "$NEW_BIN" "$STAGED_ENV" "$STAGED_LAUNCHER" "$STAGED_UNIT"
+  rm -f "$NEW_BIN" "$STAGED_ENV" "$STAGED_LAUNCHER" "$STAGED_UNIT" "$STAGED_PUB_UNIT"
   rmdir -- "$STAGE_DIR" 2>/dev/null || true
 }
 trap cleanup_staged EXIT INT TERM
@@ -140,7 +144,7 @@ fi
 # (same directory, so the activation mv is atomic) and validate them
 # BEFORE activation. Nothing installed changes until every candidate
 # passes; a failure here leaves the previous install byte-identical.
-mkdir -p "$DATA_DIR" "$ENV_DIR" "$(dirname "$LAUNCHER")" "$(dirname "$UNIT_FILE")" "$STAGE_DIR"
+mkdir -p "$DATA_DIR" "$PUB_DATA_DIR" "$ENV_DIR" "$(dirname "$LAUNCHER")" "$(dirname "$UNIT_FILE")" "$(dirname "$PUB_UNIT_FILE")" "$STAGE_DIR"
 umask 077
 {
   echo "# Ocliv relay environment (root-owned). Staging: OCLIV_DOMAIN=ocliv.test."
@@ -160,6 +164,10 @@ cp packaging/systemd/ocliv-relay-launch.sh "$STAGED_LAUNCHER"
 chmod 0755 "$STAGED_LAUNCHER"
 cp packaging/systemd/ocliv-relay.service "$STAGED_UNIT"
 chmod 0644 "$STAGED_UNIT"
+if [ -f packaging/systemd/ocliv-publisher@.service ]; then
+  cp packaging/systemd/ocliv-publisher@.service "$STAGED_PUB_UNIT"
+  chmod 0644 "$STAGED_PUB_UNIT"
+fi
 # Pre-activation unit check. systemd-analyze verify also stats ExecStart,
 # which cannot exist on a clean host before activation — there it reports
 # a bogus failure, so the check only runs when the launcher is already
@@ -205,6 +213,7 @@ rollback_all() {
   restore_managed "$ENV_FILE"
   restore_managed "$LAUNCHER"
   restore_managed "$UNIT_FILE"
+  restore_managed "$PUB_UNIT_FILE"
   # Re-read the restored files so the manager does not keep the rolled-
   # back config in memory. Best effort: the rollback itself already
   # succeeded; a reload failure is reported, not fatal.
@@ -216,19 +225,30 @@ rollback_all() {
 if ! id ocliv >/dev/null 2>&1; then
   useradd --system --home-dir "$DATA_DIR" --no-create-home --shell /usr/sbin/nologin ocliv
 fi
+if ! id ocliv-publisher >/dev/null 2>&1; then
+  useradd --system --home-dir "$PUB_DATA_DIR" --create-home --shell /usr/sbin/nologin ocliv-publisher
+fi
 chown ocliv:ocliv "$DATA_DIR"
 chmod 0700 "$DATA_DIR"
+chown ocliv-publisher:ocliv-publisher "$PUB_DATA_DIR"
+chmod 0700 "$PUB_DATA_DIR"
 chmod 0700 "$ENV_DIR"
 umask 077
 backup_managed "$ENV_FILE"
 backup_managed "$LAUNCHER"
 backup_managed "$UNIT_FILE"
+if [ -f "$STAGED_PUB_UNIT" ]; then
+  backup_managed "$PUB_UNIT_FILE"
+fi
 preserve_rollback
 mv "$NEW_BIN" "$BIN"
 mv "$STAGED_ENV" "$ENV_FILE"
 chmod 0600 "$ENV_FILE"
 mv "$STAGED_LAUNCHER" "$LAUNCHER"
 mv "$STAGED_UNIT" "$UNIT_FILE"
+if [ -f "$STAGED_PUB_UNIT" ]; then
+  mv "$STAGED_PUB_UNIT" "$PUB_UNIT_FILE"
+fi
 trap - EXIT INT TERM
 cleanup_staged
 if ! systemctl daemon-reload; then

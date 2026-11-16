@@ -26,7 +26,7 @@ func (rn *Runner) serveLocalWS(ctx context.Context, stream net.Conn, head protoc
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	dialer := &net.Dialer{Timeout: limits.UpstreamTimeout}
-	local, err := dialer.DialContext(ctx, "tcp", rn.Target)
+	local, err := dialLocalTarget(ctx, dialer, rn.Target)
 	if err != nil {
 		_ = sendAgentAbort(stream, "upstream_dial", "local websocket unreachable")
 		return

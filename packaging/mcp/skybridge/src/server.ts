@@ -49,16 +49,21 @@ export const app = new Skybridge({
     const verifyToken = (process.env.OCLIV_VERIFY_TOKEN ?? '').trim() || null;
     // Write tools require an owner-only local approval socket. Decisions
     // never pass through model-visible tool arguments.
+    const client = new NativeOclivClient(nativeConfig);
     let publisher: PublisherController | null = null;
     const approvals = new Approvals();
     let approvalServer = null;
     if (writeEnabled) {
-      publisher = new PublisherController(loadPublisherConfig());
+      publisher = new PublisherController(loadPublisherConfig(), {
+        inventoryClient: client,
+        relayOrigin: nativeConfig.relay,
+        ownerKeyId: nativeConfig.keyID,
+      });
       const socketPath = (process.env.OCLIV_APPROVAL_SOCKET ?? '').trim();
       if (!socketPath) throw new Error('OCLIV_APPROVAL_SOCKET required when OCLIV_WRITE_ENABLED=true');
       approvalServer = startOperatorApprovalSocket(approvals, socketPath);
     }
-    return { subjects, verifyToken, client:new NativeOclivClient(nativeConfig), publisher, approvals, approvalServer };
+    return { subjects, verifyToken, client, publisher, approvals, approvalServer };
   },
   oauth: customProvider({issuer, audience, baseUrl:serverUrl, scopes: writeEnabled ? ['ocliv:read','ocliv:write'] : ['ocliv:read'], requiredScopes:['ocliv:read']}),
   handler:(server, {subjects, verifyToken, client, publisher, approvals}) => server
@@ -163,7 +168,8 @@ export const app = new Skybridge({
         const subject = authorize(extra.http?.authInfo,subjects,'ocliv:write');
         if (!publisher) return done({ok:false,code:'WRITE_DISABLED',message:'Publisher control is disabled (OCLIV_WRITE_ENABLED is not true)'});
         approvals.redeem({subject,action:'stop',target:serviceName,approvalId});
-        return done({ok:true,...await publisher.stop(serviceName,`STOP ${serviceName}`)});
+        const res = await publisher.stop(serviceName,`STOP ${serviceName}`);
+        return done({ok:res.stopped === true,...res});
       }
       catch(e) {return failed(e);}
     })
