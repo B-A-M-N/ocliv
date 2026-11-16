@@ -9,6 +9,9 @@ package cli
 // (EXTERNAL_UNVERIFIED, always, until an external client qualifies it).
 
 import (
+	"bufio"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,10 +29,12 @@ import (
 // independently so success in one stage can never masquerade as success
 // in another.
 type mcpProbeOutcome struct {
-	Summary  string // one-line human verdict (back-compat with probeMCPProtocol)
-	Verified bool   // usable local connection proven
-	Auth     string // AUTH_NONE | AUTH_REQUIRED | AUTH_UNVERIFIED | NOT_APPLICABLE
-	Protocol string // negotiated protocolVersion, "" when none proven
+	Summary        string // one-line human verdict (back-compat with probeMCPProtocol)
+	Verified       bool   // usable local connection proven
+	Auth           string // AUTH_NONE | AUTH_REQUIRED | AUTH_UNVERIFIED | NOT_APPLICABLE
+	AuthEnforced   bool   // upstream rejected both missing and invalid bearer credentials
+	UnboundHandoff bool   // exact resource-file server signal before URL handoff
+	Protocol       string // negotiated protocolVersion, "" when none proven
 }
 
 // probeMCPProtocol verifies a usable MCP session against the local
@@ -44,9 +49,15 @@ func probeMCPProtocol(target, mode string) (string, bool) {
 // endpoint. The probe holds no bearer, so usability is proven but upstream
 // enforcement never is — except for the anonymous fixture, which is
 // anonymous by profile.
-func modernAuthFacet(anon bool) (auth, note string) {
+func modernAuthFacet(anon, managed, upstreamBearer bool) (auth, note string) {
 	if anon {
 		return "AUTH_NONE", ""
+	}
+	if managed {
+		return "AUTH_REQUIRED", "; visitor OAuth is enforced by the relay-managed route"
+	}
+	if upstreamBearer {
+		return "AUTH_REQUIRED", "; protocol verified with the operator-supplied upstream bearer"
 	}
 	return "AUTH_UNVERIFIED", "; auth unverified (answered without bearer — upstream OAuth enforcement NOT proven)"
 }
@@ -90,18 +101,28 @@ func presenceVerdict(status int, body []byte, anon bool) (mcpProbeOutcome, bool)
 		if !strings.Contains(strings.ToLower(string(body)), unboundHandoffSignal) {
 			return mcpProbeOutcome{}, false
 		}
-		return mcpProbeOutcome{Summary: "auth: required (server reports resource not configured; it binds after publish writes the --resource-file handoff)", Auth: "AUTH_REQUIRED"}, true
+		return mcpProbeOutcome{Summary: "auth: required (server reports resource not configured; it binds after publish writes the --resource-file handoff)", Auth: "AUTH_REQUIRED", UnboundHandoff: true}, true
 	}
 	return mcpProbeOutcome{}, false
 }
 
 // runMCPProbe executes the transport → protocol → authentication stages.
 func runMCPProbe(target, mode string) mcpProbeOutcome {
-	if mode != "mcp_upstream_oauth" && mode != "mcp_anonymous_fixture" {
+	return runMCPProbeWithBearer(target, mode, "")
+}
+
+// runMCPProbeWithBearer verifies MCP protocol behavior using an optional
+// operator-supplied upstream bearer. The token is used only in the request
+// header and is never included in probe output.
+func runMCPProbeWithBearer(target, mode, bearer string) mcpProbeOutcome {
+	if mode != "mcp_upstream_oauth" && mode != "mcp_anonymous_fixture" && mode != "mcp_managed_oauth" {
 		return mcpProbeOutcome{Summary: "not-applicable (not an MCP lease)", Verified: true, Auth: "NOT_APPLICABLE"}
 	}
 	anon := mode == "mcp_anonymous_fixture"
+	managed := mode == "mcp_managed_oauth"
 	client := &http.Client{Timeout: 5 * time.Second}
+	var sessionID string
+	var sessionVersion string
 	post := func(body, version string) (*http.Response, []byte, error) {
 		req, err := http.NewRequest(http.MethodPost, "http://"+target+"/mcp", strings.NewReader(body))
 		if err != nil {
@@ -109,20 +130,57 @@ func runMCPProbe(target, mode string) mcpProbeOutcome {
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json, text/event-stream")
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
 		if version != "" {
 			req.Header.Set("MCP-Protocol-Version", version)
+			var envelope struct {
+				Method string `json:"method"`
+			}
+			if json.Unmarshal([]byte(body), &envelope) == nil && envelope.Method != "" {
+				req.Header.Set("MCP-Method", envelope.Method)
+			}
+		}
+		if sessionID != "" {
+			req.Header.Set("Mcp-Session-Id", sessionID)
 		}
 		resp, err := client.Do(req)
 		if err != nil {
 			return nil, nil, err
 		}
+		if got := resp.Header.Get("Mcp-Session-Id"); got != "" {
+			sessionID = got
+		}
+		if got := resp.Header.Get("Mcp-Protocol-Version"); got != "" {
+			sessionVersion = got
+		} else if version != "" {
+			sessionVersion = version
+		}
 		defer resp.Body.Close()
-		raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		raw, err := readMCPProbeBody(resp, requestID(body))
 		if err != nil {
 			return nil, nil, err
 		}
 		return resp, raw, nil
 	}
+	defer func() {
+		if sessionID == "" {
+			return
+		}
+		req, err := http.NewRequest(http.MethodDelete, "http://"+target+"/mcp", nil)
+		if err != nil {
+			return
+		}
+		req.Header.Set("Mcp-Session-Id", sessionID)
+		if sessionVersion != "" {
+			req.Header.Set("Mcp-Protocol-Version", sessionVersion)
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
 	unreachable := func(step string, err error) mcpProbeOutcome {
 		return mcpProbeOutcome{Summary: step + " unreachable (" + err.Error() + ")", Auth: "AUTH_UNVERIFIED"}
 	}
@@ -135,7 +193,7 @@ func runMCPProbe(target, mode string) mcpProbeOutcome {
 	// wrong id, so it cannot verify here; see
 	// TestProbeMCPProtocolRequiresInitialize).
 	const modernVersion = "2026-07-28"
-	mresp, mraw, merr := post(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`, modernVersion)
+	mresp, mraw, merr := post(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`, modernVersion)
 	if merr == nil {
 		if v, ok := presenceVerdict(mresp.StatusCode, mraw, anon); ok {
 			return v
@@ -144,7 +202,7 @@ func runMCPProbe(target, mode string) mcpProbeOutcome {
 			if _, err := validateEnvelope(list, 1); err == nil {
 				res, _ := list["result"].(map[string]any)
 				if tools, ok := res["tools"].([]any); ok {
-					auth, authNote := modernAuthFacet(anon)
+					auth, authNote := modernAuthFacet(anon, managed, bearer != "")
 					return mcpProbeOutcome{
 						Summary:  "ok (protocol " + modernVersion + " stateless, tools/list answered; " + strconv.Itoa(len(tools)) + " tools)" + authNote,
 						Verified: true,
@@ -188,7 +246,7 @@ func runMCPProbe(target, mode string) mcpProbeOutcome {
 	// reply by definition) and tool discovery, with strict envelope
 	// validation: version match, id echo, result/error exclusivity.
 	notifBody := `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`
-	nresp, _, err := post(notifBody, "")
+	nresp, _, err := post(notifBody, version)
 	if err != nil {
 		return unreachable("notifications/initialized", err)
 	}
@@ -196,7 +254,7 @@ func runMCPProbe(target, mode string) mcpProbeOutcome {
 		return mcpProbeOutcome{Summary: "protocol: broken (initialized notification rejected: http " +
 			strconv.Itoa(nresp.StatusCode) + ")", Auth: "AUTH_UNVERIFIED"}
 	}
-	lresp, lraw, err := post(`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`, "")
+	lresp, lraw, err := post(`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`, version)
 	if err != nil {
 		return unreachable("tools/list", err)
 	}
@@ -225,6 +283,13 @@ func runMCPProbe(target, mode string) mcpProbeOutcome {
 	if anon {
 		auth = "AUTH_NONE"
 		authNote = ""
+	} else if managed || bearer != "" {
+		auth = "AUTH_REQUIRED"
+		if managed {
+			authNote = "; visitor OAuth is enforced by the relay-managed route"
+		} else {
+			authNote = "; protocol verified with the operator-supplied upstream bearer"
+		}
 	}
 	return mcpProbeOutcome{
 		Summary:  "ok (protocol " + version + ", tools/list answered; " + strconv.Itoa(len(tools)) + " tools)" + authNote,
@@ -232,6 +297,74 @@ func runMCPProbe(target, mode string) mcpProbeOutcome {
 		Auth:     auth,
 		Protocol: version,
 	}
+}
+
+// verifyUpstreamAuthEnforcement performs two independent MCP probes and
+// succeeds only when the upstream rejects both absent and invalid bearer
+// credentials. A tools/list response without credentials is explicitly
+// unverified, even when OAuth metadata is otherwise correct.
+func verifyUpstreamAuthEnforcement(target string) bool {
+	var invalidBytes [32]byte
+	if _, err := rand.Read(invalidBytes[:]); err != nil {
+		return false
+	}
+	missing := runMCPProbeWithBearer(target, "mcp_upstream_oauth", "")
+	invalidToken := "ocliv-invalid-" + hex.EncodeToString(invalidBytes[:])
+	invalid := runMCPProbeWithBearer(target, "mcp_upstream_oauth", invalidToken)
+	return !missing.Verified && missing.Auth == "AUTH_REQUIRED" &&
+		!invalid.Verified && invalid.Auth == "AUTH_REQUIRED"
+}
+
+const maxProbeBody = 1 << 20
+
+func requestID(body string) string {
+	var req struct {
+		ID any `json:"id"`
+	}
+	if json.Unmarshal([]byte(body), &req) != nil || req.ID == nil {
+		return ""
+	}
+	return fmt.Sprint(req.ID)
+}
+
+// readMCPProbeBody returns as soon as a complete SSE event carrying the
+// expected JSON-RPC ID arrives. It ignores keepalive comments and unrelated
+// notifications, while bounding all bytes read under the HTTP client's
+// request deadline. Ordinary JSON responses retain the bounded body path.
+func readMCPProbeBody(resp *http.Response, expectedID string) ([]byte, error) {
+	if !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") || expectedID == "" {
+		return io.ReadAll(io.LimitReader(resp.Body, maxProbeBody))
+	}
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 4096), maxProbeBody)
+	var total int
+	var data []string
+	for scanner.Scan() {
+		line := scanner.Text()
+		total += len(line) + 1
+		if total > maxProbeBody {
+			return nil, fmt.Errorf("SSE response exceeds %d-byte limit", maxProbeBody)
+		}
+		line = strings.TrimSuffix(line, "\r")
+		if line == "" {
+			if len(data) > 0 {
+				event := []byte(strings.Join(data, "\n"))
+				var envelope map[string]any
+				if json.Unmarshal(event, &envelope) == nil && fmt.Sprint(envelope["id"]) == expectedID {
+					return event, nil
+				}
+				data = data[:0]
+			}
+		} else if !strings.HasPrefix(line, ":") {
+			if value, ok := strings.CutPrefix(line, "data:"); ok {
+				data = append(data, strings.TrimPrefix(value, " "))
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("reading SSE response: %w", err)
+	}
+	return nil, fmt.Errorf("SSE stream ended before JSON-RPC id %s", expectedID)
 }
 
 // decodeJSONRPC decodes a plain JSON-RPC body or an SSE stream carrying
@@ -327,7 +460,7 @@ func doctorAuthLine(mode, auth string) string {
 // where the probe does not apply). Unknown, unreachable, or invalid
 // protocol health fails the oracle instead of passing it.
 func doctorProtocolExit(mode string, verified bool) int {
-	if mode != "mcp_upstream_oauth" && mode != "mcp_anonymous_fixture" {
+	if mode != "mcp_upstream_oauth" && mode != "mcp_anonymous_fixture" && mode != "mcp_managed_oauth" {
 		return apperr.ExitOK
 	}
 	if verified {

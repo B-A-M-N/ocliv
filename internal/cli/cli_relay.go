@@ -34,7 +34,7 @@ func restrictFileCreation() {
 // cmdRelay handles relay-side operations.
 func cmdRelay(argv []string) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ocliv relay init|serve|doctor|issue-enroll|keys|revoke-key|tenants|backup|restore ...")
+		fmt.Fprintln(os.Stderr, "usage: ocliv relay init|serve|doctor|issue-enroll|keys|revoke-key|tenants|backup|validate-backup|restore ...")
 		return apperr.ExitCLIValidation
 	}
 	switch argv[0] {
@@ -54,12 +54,38 @@ func cmdRelay(argv []string) int {
 		return cmdRelayTenants(argv[1:])
 	case "backup":
 		return cmdRelayBackup(argv[1:])
+	case "validate-backup":
+		return cmdRelayValidateBackup(argv[1:])
 	case "restore":
 		return cmdRelayRestore(argv[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown relay command %q\n", argv[0])
 		return apperr.ExitCLIValidation
 	}
+}
+
+// cmdRelayValidateBackup verifies a backup checksum sidecar, SQLite integrity,
+// and supported schema without opening or changing the live relay database.
+func cmdRelayValidateBackup(argv []string) int {
+	in := ""
+	for i := 0; i < len(argv); i++ {
+		if v, ok := mcpFlagValue(argv, &i, "in"); ok {
+			in = v
+		} else {
+			fmt.Fprintln(os.Stderr, "usage: ocliv relay validate-backup --in FILE")
+			return apperr.ExitCLIValidation
+		}
+	}
+	if in == "" {
+		fmt.Fprintln(os.Stderr, "usage: ocliv relay validate-backup --in FILE")
+		return apperr.ExitCLIValidation
+	}
+	if err := relay.ValidateBackup(in); err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return exitForRelayErr(err)
+	}
+	fmt.Printf("backup validated: %s\n", in)
+	return apperr.ExitOK
 }
 
 // relayFlags parses shared relay flags.
@@ -570,12 +596,14 @@ func cmdRelayKeys(argv []string) int {
 		fmt.Fprintln(os.Stderr, "usage: ocliv relay keys list [--data DIR]")
 		return apperr.ExitCLIValidation
 	}
-	db, code := openRelayDB(argv[1:])
-	if code != 0 {
-		return code
+	_, dataDir, _ := relayFlags(argv[1:])
+	db, err := openRelayDBReadOnly(dataDir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
 	}
 	defer db.Close()
-	keys, err := relay.ListAgentKeys(db)
+	keys, err := relay.ListAgentKeysReadOnly(db)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return exitForRelayErr(err)

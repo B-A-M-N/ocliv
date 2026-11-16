@@ -147,6 +147,9 @@ type Server struct {
 	// a test revoke the lease in that window to prove the atomic
 	// EXISTS predicate denies the mint. Nil in production.
 	routeCreateHold func()
+	// leaseExpiryCASHook is a test barrier for deterministic renewal-vs-expiry
+	// admission races. Nil in production.
+	leaseExpiryCASHook func(string)
 }
 
 // New builds the relay server.

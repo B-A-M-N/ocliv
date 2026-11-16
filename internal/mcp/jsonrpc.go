@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -33,11 +34,17 @@ func fileWithDeadline(w io.Writer) (*os.File, bool) {
 //     later call.
 type coordinator struct {
 	child *childProc
-	wmu   sync.Mutex
+	wmu   chan struct{}
 
 	mu      sync.Mutex
 	pending map[string]chan coordResult
-	closed  bool
+	// events carries child-originated requests and notifications to the
+	// owning Streamable HTTP session. It is nil for the legacy adapter.
+	events chan []byte
+	// serverRequests contains child-originated request IDs awaiting the
+	// corresponding client response on this same session.
+	serverRequests map[string]struct{}
+	closed         bool
 
 	maxBody int64
 	onDeath func()
@@ -68,9 +75,26 @@ func idKey(raw json.RawMessage) (string, bool) {
 func runCoordinator(c *childProc, maxBody int64, onDeath func()) *coordinator {
 	co := &coordinator{
 		child:   c,
+		wmu:     make(chan struct{}, 1),
 		pending: make(map[string]chan coordResult),
 		maxBody: maxBody,
 		onDeath: onDeath,
+	}
+	go co.readLoop(c.stdout)
+	return co
+}
+
+// runSessionCoordinator preserves server-originated MCP requests and
+// notifications in a bounded queue owned by one client session.
+func runSessionCoordinator(c *childProc, maxBody int64, eventQueue int, onDeath func()) *coordinator {
+	co := &coordinator{
+		child:          c,
+		wmu:            make(chan struct{}, 1),
+		pending:        make(map[string]chan coordResult),
+		events:         make(chan []byte, eventQueue),
+		serverRequests: make(map[string]struct{}),
+		maxBody:        maxBody,
+		onDeath:        onDeath,
 	}
 	go co.readLoop(c.stdout)
 	return co
@@ -81,6 +105,12 @@ func runCoordinator(c *childProc, maxBody int64, onDeath func()) *coordinator {
 // replies to dropped waiters) are discarded, never misattributed.
 func (co *coordinator) readLoop(r *bufio.Reader) {
 	fail := func(err error) {
+		// This callback is the adapter retirement linearization point. Mark
+		// the HTTP surface unavailable before making the coordinator reject
+		// calls or waking existing waiters.
+		if co.onDeath != nil {
+			co.onDeath()
+		}
 		co.mu.Lock()
 		if co.closed {
 			co.mu.Unlock()
@@ -93,18 +123,17 @@ func (co *coordinator) readLoop(r *bufio.Reader) {
 		for _, w := range waiters {
 			w <- coordResult{err: err}
 		}
-		if co.onDeath != nil {
-			co.onDeath()
-		}
 	}
 	var buf []byte
 	for {
-		frag, err := r.ReadBytes('\n')
-		buf = append(buf, frag...)
-		if int64(len(buf)) > co.maxBody {
-			buf = nil
+		frag, err := r.ReadSlice('\n')
+		if int64(len(buf))+int64(len(frag)) > co.maxBody {
 			fail(fmt.Errorf("child output exceeds %d bytes", co.maxBody))
 			return
+		}
+		buf = append(buf, frag...)
+		if err == bufio.ErrBufferFull {
+			continue
 		}
 		if err != nil {
 			if err == io.EOF && len(frag) != 0 {
@@ -118,10 +147,41 @@ func (co *coordinator) readLoop(r *bufio.Reader) {
 		line := buf
 		buf = nil
 		var env struct {
-			ID json.RawMessage `json:"id"`
+			JSONRPC string          `json:"jsonrpc"`
+			ID      json.RawMessage `json:"id"`
+			Method  string          `json:"method"`
 		}
-		if err := json.Unmarshal(line, &env); err != nil || len(env.ID) == 0 {
-			continue // notification or unparsable child chatter: drop
+		if err := json.Unmarshal(line, &env); err != nil || env.JSONRPC != "2.0" {
+			continue // unparsable child chatter is never forwarded
+		}
+		if env.Method != "" && co.events != nil {
+			var key string
+			if len(env.ID) != 0 {
+				var ok bool
+				key, ok = idKey(env.ID)
+				if !ok {
+					fail(fmt.Errorf("mcp child sent a request with invalid id"))
+					return
+				}
+				co.mu.Lock()
+				if _, exists := co.serverRequests[key]; exists {
+					co.mu.Unlock()
+					fail(fmt.Errorf("mcp child reused an outstanding server request id"))
+					return
+				}
+				co.serverRequests[key] = struct{}{}
+				co.mu.Unlock()
+			}
+			select {
+			case co.events <- append([]byte(nil), line...):
+			default:
+				fail(fmt.Errorf("mcp session notification queue full"))
+				return
+			}
+			continue
+		}
+		if len(env.ID) == 0 {
+			continue // malformed or non-deliverable child message
 		}
 		key, ok := idKey(env.ID)
 		if !ok {
@@ -140,16 +200,36 @@ func (co *coordinator) readLoop(r *bufio.Reader) {
 	}
 }
 
+// reply forwards a response to a child-originated request. IDs are
+// session-local and accepted once, only after the child emitted them.
+func (co *coordinator) reply(ctx context.Context, msg []byte, id string, timeout time.Duration) error {
+	co.mu.Lock()
+	if co.closed {
+		co.mu.Unlock()
+		return errChildUnavailable
+	}
+	if _, ok := co.serverRequests[id]; !ok {
+		co.mu.Unlock()
+		return fmt.Errorf("mcp response does not match a pending server request")
+	}
+	delete(co.serverRequests, id)
+	co.mu.Unlock()
+	return co.notify(ctx, msg, timeout)
+}
+
 // call writes one request and waits for the reply carrying the same id.
 // The HTTP caller's context cancels the wait without disturbing the
 // child or other in-flight calls; the timeout still fails closed and
 // reports errChildTimeout so the adapter can retire a wedged child.
 func (co *coordinator) call(ctx context.Context, msg []byte, id string, timeout time.Duration) ([]byte, error) {
+	deadline := time.Now().Add(timeout)
+	timeoutT := time.NewTimer(timeout)
+	defer timeoutT.Stop()
 	waiter := make(chan coordResult, 1)
 	co.mu.Lock()
 	if co.closed {
 		co.mu.Unlock()
-		return nil, fmt.Errorf("mcp child gone")
+		return nil, errChildUnavailable
 	}
 	if _, dup := co.pending[id]; dup {
 		co.mu.Unlock()
@@ -164,15 +244,53 @@ func (co *coordinator) call(ctx context.Context, msg []byte, id string, timeout 
 		}
 		co.mu.Unlock()
 	}
-	co.wmu.Lock()
-	_, werr := co.child.stdin.Write(msg)
-	co.wmu.Unlock()
-	if werr != nil {
+	select {
+	case co.wmu <- struct{}{}:
+	case <-ctx.Done():
 		drop()
-		return nil, werr
+		return nil, ctx.Err()
+	case <-timeoutT.C:
+		drop()
+		return nil, errChildTimeout
 	}
-	timeoutT := time.NewTimer(timeout)
-	defer timeoutT.Stop()
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	pipe, ok := fileWithDeadline(co.child.stdin)
+	if !ok {
+		<-co.wmu
+		drop()
+		return nil, fmt.Errorf("mcp child stdin does not support deadlines")
+	}
+	_ = pipe.SetWriteDeadline(deadline)
+	written := make(chan error, 1)
+	go func() {
+		_, err := co.child.stdin.Write(msg)
+		written <- err
+	}()
+	select {
+	case werr := <-written:
+		_ = pipe.SetWriteDeadline(time.Time{})
+		<-co.wmu
+		if werr != nil {
+			drop()
+			if errors.Is(werr, os.ErrDeadlineExceeded) || !time.Now().Before(deadline) {
+				co.child.kill()
+				return nil, errChildTimeout
+			}
+			return nil, werr
+		}
+	case <-ctx.Done():
+		co.child.kill()
+		<-co.wmu
+		drop()
+		return nil, ctx.Err()
+	case <-timeoutT.C:
+		co.child.kill()
+		<-co.wmu
+		drop()
+		return nil, errChildTimeout
+	}
 	select {
 	case <-ctx.Done():
 		drop()
@@ -187,28 +305,46 @@ func (co *coordinator) call(ctx context.Context, msg []byte, id string, timeout 
 
 // notify writes one notification and returns. It never waits for output
 // because notifications have no reply by definition.
-func (co *coordinator) notify(msg []byte, timeout time.Duration) error {
+func (co *coordinator) notify(ctx context.Context, msg []byte, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	timeoutT := time.NewTimer(timeout)
+	defer timeoutT.Stop()
+	select {
+	case co.wmu <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timeoutT.C:
+		co.child.kill()
+		return errChildTimeout
+	}
 	done := make(chan error, 1)
 	go func() {
-		co.wmu.Lock()
-		defer co.wmu.Unlock()
+		defer func() { <-co.wmu }()
 		if f, ok := fileWithDeadline(co.child.stdin); ok {
-			_ = f.SetWriteDeadline(time.Now().Add(timeout))
+			_ = f.SetWriteDeadline(deadline)
 			defer f.SetWriteDeadline(time.Time{})
 		}
 		if n, err := co.child.stdin.Write(msg); err != nil || n != len(msg) {
 			if err == nil {
 				err = io.ErrShortWrite
 			}
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				err = errChildTimeout
+			}
 			done <- err
 			return
 		}
 		done <- nil
 	}()
-	timeoutT := time.NewTimer(timeout)
-	defer timeoutT.Stop()
 	select {
+	case <-ctx.Done():
+		co.child.kill()
+		return errChildCancelled
 	case <-timeoutT.C:
+		co.child.kill()
 		return errChildTimeout
 	case err := <-done:
 		return err

@@ -62,12 +62,16 @@ func (s *Server) allocateOrResume(tenantID, keyID string, intent LeaseIntent) (*
 }
 
 func (s *Server) attachedFor(ls *lease.Lease) attachedMsg {
-	return attachedMsg{
+	msg := attachedMsg{
 		Type: "attached", SessionID: "sess-" + ls.ID + "-g" + itoa(ls.Generation),
 		LeaseID: ls.ID, Hostname: ls.Hostname, Generation: ls.Generation,
 		AccessMode: ls.AccessMode,
 		URL:        "https://" + ls.Hostname,
 	}
+	if !ls.ExpiresAt.IsZero() {
+		msg.ExpiresAt = ls.ExpiresAt.UTC().Format(time.RFC3339Nano)
+	}
+	return msg
 }
 
 func itoa(v uint64) string {
@@ -167,6 +171,7 @@ func (s *Server) resumeLease(tenantID, keyID string, intent LeaseIntent) (*lease
 			s.db.Audit("agent", ls.TenantID, ls.ID, "resume", "denied", "lease ttl expired")
 			return nil, apperr.E(apperr.CodeExpired, "lease ttl expired", nil)
 		}
+		ls.ExpiresAt = exp
 	}
 	if reconnectUntil.Valid {
 		t, err := time.Parse(time.RFC3339Nano, reconnectUntil.String)
@@ -435,8 +440,12 @@ func (s *Server) insertLease(tenantID, keyID, label string, intent LeaseIntent, 
 		s.evictLease(retiredID)
 		s.db.Audit("agent", tenantID, retiredID, "lease_reclaim", "ok", "named lease replaced; old session retired")
 	}
+	var expiresAt time.Time
+	if intent.TTLSeconds > 0 {
+		expiresAt = now.Add(time.Duration(intent.TTLSeconds) * time.Second)
+	}
 	ls := &lease.Lease{ID: id, TenantID: tenantID, AgentKeyID: keyID, Hostname: hostname,
-		Port: intent.Port, AccessMode: mode, State: lease.StateActive, Generation: 1}
+		Port: intent.Port, AccessMode: mode, State: lease.StateActive, Generation: 1, ExpiresAt: expiresAt}
 	// Every protected lease gets one initial single-redeem share token; the
 	// raw secret goes to the agent over the authenticated session only.
 	// The verifier committed inside the allocation transaction above, so

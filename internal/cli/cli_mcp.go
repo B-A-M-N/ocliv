@@ -268,7 +268,11 @@ func runMCPManage(in io.Reader, out io.Writer) int {
 					continue
 				}
 				action := strings.TrimPrefix(p.Name, "ocliv_")
-				code, body := mgmtCall(relayURL, k, keyID, "POST", "/v1/agent/lease/"+leaseID+"/"+action)
+				code, body, err := mgmtCall(relayURL, k, keyID, "POST", "/v1/agent/lease/"+leaseID+"/"+action)
+				if err != nil {
+					rpcError(out, req.ID, -32000, fmt.Sprintf("%s relay transport failed: %v", action, err))
+					continue
+				}
 				if code != 200 {
 					rpcError(out, req.ID, -32000, fmt.Sprintf("%s failed (relay status %d)", action, code))
 					continue

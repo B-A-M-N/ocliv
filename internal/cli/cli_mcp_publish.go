@@ -11,12 +11,8 @@ package cli
 //     close the lease and RETAIN the publication (offline until the
 //     next authorized republish rebinds it). Permanent removal is
 //     explicit via `mcp unpublish` (P1-A).
-//   - publish --stdio --auth ocliv-managed -- COMMAND [ARGS...]: run an
-//     operator-selected child through the bounded stdio adapter and
-//     publish it with relay-terminated authorization. The child is pinned
-//     by local argv; no remote client can select executables, arguments,
-//     directories, or environment. The adapter has no upstream OAuth, so
-//     upstream-oauth cannot be verified for it and is rejected.
+//   - publish --stdio: per-client Streamable HTTP sessions backed by
+//     isolated stdio children; managed authorization only.
 //   - serve: lifecycle only (tunnel, no route registration) — for
 //     wildcard-namespace use or pre-publish verification.
 //   - doctor: read-only diagnostics; never prints secrets.
@@ -81,12 +77,15 @@ type mcpPublishConfig struct {
 	// closed so an unverified binding never serves. --strict-discovery
 	// is accepted for back-compat and means the same as the default.
 	strictDiscovery bool
-	// devAllowUnverified is the ONLY relaxed mode, explicitly for
-	// development/diagnostic use (P0-B item 2): the route registers
-	// and serves, but the printed URL is marked NOT VERIFIED and must
-	// never be registered with ChatGPT. Production publication never
-	// sets this.
+	// devAllowUnverified is a discovery-only relaxation for
+	// development/diagnostic use (P0-B item 2): the route registers and
+	// serves when OAuth discovery is unreachable, but is marked NOT
+	// VERIFIED and must never be registered with ChatGPT.
 	devAllowUnverified bool
+	// acceptUnverifiedUpstreamAuth permits publication after protocol
+	// validity is proven when the upstream does not reject absent and
+	// invalid bearer credentials. Such a route remains visibly UNVERIFIED.
+	acceptUnverifiedUpstreamAuth bool
 	// resourceFile is the publisher-owned binding handoff: after route
 	// registration the publisher atomically writes the canonical public
 	// route URL here so a local MCP server (e.g. mcp-auth-fixture via
@@ -135,20 +134,24 @@ func writeResourceBinding(path, routeURL string) error {
 // status; a non-200 here means the route must be abandoned, never
 // advertised. Returns the relay status and body.
 func activatePublishedRoute(relayURL string, k *identity.KeyPair, keyID, routeLeaseID, routeID string) (int, string) {
-	st, body := mgmtCall(relayURL, k, keyID, "POST",
+	st, body, err := mgmtCall(relayURL, k, keyID, "POST",
 		"/v1/agent/lease/"+routeLeaseID+"/mcp-route/"+routeID+"/activate")
+	if err != nil {
+		return 0, "transport failure: " + err.Error()
+	}
 	return st, string(body)
 }
 
-// abandonPublishedRoute deletes a registered route when publication
-// aborts after registration. Route deletion and lease closure are
-// independent outcomes: every abort-after-registration path attempts
-// the DELETE (bad discovery URL, invalid binding, strict-unreachable)
-// and reports its result, then closes the lease regardless — a closed
-// lease denies forwarding, but the route row must not linger
-// unverified (audit P1). Returns the relay status and trimmed detail.
-func abandonPublishedRoute(del func(path string) (int, string), routeLeaseID, routeID string) (int, string) {
-	status, body := del("/v1/agent/lease/" + routeLeaseID + "/mcp-route/" + routeID)
+// abandonPublishedRoute removes only an identity created by the failing
+// run. If registration rebound an existing publication, it CAS-detaches
+// this failed lease and preserves the stable route and its grants.
+func abandonPublishedRoute(call func(method, path string) (int, string), routeLeaseID, routeID string, created bool) (int, string) {
+	method, suffix := http.MethodPost, "/detach"
+	if created {
+		method, suffix = http.MethodDelete, ""
+	}
+	path := "/v1/agent/lease/" + routeLeaseID + "/mcp-route/" + routeID + suffix
+	status, body := call(method, path)
 	return status, shortDetail(body)
 }
 
@@ -222,7 +225,7 @@ func parseMCPPublish(argv []string, serve bool) (mcpPublishConfig, int) {
 	var rest []string
 	seenDashDash := false
 	bad := func() (mcpPublishConfig, int) {
-		fmt.Fprintln(os.Stderr, "usage: ocliv mcp publish --local URL --auth upstream-oauth|ocliv-managed [--relay URL] [--name N] [--ttl D] [--strict-discovery] [--resource-file PATH] [--dev-allow-unverified-discovery]")
+		fmt.Fprintln(os.Stderr, "usage: ocliv mcp publish (--local URL | --stdio -- COMMAND [ARGS...]) --auth upstream-oauth|ocliv-managed [--relay URL] [--name N] [--ttl D] [--strict-discovery] [--resource-file PATH] [--dev-allow-unverified-discovery] [--accept-unverified-upstream-auth]")
 		return c, apperr.ExitCLIValidation
 	}
 	for i := 0; i < len(argv); i++ {
@@ -270,6 +273,8 @@ func parseMCPPublish(argv []string, serve bool) (mcpPublishConfig, int) {
 			c.freshPublication = true
 		} else if !seenDashDash && a == "--dev-allow-unverified-discovery" {
 			c.devAllowUnverified = true
+		} else if !seenDashDash && a == "--accept-unverified-upstream-auth" {
+			c.acceptUnverifiedUpstreamAuth = true
 		} else if !seenDashDash && (a == "--resource-file" || strings.HasPrefix(a, "--resource-file=")) {
 			v, ok := mcpFlagValue(argv, &i, "resource-file")
 			if !ok {
@@ -318,30 +323,21 @@ func parseMCPPublish(argv []string, serve bool) (mcpPublishConfig, int) {
 		fmt.Fprintln(os.Stderr, "pick one of --local or --stdio")
 		return c, apperr.ExitCLIValidation
 	}
-	// stdio publication runs an operator-selected child through the bounded
-	// stdio adapter. The child is pinned by local argv only; no remote
-	// client can select executables, arguments, directories, or
-	// environment (P0-1/P0-2/M07).
-	//
-	// The adapter is a plain loopback HTTP server with no OAuth of its own,
-	// so upstream-oauth cannot be verified for it: publishing --stdio with
-	// --auth upstream-oauth would either fail strict discovery or silently
-	// mark the binding NOT VERIFIED. Only relay-terminated managed
-	// authorization is supported, because the relay is the AS and the
-	// adapter never sees the external bearer.
 	if c.stdio {
-		// serve has no route, so a published stdio child would be
-		// unreachable: the child is only meaningful behind a route.
 		if serve {
-			fmt.Fprintln(os.Stderr, "mcp serve takes no --stdio: serve has no route; use `mcp publish --stdio --auth ocliv-managed`")
-			return c, apperr.ExitCLIValidation
-		}
-		if c.auth != "ocliv-managed" {
-			fmt.Fprintln(os.Stderr, "mcp publish --stdio requires --auth ocliv-managed: the stdio adapter has no upstream OAuth to verify; the relay terminates authorization instead")
+			fmt.Fprintln(os.Stderr, "mcp serve takes no --stdio: serve has no route")
 			return c, apperr.ExitCLIValidation
 		}
 		if len(c.cmd) == 0 {
 			fmt.Fprintln(os.Stderr, "mcp publish --stdio needs a command after --")
+			return c, apperr.ExitCLIValidation
+		}
+		if c.auth != "ocliv-managed" {
+			fmt.Fprintln(os.Stderr, "mcp publish --stdio requires --auth ocliv-managed")
+			return c, apperr.ExitCLIValidation
+		}
+		if c.name == "" {
+			fmt.Fprintln(os.Stderr, "mcp publish --stdio requires an explicit --name so restarts reuse the same route identity")
 			return c, apperr.ExitCLIValidation
 		}
 	}
@@ -370,6 +366,18 @@ func parseMCPPublish(argv []string, serve bool) (mcpPublishConfig, int) {
 			fmt.Fprintln(os.Stderr, "mcp publish --auth ocliv-managed takes no --resource-file: there is no upstream resource binding to hand off")
 			return c, apperr.ExitCLIValidation
 		}
+		if c.acceptUnverifiedUpstreamAuth {
+			fmt.Fprintln(os.Stderr, "mcp publish --auth ocliv-managed takes no --accept-unverified-upstream-auth: this flag applies only to upstream OAuth")
+			return c, apperr.ExitCLIValidation
+		}
+	}
+	if c.acceptUnverifiedUpstreamAuth && serve {
+		fmt.Fprintln(os.Stderr, "mcp serve takes no --accept-unverified-upstream-auth: authorization qualification applies to publish only")
+		return c, apperr.ExitCLIValidation
+	}
+	if c.acceptUnverifiedUpstreamAuth && c.auth != "upstream-oauth" {
+		fmt.Fprintln(os.Stderr, "--accept-unverified-upstream-auth requires --auth upstream-oauth")
+		return c, apperr.ExitCLIValidation
 	}
 	// --strict-discovery only constrains route publication; serve has
 	// no route and no discovery, so the combination is rejected
@@ -485,18 +493,29 @@ func validateMCPASMetadata(client *http.Client, discoveryURL, expectIssuer strin
 	return nil
 }
 
-// publishLocalProbeOK is the publish local-target gate (P1): publication
-// proceeds when the probe is either fully verified (a usable MCP session)
-// or reported authenticating presence from an upstream-oauth target
-// (bearer challenge 401/403, or an unbound resource server answering 503
-// "resource not configured" before its --resource-file handoff is
-// written). Tool functionality is never claimed from a challenge; the
-// real contract is proven later by strict OAuth discovery
-// (proveRouteReady), which fails closed if the binding never materializes.
-// Anonymous fixtures must be actually verified: their profile cannot grow
-// an auth surface, so a challenge never qualifies them.
-func publishLocalProbeOK(out mcpProbeOutcome, auth string) bool {
-	return out.Verified || (out.Auth == "AUTH_REQUIRED" && auth == "upstream-oauth")
+// publishLocalProbeOK is the publish local-target gate: a usable MCP
+// tools/list reply is mandatory. Upstream OAuth also requires a separately
+// verified rejection of absent and invalid bearer credentials, unless the
+// operator explicitly accepts that facet as unverified.
+func publishLocalProbeOK(out mcpProbeOutcome, auth string, acceptUnverifiedAuth bool) bool {
+	if !out.Verified {
+		return false
+	}
+	if auth == "upstream-oauth" {
+		return out.AuthEnforced || acceptUnverifiedAuth
+	}
+	return true
+}
+
+func publishInitialProbeOK(out mcpProbeOutcome, cfg mcpPublishConfig) bool {
+	if publishLocalProbeOK(out, cfg.auth, cfg.acceptUnverifiedUpstreamAuth) {
+		return true
+	}
+	// A resource-file-bound endpoint cannot complete tools/list until it
+	// receives the public URL. Accept only its exact pre-handoff signal;
+	// repeat protocol and auth checks after writing the binding, before
+	// activating the public route.
+	return cfg.auth == "upstream-oauth" && cfg.resourceFile != "" && out.UnboundHandoff
 }
 
 // mcpIngressProfile maps the CLI-facing --auth value to the relay-facing
@@ -592,9 +611,9 @@ func mcpTunnelOptions(port int, v6 bool, c mcpPublishConfig) (tunnelOptions, int
 	name := c.name
 	if name == "" {
 		name = defaultPublicationName(port, c.localURL, c.auth)
-		if c.freshPublication {
-			name = freshPublicationName(name)
-		}
+	}
+	if c.freshPublication {
+		name = freshPublicationName(name)
 	}
 	if name != "" {
 		argv = append(argv, "--name="+name)
@@ -613,6 +632,10 @@ func mcpTunnelOptions(port int, v6 bool, c mcpPublishConfig) (tunnelOptions, int
 	// Pass --ttl explicitly for longer-lived hosting.
 	if opts.cfg.TTLSeconds == 0 {
 		opts.cfg.TTLSeconds = 12 * 3600
+	}
+	if !c.serve && opts.cfg.TTLSeconds < 60 {
+		fmt.Fprintln(os.Stderr, "mcp publish requires --ttl of at least 60s for supervised lease renewal")
+		return opts, apperr.ExitCLIValidation
 	}
 	return opts, 0
 }
@@ -642,10 +665,18 @@ func cmdMCPServe(argv []string) int {
 // optional --name filters to one publication label.
 func cmdMCPList(argv []string) int {
 	name := ""
-	usage := "usage: ocliv mcp list [--name LABEL]"
+	profile := ""
+	usage := "usage: ocliv mcp list [--profile NAME] [--name LABEL]"
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
-		if a == "--name" || strings.HasPrefix(a, "--name=") {
+		if a == "--profile" || strings.HasPrefix(a, "--profile=") {
+			v, ok := mcpFlagValue(argv, &i, "profile")
+			if !ok || v != "default" && !config.ValidProfileName(v) {
+				fmt.Fprintln(os.Stderr, usage)
+				return apperr.ExitCLIValidation
+			}
+			profile = v
+		} else if a == "--name" || strings.HasPrefix(a, "--name=") {
 			v, ok := mcpFlagValue(argv, &i, "name")
 			if !ok {
 				fmt.Fprintln(os.Stderr, usage)
@@ -657,15 +688,41 @@ func cmdMCPList(argv []string) int {
 			return apperr.ExitCLIValidation
 		}
 	}
+	if profile != "" {
+		old, had := os.LookupEnv("OCLIV_PROFILE")
+		if err := os.Setenv("OCLIV_PROFILE", profile); err != nil {
+			fmt.Fprintf(os.Stderr, "mcp list: select profile: %v\n", err)
+			return apperr.ExitInternal
+		}
+		defer func() {
+			if had {
+				_ = os.Setenv("OCLIV_PROFILE", old)
+			} else {
+				_ = os.Unsetenv("OCLIV_PROFILE")
+			}
+		}()
+	}
 	k, keyID, err := loadKey()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "not enrolled: run `ocliv login` first")
+		if profile != "" {
+			fmt.Fprintf(os.Stderr, "mcp list: profile %q is unavailable or not enrolled; create it with `ocliv profile create %s`, then enroll with `ocliv profile use %s` and `ocliv login --relay URL --code-file PATH`\n", profile, profile, profile)
+		} else {
+			fmt.Fprintln(os.Stderr, "not enrolled: run `ocliv login` first")
+		}
 		return apperr.ExitAuth
 	}
 	relayURL := agentRelayURL()
-	code, body := mgmtCall(relayURL, k, keyID, "GET", "/v1/agent/mcp-routes")
+	code, body, callErr := mgmtCall(relayURL, k, keyID, "GET", "/v1/agent/mcp-routes")
+	if callErr != nil {
+		fmt.Fprintf(os.Stderr, "mcp list: relay transport failed: %v\n", callErr)
+		return apperr.ExitRelayTLS
+	}
 	if code != http.StatusOK {
-		fmt.Fprintf(os.Stderr, "mcp list: relay status %d: %s\n", code, shortDetail(string(body)))
+		if code == http.StatusForbidden {
+			fmt.Fprintf(os.Stderr, "mcp list: relay denied this profile's management key (403); this is an authentication/authorization failure, not an empty inventory. Relay: %s. Check the selected profile's relay, key enrollment, tenant, and authorization status.\n", config.RedactedURL(relayURL))
+		} else {
+			fmt.Fprintf(os.Stderr, "mcp list: relay status %d: %s\n", code, shortDetail(string(body)))
+		}
 		return apperr.ExitAuth
 	}
 	var list struct {
@@ -771,7 +828,11 @@ func cmdMCPUnpublish(argv []string) int {
 			fmt.Fprintln(os.Stderr, "mcp unpublish: --publication-id cannot be combined with --lease or --name")
 			return apperr.ExitCLIValidation
 		}
-		dstatus, dbody := mgmtCall(relayURL, k, keyID, "DELETE", "/v1/agent/mcp-routes/"+routeID)
+		dstatus, dbody, callErr := mgmtCall(relayURL, k, keyID, "DELETE", "/v1/agent/mcp-routes/"+routeID)
+		if callErr != nil {
+			fmt.Fprintf(os.Stderr, "mcp unpublish: route delete transport failed: %v\n", callErr)
+			return apperr.ExitRelayTLS
+		}
 		switch dstatus {
 		case http.StatusOK:
 			fmt.Printf("✓ MCP publication removed: %s\n", routeID)
@@ -803,7 +864,11 @@ func cmdMCPUnpublish(argv []string) int {
 		keyID: keyID,
 	}
 	failed := false
-	lcode, lbody := mgmtCall(relayURL, k, keyID, "GET", "/v1/agent/lease/"+leaseID+"/mcp-route")
+	lcode, lbody, callErr := mgmtCall(relayURL, k, keyID, "GET", "/v1/agent/lease/"+leaseID+"/mcp-route")
+	if callErr != nil {
+		fmt.Fprintf(os.Stderr, "mcp unpublish: route list transport failed: %v\n", callErr)
+		return apperr.ExitRelayTLS
+	}
 	if lcode != http.StatusOK {
 		fmt.Fprintf(os.Stderr, "mcp unpublish: route list failed (relay status %d): %s\n",
 			lcode, shortDetail(string(lbody)))
@@ -819,8 +884,13 @@ func cmdMCPUnpublish(argv []string) int {
 		return apperr.ExitInternal
 	}
 	for _, rt := range list.Routes {
-		dstatus, dbody := mgmtCall(relayURL, k, keyID, "DELETE",
+		dstatus, dbody, callErr := mgmtCall(relayURL, k, keyID, "DELETE",
 			"/v1/agent/lease/"+leaseID+"/mcp-route/"+rt.RouteID)
+		if callErr != nil {
+			fmt.Fprintf(os.Stderr, "mcp unpublish: route %s delete transport failed: %v\n", rt.RouteID, callErr)
+			failed = true
+			continue
+		}
 		// 404 is the desired end state (already gone), not a failure.
 		if dstatus != http.StatusOK && dstatus != http.StatusNotFound {
 			fmt.Fprintf(os.Stderr, "mcp unpublish: route %s delete reported status %d (%s)\n",
@@ -840,7 +910,7 @@ func cmdMCPUnpublish(argv []string) int {
 	return apperr.ExitOK
 }
 
-// runMCPPublish owns the full lifecycle: optional stdio child, tunnel in
+// runMCPPublish owns the full lifecycle: optional local adapter, tunnel in
 // the requested mode, optional route registration, steady state, and
 // ordered cleanup with independently recorded outcomes.
 func runMCPPublish(argv []string, serve bool) int {
@@ -864,10 +934,11 @@ func runMCPPublish(argv []string, serve bool) int {
 		// and torn down with this process. Its child was pinned by local
 		// argv in parseMCPPublish; no request content can change it.
 		a, err := mcp.New(mcp.Options{
-			Command: cfg.cmd[0],
-			Args:    cfg.cmd[1:],
-			Dir:     cfg.dir,
-			Env:     cfg.env,
+			Command:             cfg.cmd[0],
+			Args:                cfg.cmd[1:],
+			Dir:                 cfg.dir,
+			Env:                 cfg.env,
+			MultiClientSessions: true,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "mcp publish --stdio: %v\n", err)
@@ -905,15 +976,30 @@ func runMCPPublish(argv []string, serve bool) int {
 		fmt.Fprintf(os.Stderr, "local MCP unreachable at %s: %v\n", target, perr)
 		return apperr.ExitLocalTarget
 	}
+	var upstreamBearer string
+	if cfg.auth == "upstream-oauth" {
+		upstreamBearer = os.Getenv("OCLIV_UPSTREAM_MCP_TOKEN")
+	}
 	// The local endpoint must speak MCP before a public route is
-	// registered for it (P1). An upstream-oauth server that answers
-	// with an authentication challenge is sufficient presence — tool
-	// functionality is never claimed from a challenge. A stdio adapter
-	// is relay-terminated, so a live MCP session is required.
-	pout := runMCPProbe(target, mcpAccessMode(cfg.auth))
-	if !publishLocalProbeOK(pout, cfg.auth) {
+	// activated for it. For upstream OAuth, the optional operator token
+	// lets the probe verify tools/list behind the server's auth boundary.
+	pout := runMCPProbeWithBearer(target, mcpAccessMode(cfg.auth), upstreamBearer)
+	upstreamAuthUnverified := false
+	if !pout.Verified && !publishInitialProbeOK(pout, cfg) {
 		fmt.Fprintf(os.Stderr, "local MCP %s failed protocol check: %s\n", target, pout.Summary)
+		if cfg.auth == "upstream-oauth" && pout.Auth == "AUTH_REQUIRED" {
+			fmt.Fprintln(os.Stderr, "set OCLIV_UPSTREAM_MCP_TOKEN to a valid local upstream bearer so publish can verify tools/list")
+		}
 		return apperr.ExitLocalTarget
+	}
+	if pout.Verified && cfg.auth == "upstream-oauth" {
+		pout.AuthEnforced = verifyUpstreamAuthEnforcement(target)
+		if !publishLocalProbeOK(pout, cfg.auth, cfg.acceptUnverifiedUpstreamAuth) {
+			fmt.Fprintln(os.Stderr, "local MCP protocol is valid, but upstream OAuth enforcement is UNVERIFIED: the server did not reject both missing and invalid bearer credentials")
+			fmt.Fprintln(os.Stderr, "fix upstream bearer enforcement or explicitly pass --accept-unverified-upstream-auth; this route will remain marked NOT VERIFIED")
+			return apperr.ExitLocalTarget
+		}
+		upstreamAuthUnverified = !pout.AuthEnforced
 	}
 	fmt.Printf("local MCP: %s\n", pout.Summary)
 
@@ -925,6 +1011,11 @@ func runMCPPublish(argv []string, serve bool) int {
 	ready, pcode := prepareTunnel(opts)
 	if pcode != 0 {
 		return pcode
+	}
+	// MCP publish supervises a durable route and renews its lease. Ordinary
+	// tunnels retain terminal TTL semantics, including --ttl expiry.
+	if !serve {
+		ready.runner.Cfg.RenewLease = true
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -942,6 +1033,7 @@ func runMCPPublish(argv []string, serve bool) int {
 	// 3. Route registration (publish only): after attachment, so the
 	// printed endpoint is live, never speculative.
 	var routeID, routeURL, routeLeaseID string
+	var routeCreated bool
 	if !serve {
 		// The route's ingress profile is the relay-facing name, not the
 		// CLI-facing --auth value: `ocliv-managed` maps to `managed-oauth`.
@@ -952,8 +1044,12 @@ func runMCPPublish(argv []string, serve bool) int {
 		// time; runSteadyState may re-assign a to a newer attachment, so
 		// the DELETE below must use this ID, not the updated a.LeaseID.
 		routeLeaseID = a.LeaseID
-		rstatus, rbody := mgmtCall(relayURL, k, keyID, "POST",
+		rstatus, rbody, callErr := mgmtCall(relayURL, k, keyID, "POST",
 			"/v1/agent/lease/"+routeLeaseID+"/mcp-route/"+profile)
+		if callErr != nil {
+			fmt.Fprintf(os.Stderr, "mcp publish: route registration transport failed (relay %s): %v\n", relayURL, callErr)
+			return closeTunnel(ready, a, apperr.ExitRelayTLS)
+		}
 		if rstatus != http.StatusOK {
 			// Name the relay that was tried: with several relays in
 			// play (env override, HOME-scoped config, explicit
@@ -967,12 +1063,14 @@ func runMCPPublish(argv []string, serve bool) int {
 			RouteID string `json:"route_id"`
 			URL     string `json:"url"`
 			Auth    string `json:"auth"`
+			Created bool   `json:"created"`
 		}
 		if jerr := json.Unmarshal(rbody, &rr); jerr != nil || rr.RouteID == "" || rr.URL == "" {
 			fmt.Fprintln(os.Stderr, "mcp publish: relay route reply unparseable")
 			return closeTunnel(ready, a, apperr.ExitInternal)
 		}
-		routeID, routeURL = rr.RouteID, rr.URL
+		routeID, routeURL, routeCreated = rr.RouteID, rr.URL, rr.Created
+		ready.runner.SetRenewalPublication(routeID)
 		// No URL is printed yet (P0-B item 3): registration is not
 		// readiness. The URL is advertised only after the required
 		// security checks complete below.
@@ -984,17 +1082,63 @@ func runMCPPublish(argv []string, serve bool) int {
 		if cfg.resourceFile != "" {
 			if werr := writeResourceBinding(cfg.resourceFile, routeURL); werr != nil {
 				fmt.Fprintf(os.Stderr, "mcp publish: resource binding write failed: %v\n", werr)
-				del := func(path string) (int, string) {
-					st, body := mgmtCall(relayURL, k, keyID, "DELETE", path)
+				del := func(method, path string) (int, string) {
+					st, body, err := mgmtCall(relayURL, k, keyID, method, path)
+					if err != nil {
+						return 0, "transport failure: " + err.Error()
+					}
 					return st, string(body)
 				}
-				if dstatus, ddetail := abandonPublishedRoute(del, routeLeaseID, routeID); dstatus != http.StatusOK {
-					fmt.Fprintf(os.Stderr, "warning: mcp publish: abort route delete reported status %d (%s)\n", dstatus, ddetail)
+				if dstatus, ddetail := abandonPublishedRoute(del, routeLeaseID, routeID, routeCreated); dstatus != http.StatusOK {
+					if dstatus == 0 {
+						fmt.Fprintf(os.Stderr, "warning: mcp publish: abort route delete transport failed (%s)\n", ddetail)
+					} else {
+						fmt.Fprintf(os.Stderr, "warning: mcp publish: abort route delete reported status %d (%s)\n", dstatus, ddetail)
+					}
 				}
 				routeID = ""
 				return closeTunnel(ready, a, apperr.ExitInternal)
 			}
 			fmt.Println("✓ resource binding written (" + cfg.resourceFile + ")")
+			// A resource-file server may have returned its exact pre-handoff
+			// 503 above. Once bound, require a real tools/list exchange and
+			// repeat the missing/invalid bearer checks before activation.
+			pout = runMCPProbeWithBearer(target, mcpAccessMode(cfg.auth), upstreamBearer)
+			if !pout.Verified {
+				fmt.Fprintf(os.Stderr, "mcp publish: bound local server failed MCP protocol verification: %s\n", pout.Summary)
+				deleteRoute := func(method, path string) (int, string) {
+					st, body, err := mgmtCall(relayURL, k, keyID, method, path)
+					if err != nil {
+						return 0, "transport failure: " + err.Error()
+					}
+					return st, string(body)
+				}
+				if dstatus, detail := abandonPublishedRoute(deleteRoute, routeLeaseID, routeID, routeCreated); dstatus != http.StatusOK {
+					fmt.Fprintf(os.Stderr, "warning: mcp publish: abort route delete status %d (%s)\n", dstatus, detail)
+				}
+				routeID = ""
+				return closeTunnel(ready, a, apperr.ExitLocalTarget)
+			}
+			if cfg.auth == "upstream-oauth" {
+				pout.AuthEnforced = verifyUpstreamAuthEnforcement(target)
+				if !publishLocalProbeOK(pout, cfg.auth, cfg.acceptUnverifiedUpstreamAuth) {
+					fmt.Fprintln(os.Stderr, "mcp publish: bound server does not prove upstream OAuth enforcement; refusing to activate")
+					deleteRoute := func(method, path string) (int, string) {
+						st, body, err := mgmtCall(relayURL, k, keyID, method, path)
+						if err != nil {
+							return 0, "transport failure: " + err.Error()
+						}
+						return st, string(body)
+					}
+					if dstatus, detail := abandonPublishedRoute(deleteRoute, routeLeaseID, routeID, routeCreated); dstatus != http.StatusOK {
+						fmt.Fprintf(os.Stderr, "warning: mcp publish: abort route delete status %d (%s)\n", dstatus, detail)
+					}
+					routeID = ""
+					return closeTunnel(ready, a, apperr.ExitLocalTarget)
+				}
+				upstreamAuthUnverified = !pout.AuthEnforced
+			}
+			fmt.Printf("local MCP after resource binding: %s\n", pout.Summary)
 		}
 		// P0-E: for upstream-oauth publications, prove the upstream's
 		// advertised OAuth resource is exactly this route before
@@ -1018,12 +1162,19 @@ func runMCPPublish(argv []string, serve bool) int {
 			durl, derr := mcpRouteDiscoveryURL(routeURL, routeID)
 			if derr != nil {
 				fmt.Fprintf(os.Stderr, "mcp publish: bad route URL from relay: %v\n", derr)
-				del := func(path string) (int, string) {
-					st, body := mgmtCall(relayURL, k, keyID, "DELETE", path)
+				del := func(method, path string) (int, string) {
+					st, body, err := mgmtCall(relayURL, k, keyID, method, path)
+					if err != nil {
+						return 0, "transport failure: " + err.Error()
+					}
 					return st, string(body)
 				}
-				if dstatus, ddetail := abandonPublishedRoute(del, routeLeaseID, routeID); dstatus != http.StatusOK {
-					fmt.Fprintf(os.Stderr, "warning: mcp publish: abort route delete reported status %d (%s)\n", dstatus, ddetail)
+				if dstatus, ddetail := abandonPublishedRoute(del, routeLeaseID, routeID, routeCreated); dstatus != http.StatusOK {
+					if dstatus == 0 {
+						fmt.Fprintf(os.Stderr, "warning: mcp publish: abort route delete transport failed (%s)\n", ddetail)
+					} else {
+						fmt.Fprintf(os.Stderr, "warning: mcp publish: abort route delete reported status %d (%s)\n", dstatus, ddetail)
+					}
 				}
 				routeID = ""
 				return closeTunnel(ready, a, apperr.ExitInternal)
@@ -1068,19 +1219,38 @@ func runMCPPublish(argv []string, serve bool) int {
 				} else {
 					fmt.Fprintf(os.Stderr, "mcp publish: OAuth discovery invalid: %v\n", verr)
 				}
-				del := func(path string) (int, string) {
-					st, body := mgmtCall(relayURL, k, keyID, "DELETE", path)
+				del := func(method, path string) (int, string) {
+					st, body, err := mgmtCall(relayURL, k, keyID, method, path)
+					if err != nil {
+						return 0, "transport failure: " + err.Error()
+					}
 					return st, string(body)
 				}
-				if dstatus, ddetail := abandonPublishedRoute(del, routeLeaseID, routeID); dstatus != http.StatusOK {
-					fmt.Fprintf(os.Stderr, "warning: mcp publish: abort route delete reported status %d (%s)\n", dstatus, ddetail)
+				if dstatus, ddetail := abandonPublishedRoute(del, routeLeaseID, routeID, routeCreated); dstatus != http.StatusOK {
+					if dstatus == 0 {
+						fmt.Fprintf(os.Stderr, "warning: mcp publish: abort route delete transport failed (%s)\n", ddetail)
+					} else {
+						fmt.Fprintf(os.Stderr, "warning: mcp publish: abort route delete reported status %d (%s)\n", dstatus, ddetail)
+					}
 				}
 				routeID = ""
 				return closeTunnel(ready, a, apperr.ExitAuth)
 			}
-			if devOnly {
-				fmt.Fprintf(os.Stderr, "warning: mcp publish: OAuth discovery unreachable; activating WITHOUT verified discovery (dev only — do NOT register this URL with ChatGPT)\n")
-				fmt.Printf("\n⚠ MCP route active WITHOUT verified OAuth discovery (dev only, auth: %s):\n%s\n", rr.Auth, routeURL)
+			if devOnly || upstreamAuthUnverified {
+				if upstreamAuthUnverified {
+					fmt.Fprintln(os.Stderr, "warning: mcp publish: upstream bearer enforcement NOT VERIFIED by missing/invalid-token probes")
+				}
+				if devOnly {
+					fmt.Fprintln(os.Stderr, "warning: mcp publish: OAuth discovery unreachable; activating WITHOUT verified discovery (dev only)")
+				}
+				status := "NOT VERIFIED"
+				if devOnly {
+					status += " OAuth discovery"
+				}
+				if upstreamAuthUnverified {
+					status += " upstream authorization"
+				}
+				fmt.Printf("\n⚠ MCP route active — %s (do NOT register this URL with ChatGPT; auth: %s):\n%s\n", status, rr.Auth, routeURL)
 			} else {
 				fmt.Println("✓ OAuth discovery verified (resource matches published URL)")
 				fmt.Printf("\n✓ MCP route ready (auth: %s)\n", rr.Auth)
@@ -1243,7 +1413,14 @@ func cmdMCPDoctor(argv []string) int {
 	}
 	fmt.Println("enrollment: ok")
 
-	scode, sbody := mgmtCall(relayURL, k, keyID, "GET", "/v1/agent/lease/"+leaseID+"/status")
+	scode, sbody, callErr := mgmtCall(relayURL, k, keyID, "GET", "/v1/agent/lease/"+leaseID+"/status")
+	if callErr != nil {
+		fmt.Printf("relay lease status: unreachable (%v)\n", callErr)
+		fmt.Println("route status: unknown (relay unreachable)")
+		fmt.Println("local service: unknown (no lease port)")
+		fmt.Println("mcp protocol: unknown (no lease port)")
+		return apperr.ExitRelayTLS
+	}
 	if scode != http.StatusOK {
 		fmt.Printf("relay lease status: unreachable (relay status %d)\n", scode)
 		fmt.Println("route status: unknown (relay unreachable)")
@@ -1252,12 +1429,16 @@ func cmdMCPDoctor(argv []string) int {
 		return apperr.ExitRelayTLS
 	}
 	var st struct {
-		Hostname   string `json:"hostname"`
-		Port       int    `json:"port"`
-		AccessMode string `json:"access_mode"`
-		Status     string `json:"status"`
-		Generation int64  `json:"generation"`
-		RouteLive  bool   `json:"route_live"`
+		Hostname          string `json:"hostname"`
+		Port              int    `json:"port"`
+		AccessMode        string `json:"access_mode"`
+		Status            string `json:"status"`
+		Generation        int64  `json:"generation"`
+		RouteLive         bool   `json:"route_live"`
+		RouteAvailable    bool   `json:"route_available"`
+		LeaseExpiresAt    string `json:"lease_expires_at"`
+		LastRenewalAt     string `json:"last_renewal_at"`
+		LastRenewalResult string `json:"last_renewal_result"`
 	}
 	if jerr := json.Unmarshal(sbody, &st); jerr != nil {
 		fmt.Fprintln(os.Stderr, "relay status reply unparseable")
@@ -1265,8 +1446,28 @@ func cmdMCPDoctor(argv []string) int {
 	}
 	fmt.Printf("lease: %s status=%s mode=%s generation=%d\n", leaseID, st.Status, st.AccessMode, st.Generation)
 	fmt.Printf("route live: %v\n", st.RouteLive)
+	if st.LeaseExpiresAt == "" {
+		fmt.Println("lease expires at: never")
+	} else {
+		fmt.Printf("lease expires at: %s\n", st.LeaseExpiresAt)
+	}
+	if st.LastRenewalAt == "" {
+		fmt.Println("last renewal: none recorded")
+	} else {
+		fmt.Printf("last renewal: %s\n", st.LastRenewalAt)
+	}
+	if st.LastRenewalResult == "" {
+		fmt.Println("last renewal result: none recorded")
+	} else {
+		fmt.Printf("last renewal result: %s\n", st.LastRenewalResult)
+	}
+	fmt.Printf("current route availability: %v\n", st.RouteAvailable)
 
-	rcode, rbody := mgmtCall(relayURL, k, keyID, "GET", "/v1/agent/lease/"+leaseID+"/mcp-route")
+	rcode, rbody, callErr := mgmtCall(relayURL, k, keyID, "GET", "/v1/agent/lease/"+leaseID+"/mcp-route")
+	if callErr != nil {
+		fmt.Printf("route status: unreachable (%v)\n", callErr)
+		return apperr.ExitRelayTLS
+	}
 	var rl struct {
 		Routes []struct {
 			RouteID string `json:"route_id"`

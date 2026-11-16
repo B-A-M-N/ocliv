@@ -16,8 +16,8 @@ import (
 // CleanupResult records remote revocation outcomes independently: local
 // shutdown and remote revocation are different results, and a failed
 // remote close must never present as a clean exit (P1-8). Status -1
-// means the operation was not attempted; 0 means the relay was
-// unreachable (mgmtCall transport failure). Details are trimmed relay
+// means the operation was not attempted; 0 means a transport failure.
+// Details are trimmed relay
 // error strings, never secrets.
 type CleanupResult struct {
 	LeaseID, RouteID         string
@@ -75,11 +75,19 @@ func (c CleanupResult) Report() string {
 			detail = "no response from relay"
 		}
 		if c.leaseConfirmed() {
-			fmt.Fprintf(&sb, "warning: route %s delete reported status %d (%s); the closed lease denies it anyway\n",
-				c.RouteID, c.RouteDeleteStatus, detail)
+			if c.RouteDeleteStatus == 0 {
+				fmt.Fprintf(&sb, "warning: route %s delete transport failed (%s); the closed lease denies it anyway\n", c.RouteID, detail)
+			} else {
+				fmt.Fprintf(&sb, "warning: route %s delete reported status %d (%s); the closed lease denies it anyway\n",
+					c.RouteID, c.RouteDeleteStatus, detail)
+			}
 		} else {
-			fmt.Fprintf(&sb, "warning: route %s delete reported status %d (%s); the route may still be reachable until TTL expiry\n",
-				c.RouteID, c.RouteDeleteStatus, detail)
+			if c.RouteDeleteStatus == 0 {
+				fmt.Fprintf(&sb, "warning: route %s delete transport failed (%s); the route may still be reachable until TTL expiry\n", c.RouteID, detail)
+			} else {
+				fmt.Fprintf(&sb, "warning: route %s delete reported status %d (%s); the route may still be reachable until TTL expiry\n",
+					c.RouteID, c.RouteDeleteStatus, detail)
+			}
 		}
 	}
 	return sb.String()
@@ -91,7 +99,10 @@ func (c CleanupResult) Report() string {
 type leaseCloser func(ready tunnelReady, leaseID string) (int, string)
 
 func defaultLeaseCloser(ready tunnelReady, leaseID string) (int, string) {
-	status, body := mgmtCall(ready.opts.cfg.RelayURL, ready.key, ready.keyID, "POST", "/v1/agent/lease/"+leaseID+"/close")
+	status, body, err := mgmtCall(ready.opts.cfg.RelayURL, ready.key, ready.keyID, "POST", "/v1/agent/lease/"+leaseID+"/close")
+	if err != nil {
+		return 0, "transport failure: " + err.Error()
+	}
 	return status, string(body)
 }
 
@@ -149,6 +160,9 @@ func closeWarning(leaseID string, status int, body []byte) string {
 	detail := strings.TrimSpace(string(body))
 	if detail == "" {
 		detail = "no response from relay"
+	}
+	if status == 0 {
+		return fmt.Sprintf("warning: lease %s close transport failed (%s); access may linger until TTL expiry", leaseID, detail)
 	}
 	return fmt.Sprintf("warning: lease %s close reported status %d (%s); access may linger until TTL expiry",
 		leaseID, status, detail)

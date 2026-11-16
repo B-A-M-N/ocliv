@@ -139,9 +139,25 @@ func (rn *Runner) serve(ctx context.Context, ys *yamux.Session, att Attached) er
 	// the whole runner exits (previously one waiter per reconnect).
 	stop := context.AfterFunc(ctx, func() { ys.Close() })
 	defer stop()
+	renewCtx, stopRenewals := context.WithCancel(ctx)
+	defer stopRenewals()
+	renewalErr := make(chan error, 1)
+	if rn.Cfg.TTLSeconds > 0 && rn.Cfg.RenewLease {
+		go func() {
+			if err := rn.renewalLoop(renewCtx, att, func() { _ = ys.Close() }); err != nil && ctx.Err() == nil {
+				renewalErr <- err
+				_ = ys.Close()
+			}
+		}()
+	}
 	for {
 		stream, err := ys.AcceptStream()
 		if err != nil {
+			select {
+			case renewErr := <-renewalErr:
+				return renewErr
+			default:
+			}
 			return err // session over; reconnect loop decides (F09)
 		}
 		go rn.handleStream(ctx, stream, att)

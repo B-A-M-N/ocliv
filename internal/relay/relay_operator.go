@@ -27,7 +27,22 @@ type KeyInfo struct {
 
 // ListAgentKeys returns every enrolled key, newest last.
 func ListAgentKeys(db *store.DB) ([]KeyInfo, error) {
-	rows, err := db.SQL().Query(`SELECT id, tenant_id, status, created_at, revoked_at FROM agent_keys ORDER BY created_at`)
+	return listAgentKeys(db.SQL())
+}
+
+// ListAgentKeysReadOnly lists keys through an observational SQL handle.
+// It exists for the CLI's read-only inventory path, which must not enter
+// store.Open and trigger forward migrations.
+func ListAgentKeysReadOnly(db *sql.DB) ([]KeyInfo, error) {
+	return listAgentKeys(db)
+}
+
+type keyListQueryer interface {
+	Query(string, ...any) (*sql.Rows, error)
+}
+
+func listAgentKeys(db keyListQueryer) ([]KeyInfo, error) {
+	rows, err := db.Query(`SELECT id, tenant_id, status, created_at, revoked_at FROM agent_keys ORDER BY created_at`)
 	if err != nil {
 		return nil, apperr.E(apperr.CodeStoreFault, "listing agent keys", err)
 	}

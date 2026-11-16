@@ -30,6 +30,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -45,33 +46,142 @@ import (
 // relayDBName is the single state file inside a relay data directory.
 const relayDBName = "ocliv.db"
 
-// BackupState writes a consistent snapshot of db to destPath atomically:
-// VACUUM INTO a temp file (VACUUM INTO refuses an existing target),
-// owner-only permissions, then rename over the destination.
+// BackupState writes a new, immutable snapshot and checksum sidecar. The
+// pending marker makes the two-file publication recoverable: an interrupted
+// snapshot without its checksum is rejected, while an intact pair is valid
+// even if power failed before marker cleanup. Existing backup names are never
+// overwritten, so a failed replacement cannot destroy the prior snapshot.
 func BackupState(db *store.DB, destPath string) error {
+	return backupState(db, destPath, nil)
+}
+
+func backupState(db *store.DB, destPath string, afterStage func(string) error) error {
 	if destPath == "" {
 		return apperr.E(apperr.CodeCLIValidation, "backup destination required", nil)
 	}
-	tmp := destPath + ".tmp"
-	_ = os.Remove(tmp)
+	dir := filepath.Dir(destPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return apperr.E(apperr.CodeStoreFault, "creating backup directory", err)
+	}
+	for _, path := range []string{destPath, checksumPath(destPath), backupPendingPath(destPath)} {
+		if _, err := os.Lstat(path); err == nil {
+			return apperr.E(apperr.CodeCLIValidation, "backup destination already exists; choose a new timestamped path", nil)
+		} else if !os.IsNotExist(err) {
+			return apperr.E(apperr.CodeStoreFault, "checking backup destination", err)
+		}
+	}
+	tmpFile, err := os.CreateTemp(dir, ".ocliv-backup-*.db")
+	if err != nil {
+		return apperr.E(apperr.CodeStoreFault, "creating backup staging file", err)
+	}
+	tmp := tmpFile.Name()
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return apperr.E(apperr.CodeStoreFault, "closing backup staging file", err)
+	}
+	if err := os.Remove(tmp); err != nil {
+		return apperr.E(apperr.CodeStoreFault, "preparing backup staging file", err)
+	}
+	defer os.Remove(tmp)
 	if _, err := db.SQL().Exec(`VACUUM INTO ?`, tmp); err != nil {
 		return apperr.E(apperr.CodeStoreFault, "snapshotting state database", err)
 	}
+	if err := markBackupFormat(tmp); err != nil {
+		return apperr.E(apperr.CodeStoreFault, "marking versioned backup format", err)
+	}
 	if err := os.Chmod(tmp, 0o600); err != nil {
-		_ = os.Remove(tmp)
 		return apperr.E(apperr.CodeStoreFault, "securing backup file", err)
 	}
-	if err := os.Rename(tmp, destPath); err != nil {
-		_ = os.Remove(tmp)
+	if err := syncFile(tmp); err != nil {
+		return apperr.E(apperr.CodeStoreFault, "syncing backup file", err)
+	}
+	sum, err := checksumFile(tmp)
+	if err != nil {
+		return apperr.E(apperr.CodeStoreFault, "checksumming backup file", err)
+	}
+	sideTmpFile, err := os.CreateTemp(dir, ".ocliv-backup-*.sha256")
+	if err != nil {
+		return apperr.E(apperr.CodeStoreFault, "creating backup checksum staging file", err)
+	}
+	sideTmp := sideTmpFile.Name()
+	defer os.Remove(sideTmp)
+	if err := sideTmpFile.Chmod(0o600); err != nil {
+		_ = sideTmpFile.Close()
+		return apperr.E(apperr.CodeStoreFault, "securing backup checksum", err)
+	}
+	if _, err := sideTmpFile.Write([]byte(sum + "\n")); err != nil {
+		_ = sideTmpFile.Close()
+		return apperr.E(apperr.CodeStoreFault, "writing backup checksum", err)
+	}
+	if err := sideTmpFile.Sync(); err != nil {
+		_ = sideTmpFile.Close()
+		return apperr.E(apperr.CodeStoreFault, "syncing backup checksum", err)
+	}
+	if err := sideTmpFile.Close(); err != nil {
+		return apperr.E(apperr.CodeStoreFault, "closing backup checksum", err)
+	}
+	marker, err := os.OpenFile(backupPendingPath(destPath), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return apperr.E(apperr.CodeStoreFault, "marking backup publication in progress", err)
+	}
+	if _, err := marker.Write([]byte("backup and checksum publication in progress\n")); err != nil {
+		_ = marker.Close()
+		_ = os.Remove(backupPendingPath(destPath))
+		return apperr.E(apperr.CodeStoreFault, "writing backup publication marker", err)
+	}
+	if err := marker.Sync(); err != nil {
+		_ = marker.Close()
+		_ = os.Remove(backupPendingPath(destPath))
+		return apperr.E(apperr.CodeStoreFault, "syncing backup publication marker", err)
+	}
+	if err := marker.Close(); err != nil {
+		_ = os.Remove(backupPendingPath(destPath))
+		return apperr.E(apperr.CodeStoreFault, "closing backup publication marker", err)
+	}
+	if err := dirSync(dir); err != nil {
+		return apperr.E(apperr.CodeStoreFault, "syncing backup publication marker", err)
+	}
+	if afterStage != nil {
+		if err := afterStage("pending"); err != nil {
+			return err
+		}
+	}
+	// Hard-link publication is atomic and fails if another process created
+	// the chosen immutable name after the initial existence check.
+	if err := os.Link(tmp, destPath); err != nil {
 		return apperr.E(apperr.CodeStoreFault, "installing backup file", err)
 	}
-	// Tamper-evident sidecar: a byte flipped anywhere in the snapshot
-	// (including a free page, which PRAGMA integrity_check does not cover)
-	// is detected on validation.
-	if err := writeChecksum(destPath); err != nil {
-		return err
+	if err := os.Remove(tmp); err != nil {
+		return apperr.E(apperr.CodeStoreFault, "retiring backup staging file", err)
 	}
-	dirSync(filepath.Dir(destPath))
+	if err := dirSync(dir); err != nil {
+		return apperr.E(apperr.CodeStoreFault, "syncing installed backup", err)
+	}
+	if afterStage != nil {
+		if err := afterStage("snapshot"); err != nil {
+			return err
+		}
+	}
+	if err := os.Link(sideTmp, checksumPath(destPath)); err != nil {
+		return apperr.E(apperr.CodeStoreFault, "installing backup checksum", err)
+	}
+	if err := os.Remove(sideTmp); err != nil {
+		return apperr.E(apperr.CodeStoreFault, "retiring checksum staging file", err)
+	}
+	if err := dirSync(dir); err != nil {
+		return apperr.E(apperr.CodeStoreFault, "syncing installed backup checksum", err)
+	}
+	if afterStage != nil {
+		if err := afterStage("checksum"); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(backupPendingPath(destPath)); err != nil {
+		return apperr.E(apperr.CodeStoreFault, "clearing backup publication marker", err)
+	}
+	if err := dirSync(dir); err != nil {
+		return apperr.E(apperr.CodeStoreFault, "syncing completed backup publication", err)
+	}
 	return nil
 }
 
@@ -79,16 +189,68 @@ func BackupState(db *store.DB, destPath string) error {
 func checksumPath(backupPath string) string { return backupPath + ".sha256" }
 
 // writeChecksum records the SHA-256 of the backup file next to it.
-func writeChecksum(backupPath string) error {
-	raw, err := os.ReadFile(backupPath)
+func backupPendingPath(backupPath string) string { return backupPath + ".pending" }
+
+func checksumFile(path string) (string, error) {
+	f, err := os.Open(path)
 	if err != nil {
-		return apperr.E(apperr.CodeStoreFault, "reading backup for checksum", err)
+		return "", err
 	}
-	sum := sha256.Sum256(raw)
-	if err := os.WriteFile(checksumPath(backupPath), []byte(hex.EncodeToString(sum[:])+"\n"), 0o600); err != nil {
-		return apperr.E(apperr.CodeStoreFault, "writing backup checksum", err)
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
 	}
-	return nil
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func syncFile(path string) error {
+	f, err := os.OpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
+// markBackupFormat puts the checksum requirement inside the SQLite snapshot
+// itself. If an operator later loses both sidecar and pending marker, this
+// durable marker still distinguishes a new-format backup from a legacy one.
+func markBackupFormat(path string) error {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS ocliv_backup_manifest (format_version INTEGER NOT NULL CHECK(format_version=1))`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`DELETE FROM ocliv_backup_manifest`); err != nil {
+		return err
+	}
+	_, err = db.Exec(`INSERT INTO ocliv_backup_manifest(format_version) VALUES(1)`)
+	return err
+}
+
+func backupRequiresChecksum(path string) (bool, error) {
+	u := (&url.URL{Scheme: "file", Path: path}).String() + "?mode=ro"
+	db, err := sql.Open("sqlite", u)
+	if err != nil {
+		return false, err
+	}
+	defer db.Close()
+	var version int
+	err = db.QueryRow(`SELECT format_version FROM ocliv_backup_manifest`).Scan(&version)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return false, nil // legacy raw SQLite backup
+		}
+		return false, err
+	}
+	if version != 1 {
+		return false, fmt.Errorf("unsupported backup format version %d", version)
+	}
+	return true, nil
 }
 
 // verifyChecksum checks the sidecar checksum when one exists. A missing
@@ -98,17 +260,28 @@ func verifyChecksum(backupPath string) error {
 	rawSum, err := os.ReadFile(checksumPath(backupPath))
 	if err != nil {
 		if os.IsNotExist(err) {
+			if _, pendingErr := os.Lstat(backupPendingPath(backupPath)); pendingErr == nil {
+				return apperr.E(apperr.CodeStoreFault, "backup publication was interrupted before checksum installation", nil)
+			} else if !os.IsNotExist(pendingErr) {
+				return apperr.E(apperr.CodeStoreFault, "reading backup publication marker", pendingErr)
+			}
+			requires, formatErr := backupRequiresChecksum(backupPath)
+			if formatErr != nil {
+				return apperr.E(apperr.CodeStoreFault, "reading backup format manifest", formatErr)
+			}
+			if requires {
+				return apperr.E(apperr.CodeStoreFault, "versioned backup is missing its required checksum sidecar", nil)
+			}
 			return nil
 		}
 		return apperr.E(apperr.CodeStoreFault, "reading backup checksum", err)
 	}
-	raw, err := os.ReadFile(backupPath)
+	sum, err := checksumFile(backupPath)
 	if err != nil {
 		return apperr.E(apperr.CodeStoreFault, "reading backup for checksum", err)
 	}
-	sum := sha256.Sum256(raw)
 	want := strings.TrimSpace(string(rawSum))
-	if want == "" || !hmac.Equal([]byte(hex.EncodeToString(sum[:])), []byte(want)) {
+	if want == "" || !hmac.Equal([]byte(sum), []byte(want)) {
 		return apperr.E(apperr.CodeStoreFault, "backup checksum mismatch (file modified after backup)", nil)
 	}
 	return nil
@@ -480,17 +653,19 @@ func sameFile(a, b string) (bool, error) {
 	return os.SameFile(fa, fb), nil
 }
 
-// dirSync flushes directory metadata so a preceding rename is durable
-// before success is reported. Best-effort on filesystems without
-// directory fsync; the file-level fsyncs in copyFile/installValidated
-// already protect content.
-func dirSync(dir string) {
+// dirSync flushes directory metadata so preceding links, removals, or
+// renames are durable before success is reported. Filesystems that do not
+// support directory fsync fail the operation instead of claiming durability.
+func dirSync(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
-		return
+		return err
 	}
-	defer d.Close()
-	_ = d.Sync()
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return err
+	}
+	return d.Close()
 }
 
 func copyFile(src, dst string) error {
@@ -756,27 +931,89 @@ func resetRestoredAuthority(candidatePath string) error {
 // sidecars from the previous database generation are removed — the
 // candidate is a clean VACUUM-produced image with no WAL.
 func installValidated(candidatePath, livePath string) error {
+	return installValidatedWithHook(candidatePath, livePath, nil)
+}
+
+func installValidatedWithHook(candidatePath, livePath string, afterStage func(string) error) error {
 	if err := os.MkdirAll(filepath.Dir(livePath), 0o700); err != nil {
 		return apperr.E(apperr.CodeStoreFault, "creating state directory", err)
 	}
-	staged := livePath + ".restore-tmp"
-	_ = os.Remove(staged)
+	stageFile, err := os.CreateTemp(filepath.Dir(livePath), ".ocliv-restore-*.db")
+	if err != nil {
+		return apperr.E(apperr.CodeStoreFault, "creating restore staging file", err)
+	}
+	staged := stageFile.Name()
+	if err := stageFile.Close(); err != nil {
+		_ = os.Remove(staged)
+		return apperr.E(apperr.CodeStoreFault, "closing restore staging file", err)
+	}
+	defer os.Remove(staged)
 	if err := copyFile(candidatePath, staged); err != nil {
 		return apperr.E(apperr.CodeStoreFault, "staging restore candidate", err)
 	}
 	if err := os.Chmod(staged, 0o600); err != nil {
-		_ = os.Remove(staged)
 		return apperr.E(apperr.CodeStoreFault, "securing staged database", err)
 	}
+	if err := syncFile(staged); err != nil {
+		return apperr.E(apperr.CodeStoreFault, "syncing staged database", err)
+	}
+	// Checkpoint the old DB before retiring its sidecars. If power fails
+	// before the atomic rename, the old main file still contains every
+	// committed WAL transaction. After sidecar removal, the rename can no
+	// longer expose a new DB alongside an old WAL.
+	if err := checkpointAndRemoveSidecars(livePath); err != nil {
+		return apperr.E(apperr.CodeStoreFault, "preparing restore target", err)
+	}
+	if afterStage != nil {
+		if err := afterStage("sidecars-removed"); err != nil {
+			return err
+		}
+	}
 	if err := os.Rename(staged, livePath); err != nil {
-		_ = os.Remove(staged)
 		return apperr.E(apperr.CodeStoreFault, "installing restored database", err)
 	}
-	for _, sidecar := range []string{livePath + "-wal", livePath + "-shm", livePath + "-journal"} {
-		_ = os.Remove(sidecar)
+	if err := dirSync(filepath.Dir(livePath)); err != nil {
+		return apperr.E(apperr.CodeStoreFault, "syncing restored database directory", err)
 	}
-	// The rename is atomic; the directory sync makes it durable, so a
-	// power loss cannot revert to a torn mix of old and new files.
-	dirSync(filepath.Dir(livePath))
+	if afterStage != nil {
+		if err := afterStage("installed"); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func checkpointAndRemoveSidecars(livePath string) error {
+	if _, err := os.Stat(livePath); err == nil {
+		live, err := sql.Open("sqlite", livePath)
+		if err != nil {
+			return err
+		}
+		if _, err := live.Exec(`PRAGMA busy_timeout=3000`); err != nil {
+			_ = live.Close()
+			return err
+		}
+		var busy, logFrames, checkpointed int
+		if err := live.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &checkpointed); err != nil {
+			_ = live.Close()
+			return err
+		}
+		if err := live.Close(); err != nil {
+			return err
+		}
+		if busy != 0 {
+			return fmt.Errorf("live database checkpoint is busy (%d frames remain)", logFrames-checkpointed)
+		}
+		if err := syncFile(livePath); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	for _, sidecar := range []string{livePath + "-wal", livePath + "-shm", livePath + "-journal"} {
+		if err := os.Remove(sidecar); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return dirSync(filepath.Dir(livePath))
 }

@@ -37,9 +37,9 @@ import (
 // The same inputs always produce the same name, and different inputs
 // never collide (the digest covers the parts the label cannot show).
 //
-// The PORT is part of the name because it is the one component known for
-// every publication: a stdio-backed service has no local URL at all, and
-// its adapter port is what distinguishes one run from another.
+// The backend PORT is part of the name for HTTP MCP targets. Stdio-backed
+// publications require an explicit stable name because their adapter port
+// is ephemeral and must not define durable identity.
 func defaultPublicationName(port int, localURL, authProfile string) string {
 	host, _, path := publicationTargetParts(localURL)
 	sum := sha256.Sum256([]byte(host + "\x00" + path + "\x00" + authProfile))

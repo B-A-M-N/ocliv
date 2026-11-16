@@ -4,8 +4,10 @@
 package relay
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"ocliv/internal/store"
@@ -19,6 +21,117 @@ func backupTestDB(t *testing.T, dir string) *store.DB {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return db
+}
+
+func TestBackupPublicationCrashWindows(t *testing.T) {
+	dir := t.TempDir()
+	db := backupTestDB(t, dir)
+	enrollTestKey(t, db.SQL(), "key-1", "tenant-1")
+
+	for _, tc := range []struct {
+		stage     string
+		wantValid bool
+	}{
+		{stage: "pending"},
+		{stage: "snapshot"},
+		{stage: "checksum", wantValid: true},
+	} {
+		t.Run(tc.stage, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "snapshot.db")
+			crash := errors.New("simulated crash")
+			err := backupState(db, path, func(stage string) error {
+				if stage == tc.stage {
+					return crash
+				}
+				return nil
+			})
+			if !errors.Is(err, crash) {
+				t.Fatalf("backup interruption: got %v, want simulated crash", err)
+			}
+			err = ValidateBackup(path)
+			if tc.wantValid && err != nil {
+				t.Fatalf("complete backup with leftover marker rejected: %v", err)
+			}
+			if !tc.wantValid && err == nil {
+				t.Fatal("incomplete backup validated")
+			}
+		})
+	}
+}
+
+func TestVersionedBackupCannotLoseChecksumAndLookLegacy(t *testing.T) {
+	dir := t.TempDir()
+	db := backupTestDB(t, dir)
+	enrollTestKey(t, db.SQL(), "key-versioned", "tenant-versioned")
+	path := filepath.Join(dir, "versioned.db")
+	if err := BackupState(db, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(checksumPath(path)); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateBackup(path); err == nil || !strings.Contains(err.Error(), "missing its required checksum") {
+		t.Fatalf("backup without checksum was accepted or misdiagnosed: %v", err)
+	}
+}
+
+func TestBackupNamesAreImmutable(t *testing.T) {
+	dir := t.TempDir()
+	db := backupTestDB(t, dir)
+	enrollTestKey(t, db.SQL(), "key-1", "tenant-1")
+	path := filepath.Join(t.TempDir(), "snapshot.db")
+	if err := BackupState(db, path); err != nil {
+		t.Fatal(err)
+	}
+	before, err := checksumFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := BackupState(db, path); err == nil {
+		t.Fatal("existing backup path was overwritten")
+	}
+	after, err := checksumFile(path)
+	if err != nil || after != before {
+		t.Fatalf("existing backup changed: before=%s after=%s err=%v", before, after, err)
+	}
+}
+
+func TestRestoreInterruptedAfterSidecarRemovalKeepsOldState(t *testing.T) {
+	dir := t.TempDir()
+	livePath := filepath.Join(dir, relayDBName)
+	live := backupTestDB(t, dir)
+	enrollTestKey(t, live.SQL(), "old-key", "tenant-1")
+	candidateDB := backupTestDB(t, t.TempDir())
+	enrollTestKey(t, candidateDB.SQL(), "new-key", "tenant-1")
+	candidate := filepath.Join(t.TempDir(), "candidate.db")
+	if err := BackupState(candidateDB, candidate); err != nil {
+		t.Fatal(err)
+	}
+	if err := candidateDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := live.Close(); err != nil {
+		t.Fatal(err)
+	}
+	crash := errors.New("simulated crash")
+	err := installValidatedWithHook(candidate, livePath, func(stage string) error {
+		if stage == "sidecars-removed" {
+			return crash
+		}
+		return nil
+	})
+	if !errors.Is(err, crash) {
+		t.Fatalf("restore interruption: got %v, want simulated crash", err)
+	}
+	old, err := store.Open(livePath)
+	if err != nil {
+		t.Fatalf("open old state after interruption: %v", err)
+	}
+	defer old.Close()
+	var count int
+	if err := old.SQL().QueryRow(`SELECT count(*) FROM agent_keys WHERE id='old-key'`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("old state was not recoverable: count=%d err=%v", count, err)
+	}
 }
 
 // TestBackupValidateRoundTrip: snapshot validates, is owner-only, and

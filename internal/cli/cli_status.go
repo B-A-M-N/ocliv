@@ -201,17 +201,19 @@ func cmdStatus(argv []string) int {
 		fetchErr = fmt.Errorf("no recorded lease id")
 	} else if k, keyID, kerr := loadKey(); kerr != nil {
 		fetchErr = &statusProblem{state: "AUTHENTICATION REQUIRED", advice: "no usable agent key (" + kerr.Error() + "); run `ocliv login`"}
-	} else if code, body := mgmtCall(relayURL, k, keyID, "GET", "/v1/agent/lease/"+leaseID+"/status"); code != http.StatusOK {
-		switch {
-		case code == 0:
-			fetchErr = &statusProblem{state: "RELAY DISCONNECTED", advice: "relay unreachable from here; check network and relay URL, then run `ocliv doctor`"}
-		case code == http.StatusUnauthorized || code == http.StatusForbidden:
-			fetchErr = &statusProblem{state: "AUTHENTICATION REQUIRED", advice: fmt.Sprintf("relay refused these credentials (HTTP %d); re-enroll with `ocliv login`", code)}
-		default:
-			fetchErr = fmt.Errorf("relay status %d", code)
+	} else {
+		code, body, mgmtErr := mgmtCall(relayURL, k, keyID, "GET", "/v1/agent/lease/"+leaseID+"/status")
+		if mgmtErr != nil {
+			fetchErr = &statusProblem{state: "RELAY DISCONNECTED", advice: "relay management transport failed: " + mgmtErr.Error() + "; check network and relay URL, then run `ocliv doctor`"}
+		} else if code != http.StatusOK {
+			if code == http.StatusUnauthorized || code == http.StatusForbidden {
+				fetchErr = &statusProblem{state: "AUTHENTICATION REQUIRED", advice: fmt.Sprintf("relay refused these credentials (HTTP %d); re-enroll with `ocliv login`", code)}
+			} else {
+				fetchErr = fmt.Errorf("relay status %d", code)
+			}
+		} else if uerr := json.Unmarshal(body, &remote); uerr != nil {
+			fetchErr = uerr
 		}
-	} else if uerr := json.Unmarshal(body, &remote); uerr != nil {
-		fetchErr = uerr
 	}
 	out, code := renderStatus(st, remote, fetchErr, showJSON)
 	fmt.Print(out)

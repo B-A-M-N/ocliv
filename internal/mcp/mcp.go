@@ -33,6 +33,7 @@ package mcp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -53,13 +54,17 @@ import (
 const (
 	DefaultMaxBodyBytes = 1 << 20 // 1 MiB per JSON-RPC message
 	DefaultMaxConns     = 8       // concurrent in-flight stdio round trips
+	DefaultMaxSessions  = 8       // independent stdio child processes
 	DefaultTimeout      = 30 * time.Second
+	DefaultSessionIdle  = 30 * time.Minute
 )
 
 // errChildTimeout marks a wedged child. The caller kills the child,
 // maps it to 504 and retires the adapter; every other exchange error
 // is a 502.
 var errChildTimeout = errors.New("mcp child timed out")
+var errChildUnavailable = errors.New("mcp child unavailable")
+var errChildCancelled = errors.New("mcp child cancelled during notification write")
 
 // errDuplicateID marks a second in-flight call reusing an outstanding
 // request id. JSON-RPC ids must be unique per peer; answering 400 keeps
@@ -89,6 +94,16 @@ type Options struct {
 	MaxConcurrent int
 	// Timeout bounds one stdio round trip. Zero selects DefaultTimeout.
 	Timeout time.Duration
+	// MultiClientSessions enables Streamable HTTP sessions backed by one
+	// isolated child process per MCP client. Local `mcp expose` keeps the
+	// legacy single-child behavior.
+	MultiClientSessions bool
+	// MaxSessions bounds child processes in session mode. Zero selects
+	// DefaultMaxSessions.
+	MaxSessions int
+	// SessionIdleTimeout bounds abandoned session lifetime. Zero selects
+	// DefaultSessionIdle.
+	SessionIdleTimeout time.Duration
 }
 
 // childProc owns one spawned stdio MCP server: its pipes, the mutex that
@@ -142,9 +157,16 @@ func (c *childProc) kill() {
 	c.procMu.Lock()
 	proc := c.proc
 	c.proc = nil
+	stdin := c.stdin
 	c.procMu.Unlock()
+	// Kill first. Closing the parent pipe while another goroutine is
+	// blocked writing to a child that never reads can itself stall; the
+	// process exit releases the pipe before we close our endpoint.
 	if proc != nil {
 		_ = proc.Kill()
+	}
+	if stdin != nil {
+		_ = stdin.Close()
 	}
 }
 
@@ -159,28 +181,35 @@ func (c *childProc) wait() {
 	}
 }
 
-// Adapter serves one operator-selected stdio MCP server over loopback
-// HTTP. Each POST body is forwarded as a single newline-delimited
-// JSON-RPC message; exactly one reply line comes back. No request content
-// can select a different command, directory, or environment: those were
-// pinned at startup (M07).
+// Adapter serves an operator-selected stdio MCP server over loopback HTTP.
+// Legacy mode shares one child; session mode creates one isolated child per
+// Streamable HTTP session. No request content can select a different
+// command, directory, or environment: those were pinned at startup (M07).
 type Adapter struct {
-	child   *childProc
-	coord   *coordinator
-	path    string // pinned absolute executable, resolved once in New
-	args    []string
-	dir     string
-	env     []string
-	maxBody int64
-	timeout time.Duration
-	sem     chan struct{}
+	child       *childProc
+	coord       *coordinator
+	path        string // pinned absolute executable, resolved once in New
+	args        []string
+	dir         string
+	env         []string
+	maxBody     int64
+	timeout     time.Duration
+	sem         chan struct{}
+	multiClient bool
+	maxSessions int
+	sessionIdle time.Duration
+	sessionMu   sync.Mutex
+	sessions    map[string]*clientSession
+	startCtx    context.Context
 
 	ln  net.Listener
 	srv *http.Server
 
-	spawned atomic.Int32
-	broken  atomic.Bool
-	closed  atomic.Bool
+	spawned       atomic.Int32
+	nextRequestID atomic.Uint64
+	broken        atomic.Bool
+	closed        atomic.Bool
+	done          chan struct{}
 }
 
 // New validates options and resolves the executable. It does not start
@@ -216,6 +245,20 @@ func New(o Options) (*Adapter, error) {
 	if maxConns < 0 {
 		return nil, fmt.Errorf("mcp: negative concurrency")
 	}
+	maxSessions := o.MaxSessions
+	if maxSessions == 0 {
+		maxSessions = DefaultMaxSessions
+	}
+	if maxSessions < 1 {
+		return nil, fmt.Errorf("mcp: max sessions must be positive")
+	}
+	sessionIdle := o.SessionIdleTimeout
+	if sessionIdle == 0 {
+		sessionIdle = DefaultSessionIdle
+	}
+	if sessionIdle < 0 {
+		return nil, fmt.Errorf("mcp: negative session idle timeout")
+	}
 	timeout := o.Timeout
 	if timeout == 0 {
 		timeout = DefaultTimeout
@@ -232,20 +275,29 @@ func New(o Options) (*Adapter, error) {
 		path = abs
 	}
 	return &Adapter{
-		path:    path,
-		args:    append([]string(nil), o.Args...),
-		dir:     o.Dir,
-		env:     append([]string(nil), o.Env...),
-		maxBody: maxBody,
-		timeout: timeout,
-		sem:     make(chan struct{}, maxConns),
+		path:        path,
+		args:        append([]string(nil), o.Args...),
+		dir:         o.Dir,
+		env:         append([]string(nil), o.Env...),
+		maxBody:     maxBody,
+		timeout:     timeout,
+		sem:         make(chan struct{}, maxConns),
+		multiClient: o.MultiClientSessions,
+		maxSessions: maxSessions,
+		sessionIdle: sessionIdle,
+		sessions:    make(map[string]*clientSession),
+		done:        make(chan struct{}),
 	}, nil
 }
 
-// Start spawns the pinned child and serves it on a loopback-only listener.
-// The child dies with ctx. All process parameters were pinned in New;
-// Start takes no command, directory, or environment input.
+// Start serves on a loopback-only listener. Legacy mode starts one pinned
+// child here; session mode starts one pinned child for each accepted
+// initialize request. Every child dies with ctx. Process parameters were
+// pinned in New; Start takes no command, directory, or environment input.
 func (a *Adapter) Start(ctx context.Context) error {
+	if a.multiClient {
+		return a.startSessionServer(ctx)
+	}
 	c, err := startChild(ctx, a.path, a.args, a.dir, a.env)
 	if err != nil {
 		return err
@@ -282,20 +334,41 @@ func (a *Adapter) Addr() net.Addr {
 	return a.ln.Addr()
 }
 
-// Spawned reports how many child processes were started. Exactly one per
-// Start; HTTP traffic never spawns processes (M07).
+// Spawned reports how many child processes were started. Legacy mode starts
+// one at Start; session mode starts one per accepted initialize, within the
+// configured session cap. Remote requests cannot select process parameters.
 func (a *Adapter) Spawned() int32 { return a.spawned.Load() }
 
-// Close stops the HTTP listener and terminates the child. Kill precedes
+// SessionCount reports currently active Streamable HTTP client sessions.
+// It returns zero for the legacy single-child adapter.
+func (a *Adapter) SessionCount() int {
+	a.sessionMu.Lock()
+	defer a.sessionMu.Unlock()
+	return len(a.sessions)
+}
+
+// Close stops the HTTP listener and terminates every owned child. Kill precedes
 // any exchange serialization so shutdown cannot hang behind a wedged
 // child holding the round-trip mutex.
 func (a *Adapter) Close() error {
 	if !a.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	close(a.done)
 	var err error
 	if a.srv != nil {
 		err = a.srv.Close()
+	}
+	if a.multiClient {
+		a.sessionMu.Lock()
+		all := make([]*clientSession, 0, len(a.sessions))
+		for _, s := range a.sessions {
+			all = append(all, s)
+		}
+		a.sessionMu.Unlock()
+		for _, s := range all {
+			s.shutdown()
+		}
 	}
 	if a.child != nil {
 		a.child.kill()
@@ -307,6 +380,10 @@ func (a *Adapter) Close() error {
 // ServeHTTP forwards one POST body as one stdio message and returns the
 // single reply line.
 func (a *Adapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if a.multiClient {
+		a.serveSessionHTTP(w, r)
+		return
+	}
 	if a.broken.Load() {
 		http.Error(w, "mcp adapter broken", http.StatusServiceUnavailable)
 		return
@@ -369,37 +446,129 @@ func (a *Adapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(env.ID) == 0 {
-		if err := a.coord.notify(body, a.timeout); err != nil {
+		if err := a.coord.notify(r.Context(), body, a.timeout); err != nil {
+			if errors.Is(err, errChildCancelled) {
+				a.broken.Store(true)
+				return // caller is gone; notify retired the blocked child
+			}
+			if r.Context().Err() != nil {
+				return // caller left before the notification write began
+			}
+			a.broken.Store(true)
+			a.child.kill()
+			if errors.Is(err, errChildTimeout) {
+				http.Error(w, "mcp child timed out; adapter retired", http.StatusGatewayTimeout)
+				return
+			}
 			http.Error(w, "mcp child exchange failed", http.StatusBadGateway)
 			return
 		}
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
-	key, ok := idKey(env.ID)
+	_, ok := idKey(env.ID)
 	if !ok {
 		http.Error(w, "request id must be a string or number", http.StatusBadRequest)
 		return
 	}
-	line, err := a.coord.call(r.Context(), body, key, a.timeout)
+	internalID, _ := json.Marshal(fmt.Sprintf("ocliv-%d", a.nextRequestID.Add(1)))
+	internalKey, _ := idKey(internalID)
+	internalBody, err := replaceJSONRPCID(body, internalID)
 	if err != nil {
+		http.Error(w, "invalid JSON-RPC request id", http.StatusBadRequest)
+		return
+	}
+	line, err := a.coord.call(r.Context(), internalBody, internalKey, a.timeout)
+	if err != nil {
+		if errors.Is(err, errChildUnavailable) {
+			a.broken.Store(true)
+			http.Error(w, "mcp adapter broken", http.StatusServiceUnavailable)
+			return
+		}
 		if errors.Is(err, errChildTimeout) {
 			a.child.kill()
 			a.broken.Store(true)
 			http.Error(w, "mcp child timed out; adapter retired", http.StatusGatewayTimeout)
 			return
 		}
-		if errors.Is(err, errDuplicateID) {
-			http.Error(w, "duplicate request id in flight", http.StatusBadRequest)
-			return
-		}
 		if r.Context().Err() != nil {
 			return // caller gone; nothing to report to
 		}
+		a.broken.Store(true)
+		a.child.kill()
 		http.Error(w, "mcp child exchange failed", http.StatusBadGateway)
+		return
+	}
+	line, err = replaceJSONRPCID(line, env.ID)
+	if err != nil {
+		a.broken.Store(true)
+		a.child.kill()
+		http.Error(w, "mcp child returned an invalid JSON-RPC reply", http.StatusBadGateway)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(line)
+}
+
+// replaceJSONRPCID gives every child round trip a private internal ID, then
+// restores the caller's original ID in the HTTP reply. This keeps two MCP
+// clients that reuse the same JSON-RPC ID from colliding on the shared stdio
+// child while preserving each client's wire contract.
+func replaceJSONRPCID(message, id json.RawMessage) ([]byte, error) {
+	if len(id) == 0 || !json.Valid(id) {
+		return nil, fmt.Errorf("missing JSON-RPC id")
+	}
+	dec := json.NewDecoder(bytes.NewReader(message))
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('{') {
+		return nil, fmt.Errorf("JSON-RPC message is not an object")
+	}
+	start, end := -1, -1
+	for dec.More() {
+		keyToken, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return nil, fmt.Errorf("JSON-RPC object key is not a string")
+		}
+		afterKey := int(dec.InputOffset())
+		colon := afterKey
+		for colon < len(message) && (message[colon] == ' ' || message[colon] == '\t' || message[colon] == '\r' || message[colon] == '\n') {
+			colon++
+		}
+		if colon >= len(message) || message[colon] != ':' {
+			return nil, fmt.Errorf("malformed JSON-RPC object")
+		}
+		valueStart := colon + 1
+		for valueStart < len(message) && (message[valueStart] == ' ' || message[valueStart] == '\t' || message[valueStart] == '\r' || message[valueStart] == '\n') {
+			valueStart++
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return nil, err
+		}
+		if key == "id" {
+			if start >= 0 {
+				return nil, fmt.Errorf("duplicate JSON-RPC id field")
+			}
+			start, end = valueStart, int(dec.InputOffset())
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, err
+	}
+	if start < 0 || end < start {
+		return nil, fmt.Errorf("missing JSON-RPC id")
+	}
+	result := make([]byte, 0, len(message)-end+start+len(id)+1)
+	result = append(result, message[:start]...)
+	result = append(result, id...)
+	result = append(result, message[end:]...)
+	if len(result) == 0 || result[len(result)-1] != '\n' {
+		result = append(result, '\n')
+	}
+	return result, nil
 }

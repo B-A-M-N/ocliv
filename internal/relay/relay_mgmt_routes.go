@@ -339,6 +339,10 @@ func (s *Server) serveMCPRouteMutation(w http.ResponseWriter, r *http.Request, t
 			s.serveMCPRouteActivate(w, tenant, keyID, leaseID, id)
 			return
 		}
+		if id, ok := strings.CutSuffix(rest, "/detach"); ok {
+			s.serveMCPRouteDetach(w, tenant, keyID, leaseID, id)
+			return
+		}
 	}
 	switch r.Method {
 	case http.MethodPost:
@@ -424,12 +428,15 @@ func (s *Server) serveMCPRouteMutation(w http.ResponseWriter, r *http.Request, t
 					// A MANAGED publication keeps its verification across the
 					// rebind: there is no upstream discovery to re-verify,
 					// so clearing verified_at would strand the route at 404.
-					oldBinding := boundLease.String
+					var oldBinding any
+					if boundLease.Valid {
+						oldBinding = boundLease.String
+					}
 					res, err := s.db.SQL().Exec(
 						`UPDATE mcp_publications SET lease_id=?,
 						   verified_at=CASE WHEN profile=? THEN verified_at ELSE NULL END,
 						   updated_at=?
-						 WHERE route_id=? AND lease_id=? AND revoked_at IS NULL
+						 WHERE route_id=? AND lease_id IS ? AND revoked_at IS NULL
 						   AND EXISTS(SELECT 1 FROM leases WHERE id=? AND status='ACTIVE' AND (expires_at IS NULL OR expires_at > ?))`,
 						leaseID, ingressProfileManaged, now, routeID, oldBinding, leaseID, now)
 					if err != nil {
@@ -443,10 +450,11 @@ func (s *Server) serveMCPRouteMutation(w http.ResponseWriter, r *http.Request, t
 					}
 				}
 				s.db.Audit("agent", tenant, leaseID, "mcp-route", "ok", "publication "+routeID+" bound")
-				writeJSON(w, http.StatusOK, map[string]string{
+				writeJSON(w, http.StatusOK, map[string]any{
 					"route_id": routeID,
 					"url":      s.mcpBaseURL() + "/r/" + routeID + "/mcp",
 					"auth":     rest,
+					"created":  false,
 				})
 				return
 			}
@@ -476,7 +484,7 @@ func (s *Server) serveMCPRouteMutation(w http.ResponseWriter, r *http.Request, t
 			if profile == IngressMCPManaged {
 				verifiedAt = now
 			}
-			_, err = s.db.SQL().Exec(
+			res, err := s.db.SQL().Exec(
 				`INSERT INTO mcp_publications(route_id, tenant_id, owner_key_id, external_host, profile, pub_name, target_path, lease_id, created_at, updated_at, verified_at)
 				 SELECT ?,?,?,?,?,?,?,?, ?,?, ? WHERE EXISTS(SELECT 1 FROM leases WHERE id=? AND status='ACTIVE')
 				 ON CONFLICT(tenant_id, owner_key_id, external_host, profile, pub_name) DO NOTHING`,
@@ -484,6 +492,19 @@ func (s *Server) serveMCPRouteMutation(w http.ResponseWriter, r *http.Request, t
 				now, now, verifiedAt, leaseID)
 			if err != nil {
 				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+			if inserted, rowsErr := res.RowsAffected(); rowsErr != nil {
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			} else if inserted == 1 {
+				s.db.Audit("agent", tenant, leaseID, "mcp-route", "ok", "publication "+minted+" created")
+				writeJSON(w, http.StatusOK, map[string]any{
+					"route_id": minted,
+					"url":      s.mcpBaseURL() + "/r/" + minted + "/mcp",
+					"auth":     rest,
+					"created":  true,
+				})
 				return
 			}
 			continue
@@ -540,6 +561,35 @@ func (s *Server) serveMCPRouteMutation(w http.ResponseWriter, r *http.Request, t
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// serveMCPRouteDetach releases a failed replacement lease from a durable
+// publication without deleting its identity or grants. The expected lease
+// predicate is a CAS: a late cleanup cannot detach a newer successful
+// publisher that already rebound the route.
+func (s *Server) serveMCPRouteDetach(w http.ResponseWriter, tenant, keyID, leaseID, routeID string) {
+	if !validRouteID(routeID) {
+		http.Error(w, "unknown route", http.StatusNotFound)
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	res, err := s.db.SQL().Exec(
+		`UPDATE mcp_publications SET lease_id=NULL, verified_at=NULL, updated_at=?
+		 WHERE route_id=? AND tenant_id=? AND owner_key_id=? AND lease_id=? AND revoked_at IS NULL`,
+		now, routeID, tenant, keyID, leaseID)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	} else if n != 1 {
+		http.Error(w, "publication binding changed", http.StatusConflict)
+		return
+	}
+	s.db.AuditKey("agent", tenant, keyID, leaseID, "mcp-route-detach", "ok", "failed publication binding detached: "+routeID)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "detached", "route_id": routeID})
 }
 
 // serveMCPRouteActivate marks one pending publication verified. The

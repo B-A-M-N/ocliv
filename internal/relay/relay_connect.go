@@ -134,6 +134,7 @@ type attachedMsg struct {
 	Generation uint64 `json:"generation"`
 	AccessMode string `json:"access_mode"`
 	URL        string `json:"url"`
+	ExpiresAt  string `json:"expires_at,omitempty"`
 	ShareURL   string `json:"share_url,omitempty"`
 }
 

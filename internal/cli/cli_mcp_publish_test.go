@@ -103,6 +103,21 @@ func TestParseMCPPublishStrictDiscovery(t *testing.T) {
 	}
 }
 
+func TestParseMCPPublishUnverifiedUpstreamAuthAcceptanceIsExplicit(t *testing.T) {
+	base := []string{"--local=http://127.0.0.1:8765/mcp", "--auth=upstream-oauth", "--accept-unverified-upstream-auth"}
+	cfg, code := parseMCPPublish(base, false)
+	if code != 0 || !cfg.acceptUnverifiedUpstreamAuth {
+		t.Fatalf("explicit upstream-auth acceptance rejected or dropped: cfg=%+v code=%d", cfg, code)
+	}
+	if _, code := parseMCPPublish(base, true); code == 0 {
+		t.Fatal("serve accepted publish-only upstream-auth acceptance")
+	}
+	managed := []string{"--local=http://127.0.0.1:8765/mcp", "--auth=ocliv-managed", "--accept-unverified-upstream-auth"}
+	if _, code := parseMCPPublish(managed, false); code == 0 {
+		t.Fatal("managed authorization accepted upstream-only relaxation")
+	}
+}
+
 func TestParseMCPPublishResourceFile(t *testing.T) {
 	pub := []string{"--local=http://127.0.0.1:8765/mcp", "--auth=upstream-oauth", "--resource-file", "/tmp/x.resource"}
 	c, code := parseMCPPublish(pub, false)
@@ -156,64 +171,57 @@ func TestWriteResourceBindingAtomic(t *testing.T) {
 	}
 }
 
-// Every abort-after-registration path must attempt the route DELETE
-// with the route-owning lease ID and surface its outcome independently
-// of the lease close (audit P1): a closed lease denies forwarding, but
-// the route row must not linger unverified.
-func TestAbandonPublishedRouteDeletesAndReports(t *testing.T) {
-	var gotPath string
-	del := func(path string) (int, string) {
-		gotPath = path
-		return http.StatusInternalServerError, "  relay exploded  \n"
-	}
-	status, detail := abandonPublishedRoute(del, "lse-own", "r-1")
-	if status != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want passthrough", status)
-	}
-	if detail != "relay exploded" {
-		t.Fatalf("detail untrimmed: %q", detail)
-	}
-	want := "/v1/agent/lease/lse-own/mcp-route/r-1"
-	if gotPath != want {
-		t.Fatalf("delete path = %q, want %q", gotPath, want)
+// A newly created route is deleted on abort; a reused durable identity is
+// detached with CAS so its route ID and grants survive a failed rebind.
+func TestAbandonPublishedRouteDeletesOnlyNewIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name, wantMethod, wantPath string
+		created                    bool
+	}{
+		{name: "new route deleted", wantMethod: http.MethodDelete, wantPath: "/v1/agent/lease/lse-own/mcp-route/r-1", created: true},
+		{name: "rebind detached", wantMethod: http.MethodPost, wantPath: "/v1/agent/lease/lse-own/mcp-route/r-1/detach", created: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotMethod, gotPath string
+			call := func(method, path string) (int, string) {
+				gotMethod, gotPath = method, path
+				return http.StatusInternalServerError, "  relay exploded  \n"
+			}
+			status, detail := abandonPublishedRoute(call, "lse-own", "r-1", tc.created)
+			if status != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want passthrough", status)
+			}
+			if detail != "relay exploded" {
+				t.Fatalf("detail untrimmed: %q", detail)
+			}
+			if gotMethod != tc.wantMethod || gotPath != tc.wantPath {
+				t.Fatalf("cleanup = %s %s, want %s %s", gotMethod, gotPath, tc.wantMethod, tc.wantPath)
+			}
+		})
 	}
 }
 
-// stdio publication is supported ONLY with relay-managed authorization
-// (P0-1, P0-2): the stdio adapter is a plain loopback HTTP server with no
-// OAuth of its own, so an upstream-oauth or anonymous-fixture publication
-// could never prove its resource binding. The child is pinned by local
-// argv only, so no remote client can select what runs.
-func TestParseMCPPublishStdioAuthModes(t *testing.T) {
-	// Non-managed profiles are refused with --stdio, in publish and
-	// serve mode alike.
-	for _, serve := range []bool{false, true} {
-		for _, auth := range []string{"upstream-oauth", "fixture-anonymous"} {
-			argv := []string{"--stdio", "--auth=" + auth, "--dir=/tmp/x", "--env=A=B", "--", "/bin/srv", "--flag"}
-			if _, code := parseMCPPublish(argv, serve); code == 0 {
-				t.Errorf("stdio publish (serve=%v auth=%s) accepted, want rejection", serve, auth)
-			}
+// Public stdio publication is supported only behind relay-managed auth:
+// each HTTP session receives its own child and upstream OAuth cannot be
+// verified for an arbitrary local stdio process.
+func TestParseMCPPublishStdioManagedAuthOnly(t *testing.T) {
+	argv := []string{"--stdio", "--auth=ocliv-managed", "--name=stable-tools", "--", "/bin/srv", "--safe"}
+	cfg, code := parseMCPPublish(argv, false)
+	if code != 0 {
+		t.Fatalf("managed stdio publish rejected: code=%d", code)
+	}
+	if !cfg.stdio || cfg.auth != "ocliv-managed" || cfg.name != "stable-tools" || len(cfg.cmd) != 2 || cfg.cmd[1] != "--safe" {
+		t.Fatalf("stdio command or policy not preserved: %#v", cfg)
+	}
+	for _, auth := range []string{"upstream-oauth", "fixture-anonymous"} {
+		if _, code := parseMCPPublish([]string{"--stdio", "--auth=" + auth, "--", "/bin/srv"}, false); code == 0 {
+			t.Errorf("publish --stdio auth=%s accepted; want rejection", auth)
 		}
 	}
-	// Managed authorization IS accepted for --stdio in publish mode, with
-	// the argv-pinned child: this is the supported stdio shape, and it
-	// must not silently rot into "stdio is disabled".
-	argv := []string{"--stdio", "--auth=ocliv-managed", "--dir=/tmp/x", "--env=A=B", "--", "/bin/srv", "--flag"}
-	c, code := parseMCPPublish(argv, false)
-	if code != 0 {
-		t.Fatalf("publish --stdio --auth ocliv-managed rejected: code=%d (the supported stdio shape must parse)", code)
+	if _, code := parseMCPPublish([]string{"--stdio", "--auth=ocliv-managed"}, false); code == 0 {
+		t.Error("publish --stdio without a command accepted")
 	}
-	if !c.stdio || c.auth != "ocliv-managed" {
-		t.Fatalf("stdio config misparsed: %+v", c)
-	}
-	if len(c.cmd) != 2 || c.cmd[0] != "/bin/srv" || c.cmd[1] != "--flag" {
-		t.Fatalf("child argv not pinned verbatim: %+v", c.cmd)
-	}
-	if c.dir != "/tmp/x" || len(c.env) != 1 || c.env[0] != "A=B" {
-		t.Fatalf("stdio child environment not preserved: dir=%q env=%v", c.dir, c.env)
-	}
-	// serve has no route, so the stdio child would be unreachable there.
-	if _, code := parseMCPPublish(argv, true); code == 0 {
+	if _, code := parseMCPPublish([]string{"--stdio", "--auth=ocliv-managed", "--", "/bin/srv"}, true); code == 0 {
 		t.Error("mcp serve --stdio accepted, want rejection (serve registers no route)")
 	}
 }
@@ -435,6 +443,9 @@ func TestDoctorProtocolExit(t *testing.T) {
 	if got := doctorProtocolExit("mcp_anonymous_fixture", false); got != apperr.ExitProtocol {
 		t.Errorf("unverified MCP fixture: got %d want ExitProtocol", got)
 	}
+	if got := doctorProtocolExit("mcp_managed_oauth", false); got != apperr.ExitProtocol {
+		t.Errorf("unverified managed MCP: got %d want ExitProtocol", got)
+	}
 }
 
 // MCP publication defaults to a bounded lease TTL so a failed remote
@@ -454,6 +465,15 @@ func TestMCPPublishBoundedDefaultTTL(t *testing.T) {
 	}
 	if opts.cfg.TTLSeconds != 7200 {
 		t.Fatalf("explicit publish TTL = %d, want 7200", opts.cfg.TTLSeconds)
+	}
+}
+
+func TestMCPPublishRejectsTTLBelowRenewalMinimum(t *testing.T) {
+	if _, code := mcpTunnelOptions(8765, false, mcpPublishConfig{auth: "upstream-oauth", ttl: "30s"}); code != apperr.ExitCLIValidation {
+		t.Fatalf("publish TTL below 60s accepted: code=%d", code)
+	}
+	if _, code := mcpTunnelOptions(8765, false, mcpPublishConfig{serve: true, auth: "upstream-oauth", ttl: "30s"}); code != 0 {
+		t.Fatalf("non-supervised mcp serve TTL was constrained by publisher renewal: code=%d", code)
 	}
 }
 

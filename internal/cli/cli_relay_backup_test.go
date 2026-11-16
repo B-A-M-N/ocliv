@@ -22,6 +22,13 @@ func TestRelayBackupRestoreCommands(t *testing.T) {
 	if err != nil || fi.Size() == 0 {
 		t.Fatalf("backup missing or empty: %v %v", fi, err)
 	}
+	if code := cmdRelay([]string{"validate-backup", "--in", snap}); code != 0 {
+		t.Fatalf("documented backup validation: exit=%d", code)
+	}
+	sidecar, err := os.ReadFile(snap + ".sha256")
+	if err != nil || len(sidecar) != 65 || sidecar[64] != '\n' {
+		t.Fatalf("Ocliv checksum sidecar was overwritten or malformed: %q (%v)", sidecar, err)
+	}
 
 	// Without the stopped attestation, restore refuses.
 	if code := cmdRelay([]string{"restore", "--data", dir, "--in", snap}); code == 0 {

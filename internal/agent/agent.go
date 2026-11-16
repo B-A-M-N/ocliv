@@ -35,6 +35,7 @@ type Attached struct {
 	Generation uint64 `json:"generation"`
 	AccessMode string `json:"access_mode"`
 	URL        string `json:"url"`
+	ExpiresAt  string `json:"expires_at,omitempty"`
 	ShareURL   string `json:"share_url,omitempty"`
 }
 
@@ -52,13 +53,20 @@ type Runner struct {
 	Upstream    string // Host to present locally (D09)
 	OnAttach    func(a Attached)
 	OnState     func(state string) // CONNECTED / RECONNECTING
-	HTTP        *http.Client       // test hook: local upstream client
-	WSURL       string             // test hook: ws base for upgrades (unused, raw TCP used)
+	OnRenewal   func(status LeaseRenewalStatus)
+	HTTP        *http.Client // test hook: local upstream client
+	WSURL       string       // test hook: ws base for upgrades (unused, raw TCP used)
 	// HandshakeTransport overrides the agent handshake transport
 	// (challenge POST + WSS dial). Test hook only: lets a harness
 	// present the public relay authority while dialing loopback.
 	// nil preserves production behavior exactly.
-	HandshakeTransport http.RoundTripper
+	HandshakeTransport   http.RoundTripper
+	RenewalTransport     http.RoundTripper // test hook for signed lease renewals
+	renewalInterval      time.Duration     // test hook for accelerated renewal schedules
+	renewalRetryInterval time.Duration     // test hook for accelerated retry schedules
+	renewalNow           func() time.Time  // test hook for accelerated lease-time simulations
+	renewalMu            sync.RWMutex
+	renewalPublication   string
 
 	mu         sync.Mutex
 	httpShared *http.Client // loopback client shared across streams (P2-1)

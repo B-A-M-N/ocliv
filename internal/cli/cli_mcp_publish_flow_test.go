@@ -100,6 +100,7 @@ func publishFlowKey(t *testing.T, home, relayURL string, db *store.DB) (*identit
 
 func publishFlowEnroll(t *testing.T, home, relayURL string, db *store.DB) {
 	t.Helper()
+	t.Setenv("OCLIV_UPSTREAM_MCP_TOKEN", "flow-valid-token")
 	if _, _, err := publishFlowKey(t, home, relayURL, db); err != nil {
 		t.Fatal(err)
 	}
@@ -154,6 +155,7 @@ func serveFlowMCP(c net.Conn) {
 	}
 	head := strings.Fields(line)
 	body := []byte{}
+	authorized := false
 	if len(head) > 0 && head[0] == "POST" {
 		bodyLen := 0
 		for {
@@ -164,6 +166,9 @@ func serveFlowMCP(c net.Conn) {
 			if n, ok := strings.CutPrefix(strings.ToLower(h), "content-length:"); ok {
 				fmt.Sscanf(strings.TrimSpace(n), "%d", &bodyLen)
 			}
+			if parts := strings.SplitN(h, ":", 2); len(parts) == 2 && strings.EqualFold(strings.TrimSpace(parts[0]), "Authorization") {
+				authorized = strings.TrimSpace(parts[1]) == "Bearer flow-valid-token"
+			}
 		}
 		if bodyLen > 0 && bodyLen <= 1<<20 {
 			body = make([]byte, bodyLen)
@@ -171,6 +176,11 @@ func serveFlowMCP(c net.Conn) {
 				return
 			}
 		}
+	}
+	if len(head) > 0 && head[0] == "POST" && !authorized {
+		const body = "bearer required"
+		fmt.Fprintf(c, "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"mcp\"\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+		return
 	}
 	reply := "ok"
 	if len(head) > 0 && head[0] == "POST" {
@@ -313,6 +323,64 @@ func TestMCPPublishFullCycleRetainsRouteAndClosesLease(t *testing.T) {
 	}
 	if bound != flowLeaseID(t, db, "flowtest.t.example.test") {
 		t.Fatalf("retained publication bound to %q, want the closed lease", bound)
+	}
+}
+
+// Managed public stdio publication owns one isolated child per HTTP MCP
+// session, registers a durable route, and closes only its lease on stop.
+func TestMCPStdioPublishManagedCycleRetainsNamedRoute(t *testing.T) {
+	home := t.TempDir()
+	db, relayURL := publishFlowRelay(t, "mcp.example.test")
+	publishFlowEnroll(t, home, relayURL, db)
+	child := "while IFS= read -r req; do\n" +
+		"id=$(printf '%s' \"$req\" | sed -n 's/.*\"id\":\\([^,}]*\\).*/\\1/p')\n" +
+		"case \"$req\" in\n" +
+		"  *'\"method\":\"initialize\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"stdio-flow\",\"version\":\"1\"}}}\\n' \"$id\" ;;\n" +
+		"  *'\"method\":\"tools/list\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"tools\":[]}}\\n' \"$id\" ;;\n" +
+		"  *'\"method\":\"notifications/initialized\"'*) ;;\n" +
+		"esac\ndone"
+	argv := []string{"--stdio", "--auth", "ocliv-managed", "--name", "stdio-flow", "--", "/bin/sh", "-c", child}
+	done := make(chan int, 1)
+	go func() { done <- runMCPPublish(argv, false) }()
+	deadline := time.Now().Add(25 * time.Second)
+	for routeRowCount(t, db) != 1 {
+		select {
+		case code := <-done:
+			t.Fatalf("stdio publisher exited before route registration: %d", code)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stdio publication route was never registered")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	var routeID, name, profile string
+	if err := db.SQL().QueryRow(`SELECT route_id,pub_name,profile FROM mcp_publications`).Scan(&routeID, &name, &profile); err != nil {
+		t.Fatal(err)
+	}
+	if name != "stdio-flow" || profile != "managed-oauth" {
+		t.Fatalf("publication identity = (%q,%q), want (stdio-flow,managed-oauth)", name, profile)
+	}
+	self, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := self.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case code := <-done:
+		if code != apperr.ExitOK {
+			t.Fatalf("stdio publish shutdown exit=%d, want clean 0", code)
+		}
+	case <-time.After(45 * time.Second):
+		t.Fatal("stdio publisher did not shut down after SIGINT")
+	}
+	if n := routeRowCount(t, db); n != 1 {
+		t.Fatalf("route rows after shutdown: %d, want retained 1 (route %s)", n, routeID)
+	}
+	if n := routeVerifiedCount(t, db); n != 1 {
+		t.Fatalf("verified rows after shutdown: %d, want 1", n)
 	}
 }
 

@@ -250,6 +250,9 @@ func runTunnel(ctx context.Context, ready tunnelReady) (agent.Attached, *tunnelL
 			fmt.Fprintln(os.Stderr, "… reconnecting (public traffic gets 503 until resume)")
 		}
 	}
+	ready.runner.OnRenewal = func(status agent.LeaseRenewalStatus) {
+		fmt.Fprintf(os.Stderr, "lease renewal: result=%s expires_at=%s\n", status.Result, status.ExpiresAt.Format(time.RFC3339))
+	}
 	runErr := make(chan error, 1)
 	go func() {
 		runErr <- ready.runner.Run(ctx)

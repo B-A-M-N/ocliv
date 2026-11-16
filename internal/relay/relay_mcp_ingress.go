@@ -377,17 +377,52 @@ func (s *Server) admitRoutedLease(t *routeTarget, state string, expiresAt sql.Nu
 		return nil, nil, code
 	}
 	if expiresAt.Valid {
-		exp, err := time.Parse(time.RFC3339Nano, expiresAt.String)
-		if err != nil || time.Now().UTC().After(exp) {
-			s.evictLease(t.LeaseID)
-			_, _ = s.db.SQL().Exec(`UPDATE leases SET status=? WHERE id=?`, lease.StateExpired, t.LeaseID)
-			s.db.Audit("visitor", "", t.LeaseID, "route", "denied", "lease ttl expired")
-			if IsMCPMode(t.AccessMode) {
-				metrics.Global.MCPAdmissionRejects.Add(1)
+		for attempt := 0; attempt < 2; attempt++ {
+			exp, err := time.Parse(time.RFC3339Nano, expiresAt.String)
+			if err == nil && time.Now().UTC().Before(exp) {
+				t.ExpiresAt = exp
+				break
 			}
-			return nil, nil, http.StatusNotFound
+			// Expiry is a terminal transition only if the exact row snapshot
+			// is still current. Renewal may have committed after the route
+			// lookup; in that case this CAS must not evict its live session.
+			if s.leaseExpiryCASHook != nil {
+				s.leaseExpiryCASHook(t.LeaseID)
+			}
+			res, updateErr := s.db.SQL().Exec(`UPDATE leases SET status=? WHERE id=? AND status=? AND generation=? AND expires_at=?`,
+				lease.StateExpired, t.LeaseID, lease.StateActive, t.Generation, expiresAt.String)
+			if updateErr == nil {
+				if n, rowsErr := res.RowsAffected(); rowsErr == nil && n == 1 {
+					s.evictLease(t.LeaseID)
+					s.db.Audit("visitor", "", t.LeaseID, "route", "denied", "lease ttl expired")
+					if IsMCPMode(t.AccessMode) {
+						metrics.Global.MCPAdmissionRejects.Add(1)
+					}
+					return nil, nil, http.StatusNotFound
+				}
+			}
+			var currentState string
+			var currentGeneration uint64
+			var currentExpiry sql.NullString
+			if err := s.db.SQL().QueryRow(`SELECT status,generation,expires_at FROM leases WHERE id=?`, t.LeaseID).
+				Scan(&currentState, &currentGeneration, &currentExpiry); err != nil {
+				return nil, nil, http.StatusNotFound
+			}
+			if currentGeneration != t.Generation {
+				metrics.Global.FencingRejects.Add(1)
+				return nil, nil, http.StatusServiceUnavailable
+			}
+			if currentState != lease.StateActive {
+				s.evictLease(t.LeaseID)
+				return mcpDeny("route lease not active", http.StatusServiceUnavailable)
+			}
+			expiresAt = currentExpiry
+			if attempt == 1 {
+				// The row moved again during revalidation. Fail this request
+				// closed without evicting a generation we did not observe.
+				return nil, nil, http.StatusServiceUnavailable
+			}
 		}
-		t.ExpiresAt = exp
 	}
 	if state != lease.StateActive {
 		// Immediate termination (P0-A): a revocation/close racing an

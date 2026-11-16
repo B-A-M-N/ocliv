@@ -556,18 +556,54 @@ func (x *httpExchange) uploadIdleExpired() bool {
 // it tears the connection down, because returning or writing another
 // status would end the chunked stream cleanly and fabricate a complete
 // delivery (P0-05).
-// Read deadlines keep a blocked read responsive to visitor cancellation.
-// A TTL expiring mid-stream aborts it: expiry bounds in-flight requests,
-// not just new admissions (R4).
+// The yamux session keepalive detects dead transports independently of
+// application data. Do not impose an application-frame idle timeout here:
+// valid MCP subscriptions may remain quiet for minutes. A TTL expiring
+// mid-stream still aborts it: expiry bounds in-flight requests, not just
+// new admissions (R4).
 func (x *httpExchange) streamBody() {
 	flusher, _ := x.w.(http.Flusher)
-	for {
-		if leaseExpired(x.t) {
-			x.abort("cancelled", "lease ttl expired")
-			// Committed headers mean only teardown is honest (P0-05).
-			tearDownResponse(x.w)
+	interruptDone := make(chan struct{})
+	go func() {
+		if x.t.ExpiresAt.IsZero() {
+			select {
+			case <-x.ctx.Done():
+				_ = x.stream.Close()
+				x.abort("cancelled", "visitor went away")
+			case <-interruptDone:
+			}
 			return
 		}
+		timer := time.NewTimer(max(time.Duration(0), time.Until(x.t.ExpiresAt)))
+		defer timer.Stop()
+		for {
+			select {
+			case <-x.ctx.Done():
+				_ = x.stream.Close()
+				x.abort("cancelled", "visitor went away")
+				return
+			case <-interruptDone:
+				return
+			case <-timer.C:
+				expiry, active := x.srv.currentLeaseExpiry(x.t)
+				if active && (expiry.IsZero() || expiry.After(time.Now().UTC())) {
+					if expiry.IsZero() {
+						// The authoritative row no longer has a TTL.
+						return
+					}
+					timer.Reset(time.Until(expiry))
+					continue
+				}
+				// Close first so a blocked ABORT write cannot prevent the
+				// response reader from being interrupted on a quiet stream.
+				_ = x.stream.Close()
+				x.abort("cancelled", "lease ttl expired or lease closed")
+				return
+			}
+		}
+	}()
+	defer close(interruptDone)
+	for {
 		select {
 		case <-x.ctx.Done():
 			x.abort("cancelled", "visitor went away")
@@ -580,9 +616,7 @@ func (x *httpExchange) streamBody() {
 			return
 		default:
 		}
-		_ = x.stream.SetReadDeadline(time.Now().Add(30 * time.Second))
 		ft, data, err := protocol.ReadFrame(x.stream)
-		_ = x.stream.SetReadDeadline(time.Time{})
 		if err != nil {
 			select {
 			case <-x.ctx.Done():
@@ -592,6 +626,13 @@ func (x *httpExchange) streamBody() {
 			}
 			// Partial delivery after commit: returning would end the
 			// chunked stream cleanly. Tear down instead (P0-05).
+			tearDownResponse(x.w)
+			return
+		}
+		// Closing a yamux stream can still leave already-buffered frames
+		// readable. Once the expiry or another abort wins, none of those
+		// frames may complete the committed visitor response cleanly.
+		if x.stopped.Load() {
 			tearDownResponse(x.w)
 			return
 		}

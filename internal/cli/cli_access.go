@@ -41,7 +41,11 @@ func cmdAccess(argv []string) int {
 		return apperr.ExitCLIValidation
 	}
 	method := "POST"
-	code, body := mgmtCall(relayURL, k, keyID, method, "/v1/agent/lease/"+leaseID+"/"+action)
+	code, body, err := mgmtCall(relayURL, k, keyID, method, "/v1/agent/lease/"+leaseID+"/"+action)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "access %s relay transport failed: %v\n", action, err)
+		return apperr.ExitRelayTLS
+	}
 	if code != http.StatusOK {
 		fmt.Fprintf(os.Stderr, "access %s failed (relay status %d)\n", action, code)
 		return apperr.ExitAuth

@@ -1,7 +1,9 @@
 package mcp
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -98,16 +100,24 @@ func post(t *testing.T, a *Adapter, body string) *httptest.ResponseRecorder {
 	return w
 }
 
-// TestAdapterEchoRoundTrip: the happy path pins that one POST becomes one
-// stdio message and the single reply line comes back byte-for-byte.
+func postCode(a *Adapter, body string) int {
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	a.ServeHTTP(w, req)
+	return w.Code
+}
+
+// TestAdapterEchoRoundTrip pins that one POST becomes one stdio message and
+// the caller's JSON-RPC ID is restored in the reply.
 func TestAdapterEchoRoundTrip(t *testing.T) {
 	a := startEcho(t, nil)
 	w := post(t, a, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%q", w.Code, w.Body.String())
 	}
-	if got := w.Body.String(); got != "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n" {
-		t.Fatalf("reply mismatch: %q", got)
+	var reply map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &reply); err != nil || reply["id"] != float64(1) || reply["method"] != "tools/list" {
+		t.Fatalf("reply mismatch: %q err=%v", w.Body.String(), err)
 	}
 	if n := a.Spawned(); n != 1 {
 		t.Fatalf("spawned=%d, want exactly 1", n)
@@ -162,7 +172,7 @@ func TestEnvScrubbed(t *testing.T) {
 	// Positive control: an explicit entry reaches the child.
 	pos := startEcho(t, func(o *Options) {
 		o.Command = "sh"
-		o.Args = []string{"-c", `IFS= read -r req; echo "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"$MCP_ROLE\"}"`}
+		o.Args = []string{"-c", `IFS= read -r req; id=$(printf '%s' "$req" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p'); echo "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":\"$MCP_ROLE\"}"`}
 		o.Env = []string{"MCP_ROLE=test"}
 	})
 	// Positive control: an explicit entry reaches the child. The fixture
@@ -177,7 +187,7 @@ func TestEnvScrubbed(t *testing.T) {
 	// would prove a leak.
 	neg := startEcho(t, func(o *Options) {
 		o.Command = "sh"
-		o.Args = []string{"-c", `IFS= read -r req; echo "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":\"$` + sentinelKey + `\"}"`}
+		o.Args = []string{"-c", `IFS= read -r req; id=$(printf '%s' "$req" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p'); echo "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":\"$` + sentinelKey + `\"}"`}
 	})
 	w2 := post(t, neg, `{"jsonrpc":"2.0","id":2,"method":"probe"}`)
 	if strings.Contains(w2.Body.String(), sentinelVal) {
@@ -194,7 +204,7 @@ func TestWorkingDirPinned(t *testing.T) {
 	dir := t.TempDir()
 	a := startEcho(t, func(o *Options) {
 		o.Command = "sh"
-		o.Args = []string{"-c", `IFS= read -r req; echo "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"$PWD\"}"`}
+		o.Args = []string{"-c", `IFS= read -r req; id=$(printf '%s' "$req" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p'); echo "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":\"$PWD\"}"`}
 		o.Dir = dir
 	})
 	w := post(t, a, `{"jsonrpc":"2.0","id":1,"method":"probe","params":{"dir":"/tmp/evil"}}`)
@@ -229,18 +239,18 @@ func TestOversizeRequestRejected(t *testing.T) {
 // for id (or fails). It removes scheduling luck from tests that must
 // deliver child output while a request is in flight: the write happens
 // strictly after registration, so the reply path is the only outcome.
-func waitPending(t *testing.T, a *Adapter, id string) {
+func waitPending(t *testing.T, a *Adapter, _ string) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		a.coord.mu.Lock()
-		_, ok := a.coord.pending[id]
+		ok := len(a.coord.pending) > 0
 		a.coord.mu.Unlock()
 		if ok {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("waiter %q never registered", id)
+			t.Fatal("no in-flight waiter registered")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -295,6 +305,77 @@ func TestOversizeChildOutputRejected(t *testing.T) {
 	w := post(t, a, `{"jsonrpc":"2.0","id":2,"method":"p"}`)
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status=%d want 503 after oversize retirement", w.Code)
+	}
+}
+
+// Retirement has one observable publication point: once broken is stored,
+// every newly admitted request must return 503 even while the reader is
+// still unwinding pending calls. The callback barrier forces that exact
+// interleaving instead of relying on scheduler luck.
+func TestRetirementPublishesUnavailableBeforeCoordinatorCloses(t *testing.T) {
+	fifo := filepath.Join(t.TempDir(), "retire.fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a, err := New(Options{Command: "cat", Args: []string{fifo}, MaxBodyBytes: 64, Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	child, err := startChild(ctx, a.path, a.args, a.dir, a.env)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	a.child = child
+	deathPublished := make(chan struct{})
+	releaseDeath := make(chan struct{})
+	var releaseOnce sync.Once
+	a.coord = runCoordinator(child, a.maxBody, func() {
+		a.broken.Store(true)
+		close(deathPublished)
+		<-releaseDeath
+	})
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(releaseDeath) })
+		_ = a.Close()
+		cancel()
+	})
+
+	firstDone := make(chan int, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"probe"}`))
+		w := httptest.NewRecorder()
+		a.ServeHTTP(w, req)
+		firstDone <- w.Code
+	}()
+	waitPending(t, a, "1")
+	f, err := os.OpenFile(fifo, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(strings.Repeat("x", 1024) + "\n"); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	select {
+	case <-deathPublished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reader did not publish adapter retirement")
+	}
+	second := post(t, a, `{"jsonrpc":"2.0","id":2,"method":"probe"}`)
+	if second.Code != http.StatusServiceUnavailable {
+		t.Fatalf("request during retirement callback status=%d want 503", second.Code)
+	}
+	releaseOnce.Do(func() { close(releaseDeath) })
+	select {
+	case code := <-firstDone:
+		if code != http.StatusBadGateway {
+			t.Fatalf("in-flight request status=%d want 502", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("pending request was not released after retirement")
 	}
 }
 
@@ -402,6 +483,203 @@ func TestTimeoutRetiresAdapter(t *testing.T) {
 	}
 }
 
+// A child that never reads stdin must not hold an HTTP request beyond the
+// same round-trip timeout used while waiting for its response.
+func TestBlockedChildStdinWriteTimesOut(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cmd  string
+		args []string
+	}{
+		{name: "never reads", cmd: "sleep", args: []string{"30"}},
+		{name: "reads only one byte", cmd: "sh", args: []string{"-c", "dd bs=1 count=1 of=/dev/null 2>/dev/null; sleep 30"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := startEcho(t, func(o *Options) {
+				o.Command = tc.cmd
+				o.Args = tc.args
+				o.Timeout = 300 * time.Millisecond
+				o.MaxBodyBytes = 2 << 20
+			})
+			body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"padding":"` + strings.Repeat("x", 1<<20) + `"}}`
+			start := time.Now()
+			w := post(t, a, body)
+			if w.Code != http.StatusGatewayTimeout {
+				t.Fatalf("blocked child write status=%d want 504", w.Code)
+			}
+			if elapsed := time.Since(start); elapsed > 2*time.Second {
+				t.Fatalf("blocked child write took %s, want bounded completion", elapsed)
+			}
+			if w := post(t, a, `{"jsonrpc":"2.0","id":2,"method":"ping"}`); w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status after blocked write retirement=%d want 503", w.Code)
+			}
+		})
+	}
+}
+
+func TestConcurrentBlockedStdinWritersFinishByRequestDeadlines(t *testing.T) {
+	a, err := New(Options{Command: "sleep", Args: []string{"30"}, Timeout: 300 * time.Millisecond, MaxBodyBytes: 2 << 20, MaxConcurrent: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer func() { _ = a.Close() }()
+	if err := a.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"padding":"` + strings.Repeat("x", 1<<20) + `"}}`
+	started := time.Now()
+	results := make(chan int, 2)
+	for id := 1; id <= 2; id++ {
+		id := id
+		go func() { results <- postCode(a, fmt.Sprintf(body, id)) }()
+	}
+	for range 2 {
+		select {
+		case code := <-results:
+			if code != http.StatusGatewayTimeout && code != http.StatusBadGateway && code != http.StatusServiceUnavailable {
+				t.Fatalf("concurrent blocked writer status=%d, want timeout, child-exit, or fail-closed retirement", code)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("concurrent blocked writer exceeded request deadline")
+		}
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("concurrent blocked writers took %s, want bounded completion", elapsed)
+	}
+}
+
+func TestBlockedStdinWriteHonorsRequestCancellation(t *testing.T) {
+	a := startEcho(t, func(o *Options) {
+		o.Command = "sleep"
+		o.Args = []string{"30"}
+		o.Timeout = 5 * time.Second
+		o.MaxBodyBytes = 2 << 20
+	})
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"padding":"` + strings.Repeat("x", 1<<20) + `"}}`
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body)).WithContext(ctx)
+		a.ServeHTTP(httptest.NewRecorder(), req)
+		close(done)
+	}()
+	waitPending(t, a, "1")
+	deadline := time.Now().Add(time.Second)
+	for len(a.coord.wmu) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(a.coord.wmu) == 0 {
+		t.Fatal("request did not start writing to child stdin")
+	}
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled request remained blocked on child stdin")
+	}
+	deadline = time.Now().Add(time.Second)
+	for !a.broken.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !a.broken.Load() {
+		t.Fatal("cancelled blocked request did not retire the child")
+	}
+}
+
+func TestNotificationBlockedWriteHonorsCancellation(t *testing.T) {
+	a := startEcho(t, func(o *Options) {
+		o.Command = "sleep"
+		o.Args = []string{"30"}
+		o.Timeout = 5 * time.Second
+		o.MaxBodyBytes = 2 << 20
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	body := `{"jsonrpc":"2.0","method":"notifications/progress","params":{"padding":"` + strings.Repeat("x", 1<<20) + `"}}`
+	done := make(chan struct{})
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body)).WithContext(ctx)
+		a.ServeHTTP(httptest.NewRecorder(), req)
+		close(done)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for len(a.coord.wmu) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(a.coord.wmu) == 0 {
+		t.Fatal("notification did not start writing to child stdin")
+	}
+	// The sleeping child never drains its pipe; allow the 1 MiB message to
+	// fill it before cancellation so this covers a genuinely blocked write.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled notification remained blocked on child stdin")
+	}
+	if !a.broken.Load() {
+		t.Fatal("cancelled blocked notification did not retire the child")
+	}
+}
+
+// A multi-megabyte unterminated child frame is rejected before the adapter
+// accumulates an unbounded line.
+func TestMultiMegabyteUnterminatedChildOutputRetires(t *testing.T) {
+	a := startEcho(t, func(o *Options) {
+		o.Command = "sh"
+		o.Args = []string{"-c", "head -c 8388608 /dev/zero"}
+		o.MaxBodyBytes = 1024
+	})
+	deadline := time.Now().Add(3 * time.Second)
+	for !a.broken.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !a.broken.Load() {
+		t.Fatal("adapter did not retire after oversized unterminated output")
+	}
+	w := post(t, a, `{"jsonrpc":"2.0","id":1,"method":"ping"}`)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status after oversized child output=%d want 503", w.Code)
+	}
+}
+
+type countingUnterminatedReader struct{ bytesRead int }
+
+func (r *countingUnterminatedReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'x'
+	}
+	r.bytesRead += len(p)
+	return len(p), nil
+}
+
+// The line reader consumes only the configured frame bound plus one
+// bufio fragment before rejecting an unterminated frame. This pins the
+// allocation bound independently of process scheduling or heap noise.
+func TestUnterminatedChildOutputReadBound(t *testing.T) {
+	const maxBody = 1024
+	const readBuffer = 64
+	r := &countingUnterminatedReader{}
+	retired := make(chan struct{})
+	co := &coordinator{
+		pending: make(map[string]chan coordResult), maxBody: maxBody,
+		onDeath: func() { close(retired) },
+	}
+	co.readLoop(bufio.NewReaderSize(r, readBuffer))
+	select {
+	case <-retired:
+	default:
+		t.Fatal("oversized unterminated frame did not retire coordinator")
+	}
+	if r.bytesRead > maxBody+readBuffer {
+		t.Fatalf("reader consumed %d bytes before rejection, cap is %d", r.bytesRead, maxBody+readBuffer)
+	}
+}
+
 // TestCloseTerminatesChild: Close kills the child and frees the port.
 func TestCloseTerminatesChild(t *testing.T) {
 	a, err := New(Options{Command: "cat"})
@@ -467,7 +745,7 @@ func TestMethodNotAllowed(t *testing.T) {
 func TestInterleavedNotificationBeforeReply(t *testing.T) {
 	a := startEcho(t, func(o *Options) {
 		o.Command = "sh"
-		o.Args = []string{"-c", `IFS= read -r req; echo '{"jsonrpc":"2.0","method":"note"}'; echo '{"jsonrpc":"2.0","id":1,"result":{}}'`}
+		o.Args = []string{"-c", `IFS= read -r req; echo '{"jsonrpc":"2.0","method":"note"}'; echo "$req"`}
 	})
 	w := post(t, a, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
 	if w.Code != http.StatusOK {
@@ -500,26 +778,57 @@ func TestCancelledCallReleasesWaiter(t *testing.T) {
 	}
 }
 
-// TestDuplicateIDRejected: a second in-flight call reusing an
-// outstanding request id gets 400 immediately instead of stealing the
-// first call's reply.
-func TestDuplicateIDRejected(t *testing.T) {
-	a := startSilent(t, 30*time.Second)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	defer func() { _ = a.Close() }()
-	firstDone := make(chan struct{})
+// Independent MCP clients may reuse the same JSON-RPC ID. Internal IDs keep
+// replies attached to the originating caller even when the child responds in
+// reverse order.
+func TestConcurrentDuplicateIDsRemainIsolated(t *testing.T) {
+	releaseFile := filepath.Join(t.TempDir(), "release-child")
+	a := startEcho(t, func(o *Options) {
+		o.Command = "sh"
+		o.Args = []string{"-c", `IFS= read -r first || exit; IFS= read -r second || exit; while [ ! -e "$OCLIV_TEST_RELEASE" ]; do sleep 0.01; done; printf '%s\n' "$second"; printf '%s\n' "$first"`}
+		o.Env = []string{"OCLIV_TEST_RELEASE=" + releaseFile}
+	})
+	defer a.Close()
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	secondDone := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
-		defer close(firstDone)
-		req := httptest.NewRequest(http.MethodPost, "/",
-			strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"slow"}`)).WithContext(ctx)
-		a.ServeHTTP(httptest.NewRecorder(), req)
+		firstDone <- post(t, a, `{"jsonrpc":"2.0","id":1,"method":"call","params":{"client":"first"}}`)
 	}()
-	waitPending(t, a, "1") // first call registered; duplicate id must be refused
-	w := post(t, a, `{"jsonrpc":"2.0","id":1,"method":"slow"}`)
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("duplicate id status=%d body=%q, want 400", w.Code, w.Body.String())
+	waitPendingCount(t, a, 1)
+	go func() {
+		secondDone <- post(t, a, `{"jsonrpc":"2.0","id":1,"method":"call","params":{"client":"second"}}`)
+	}()
+	waitPendingCount(t, a, 2)
+	if err := os.WriteFile(releaseFile, []byte("go"), 0o600); err != nil {
+		t.Fatal(err)
 	}
+	first, second := <-firstDone, <-secondDone
+	for _, result := range []struct {
+		name string
+		w    *httptest.ResponseRecorder
+	}{
+		{name: "first", w: first},
+		{name: "second", w: second},
+	} {
+		if result.w.Code != http.StatusOK || !strings.Contains(result.w.Body.String(), `"id":1`) || !strings.Contains(result.w.Body.String(), `"client":"`+result.name+`"`) {
+			t.Errorf("%s client received wrong reply: status=%d body=%q", result.name, result.w.Code, result.w.Body.String())
+		}
+	}
+}
+
+func waitPendingCount(t *testing.T, a *Adapter, want int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		a.coord.mu.Lock()
+		got := len(a.coord.pending)
+		a.coord.mu.Unlock()
+		if got == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("pending calls never reached %d", want)
 }
 
 // TestParallelDistinctIDs: two concurrent calls receive their own
@@ -550,7 +859,8 @@ func TestParallelDistinctIDs(t *testing.T) {
 
 // TestNoisyFailingChild: a child that logs to stderr and exits without a
 // reply cannot hang the adapter: stderr goes to the null device (no pipe
-// to fill) and EOF-without-newline is a 502, not a clean completion.
+// to fill) and the failed request is rejected (502 during exchange, or
+// 503 if child retirement wins before request admission).
 func TestNoisyFailingChild(t *testing.T) {
 	a := startEcho(t, func(o *Options) {
 		o.Command = "ls"
@@ -562,8 +872,8 @@ func TestNoisyFailingChild(t *testing.T) {
 	}()
 	select {
 	case code := <-done:
-		if code != http.StatusBadGateway {
-			t.Fatalf("status=%d want 502", code)
+		if code != http.StatusBadGateway && code != http.StatusServiceUnavailable {
+			t.Fatalf("status=%d want 502 during exchange or 503 after retirement", code)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("noisy failing child hung the adapter")

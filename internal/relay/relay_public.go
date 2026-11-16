@@ -72,6 +72,31 @@ func leaseExpired(t *routeTarget) bool {
 	return !t.ExpiresAt.IsZero() && time.Now().UTC().After(t.ExpiresAt)
 }
 
+// currentLeaseExpiry re-reads the authoritative lease row when an admitted
+// stream reaches its snapshot expiry. Renewal may extend this same generation
+// while the stream is open; every other state change closes it.
+func (s *Server) currentLeaseExpiry(t *routeTarget) (time.Time, bool) {
+	var state string
+	var generation uint64
+	var raw sql.NullString
+	if err := s.db.SQL().QueryRow(`SELECT status,generation,expires_at FROM leases WHERE id=?`, t.LeaseID).
+		Scan(&state, &generation, &raw); err != nil || state != lease.StateActive || generation != t.Generation {
+		return time.Time{}, false
+	}
+	sess, ok := s.liveSession(t.LeaseID)
+	if !ok || sess.Generation != t.Generation {
+		return time.Time{}, false
+	}
+	if !raw.Valid {
+		return time.Time{}, true
+	}
+	expiry, err := time.Parse(time.RFC3339Nano, raw.String)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return expiry, expiry.After(time.Now().UTC())
+}
+
 // route maps an exact Host to exactly one live lease generation. Anything
 // else maps to no destination (D01, D03): malformed -> 400/421, unknown or
 // offline -> 404/503 with no cross-tenant hint.

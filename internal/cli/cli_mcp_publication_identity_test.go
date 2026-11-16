@@ -83,17 +83,16 @@ func TestDefaultPublicationNameIsValidLabel(t *testing.T) {
 	}
 }
 
-// TestDefaultPublicationNameSeparatesStdioServices pins that a stdio-backed
-// service (no local URL at all) still gets its own identity: the adapter
-// port is what distinguishes one run from another.
-func TestDefaultPublicationNameSeparatesStdioServices(t *testing.T) {
-	a := defaultPublicationName(45123, "", "ocliv-managed")
-	b := defaultPublicationName(45124, "", "ocliv-managed")
-	if a == b {
-		t.Fatalf("two stdio services on different adapter ports share the name %q", a)
+// Managed stdio publication requires a stable operator-selected name and
+// is available only through the isolated Streamable HTTP adapter.
+func TestStdioPublicationRequiresExplicitStableName(t *testing.T) {
+	argv := []string{"--stdio", "--auth=ocliv-managed", "--name=stable-tools", "--", "mcp-server"}
+	cfg, code := parseMCPPublish(argv, false)
+	if code != 0 || !cfg.stdio || cfg.auth != "ocliv-managed" || cfg.name != "stable-tools" {
+		t.Fatalf("managed stdio publication did not parse: cfg=%#v code=%d", cfg, code)
 	}
-	if err := lease.ValidateLabel(a); err != nil {
-		t.Fatalf("stdio name %q is not a valid label: %v", a, err)
+	if _, code := parseMCPPublish([]string{"--stdio", "--auth=ocliv-managed", "--", "mcp-server"}, false); code == 0 {
+		t.Fatal("stdio publication without an explicit stable name was accepted")
 	}
 }
 

@@ -29,12 +29,15 @@ const (
 
 // Agent holds validated agent-side configuration.
 type Agent struct {
-	RelayURL      string
-	Port          int
-	Public        bool
-	AccessMode    string // explicit lease policy (e.g. mcp_upstream_oauth); "" = protected/public from Public. Set only by `mcp serve`/`mcp publish`, never by `ocliv PORT` flags.
-	Name          string
-	TTLSeconds    int64
+	RelayURL   string
+	Port       int
+	Public     bool
+	AccessMode string // explicit lease policy (e.g. mcp_upstream_oauth); "" = protected/public from Public. Set only by `mcp serve`/`mcp publish`, never by `ocliv PORT` flags.
+	Name       string
+	TTLSeconds int64
+	// RenewLease opts supervised MCP publishers into lease renewal. Generic
+	// finite-TTL tunnels remain terminal at expiry unless explicitly managed.
+	RenewLease    bool
 	UpstreamHost  string
 	IPv6          bool
 	JSONOut       bool
@@ -104,11 +107,44 @@ func DataDir() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	dir := filepath.Join(home, ".config", "ocliv")
+	root := filepath.Join(home, ".config", "ocliv")
+	profile := strings.TrimSpace(os.Getenv("OCLIV_PROFILE"))
+	if profile == "" {
+		if b, readErr := os.ReadFile(filepath.Join(root, "active-profile")); readErr == nil {
+			profile = strings.TrimSpace(string(b))
+		} else if !os.IsNotExist(readErr) {
+			return "", readErr
+		}
+	}
+	dir := root
+	if profile != "" && profile != "default" {
+		if !ValidProfileName(profile) {
+			return "", fmt.Errorf("invalid Ocliv profile name %q", profile)
+		}
+		dir = filepath.Join(root, "profiles", profile)
+		if _, statErr := os.Stat(dir); os.IsNotExist(statErr) {
+			return "", fmt.Errorf("Ocliv profile %q does not exist; create it with `ocliv profile create %s`", profile, profile)
+		} else if statErr != nil {
+			return "", statErr
+		}
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
 	return dir, nil
+}
+
+// ValidProfileName accepts a short, path-safe profile identifier.
+func ValidProfileName(name string) bool {
+	if len(name) == 0 || len(name) > 32 || name == "default" {
+		return false
+	}
+	for _, r := range name {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // RedactedURL removes any userinfo from a URL for logs/diagnostics.

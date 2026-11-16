@@ -17,16 +17,20 @@ package relay
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/hashicorp/yamux"
 
 	"ocliv/internal/limits"
 	"ocliv/internal/protocol"
@@ -308,4 +312,301 @@ func TestStalledUploadWithEarlySuccessTearsDown(t *testing.T) {
 		t.Fatalf("unexpected read error after teardown: %v", err)
 	}
 	_ = bodyW.CloseWithError(stalled)
+}
+
+// A real subscriptions/listen request is application-idle while its yamux
+// transport remains healthy. Transport keepalives, not response-frame
+// deadlines, own dead-peer detection. The default test stays fast; set
+// OCLIV_LONG_STREAM_TESTS=1 for the separate 45/90/180-second endurance run.
+func TestQuietMCPSubscriptionGaps(t *testing.T) {
+	for _, gap := range []time.Duration{20 * time.Millisecond, 50 * time.Millisecond, 100 * time.Millisecond} {
+		t.Run(gap.String(), func(t *testing.T) { runQuietMCPSubscriptionGap(t, gap) })
+	}
+}
+
+func TestQuietMCPSubscriptionEndurance(t *testing.T) {
+	if os.Getenv("OCLIV_LONG_STREAM_TESTS") != "1" {
+		t.Skip("set OCLIV_LONG_STREAM_TESTS=1 to run 45/90/180-second stream endurance")
+	}
+	for _, gap := range []time.Duration{45 * time.Second, 90 * time.Second, 180 * time.Second} {
+		t.Run(gap.String(), func(t *testing.T) { runQuietMCPSubscriptionGap(t, gap) })
+	}
+}
+
+func runQuietMCPSubscriptionGap(t *testing.T, gap time.Duration) {
+	t.Helper()
+	s, _ := newLifecycleServer(t)
+	relayEnd, agentEnd := net.Pipe()
+	defer relayEnd.Close()
+	defer agentEnd.Close()
+	w := newHijackRecorder(t)
+	defer w.testEnd.Close()
+	subscription := `{"jsonrpc":"2.0","id":1,"method":"subscriptions/listen","params":{"uri":"test://quiet"}}`
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(subscription))
+	x := newHTTPExchange(s, w, req, relayEnd, &routeTarget{LeaseID: "quiet-subscription", ExpiresAt: time.Now().Add(10 * time.Minute)})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		x.run()
+	}()
+	var uploaded []byte
+	for {
+		ft, payload, err := protocol.ReadFrame(agentEnd)
+		if err != nil {
+			t.Fatalf("read subscription request: %v", err)
+		}
+		switch ft {
+		case protocol.FRequestData:
+			uploaded = append(uploaded, payload...)
+		case protocol.FRequestEnd:
+			if !strings.Contains(string(uploaded), `"method":"subscriptions/listen"`) {
+				t.Fatalf("request was not subscriptions/listen: %s", uploaded)
+			}
+			goto requestSent
+		default:
+			t.Fatalf("unexpected request frame %d", ft)
+		}
+	}
+requestSent:
+	writeResponseFrameBounded(t, agentEnd, relayEnd, protocol.FResponseHead, protocol.ResponseHead{
+		Type: "response_head", Proto: protocol.Version, RequestID: "quiet-subscription", Status: http.StatusOK,
+		Headers: map[string]string{"Content-Type": "text/event-stream"},
+	})
+	time.Sleep(gap)
+	payload := []byte("event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\",\"params\":{}}\n\n")
+	writeProtocolFrameBounded(t, agentEnd, relayEnd, protocol.FResponseData, payload)
+	writeResponseFrameBounded(t, agentEnd, relayEnd, protocol.FResponseEnd, protocol.EndFrame{Type: "response_end"})
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("subscription did not finish after event")
+	}
+	w.mu.Lock()
+	got := w.body.String()
+	w.mu.Unlock()
+	if got != string(payload) {
+		t.Fatalf("response after %s quiet gap = %q, want event", gap, got)
+	}
+}
+
+func writeResponseFrameBounded(t *testing.T, w, peer net.Conn, ftype byte, v any) {
+	t.Helper()
+	raw, err := protocol.MarshalJSON(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeProtocolFrameBounded(t, w, peer, ftype, raw)
+}
+
+func writeProtocolFrameBounded(t *testing.T, w, peer net.Conn, ftype byte, raw []byte) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- protocol.WriteFrame(w, ftype, raw) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("write response frame: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		_ = w.Close()
+		_ = peer.Close()
+		t.Fatal("response frame write blocked; closed both net.Pipe ends")
+	}
+}
+
+func TestRenewedLeaseKeepsQuietStreamUntilRevocation(t *testing.T) {
+	s, db := newLifecycleServer(t)
+	insertLeaseRow(t, db, "stream-renew", "ACTIVE", 7, nil)
+	initialExpiry := time.Now().UTC().Add(100 * time.Millisecond)
+	if _, err := db.SQL().Exec(`UPDATE leases SET expires_at=? WHERE id='stream-renew'`, initialExpiry.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	relayConn, agentConn := net.Pipe()
+	cfg := yamux.DefaultConfig()
+	cfg.KeepAliveInterval = 20 * time.Millisecond
+	cfg.ConnectionWriteTimeout = 100 * time.Millisecond
+	relaySession, err := yamux.Server(relayConn, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentSession, err := yamux.Client(agentConn, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = relaySession.Close(); _ = agentSession.Close() })
+	stream, err := relaySession.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentStream, err := agentSession.AcceptStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.registry.mu.Lock()
+	s.registry.sessions["stream-renew"] = &Session{LeaseID: "stream-renew", Generation: 7, Yamux: relaySession, closed: make(chan struct{})}
+	s.registry.mu.Unlock()
+	w := newHijackRecorder(t)
+	defer w.testEnd.Close()
+	x := &httpExchange{srv: s, w: w, stream: stream, ctx: context.Background(),
+		t:          &routeTarget{LeaseID: "stream-renew", Generation: 7, ExpiresAt: initialExpiry},
+		headStatus: http.StatusOK, uploadClean: true}
+	done := make(chan struct{})
+	go func() { defer close(done); x.streamBody() }()
+	newExpiry := time.Now().UTC().Add(450 * time.Millisecond)
+	if _, err := db.SQL().Exec(`UPDATE leases SET expires_at=? WHERE id='stream-renew'`, newExpiry.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(150 * time.Millisecond) // pass the original snapshot expiry
+	event := []byte("event: message\ndata: renewal survived\n\n")
+	writeProtocolFrameBounded(t, agentStream, stream, protocol.FResponseData, event)
+	deadline := time.Now().Add(time.Second)
+	for {
+		w.mu.Lock()
+		got := w.body.String()
+		w.mu.Unlock()
+		if got == string(event) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("renewed subscription did not deliver event; body=%q", got)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := s.revokeLease("stream-renew"); err != nil {
+		t.Fatal(err)
+	}
+	s.evictLease("stream-renew") // same post-commit action used by explicit revoke
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("explicit revoke did not close the active stream")
+	}
+}
+
+func TestQuietStreamInterruptsOnDisconnectAndLeaseExpiry(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ctx  func() (context.Context, func())
+		exp  time.Time
+	}{
+		{name: "visitor disconnect", ctx: func() (context.Context, func()) { return context.WithCancel(context.Background()) }, exp: time.Now().Add(time.Hour)},
+		{name: "lease expiry", ctx: func() (context.Context, func()) { return context.Background(), func() {} }, exp: time.Now().Add(20 * time.Millisecond)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := newLifecycleServer(t)
+			relayEnd, agentEnd := net.Pipe()
+			defer relayEnd.Close()
+			defer agentEnd.Close()
+			w := newHijackRecorder(t)
+			defer w.testEnd.Close()
+			ctx, cancel := tc.ctx()
+			defer cancel()
+			x := &httpExchange{srv: s, w: w, stream: relayEnd, ctx: ctx, t: &routeTarget{LeaseID: "quiet-cancel", ExpiresAt: tc.exp}, headStatus: http.StatusOK, uploadClean: true}
+			done := make(chan struct{})
+			go func() { defer close(done); x.streamBody() }()
+			if tc.name == "visitor disconnect" {
+				cancel()
+			}
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("quiet stream did not stop after cancellation condition")
+			}
+		})
+	}
+}
+
+func TestYamuxKeepaliveStaysBelowMCPStreamAndDetectsDisconnect(t *testing.T) {
+	newPair := func(t *testing.T) (*yamux.Session, *yamux.Session, net.Conn, net.Conn) {
+		t.Helper()
+		relayConn, agentConn := net.Pipe()
+		cfg := yamux.DefaultConfig()
+		cfg.KeepAliveInterval = 20 * time.Millisecond
+		cfg.ConnectionWriteTimeout = 100 * time.Millisecond
+		relaySession, err := yamux.Client(relayConn, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		agentSession, err := yamux.Server(agentConn, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return relaySession, agentSession, relayConn, agentConn
+	}
+
+	t.Run("transport pings are not response frames", func(t *testing.T) {
+		relaySession, agentSession, relayConn, agentConn := newPair(t)
+		defer relayConn.Close()
+		defer agentConn.Close()
+		defer relaySession.Close()
+		defer agentSession.Close()
+		relayStream, err := relaySession.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		agentStream, err := agentSession.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer relayStream.Close()
+		defer agentStream.Close()
+
+		s, _ := newLifecycleServer(t)
+		w := newHijackRecorder(t)
+		defer w.testEnd.Close()
+		x := &httpExchange{srv: s, w: w, stream: relayStream, ctx: context.Background(),
+			t: &routeTarget{LeaseID: "yamux-quiet", ExpiresAt: time.Now().Add(time.Hour)}, headStatus: http.StatusOK, uploadClean: true}
+		done := make(chan struct{})
+		go func() { defer close(done); x.streamBody() }()
+		time.Sleep(100 * time.Millisecond) // several transport pings, no application data
+		if err := protocol.WriteFrame(agentStream, protocol.FResponseData, []byte("event")); err != nil {
+			t.Fatal(err)
+		}
+		writeResponseFrame(t, agentStream, protocol.FResponseEnd, protocol.EndFrame{Type: "response_end"})
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("quiet stream did not finish after application data")
+		}
+		w.mu.Lock()
+		got := w.body.String()
+		w.mu.Unlock()
+		if got != "event" {
+			t.Fatalf("application body=%q, want only the MCP event", got)
+		}
+	})
+
+	t.Run("peer loss releases quiet stream", func(t *testing.T) {
+		relaySession, agentSession, relayConn, agentConn := newPair(t)
+		defer relayConn.Close()
+		defer agentConn.Close()
+		defer relaySession.Close()
+		defer agentSession.Close()
+		relayStream, err := relaySession.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		agentStream, err := agentSession.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer relayStream.Close()
+		defer agentStream.Close()
+
+		s, _ := newLifecycleServer(t)
+		w := newHijackRecorder(t)
+		defer w.testEnd.Close()
+		x := &httpExchange{srv: s, w: w, stream: relayStream, ctx: context.Background(),
+			t: &routeTarget{LeaseID: "yamux-disconnect", ExpiresAt: time.Now().Add(time.Hour)}, headStatus: http.StatusOK, uploadClean: true}
+		done := make(chan struct{})
+		go func() { defer close(done); x.streamBody() }()
+		if err := agentConn.Close(); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("peer disconnect did not release quiet stream")
+		}
+	})
 }

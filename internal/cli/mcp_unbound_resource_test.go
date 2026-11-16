@@ -7,8 +7,6 @@ import (
 	"os"
 	"strings"
 	"testing"
-
-	"ocliv/internal/apperr"
 )
 
 // metisLikeUnboundServer stands in for Metis `mcp serve-http` in
@@ -36,20 +34,11 @@ func metisLikeUnboundServer(t *testing.T, resourcePath string) *httptest.Server 
 	}))
 }
 
-// Reproduces the Ocliv↔Metis publish pre-flight deadlock. Metis
-// serve-http answers 503 "resource not configured" on /mcp until Ocliv's
-// publish writes the --resource-file handoff (step 3 of runMCPPublish).
-// But step 1 probes the local target BEFORE that handoff exists, so the
-// probe sees a 503. If a 503 is not recognized as authenticating
-// presence for an upstream-oauth target, publish aborts with
-// ExitLocalTarget and can NEVER reach the handoff write — a hard
-// deadlock for any file-bound upstream.
-//
-// Failing-first: on the unfixed probe a 503 reports AUTH_UNVERIFIED and
-// the publish local-target gate (publishLocalProbeOK) refuses it, so
-// this test fails with the exact stderr and exit code publish would
-// produce.
-func TestProbeTreatsUnboundResourceServerAsPresence(t *testing.T) {
+// Resource-file-bound servers may report their narrow pre-handoff signal,
+// but that is not protocol evidence. It permits the handoff step only;
+// tools/list and authorization checks must pass afterward and before route
+// activation.
+func TestProbeUnboundResourceServerOnlyPassesHandoffPreflight(t *testing.T) {
 	dir := t.TempDir()
 	resourceFile := dir + "/route.txt"
 	srv := metisLikeUnboundServer(t, resourceFile)
@@ -59,16 +48,18 @@ func TestProbeTreatsUnboundResourceServerAsPresence(t *testing.T) {
 	target := probeTarget(srv)
 	out := runMCPProbe(target, "mcp_upstream_oauth")
 
-	// Exact publish decision (cli_mcp_publish.go, publishLocalProbeOK).
-	if !publishLocalProbeOK(out, "upstream-oauth") {
-		msg := fmt.Sprintf("local MCP %s failed protocol check: %s", target, out.Summary)
-		t.Logf("publish aborts: stderr=%q exit=%d", msg, apperr.ExitLocalTarget)
-		t.Fatalf("unbound upstream-oauth target FAILED the publish local-target gate: verified=%v auth=%q summary=%q\n"+
-			"=> publish would abort with ExitLocalTarget before the resource-file handoff is written",
-			out.Verified, out.Auth, out.Summary)
+	cfg := mcpPublishConfig{auth: "upstream-oauth", resourceFile: resourceFile}
+	if !publishInitialProbeOK(out, cfg) {
+		t.Fatalf("exact unbound handoff signal did not pass initial preflight: %+v", out)
+	}
+	if !out.UnboundHandoff || out.Verified {
+		t.Fatalf("preflight must report handoff-only, not protocol validity: %+v", out)
+	}
+	if publishLocalProbeOK(out, "upstream-oauth", false) || publishLocalProbeOK(out, "upstream-oauth", true) {
+		t.Fatal("unbound signal alone must never satisfy the post-handoff protocol gate")
 	}
 	if out.Auth != "AUTH_REQUIRED" {
-		t.Fatalf("auth=%q, want AUTH_REQUIRED: an unbound-but-alive upstream-oauth target is authenticating presence (like a 401 challenge), not a broken target", out.Auth)
+		t.Fatalf("auth=%q, want AUTH_REQUIRED", out.Auth)
 	}
 	if !strings.Contains(strings.ToLower(out.Summary), "resource not configured") {
 		t.Fatalf("summary=%q should name the resource-not-configured state", out.Summary)
@@ -84,7 +75,7 @@ func TestProbeUnboundServerStillFailsAnonymousFixture(t *testing.T) {
 	srv := metisLikeUnboundServer(t, dir+"/route.txt")
 	defer srv.Close()
 	out := runMCPProbe(probeTarget(srv), "mcp_anonymous_fixture")
-	if out.Verified || publishLocalProbeOK(out, "fixture-anonymous") {
+	if out.Verified || publishLocalProbeOK(out, "fixture-anonymous", false) {
 		t.Fatalf("anonymous fixture must not publish an unbound server: verified=%v auth=%q summary=%q", out.Verified, out.Auth, out.Summary)
 	}
 	// The 401 challenge (once bound) still maps to AUTH_REQUIRED for
@@ -116,7 +107,7 @@ func TestProbeRejects503WithoutUnboundHandoffSignal(t *testing.T) {
 	}))
 	defer srv.Close()
 	out := runMCPProbe(probeTarget(srv), "mcp_upstream_oauth")
-	if out.Auth == "AUTH_REQUIRED" && publishLocalProbeOK(out, "upstream-oauth") {
+	if out.Auth == "AUTH_REQUIRED" && publishLocalProbeOK(out, "upstream-oauth", false) {
 		t.Fatalf("a non-handoff 503 must not be accepted as authenticating presence: auth=%q summary=%q",
 			out.Auth, out.Summary)
 	}

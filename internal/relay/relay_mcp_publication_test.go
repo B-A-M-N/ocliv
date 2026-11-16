@@ -9,8 +9,10 @@ package relay
 
 import (
 	"crypto/ed25519"
+	"database/sql"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -36,6 +38,17 @@ func publishRoute(t *testing.T, s *Server, priv ed25519.PrivateKey, keyID, lease
 		t.Fatalf("publish %s: bad reply %q err=%v", leaseID, body, err)
 	}
 	return rr.RouteID
+}
+
+func postMCPRouteAction(t *testing.T, s *Server, priv ed25519.PrivateKey, keyID, leaseID, routeID, action string) (int, string) {
+	t.Helper()
+	path := "/v1/agent/lease/" + leaseID + "/mcp-route/" + routeID + "/" + action
+	r := signedMgmtRequest(t, priv, keyID, http.MethodPost, path)
+	r.Host = "relay.example.test"
+	r.RequestURI = path
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	return w.Code, w.Body.String()
 }
 
 // relabel sets a lease's publication label directly, mirroring a
@@ -85,6 +98,90 @@ func TestPublicationStableAcrossLeases(t *testing.T) {
 	liveFabricatedSession(t, s, "lse-b", 1)
 	if _, _, _, code := s.resolveMCPRouteID(r1); code != 0 {
 		t.Fatalf("rebound publication denied: code=%d", code)
+	}
+}
+
+// A failed replacement publisher must detach only its own lease, preserving
+// the durable route ID and existing grants. A later publisher reuses that
+// same identity, and a stale cleanup cannot detach the newer successful bind.
+func TestFailedRebindPreservesPublicationAndGrant(t *testing.T) {
+	s, db := newMCPServer(t)
+	priv := enrollTestKey(t, db.SQL(), "key-test", "tenant-test")
+	insertMCPLeaseRow(t, db, "lse-original", "recover.t.example.test", AccessModeMCPUpstreamOAuth, lease.StateActive, 1, nil)
+	code, body := postMCPRoute(t, s, priv, "key-test", "lse-original", "upstream-oauth")
+	if code != http.StatusOK {
+		t.Fatalf("initial publish: status=%d body=%s", code, body)
+	}
+	var initial struct {
+		RouteID string `json:"route_id"`
+		Created bool   `json:"created"`
+	}
+	if err := json.Unmarshal([]byte(body), &initial); err != nil || initial.RouteID == "" || !initial.Created {
+		t.Fatalf("initial publication response=%q err=%v; want created=true", body, err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.SQL().Exec(`INSERT INTO authz_grants(client_id,tenant_id,route_id,status,created_at,updated_at) VALUES('client-test','tenant-test',?,'active',?,?)`, initial.RouteID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.closeLeaseDurable("lse-original"); err != nil {
+		t.Fatal(err)
+	}
+	insertMCPLeaseRow(t, db, "lse-failed", "other.t.example.test", AccessModeMCPUpstreamOAuth, lease.StateActive, 1, nil)
+	relabel(t, db, "lse-failed", "recover")
+	code, body = postMCPRoute(t, s, priv, "key-test", "lse-failed", "upstream-oauth")
+	if code != http.StatusOK {
+		t.Fatalf("failed publisher rebind: status=%d body=%s", code, body)
+	}
+	var rebound struct {
+		RouteID string `json:"route_id"`
+		Created bool   `json:"created"`
+	}
+	if err := json.Unmarshal([]byte(body), &rebound); err != nil || rebound.RouteID != initial.RouteID || rebound.Created {
+		t.Fatalf("rebind response=%q err=%v; want same route created=false", body, err)
+	}
+	if status, body := postMCPRouteAction(t, s, priv, "key-test", "lse-failed", rebound.RouteID, "detach"); status != http.StatusOK {
+		t.Fatalf("failed rebind detach: status=%d body=%s", status, body)
+	}
+	var bound sql.NullString
+	var verified sql.NullString
+	if err := db.SQL().QueryRow(`SELECT lease_id,verified_at FROM mcp_publications WHERE route_id=?`, initial.RouteID).Scan(&bound, &verified); err != nil {
+		t.Fatal(err)
+	}
+	if bound.Valid || verified.Valid {
+		t.Fatalf("failed lease binding survived detach: lease=%v verified=%v", bound, verified)
+	}
+	var grants int
+	if err := db.SQL().QueryRow(`SELECT COUNT(*) FROM authz_grants WHERE route_id=? AND status='active'`, initial.RouteID).Scan(&grants); err != nil || grants != 1 {
+		t.Fatalf("grant count after failed rebind=%d err=%v; want 1", grants, err)
+	}
+	if _, _, _, admission := s.resolveMCPRouteID(initial.RouteID); admission != http.StatusNotFound {
+		t.Fatalf("detached route admission=%d, want 404", admission)
+	}
+
+	insertMCPLeaseRow(t, db, "lse-retry", "third.t.example.test", AccessModeMCPUpstreamOAuth, lease.StateActive, 1, nil)
+	relabel(t, db, "lse-retry", "recover")
+	code, body = postMCPRoute(t, s, priv, "key-test", "lse-retry", "upstream-oauth")
+	if code != http.StatusOK {
+		t.Fatalf("retry publish: status=%d body=%s", code, body)
+	}
+	var retry struct {
+		RouteID string `json:"route_id"`
+		Created bool   `json:"created"`
+	}
+	if err := json.Unmarshal([]byte(body), &retry); err != nil || retry.RouteID != initial.RouteID || retry.Created {
+		t.Fatalf("retry response=%q err=%v; want original route and created=false", body, err)
+	}
+	if status, body := postMCPRouteAction(t, s, priv, "key-test", "lse-retry", retry.RouteID, "activate"); status != http.StatusOK {
+		t.Fatalf("retry activation: status=%d body=%s", status, body)
+	}
+	if status, _ := postMCPRouteAction(t, s, priv, "key-test", "lse-failed", retry.RouteID, "detach"); status != http.StatusConflict {
+		t.Fatalf("stale failed-publisher detach status=%d, want 409", status)
+	}
+	if err := db.SQL().QueryRow(`SELECT lease_id FROM mcp_publications WHERE route_id=?`, retry.RouteID).Scan(&bound); err != nil || !bound.Valid || bound.String != "lse-retry" {
+		t.Fatalf("stale detach changed new binding: lease=%v err=%v", bound, err)
+	}
+	if err := db.SQL().QueryRow(`SELECT COUNT(*) FROM authz_grants WHERE route_id=? AND status='active'`, retry.RouteID).Scan(&grants); err != nil || grants != 1 {
+		t.Fatalf("grant count after successful retry=%d err=%v; want 1", grants, err)
 	}
 }
 

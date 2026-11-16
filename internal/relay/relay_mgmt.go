@@ -11,10 +11,12 @@ package relay
 import (
 	"crypto/ed25519"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -97,6 +99,98 @@ func (s *Server) consumeMgmtNonce(tenant, leaseID, nonce string) bool {
 	return true
 }
 
+// renewLeaseExpiry compare-and-updates only a still-active lease owned by
+// the authenticated key and current generation. Expired or revoked leases
+// cannot be resurrected by renewal.
+func (s *Server) renewLeaseExpiry(leaseID, tenantID, keyID, publicationID string, generation uint64, ttl time.Duration) (time.Time, bool, error) {
+	var updated bool
+	var expiry time.Time
+	err := withTx(s.db.SQL(), func(tx *sql.Tx) error {
+		var state, currentExpiry string
+		var currentGeneration int64
+		err := tx.QueryRow(`SELECT status, generation, expires_at FROM leases WHERE id=? AND tenant_id=? AND agent_key_id=?`, leaseID, tenantID, keyID).
+			Scan(&state, &currentGeneration, &currentExpiry)
+		if err == sql.ErrNoRows {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		parsedExpiry, err := time.Parse(time.RFC3339Nano, currentExpiry)
+		if err != nil || state != "ACTIVE" || uint64(currentGeneration) != generation || !parsedExpiry.After(now) {
+			return nil
+		}
+		expiry = now.Add(ttl)
+		res, err := tx.Exec(
+			`UPDATE leases SET expires_at=? WHERE id=? AND tenant_id=? AND agent_key_id=? AND status='ACTIVE' AND generation=? AND expires_at=? AND (?='none' OR EXISTS(SELECT 1 FROM mcp_publications WHERE route_id=? AND tenant_id=? AND owner_key_id=? AND lease_id=? AND revoked_at IS NULL))`,
+			expiry.Format(time.RFC3339Nano), leaseID, tenantID, keyID, generation, currentExpiry, publicationID, publicationID, tenantID, keyID, leaseID)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		updated = n == 1
+		return nil
+	})
+	return expiry, updated, err
+}
+
+func (s *Server) handleLeaseRenew(w http.ResponseWriter, tenantID, keyID, leaseID, action string, generation int64, state string, expiresAt sql.NullString) {
+	parts := strings.Split(action, "/")
+	if len(parts) != 4 || parts[0] != "renew" {
+		http.Error(w, "usage: renew/<generation>/<ttl-seconds>/<publication-id|none>", http.StatusBadRequest)
+		return
+	}
+	requestedGeneration, gerr := strconv.ParseUint(parts[1], 10, 64)
+	ttlSeconds, terr := strconv.ParseInt(parts[2], 10, 64)
+	publicationID := parts[3]
+	if requestedGeneration == 0 || gerr != nil || requestedGeneration != uint64(generation) || terr != nil || ttlSeconds < 1 || ttlSeconds > maxIntentTTLSeconds {
+		s.db.Audit("agent", tenantID, leaseID, "lease-renew", "denied", "invalid generation or ttl")
+		http.Error(w, "invalid generation or ttl", http.StatusConflict)
+		return
+	}
+	now := time.Now().UTC()
+	if !expiresAt.Valid || state != "ACTIVE" {
+		http.Error(w, "lease is not renewable", http.StatusConflict)
+		return
+	}
+	oldExpiry, err := time.Parse(time.RFC3339Nano, expiresAt.String)
+	if err != nil || !oldExpiry.After(now) {
+		http.Error(w, "lease has expired", http.StatusConflict)
+		return
+	}
+	if sess, ok := s.liveSession(leaseID); !ok || sess.Generation != requestedGeneration {
+		s.db.Audit("agent", tenantID, leaseID, "lease-renew", "denied", "session generation is not current")
+		http.Error(w, "session generation is not current", http.StatusConflict)
+		return
+	}
+	expiry, updated, err := s.renewLeaseExpiry(leaseID, tenantID, keyID, publicationID, requestedGeneration, time.Duration(ttlSeconds)*time.Second)
+	if err != nil {
+		s.db.Audit("agent", tenantID, leaseID, "lease-renew", "error", "database update failed")
+		http.Error(w, "renewal failed", http.StatusInternalServerError)
+		return
+	}
+	if !updated {
+		if publicationID != "none" {
+			var exists bool
+			if qerr := s.db.SQL().QueryRow(`SELECT EXISTS(SELECT 1 FROM mcp_publications WHERE route_id=? AND tenant_id=? AND owner_key_id=? AND lease_id=? AND revoked_at IS NULL)`, publicationID, tenantID, keyID, leaseID).Scan(&exists); qerr == nil && !exists {
+				s.db.Audit("agent", tenantID, leaseID, "lease-renew", "denied", "publication is deleted, revoked, or no longer bound")
+				http.Error(w, "publication is deleted, revoked, or no longer bound", http.StatusGone)
+				return
+			}
+		}
+		s.db.Audit("agent", tenantID, leaseID, "lease-renew", "denied", "lease is no longer active or current")
+		http.Error(w, "lease is no longer active or current", http.StatusConflict)
+		return
+	}
+	expiryText := expiry.Format(time.RFC3339Nano)
+	s.db.Audit("agent", tenantID, leaseID, "lease-renew", "ok", expiryText)
+	writeJSON(w, http.StatusOK, map[string]string{"lease_expires_at": expiryText})
+}
+
 // handleAgentLease serves signed agent management: status, share, rotate,
 // revoke, close. Only the owning key may act (D04).
 func (s *Server) handleAgentLease(w http.ResponseWriter, r *http.Request) {
@@ -116,11 +210,20 @@ func (s *Server) handleAgentLease(w http.ResponseWriter, r *http.Request) {
 	var hostname, mode, state string
 	var port int
 	var gen, tokenGen int64
+	var expiresAt sql.NullString
 	err := s.db.SQL().QueryRow(
-		`SELECT hostname, port, access_mode, status, generation, token_generation FROM leases WHERE id=?`,
-		leaseID).Scan(&hostname, &port, &mode, &state, &gen, &tokenGen)
+		`SELECT hostname, port, access_mode, status, generation, token_generation, expires_at FROM leases WHERE id=?`,
+		leaseID).Scan(&hostname, &port, &mode, &state, &gen, &tokenGen, &expiresAt)
 	if err != nil {
 		http.Error(w, "unknown lease", http.StatusNotFound)
+		return
+	}
+	if strings.HasPrefix(action, "renew/") {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.handleLeaseRenew(w, tenant, keyID, leaseID, action, gen, state, expiresAt)
 		return
 	}
 	switch action {
@@ -136,11 +239,30 @@ func (s *Server) handleAgentLease(w http.ResponseWriter, r *http.Request) {
 		if sess, ok := s.liveSession(leaseID); ok && gen >= 0 && sess.Generation == uint64(gen) {
 			routeLive, liveGen = true, gen
 		}
+		expiry := ""
+		if expiresAt.Valid {
+			expiry = expiresAt.String
+		}
+		var renewedAt, renewalResult, renewalDetail string
+		_ = s.db.SQL().QueryRow(
+			`SELECT time, result, detail FROM audit_events WHERE lease_id=? AND category='lease-renew' ORDER BY id DESC LIMIT 1`, leaseID,
+		).Scan(&renewedAt, &renewalResult, &renewalDetail)
+		if renewalDetail != "" {
+			renewalResult += ": " + renewalDetail
+		}
+		leaseUnexpired := !expiresAt.Valid
+		if expiresAt.Valid {
+			if parsed, parseErr := time.Parse(time.RFC3339Nano, expiresAt.String); parseErr == nil && parsed.After(time.Now().UTC()) {
+				leaseUnexpired = true
+			}
+		}
+		routeAvailable := routeLive && state == "ACTIVE" && leaseUnexpired
 		writeJSON(w, http.StatusOK, map[string]any{
 			"lease_id": leaseID, "hostname": hostname, "port": port,
 			"access_mode": mode, "status": state, "generation": gen,
 			"url":        "https://" + hostname,
-			"route_live": routeLive, "live_generation": liveGen,
+			"route_live": routeLive, "route_available": routeAvailable, "live_generation": liveGen,
+			"lease_expires_at": expiry, "last_renewal_at": renewedAt, "last_renewal_result": renewalResult,
 		})
 	case "share":
 		if r.Method != http.MethodPost {

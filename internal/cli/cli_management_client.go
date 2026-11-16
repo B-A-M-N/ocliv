@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -43,28 +42,37 @@ func mgmtHTTPClient(timeout time.Duration) (*http.Client, error) {
 // mgmtCall performs a signed agent management request. Mutations carry a
 // one-time nonce the relay consumes; without a fresh nonce the relay
 // rejects the call as a potential replay (P1-07).
-func mgmtCall(relayURL string, k *identity.KeyPair, keyID, method, path string) (int, []byte) {
+func mgmtCall(relayURL string, k *identity.KeyPair, keyID, method, path string) (int, []byte, error) {
 	ts := time.Now().UTC()
 	nonce, err := agent.MgmtNonce()
 	if err != nil {
-		return 0, nil
+		return 0, nil, fmt.Errorf("creating management nonce: %w", err)
 	}
 	sig := ed25519.Sign(k.Private(), agent.MgmtMessage(keyID, method, path, ts, nonce))
-	req, _ := http.NewRequest(method, strings.TrimRight(relayURL, "/")+path, nil)
+	req, err := http.NewRequest(method, strings.TrimRight(relayURL, "/")+path, nil)
+	if err != nil {
+		return 0, nil, fmt.Errorf("building management request: %w", err)
+	}
 	req.Header.Set("X-Ocliv-Key", keyID)
 	req.Header.Set("X-Ocliv-TS", ts.Format(time.RFC3339Nano))
 	req.Header.Set("X-Ocliv-Nonce", nonce)
 	req.Header.Set("X-Ocliv-Sig", base64.StdEncoding.EncodeToString(sig))
 	client, err := mgmtHTTPClient(15 * time.Second)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error: unreadable OCLIV_CACERT bundle: "+err.Error())
-		return 0, nil
+		return 0, nil, fmt.Errorf("management TLS configuration: %w", err)
 	}
+	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, nil
+		return 0, nil, fmt.Errorf("management transport failure: %w", err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-	return resp.StatusCode, body
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024+1))
+	if err != nil {
+		return resp.StatusCode, nil, fmt.Errorf("reading management response: %w", err)
+	}
+	if len(body) > 64*1024 {
+		return resp.StatusCode, nil, fmt.Errorf("management response exceeds 65536-byte limit")
+	}
+	return resp.StatusCode, body, nil
 }
