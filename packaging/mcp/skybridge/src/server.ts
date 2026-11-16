@@ -56,7 +56,7 @@ export const app = new Skybridge({
     .registerTool({
       name:'request-approval', title:'Request a write approval',
       description:'Propose a publish/unpublish for human approval. Returns an approval ID only — the single-use code is never in this tool result and never in general logs. The human provides the code back for exactly that action through an operator-private channel. A model that only sees tool results cannot complete its own approval. Until that channel is provisioned, keep writes disabled.',
-      inputSchema:{action:z.enum(['publish','unpublish']),target:z.string().min(1).max(64)},
+      inputSchema:{action:z.enum(['publish','stop','unpublish']),target:z.string().min(1).max(64)},
       annotations:{readOnlyHint:false,openWorldHint:false,destructiveHint:false}, auth:{scopes:['ocliv:write']}
     }, async ({action,target},extra)=>{
       try {
@@ -125,6 +125,20 @@ export const app = new Skybridge({
       catch(e) {return failed(e);}
     })
     .registerTool({
+      name:'resume-service', title:'Resume a retained publication',
+      description:'Restart or reattach the publisher for an operator-allowlisted service, preserving its stable route identity. Use this after stop-service. Requires a single-use human approval bound to this service, ocliv:write, and OCLIV_WRITE_ENABLED=true.',
+      inputSchema:{serviceName:z.string().min(1).max(48),approvalId:z.string().min(1).max(128),approvalCode:z.string().min(1).max(128)},
+      annotations:{readOnlyHint:false,openWorldHint:false,destructiveHint:false}, auth:{scopes:['ocliv:write']}
+    }, async ({serviceName,approvalId,approvalCode},extra)=>{
+      try {
+        const subject = authorize(extra.http?.authInfo,subjects,'ocliv:write');
+        if (!publisher) return done({ok:false,code:'WRITE_DISABLED',message:'Publisher control is disabled (OCLIV_WRITE_ENABLED is not true)'});
+        approvals.redeem({subject,action:'publish',target:serviceName,approvalId,code:approvalCode});
+        return done({ok:true,...await publisher.publish(serviceName,`PUBLISH ${serviceName}`)});
+      }
+      catch(e) {return failed(e);}
+    })
+    .registerTool({
       name:'unpublish-service', title:'Unpublish one publication',
       description:'Stop the supervised local publisher (if it owns the route) and revoke exactly one publication via the signed native adapter. Requires a single-use human approval (approvalId from request-approval plus the code from the operator-private channel) bound to this exact publication ID. Requires ocliv:write and OCLIV_WRITE_ENABLED=true.',
       inputSchema:{publicationId:z.string().min(3).max(64),approvalId:z.string().min(1).max(128),approvalCode:z.string().min(1).max(128)},
@@ -136,6 +150,20 @@ export const app = new Skybridge({
         approvals.redeem({subject,action:'unpublish',target:publicationId,approvalId,code:approvalCode});
         const result = await publisher.unpublish(publicationId,publicationId,{revoker:(id)=>client.unpublish(id)});
         return done({ok:result.revoked==='REVOKED',...result});
+      }
+      catch(e) {return failed(e);}
+    })
+    .registerTool({
+      name:'stop-service', title:'Stop a publisher and retain its route',
+      description:'Gracefully stop the supervised publisher for one allowlisted service. Its stable route identity is retained offline and can be resumed with publish-service. Requires a single-use human approval bound to this service, ocliv:write, and OCLIV_WRITE_ENABLED=true.',
+      inputSchema:{serviceName:z.string().min(1).max(48),approvalId:z.string().min(1).max(128),approvalCode:z.string().min(1).max(128)},
+      annotations:{readOnlyHint:false,openWorldHint:false,destructiveHint:false}, auth:{scopes:['ocliv:write']}
+    }, async ({serviceName,approvalId,approvalCode},extra)=>{
+      try {
+        const subject = authorize(extra.http?.authInfo,subjects,'ocliv:write');
+        if (!publisher) return done({ok:false,code:'WRITE_DISABLED',message:'Publisher control is disabled (OCLIV_WRITE_ENABLED is not true)'});
+        approvals.redeem({subject,action:'stop',target:serviceName,approvalId,code:approvalCode});
+        return done({ok:true,...await publisher.stop(serviceName,`STOP ${serviceName}`)});
       }
       catch(e) {return failed(e);}
     })

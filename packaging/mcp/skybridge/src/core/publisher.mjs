@@ -43,7 +43,10 @@ export function parseService(raw) {
       (typeof raw.resourceFile !== 'string' || !raw.resourceFile.startsWith('/') || raw.resourceFile.includes('\0'))) {
     throw new PublisherError('INVALID_SERVICE', 'resourceFile must be an absolute local path');
   }
-  return { name: raw.name, localUrl: `${u.protocol}//${u.host}/mcp`, resourceFile: raw.resourceFile };
+  if (raw.auth !== 'upstream-oauth' && raw.auth !== 'ocliv-managed') {
+    throw new PublisherError('INVALID_SERVICE', 'Service auth must explicitly be upstream-oauth or ocliv-managed');
+  }
+  return { name: raw.name, localUrl: `${u.protocol}//${u.host}/mcp`, resourceFile: raw.resourceFile, auth: raw.auth };
 }
 
 export function loadPublisherConfig(env = process.env) {
@@ -103,10 +106,10 @@ export class PublisherController extends EventEmitter {
     this.children = new Map(); // name -> { child, routeUrl, startedAt, log: [], exited }
   }
 
-  /** Readiness probe: an unauthenticated tools/list must be denied with
-   * 401 — that proves ingress → relay → publisher forwarding is alive,
-   * rather than trusting a URL the child printed. Any other outcome
-   * (refused, wrong status, timeout) means the route is not serving. */
+  /** Boundary probe: an unauthenticated tools/list must be denied with
+   * 401. This proves the route answers from the publisher's network
+   * vantage and rejects missing credentials; it does not prove MCP
+   * execution, invalid-token rejection, or off-LAN reachability. */
   async probeRoute(routeUrl, { timeoutMs = 10000 } = {}) {
     let r;
     try {
@@ -123,7 +126,16 @@ export class PublisherController extends EventEmitter {
     if (r.status !== 401) {
       throw new PublisherError('PUBLISH_UNHEALTHY', `Readiness probe answered HTTP ${r.status} (want 401 auth challenge)`);
     }
-    return true;
+    return {
+      routeReachableFromPublisher: true,
+      missingBearerRejected: true,
+      protocolVerified: false,
+      resourceDiscoveryVerified: false,
+      invalidBearerRejected: false,
+      authenticatedToolsListVerified: false,
+      authenticatedToolExecutionVerified: false,
+      offLanReachabilityVerified: false,
+    };
   }
 
   statePath() { return join(this.c.home, STATE_FILE); }
@@ -254,10 +266,10 @@ export class PublisherController extends EventEmitter {
 
   /** Start (or reattach to) the supervised publisher for an allowlisted
    * service. Requires the exact confirmation `PUBLISH <name>`. Resolves
-   * with { routeUrl } once the CLI reports a route AND the readiness
-   * probe confirms the route serves (401 challenge); the child keeps
-   * running under supervision afterwards. Pass { probe: false } only
-   * when the caller performs its own equivalent health verification. */
+   * with { routeUrl, readiness } once the CLI reports a route and the
+   * boundary probe confirms a 401 challenge. Readiness facets explicitly
+   * state which stronger checks remain unproven. Pass { probe: false }
+   * only when the caller performs its own equivalent verification. */
   async publish(name, confirmation, { readyTimeoutMs = 90000, probe = true } = {}) {
     const svc = this.c.registry.get(name);
     if (!svc) throw new PublisherError('UNKNOWN_SERVICE', `No allowlisted service: ${name}`);
@@ -269,9 +281,10 @@ export class PublisherController extends EventEmitter {
       // lease, revoked publication) since it was first observed. Re-probe
       // before claiming health; on failure retire the stale child and
       // fall through to a fresh publish below.
+      let readiness = null;
       if (probe) {
         try {
-          await this.probeRoute(existing.routeUrl);
+          readiness = await this.probeRoute(existing.routeUrl);
         } catch {
           this.children.delete(name);
           try { existing.child.kill('SIGTERM'); } catch { /* already gone */ }
@@ -280,14 +293,15 @@ export class PublisherController extends EventEmitter {
       }
       const stillThere = this.children.get(name);
       if (stillThere && !stillThere.exited && stillThere.routeUrl) {
-        return { name, routeUrl: stillThere.routeUrl, resumed: true, probed: probe };
+        return { name, routeUrl: stillThere.routeUrl, resumed: true, probed: probe, readiness };
       }
       // Stale attachment retired; continue to fresh publish.
     }
-    const args = ['mcp', 'publish', '--local', svc.localUrl, '--auth', 'upstream-oauth', '--name', name];
+    const args = ['mcp', 'publish', '--local', svc.localUrl, '--auth', svc.auth, '--name', name];
     if (svc.resourceFile) args.push('--resource-file', svc.resourceFile);
     const childEnv = { HOME: this.c.home, PATH: '/usr/bin:/bin' };
     if (process.env.OCLIV_CACERT) childEnv.OCLIV_CACERT = process.env.OCLIV_CACERT;
+    if (process.env.OCLIV_PROFILE) childEnv.OCLIV_PROFILE = process.env.OCLIV_PROFILE;
     const child = this.spawnImpl(this.c.bin, args, { env: childEnv, cwd: this.c.home, stdio: ['ignore', 'pipe', 'pipe'] });
     if (!child || !child.stdout || !child.stderr || typeof child.pid !== 'number') {
       throw new PublisherError('SPAWN_FAILED', 'Publisher process failed to start');
@@ -332,11 +346,12 @@ export class PublisherController extends EventEmitter {
     };
     const deadline = this.now() + readyTimeoutMs;
     let probed = false;
+    let readiness = null;
     for (;;) {
-      if (rec.routeUrl && (!probe || probed)) return { name, routeUrl: rec.routeUrl, resumed: false, probed: probe };
+      if (rec.routeUrl && (!probe || probed)) return { name, routeUrl: rec.routeUrl, resumed: false, probed: probe, readiness };
       if (rec.routeUrl && probe && !probed) {
         try {
-          await this.probeRoute(rec.routeUrl);
+          readiness = await this.probeRoute(rec.routeUrl);
           probed = true;
         } catch (e) {
           if (e.code === 'PUBLISH_UNHEALTHY' && this.now() < deadline && !rec.exited) {
@@ -361,6 +376,24 @@ export class PublisherController extends EventEmitter {
       }
       await new Promise((r) => setTimeout(r, 250));
     }
+  }
+
+  /** Gracefully stop the managed child while retaining its durable route
+   * identity for a later publish/resume. The CLI closes its lease, leaving
+   * the route offline until it is rebound. */
+  async stop(name, confirmation) {
+    const svc = this.c.registry.get(name);
+    if (!svc) throw new PublisherError('UNKNOWN_SERVICE', `No allowlisted service: ${name}`);
+    if (confirmation !== `STOP ${name}`) throw new PublisherError('CONFIRMATION_REQUIRED', 'Stop requires the exact confirmation `STOP <name>`');
+    const rec = this.children.get(name);
+    if (!rec || rec.exited) return { name, stopped: false, retainedRoute: this.loadPersisted()[name]?.routeUrl ?? rec?.routeUrl ?? null };
+    await new Promise((resolve) => {
+      const timer = setTimeout(() => { try { rec.child.kill('SIGKILL'); } catch { /* already gone */ } resolve(); }, 5000);
+      rec.child.once('exit', () => { clearTimeout(timer); resolve(); });
+      try { rec.child.kill('SIGTERM'); } catch { clearTimeout(timer); resolve(); }
+    });
+    this.persistState();
+    return { name, stopped: true, retainedRoute: rec.routeUrl };
   }
 
   /** Stop the supervised child for a service. Revocation of the public

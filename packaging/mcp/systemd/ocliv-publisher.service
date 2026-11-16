@@ -8,17 +8,31 @@ Type=simple
 User=ocliv-publisher
 Group=ocliv-publisher
 EnvironmentFile=/etc/ocliv/publisher.env
-# Foreground publication: route registration, steady state, and cleanup
-# (route delete + lease close) on exit. No restart hides a revocation:
-# a revoked credential exits the publisher instead of reconnecting.
-ExecStart=/usr/local/bin/ocliv mcp publish --local http://127.0.0.1:18766/mcp --auth upstream-oauth --ttl 2h --strict-discovery --resource-file ${MCP_BINDING_FILE}
+StateDirectory=ocliv-publisher
+# Foreground publication follows the shared publisher contract:
+# SIGTERM closes the lease, while the publication stays registered
+# and offline for stable republish. Permanent removal uses `mcp unpublish`.
+ExecStart=/bin/sh -c '\
+[ -n "$${OCLIV_LOCAL_URL:-}" ] || { echo "ocliv-publisher: OCLIV_LOCAL_URL is unset" >&2; exit 2; }; \
+[ -n "$${OCLIV_AUTH:-}" ] || { echo "ocliv-publisher: OCLIV_AUTH must be set explicitly (upstream-oauth or ocliv-managed)" >&2; exit 2; }; \
+[ -n "$${OCLIV_PROFILE:-}" ] && export OCLIV_PROFILE; \
+set -- mcp publish --local="$${OCLIV_LOCAL_URL}" --auth="$${OCLIV_AUTH}"; \
+[ -n "$${OCLIV_NAME:-}" ] && set -- "$$@" --name="$${OCLIV_NAME}"; \
+[ -n "$${OCLIV_TTL:-}" ] && set -- "$$@" --ttl="$${OCLIV_TTL}"; \
+[ -n "$${OCLIV_STRICT:-}" ] && set -- "$$@" --strict-discovery; \
+[ -n "$${OCLIV_RESOURCE_FILE:-}" ] && set -- "$$@" --resource-file="$${OCLIV_RESOURCE_FILE}"; \
+exec $${OCLIV_BIN:-/usr/local/bin/ocliv} "$$@"'
 WorkingDirectory=/var/lib/ocliv-publisher
-Restart=no
+Restart=on-failure
+RestartPreventExitStatus=2 4 6 7
+RestartSec=30
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/ocliv-publisher
+ProtectHome=false
+ReadWritePaths=/var/lib/ocliv-publisher /var/lib/ocliv
+# Enrollment and lease state are owned by the service user under its home.
+ReadWritePaths=/home/ocliv-publisher/.config/ocliv
 
 [Install]
 WantedBy=multi-user.target

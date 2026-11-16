@@ -3,10 +3,8 @@
 # Usage: ./build-plugin.sh [--release] [out-dir]
 #
 # plugin/mcp.json ships a clearly-labeled REPLACE-WITH-* development
-# template URL (see plugin/README.md). A plain dev build keeps it and
-# warns. A --release build rejects any unresolved placeholder, lab
-# host, or loopback URL: release artifacts must point at a qualified
-# live route (qualified per plugin/skills/setup/SKILL.md).
+# template URL (see plugin/README.md). A --release build requires the
+# exact operator-qualified endpoint through OCLIV_QUALIFIED_MCP_URL.
 set -eu
 cd "$(dirname "$0")"
 
@@ -23,7 +21,8 @@ case "$OUT" in
 esac
 
 python3 - "$RELEASE" <<'EOF'
-import json, re, sys
+import datetime, json, os, re, subprocess, sys
+from urllib.parse import urlsplit
 
 release = sys.argv[1] == "1"
 failures = []
@@ -68,9 +67,9 @@ if mcp is not None:
     else:
         if entry.get("type") != "streamable-http":
             fail("mcp.json: mcpServers.ocliv.type must be 'streamable-http', got %r" % entry.get("type"))
-        url = entry.get("url", "")
+        url = os.environ.get("OCLIV_QUALIFIED_MCP_URL", "") if release else entry.get("url", "")
         if not isinstance(url, str) or not url:
-            fail("mcp.json: mcpServers.ocliv.url must be a nonempty string")
+            fail("mcp.json: release requires OCLIV_QUALIFIED_MCP_URL; dev builds require a nonempty template URL")
         else:
             if "relay.ocliv.test" in url or "ocliv.test" in url:
                 fail("mcp.json: url points at a lab host (ocliv.test); release and dev builds must never bake it in")
@@ -83,6 +82,42 @@ if mcp is not None:
                     print("warning: dev build keeps the REPLACE-WITH-* template URL (not a release artifact)")
             elif not url.startswith("https://"):
                 fail("mcp.json: url must use https, got %r" % url)
+            elif release:
+                host = (urlsplit(url).hostname or "").lower()
+                if host == "pop-os.tail8d285a.ts.net":
+                    fail("mcp.json: retired Ocliv Funnel host is offline; release URL must use a currently qualified public endpoint")
+                if not re.match(r"^https://[^/]+/r/[^/]+/mcp$", url):
+                    fail("mcp.json: OCLIV_QUALIFIED_MCP_URL must be an exact HTTPS /r/<route-id>/mcp endpoint")
+                receipt_path = os.environ.get("OCLIV_MCP_QUALIFICATION_RECEIPT", "")
+                verify_key = os.environ.get("OCLIV_RECEIPT_VERIFY_KEY", "")
+                expected_revision = os.environ.get("OCLIV_SOURCE_REVISION", "")
+                expected_digest = os.environ.get("OCLIV_ARTIFACT_SHA256", "").lower()
+                if not receipt_path:
+                    fail("mcp.json: release requires OCLIV_MCP_QUALIFICATION_RECEIPT from verify-ingress.sh")
+                if not verify_key or not expected_revision or not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+                    fail("release requires OCLIV_RECEIPT_VERIFY_KEY, OCLIV_SOURCE_REVISION, and a 64-hex OCLIV_ARTIFACT_SHA256")
+                else:
+                    try:
+                        subprocess.run(["openssl", "dgst", "-sha256", "-verify", verify_key,
+                                        "-signature", receipt_path + ".sig", receipt_path],
+                                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                        with open(receipt_path, encoding="utf-8") as f:
+                            receipt = json.load(f)
+                        checked = datetime.datetime.fromisoformat(receipt["checked_at"].replace("Z", "+00:00"))
+                        age = (datetime.datetime.now(datetime.timezone.utc) - checked).total_seconds()
+                        if receipt.get("route_url") != url:
+                            fail("qualification receipt URL does not match OCLIV_QUALIFIED_MCP_URL")
+                        if receipt.get("source_revision") != expected_revision:
+                            fail("qualification receipt source revision does not match OCLIV_SOURCE_REVISION")
+                        if receipt.get("artifact_sha256") != expected_digest:
+                            fail("qualification receipt artifact digest does not match OCLIV_ARTIFACT_SHA256")
+                        if not 0 <= age <= 3600:
+                            fail("qualification receipt must be no more than one hour old")
+                        for key in ("resource_discovery_verified", "authorization_server_discovery_verified", "missing_bearer_rejected", "invalid_bearer_rejected", "authenticated_tools_list_verified", "authenticated_tool_execution_verified"):
+                            if receipt.get(key) is not True:
+                                fail("qualification receipt lacks required result: %s" % key)
+                    except Exception as e:
+                        fail("cannot verify signed OCLIV_MCP_QUALIFICATION_RECEIPT: %s" % e)
 
 # --- skill frontmatter ---
 try:
@@ -122,6 +157,18 @@ mkdir -p "$ABS_OUT"
 rm -f "$ABS_OUT/ocliv-chatgpt-plugin.zip"
 EPOCH="${SOURCE_DATE_EPOCH:-1700000000}"
 rm -rf stage-plugin && cp -r plugin stage-plugin
+if [ "$RELEASE" = 1 ]; then
+  python3 - "$OCLIV_QUALIFIED_MCP_URL" <<'EOF'
+import json, sys
+path = "stage-plugin/mcp.json"
+with open(path, encoding="utf-8") as f:
+    manifest = json.load(f)
+manifest["mcpServers"]["ocliv"]["url"] = sys.argv[1]
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(manifest, f, indent=2)
+    f.write("\n")
+EOF
+fi
 find stage-plugin -exec touch -h -d "@$EPOCH" {} +
 (cd stage-plugin && find . -type f | LC_ALL=C sort | zip -X -9 -q -@ "$ABS_OUT/ocliv-chatgpt-plugin.zip")
 rm -rf stage-plugin

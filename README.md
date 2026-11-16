@@ -31,6 +31,18 @@ ocliv doctor     # key, relay reachability, local service, DNS/TLS
 `ocliv help` lists the five everyday commands first; relay, DNS, and
 identity administration live under Advanced.
 
+Use named profiles to keep staging and production enrollment keys and relay
+URLs separate. For example, create and select `production`, then log in to
+the production relay. You can inspect it without changing the active
+profile with `ocliv mcp list --profile production`.
+
+```sh
+ocliv profile create production
+ocliv profile use production
+ocliv login --relay https://production.example.net --code-file ./production-code.txt
+ocliv mcp list --profile production
+```
+
 ## What Ocliv is (and is not)
 
 | Capability | State |
@@ -81,13 +93,9 @@ See [docs/SETUP.md](docs/SETUP.md), [docs/HOME-HOST.md](docs/HOME-HOST.md),
   `--auth ocliv-managed`, which the bare `ocliv mcp PORT` alias defaults
   to, where the relay terminates OAuth for that one route. Anonymous
   fixtures are refused outright for publish.
-- stdio MCP servers can be published, but only with relay-managed
-  authorization: `mcp publish --stdio --auth ocliv-managed -- CMD`. The
-  child is started locally and pinned by your own argv (no remote client
-  picks the executable, arguments, workdir, or environment), runs behind
-  a loopback-bounded adapter, and the relay enforces the bearer.
-  `--stdio` with `upstream-oauth` is refused, because the stdio adapter
-  has no upstream OAuth to verify. `mcp expose` stays loopback-only and
-  is never remotely reachable.
+- `mcp publish --stdio --auth ocliv-managed --name NAME -- CMD` publishes a
+  stdio MCP server through isolated per-client Streamable HTTP sessions.
+  `--name` is required so its route remains stable across restarts;
+  `mcp expose` remains available for local-only use.
 - DNS tokens come from `DYNV6_TOKEN` or a `0600` file, never argv; transport
   errors are sanitized so tokens never reach logs or output.

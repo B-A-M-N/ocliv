@@ -13,10 +13,21 @@ The Ocliv control adapter, publisher controller, approvals, and their tests run 
 | `get-ocliv-status` | Read actual Ocliv management status | `ocliv:read` |
 | `list-publications` | Read endpoint list, render an inline React view | `ocliv:read` |
 | `verify-publication` | Real MCP initialize, initialized, tools/list handshake; no fake green status | `ocliv:read` |
-| `publish-mcp` | Publish an **already enrolled** service, authenticated-only; requires `confirm=PUBLISH` | `ocliv:write` |
-| `unpublish-mcp` | Delete exact publication; matching confirmation ID required | `ocliv:write` |
+| `request-approval` | Issue a single-use approval ID for publish, stop, or unpublish; the approval code stays in the operator-private channel | `ocliv:write` |
+| `publish-service` | Publish or reattach an allowlisted loopback service | `ocliv:write` plus approval |
+| `resume-service` | Restart a stopped publisher and rebind its retained route identity | `ocliv:write` plus approval |
+| `stop-service` | Gracefully stop its publisher and retain the route offline | `ocliv:write` plus approval |
+| `unpublish-service` | Stop its publisher and revoke the exact publication | `ocliv:write` plus approval |
 
 All tools additionally require the verified OAuth subject to match `OCLIV_ALLOWED_SUBJECTS`. Credentials are never placed in MCP tool output or UI state. The OAuth provider must issue access tokens with the configured audience and scopes.
+
+Publisher targets are configured on the publisher host with
+`OCLIV_SERVICES_JSON`. Each entry fixes a name, a loopback `/mcp` URL, and an
+explicit auth mode (`ocliv-managed` or `upstream-oauth`); remote tool callers
+can select only one of those entries. `OCLIV_PROFILE` may select the named
+enrollment profile used by spawned publishers. A stop closes the lease and
+keeps the stable route offline; resume republishes the same owner/name
+identity. Unpublish is the separate destructive action.
 
 ## Build and run on a hosted development environment
 

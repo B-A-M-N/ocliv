@@ -380,7 +380,7 @@ in disposable dirs (`/tmp`, never the tree):
 - `mcp publish --stdio -- echo hi` -> exit 2, usage, no route created.
 - NOTE (correction 2026-11-13): that command is refused because `--stdio`
   without `--auth ocliv-managed` is refused, not because stdio publication
-  is disabled. `mcp publish --stdio --auth ocliv-managed -- CMD` is
+  is disabled. `mcp publish --stdio --auth ocliv-managed --name stable-tools -- CMD` is
   supported (see the Round 31 NOTE). The original wording "remote-stdio
   refusal intact" described the behaviour correctly for the command as
   written but characterized it wrongly.

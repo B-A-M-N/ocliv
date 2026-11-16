@@ -13,29 +13,33 @@ publisher that already exited — the connection would be dead on arrival.
 
 Builds: `./packaging/mcp/build-plugin.sh [out-dir]` makes a dev ZIP
 (template URL allowed, warns loudly). Release builds take `--release`
-and refuse any unresolved `REPLACE-WITH-*` placeholder, lab host, or
-loopback URL — a release ZIP always points at a qualified live route.
+and require `OCLIV_QUALIFIED_MCP_URL` plus a fresh
+`OCLIV_MCP_QUALIFICATION_RECEIPT` from `scripts/verify-ingress.sh`. That
+probe verifies protected-resource metadata, the exact authorization-server
+issuer, missing and invalid bearer rejection,
+authenticated `tools/list`, and a successful authenticated harmless tool
+call. The receipt is tied to the exact endpoint and expires after one hour.
+See [`MCP-READINESS-CONTRACT.md`](../../../docs/qualification/MCP-READINESS-CONTRACT.md)
+for the distinction between route probing, release qualification, off-LAN
+reachability, and hosted-assistant acceptance. Builds reject the retired
+`pop-os.tail8d285a.ts.net` host, lab hosts, loopback URLs, and
+placeholders. The current public endpoint has not been qualified, so
+release packaging must remain blocked until one is supplied.
 
 ## Publishing a release ZIP for the current route
 
-Route IDs rotate on every `mcp publish`, so the source `mcp.json`
-keeps the placeholder and each release ZIP is built per-publication
-(never commit a transient route URL):
+The publication identity and route ID are stable across authorized
+publisher restarts for the same profile, name, host, and enrolled owner.
+They change only when that identity is explicitly removed/recreated or
+its identity inputs change. Keep the source `mcp.json` on its placeholder
+and build each release ZIP for the currently qualified route URL:
 
 ```sh
-R=$(cat ~/ocliv-funnel-lab/resource.url)   # active publication
-rm -rf /tmp/plugin-build && cp -r packaging/mcp /tmp/plugin-build
-cd /tmp/plugin-build
-python3 - "$R" <<'EOF'
-import json, sys
-with open("plugin/mcp.json") as f:
-    m = json.load(f)
-m["mcpServers"]["ocliv"]["url"] = sys.argv[1]
-with open("plugin/mcp.json", "w") as f:
-    json.dump(m, f, indent=2)
-    f.write("\n")
-EOF
-./build-plugin.sh --release /tmp/plugin-out   # must print validation OK
+export OCLIV_QUALIFIED_MCP_URL='https://<qualified-host>/r/<route-id>/mcp'
+export OCLIV_MCP_QUALIFICATION_RECEIPT="$HOME/releases/ocliv-mcp/<route-id>/qualification.json"
+./packaging/mcp/scripts/verify-ingress.sh --token-file="$HOME/.config/ocliv/upstream-token" \
+  --receipt="$OCLIV_MCP_QUALIFICATION_RECEIPT" "$OCLIV_QUALIFIED_MCP_URL"
+./packaging/mcp/build-plugin.sh --release "$HOME/releases/ocliv-mcp/<route-id>"
 ```
 
 Copy the resulting `ocliv-chatgpt-plugin.zip` to

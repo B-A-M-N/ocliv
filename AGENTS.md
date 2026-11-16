@@ -66,10 +66,51 @@ practical, corrected with the smallest coherent edit, and verified.
   a targeted crash-injection suite should be added when the promotion
   candidate is re-cut (the artifact changes anyway).
 
-Gates on the branch: `go build ./...`, `go vet ./...`, `gofmt -l internal/
-tests/` clean; `go test ./internal/... -count=1` green (19 packages);
-`go test -race` green for authz/cli/relay/setup/store; full integration
-suite green (252.8s, 420s cap).
+### 2026-11-15 post-rereview safety corrections (working tree)
+
+- Legacy MCP doctor probes now retain session and protocol headers; managed
+  mode requires a valid MCP tools/list reply. SSE probe replies are read
+  incrementally.
+- Lease renewal is opt-in for supervised MCP publishers, schedules from the
+  authoritative remaining expiry, and requires a 60-second minimum publish
+  TTL. Admission expiry uses a generation/status/expiry CAS. Existing streams
+  recheck current lease state at the old expiry and survive a real renewal.
+- The stale ChatGPT plugin ZIP embedding the retired
+  `pop-os.tail8d285a.ts.net` route was moved under the ignored local
+  `packaging/mcp/dist/superseded/` archive and removed from the deployable
+  filename. Release builds now require an exact endpoint and a fresh,
+  secret-free ingress qualification receipt proving both metadata
+  documents, negative bearer checks, authenticated `tools/list`, and
+  authenticated tool execution. No current public endpoint is qualified;
+  release remains on HOLD.
+- Backup snapshots carry an embedded format marker, so deleting a new-format
+  checksum sidecar cannot make the backup look legacy. Management calls
+  return transport errors separately from HTTP statuses. Publisher units now
+  allow only the required state paths and share the `OCLIV_RESOURCE_FILE`
+  name.
+- Upstream-OAuth publish proves `tools/list` with an optional local-only
+  `OCLIV_UPSTREAM_MCP_TOKEN`, then probes missing and invalid bearer
+  rejection. The explicit `--accept-unverified-upstream-auth` override
+  cannot waive protocol verification and labels the route NOT VERIFIED.
+- The ingress receipt now requires authenticated `tools/list` and a real
+  authenticated tool call; `tools/list` alone cannot certify execution.
+- The Streamable HTTP adapter has isolated children per session and official
+  Go MCP SDK interoperability tests. Public `mcp publish --stdio` is
+  supported with `--auth ocliv-managed` and an explicit `--name`, which
+  keeps the route stable across the adapter's ephemeral listener ports.
+  Production publication qualification remains a separate release gate.
+- Quiet-stream response writes are bounded and the default tests are fast.
+  The 45/90/180-second endurance run is opt-in locally and has a named manual
+  GitHub Actions job at `.github/workflows/long-stream-endurance.yml`.
+  Full public ChatGPT acceptance, off-LAN reachability, and production
+  promotion remain NOT VERIFIED/HOLD.
+
+Current working-tree source gates (2026-11-15): `go test ./... -count=1 -timeout=420s` PASS (integration package 270.8s); `go test -race ./internal/mcp ./internal/cli ./internal/relay` PASS; `go build ./...`, `go vet ./...`, `gofmt -l internal tests`, and `git diff --check` PASS.
+`npm run check` in `packaging/mcp/skybridge` PASS (typecheck, five Node test
+files, and production build; PostHog telemetry flush was blocked by restricted
+DNS and did not fail the build). The current 45/90/180-second endurance run
+also PASSED in 316.0s. These are source checks only; they do not qualify a
+public endpoint or the frozen production artifact.
 
 ### 2026-11-15 rereview artifact qualification — candidate realigned to 2089516
 

@@ -7,7 +7,7 @@ import { PublisherController, PublisherError, loadPublisherConfig, parseService,
 
 const BIN = '/bin/true'; // any executable: spawn is injected, never run
 const HOME = '/tmp/ocliv-pub-test';
-const SVC = { name: 'lab', localUrl: 'http://127.0.0.1:18767/mcp', resourceFile: '/tmp/ocliv-pub-test/resource.url' };
+const SVC = { name: 'lab', localUrl: 'http://127.0.0.1:18767/mcp', resourceFile: '/tmp/ocliv-pub-test/resource.url', auth: 'upstream-oauth' };
 
 function cfg(extra = {}) {
   return loadPublisherConfig({ OCLIV_BIN: BIN, OCLIV_PUBLISHER_HOME: HOME, OCLIV_SERVICES_JSON: JSON.stringify([SVC]), ...extra });
@@ -33,7 +33,7 @@ test('config rejects remote URLs, bad names, relative paths', () => {
   assert.throws(() => parseService({ name: 'x', localUrl: 'http://127.0.0.1/mcp' }), { code: 'INVALID_SERVICE' }); // no port
   assert.throws(() => parseService({ name: '../evil', localUrl: 'http://127.0.0.1:8/mcp' }), { code: 'INVALID_SERVICE' });
   assert.throws(() => parseService({ name: 'ok', localUrl: 'http://127.0.0.1:8/mcp', resourceFile: 'relative/path' }), { code: 'INVALID_SERVICE' });
-  const ok = parseService({ name: 'ok-name_1', localUrl: 'http://127.0.0.1:18767/mcp' });
+  const ok = parseService({ name: 'ok-name_1', localUrl: 'http://127.0.0.1:18767/mcp', auth: 'ocliv-managed' });
   assert.equal(ok.localUrl, 'http://127.0.0.1:18767/mcp');
 });
 
@@ -69,6 +69,40 @@ test('publish single-flights; resumes when route known', async () => {
   await p;
   const resumed = await c.publish('lab', 'PUBLISH lab', { probe: false });
   assert.equal(resumed.resumed, true);
+});
+
+test('operator stop retains route and resume reuses the same publication identity', async (t) => {
+  const started = [];
+  const c = new PublisherController(cfg({
+    OCLIV_SERVICES_JSON: JSON.stringify([{ ...SVC, auth: 'ocliv-managed' }]),
+  }), { spawnImpl: fakeSpawnFactory(t, (s) => started.push(s)) });
+  const first = c.publish('lab', 'PUBLISH lab', { readyTimeoutMs: 5000, probe: false });
+  await new Promise((r) => setTimeout(r, 20));
+  const firstRec = c.children.get('lab');
+  firstRec.child.stderr.emit('data', 'https://edge.example/r/route-abc-9/mcp\n');
+  const firstOut = await first;
+  assert.deepEqual(started[0].args, [
+    'mcp', 'publish', '--local', SVC.localUrl, '--auth', 'ocliv-managed',
+    '--name', 'lab', '--resource-file', SVC.resourceFile,
+  ]);
+  await assert.rejects(c.stop('lab', 'STOP wrong'), { code: 'CONFIRMATION_REQUIRED' });
+  firstRec.child.once = (event, fn) => {
+    if (event === 'exit') setTimeout(() => { firstRec.exited = true; fn(0); }, 10);
+    return firstRec.child;
+  };
+  const stopped = await c.stop('lab', 'STOP lab');
+  assert.equal(stopped.stopped, true);
+  assert.equal(stopped.retainedRoute, firstOut.routeUrl);
+  assert.equal(firstRec.child.killed, 'SIGTERM');
+  assert.equal(c.loadPersisted().lab.routeUrl, firstOut.routeUrl);
+
+  const resumed = c.publish('lab', 'PUBLISH lab', { readyTimeoutMs: 5000, probe: false });
+  await new Promise((r) => setTimeout(r, 20));
+  c.children.get('lab').child.stderr.emit('data', firstOut.routeUrl + '\n');
+  const resumedOut = await resumed;
+  assert.equal(resumedOut.routeUrl, firstOut.routeUrl);
+  assert.equal(started.length, 2);
+  assert.equal(started[1].args[5], 'ocliv-managed');
 });
 
 test('publish surfaces early child exit, never a fake route', async () => {
@@ -300,6 +334,16 @@ test('publish probes route health before reporting success', async (t) => {
   const out = await p;
   assert.equal(out.routeUrl, url);
   assert.equal(out.probed, true);
+  assert.deepEqual(out.readiness, {
+    routeReachableFromPublisher: true,
+    missingBearerRejected: true,
+    protocolVerified: false,
+    resourceDiscoveryVerified: false,
+    invalidBearerRejected: false,
+    authenticatedToolsListVerified: false,
+    authenticatedToolExecutionVerified: false,
+    offLanReachabilityVerified: false,
+  });
   assert.deepEqual(seen, [url]);
 });
 

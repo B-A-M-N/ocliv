@@ -32,6 +32,11 @@ Anonymous fixtures are local-only (`mcp serve`) and are refused by
 `mcp publish`: an unprotected public tool endpoint is never created
 implicitly.
 
+Readiness is reported as separate evidence facets. The Go publisher, the
+Skybridge 401 boundary probe, release receipt, off-LAN check, and hosted
+assistant check prove different things; see
+[`MCP-READINESS-CONTRACT.md`](qualification/MCP-READINESS-CONTRACT.md).
+
 ## Quickstart A — upstream OAuth (server already authenticates)
 
 1. Install the `ocliv` binary and enroll once:
@@ -40,6 +45,16 @@ implicitly.
    (e.g. `http://127.0.0.1:8765/mcp`).
 3. Publish it:
    `ocliv mcp publish --local http://127.0.0.1:8765/mcp --auth upstream-oauth`
+   If the local server requires a bearer for MCP requests, set
+   `OCLIV_UPSTREAM_MCP_TOKEN` in the publisher environment to a valid,
+   short-lived token so the command can prove `tools/list`. The token is
+   sent only to the local server and is not printed or persisted. Before
+   publication proceeds, Ocliv separately checks that both a missing
+   bearer and an invalid bearer are rejected. If it cannot prove that
+   boundary, publish refuses by default. The explicit
+   `--accept-unverified-upstream-auth` option allows a protocol-verified
+   route to run with that facet marked **NOT VERIFIED**; do not register
+   such a route with ChatGPT or treat it as release-qualified.
    The command prints one stable endpoint:
    `https://<relay-host>/r/<route-id>/mcp`. The route ID is an opaque
    identifier, not a secret — it authorizes nothing by itself.
@@ -115,30 +130,18 @@ never outlives the route it authorized.
 
 ## stdio MCP servers
 
-Publishing a **stdio** MCP server is supported **only with
-relay-managed authorization**:
+Public stdio publishing uses one isolated child per negotiated
+Streamable HTTP session and is available only with relay-managed OAuth:
 
+```sh
+ocliv mcp publish --stdio --auth ocliv-managed --name personal-tools -- \
+  /path/to/mcp-server
 ```
-ocliv mcp publish --stdio --auth ocliv-managed -- /usr/local/bin/my-mcp-server --flag value
-```
 
-The child is started locally, pinned by the argv you typed — no remote
-client can select executables, arguments, directories, or environment —
-and runs behind a bounded adapter bound to loopback only. The relay
-terminates authorization for the route, so the external bearer never
-reaches the child. The route URL is registered and served only after the
-local MCP session is verified.
-
-The other stdio shapes are refused, deliberately:
-
-| Command | Why refused |
-|---|---|
-| `publish --stdio --auth upstream-oauth` | the stdio adapter has no upstream OAuth to verify, so the resource binding cannot be proven |
-| `mcp serve --stdio` | serve has no route, so a stdio child would be unreachable |
-| `publish --stdio` with no command after `--` | there is nothing to run |
-
-For purely local use, `ocliv mcp expose -- COMMAND` still adapts an
-operator-selected stdio child and never becomes remotely reachable.
+`--name` is required because the adapter receives a new ephemeral loopback
+port on each start; keeping the name stable reuses the same route. For
+local-only use, `ocliv mcp expose -- COMMAND` remains available.
+Production route and external-client qualification remain separate gates.
 `mcp serve --auth fixture-anonymous` is the local-only demo path — never
 a public route.
 

@@ -1,0 +1,20 @@
+name: Long stream endurance
+
+on:
+  workflow_dispatch:
+
+jobs:
+  relay-stream-endurance:
+    name: 45/90/180-second MCP quiet subscriptions
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run quiet-stream endurance cases
+        env:
+          OCLIV_LONG_STREAM_TESTS: "1"
+        run: go test ./internal/relay -run '^TestQuietMCPSubscriptionEndurance$' -count=1 -timeout=420s

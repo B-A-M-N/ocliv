@@ -1,10 +1,12 @@
 # Production promotion runbook — qualified candidate `2089516`
 
-**Status: QUALIFIED IN ISOLATED PI STAGING, AWAITING OPERATOR APPROVAL.**
+**Status: HOLD — remediation changes after this qualified artifact require a new build and qualification record.**
 This is the promotion package for the remediated Ocliv candidate. It rests on
 a **passing, reproducible isolated qualification** of the exact ARM64 artifact
-on PiInDaSky. **No production change has been made.** Every privileged step is
-an explicit operator gate. Do not execute until you choose to promote.
+on PiInDaSky. The artifact below remains evidence for source `2089516` only;
+subsequent source fixes in the review branch are not covered by that evidence.
+**Do not promote a binary containing those fixes using this artifact record.**
+No production change has been made.
 
 ---
 
@@ -27,11 +29,13 @@ clean-host service rollback, autoEnroll relay-identity verification,
 read-only inventory commands). Earlier binaries must not be deployed.
 Provenance: `docs/qualification/pi-staging/PROVENANCE.txt`.
 
-Build (off-Pi, on the build host, from a clean checkout of `19d46d8`):
+Build (off-Pi, on the build host, from a clean checkout of the exact qualified source commit):
 ```
-cd <clean clone at 19d46d8>
-GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o /tmp/ocliv-arm64 ./cmd/ocliv
-sha256sum /tmp/ocliv-arm64    # MUST equal 65ed20b2... above
+cd <clean clone at 2089516da0180dee0ee95b6c915335e6cdf572c4>
+RELEASE_DIR="$HOME/releases/ocliv/2089516"
+mkdir -p "$RELEASE_DIR"
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o "$RELEASE_DIR/ocliv-arm64" ./cmd/ocliv
+printf '%s  %s\n' '65ed20b21eddb40b3cdf3fbb60388dc7deb81066fec6dda9c0142043727b8a53' "$RELEASE_DIR/ocliv-arm64" | sha256sum --check
 ```
 
 ---
@@ -143,15 +147,20 @@ noted for post-upgrade re-registration.
 ```
 TS=$(date -u +%Y%m%d-%H%M%S)
 sudo /usr/local/bin/ocliv relay backup --data /var/lib/ocliv --out /var/lib/ocliv/ocliv.db.bak-$TS
-sudo sha256sum /var/lib/ocliv/ocliv.db.bak-$TS | sudo tee /var/lib/ocliv/ocliv.db.bak-$TS.sha256
+# Ocliv creates and verifies the .sha256 sidecar itself; do not overwrite it.
+sudo /usr/local/bin/ocliv relay validate-backup --in /var/lib/ocliv/ocliv.db.bak-$TS
+# Optional independent evidence goes to a distinct path, never the .sha256 sidecar.
+sudo sha256sum /var/lib/ocliv/ocliv.db.bak-$TS | sudo tee /var/lib/ocliv/ocliv.db.bak-$TS.external.sha256
 sudo chmod 600 /var/lib/ocliv/ocliv.db.bak-$TS*
 ```
+Proceed to Step 2 and binary replacement only after `relay validate-backup`
+has succeeded. Preserve both the database snapshot and Ocliv-generated sidecar.
 
 ### Step 2 — Build + stage the candidate (build host; digest MUST match §1)
 ```
 # already built; verify the digest before transfer:
-sha256sum /tmp/ocliv-arm64    # == 65ed20b2...
-scp /tmp/ocliv-arm64 bamn@10.9.66.170:/tmp/ocliv-new
+sha256sum "$RELEASE_DIR/ocliv-arm64"    # == 65ed20b2...
+scp "$RELEASE_DIR/ocliv-arm64" bamn@10.9.66.170:/tmp/ocliv-new
 ssh bamn@10.9.66.170 'sha256sum /tmp/ocliv-new'   # confirm 65ed20b2... on the Pi
 ```
 

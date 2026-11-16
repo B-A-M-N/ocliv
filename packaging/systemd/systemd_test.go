@@ -1,6 +1,9 @@
 package systemd
 
 import (
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -55,5 +58,93 @@ func TestDNSRefreshUnits(t *testing.T) {
 	}
 	if strings.Contains(timer, "WantedBy=multi-user.target") {
 		t.Fatal("refresh timer must be timer-activated, not boot-activated as a service")
+	}
+}
+
+func TestPublisherUnitsShareSupervisionContract(t *testing.T) {
+	_, source, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve test source path")
+	}
+	root := filepath.Dir(source)
+	units := []string{
+		filepath.Join(root, "ocliv-mcp-publisher.service"),
+		filepath.Join(root, "..", "mcp", "systemd", "ocliv-publisher.service"),
+	}
+	for i, path := range units {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read publisher unit %s: %v", path, err)
+		}
+		unit := string(raw)
+		for _, want := range []string{
+			"OCLIV_LOCAL_URL",
+			"OCLIV_AUTH",
+			"OCLIV_NAME",
+			"OCLIV_TTL",
+			"OCLIV_RESOURCE_FILE",
+			"Restart=on-failure",
+			"RestartPreventExitStatus=2 4 6 7",
+			"RestartSec=30",
+			"stays registered",
+			"mcp unpublish",
+		} {
+			if !strings.Contains(unit, want) {
+				t.Errorf("%s lacks shared publisher contract field %q", path, want)
+			}
+		}
+		if start := strings.Index(unit, "ExecStart="); start < 0 {
+			t.Errorf("%s has no supervised ExecStart", path)
+		} else {
+			execStart := unit[start:]
+			if end := strings.Index(execStart, "\nWorkingDirectory="); end >= 0 {
+				execStart = execStart[:end]
+			}
+			if end := strings.Index(execStart, "\nRestart="); end >= 0 {
+				execStart = execStart[:end]
+			}
+			if strings.Contains(execStart, "mcp unpublish") {
+				t.Errorf("%s permanently unpublishes during supervised startup", path)
+			}
+		}
+		homeStore := "/home/ocliv/.config/ocliv"
+		if i == 1 {
+			homeStore = "/home/ocliv-publisher/.config/ocliv"
+		}
+		hasHomeWrite := false
+		for _, line := range strings.Split(unit, "\n") {
+			if paths, ok := strings.CutPrefix(line, "ReadWritePaths="); ok {
+				for _, path := range strings.Fields(paths) {
+					if path == homeStore {
+						hasHomeWrite = true
+					}
+				}
+			}
+		}
+		if strings.Contains(unit, "ProtectHome=true") || !hasHomeWrite {
+			t.Errorf("%s blocks the home-scoped enrollment store required by the publisher", path)
+		}
+		if i == 1 {
+			if !strings.Contains(unit, "StateDirectory=ocliv-publisher") {
+				t.Errorf("%s does not provision its resource-file state directory", path)
+			}
+		}
+	}
+	envPath := filepath.Join(root, "ocliv-mcp-publisher.env.example")
+	env, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("read publisher environment example: %v", err)
+	}
+	for _, want := range []string{"OCLIV_LOCAL_URL=", "OCLIV_AUTH=", "OCLIV_NAME=", "OCLIV_TTL=", "OCLIV_RESOURCE_FILE="} {
+		if !strings.Contains(string(env), want) {
+			t.Errorf("publisher environment example lacks %q", want)
+		}
+	}
+	duplicateEnv, err := os.ReadFile(filepath.Join(root, "..", "mcp", "config", "publisher.env.example"))
+	if err != nil {
+		t.Fatalf("read duplicate publisher environment example: %v", err)
+	}
+	if !strings.Contains(string(duplicateEnv), "OCLIV_RESOURCE_FILE=") || strings.Contains(string(duplicateEnv), "MCP_BINDING_FILE=") {
+		t.Fatalf("duplicate publisher env example does not match systemd variable: %s", duplicateEnv)
 	}
 }

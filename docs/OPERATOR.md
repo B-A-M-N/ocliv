@@ -44,8 +44,11 @@ silent resurrection of old authority.
 Forwarding termination: the in-process path evicts live sessions at
 commit, and per-request admission evicts on the next denied request; a
 CLI-driven revocation without a local Server converges through the
-relay's 5s supervise revalidation. Bound all leases with TTLs so the
-worst case stays time-boxed.
+relay's 5s supervise revalidation. Finite-TTL agents renew their current
+generation before expiry using signed, one-time management requests. A
+failed renewal retries only until the known expiry deadline; the agent then
+reconnects through the ordinary authenticated resume path. Revoked keys and
+closed leases never gain a renewal exception.
 
 ## Restart semantics (P1 — fail-closed session invalidation)
 
@@ -57,7 +60,8 @@ by design, not a rotation service.
 
 Lease rows are durable: restart runs `reconcileBoot`, which moves
 `ACTIVE` leases to `RECONNECTING` (bounded by the reconnect grace) and
-expires lapsed TTLs. Agents reconnect and resume live leases; nothing
+expires lapsed TTLs. The agent reconnects, receives a new generation, then
+resumes renewal against the relay's persisted expiry. Nothing
 resurrects `CLOSED`/`REVOKED`/`EXPIRED` rows. Revocations, token
 generation bumps, and audit history all survive restarts — restore from
 an older backup can still resurrect revoked identities (H06), so treat
@@ -118,6 +122,16 @@ systemctl start ocliv-relay
 
 `backup` is a consistent online snapshot (VACUUM INTO, owner-only);
 `restore` is explicitly offline and fail-closed:
+
+- Backup paths are immutable. Choose a new timestamped destination for each
+  snapshot; Ocliv refuses to replace an existing backup or checksum. It
+  publishes a `.pending` marker while installing the database and `.sha256`
+  sidecar. `relay validate-backup --in FILE` must succeed before relying on
+  the snapshot. A complete database/checksum pair remains valid if a crash
+  leaves the marker; an incomplete pair with a marker is rejected.
+- Restore stages and syncs the candidate, checkpoints the old database, then
+  removes its WAL sidecars before the atomic replacement. If interrupted
+  before replacement, the checkpointed old database remains readable.
 
 - The relay must be stopped first; without `--relay-stopped` restore
   refuses, and an active writer on the live database also refuses.

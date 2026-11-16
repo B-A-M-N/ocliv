@@ -13,11 +13,9 @@
 #   the process catches SIGTERM, closes the lease, and exits; the route
 #   stays registered but offline (503) until republished. `systemctl
 #   start` re-publishes and rebinds the same stable route ID.
-# - There is NO in-unit permanent unpublish. If the publication itself
-#   must end (route gone for good), stop the unit AND disable it
-#   (`systemctl disable --now ocliv-mcp-publisher`), then verify with
-#   `ocliv mcp doctor` that no route remains. Stopping alone leaves the
-#   unit enabled and a later boot/start will re-publish.
+# - Permanent removal requires `ocliv mcp unpublish --name LABEL` after
+#   stopping the unit. Disabling the unit only prevents boot activation;
+#   it does not remove the retained publication.
 #
 # ENROLLMENT: the service user (ocliv) must already be enrolled
 # (`ocliv login` run as that user: key + relay URL live in
@@ -61,7 +59,9 @@ StateDirectory=ocliv-mcp-publisher
 # Missing OCLIV_LOCAL_URL fails with exit 2 (config error, no restart).
 ExecStart=/bin/sh -c '\
 [ -n "$${OCLIV_LOCAL_URL:-}" ] || { echo "ocliv-mcp-publisher: OCLIV_LOCAL_URL is unset (see /etc/ocliv/publisher.env)" >&2; exit 2; }; \
-set -- mcp publish --local="$${OCLIV_LOCAL_URL}" --auth="$${OCLIV_AUTH:-upstream-oauth}"; \
+[ -n "$${OCLIV_AUTH:-}" ] || { echo "ocliv-mcp-publisher: OCLIV_AUTH must be set explicitly (upstream-oauth or ocliv-managed)" >&2; exit 2; }; \
+[ -n "$${OCLIV_PROFILE:-}" ] && export OCLIV_PROFILE; \
+set -- mcp publish --local="$${OCLIV_LOCAL_URL}" --auth="$${OCLIV_AUTH}"; \
 [ -n "$${OCLIV_NAME:-}" ] && set -- "$$@" --name="$${OCLIV_NAME}"; \
 [ -n "$${OCLIV_TTL:-}" ] && set -- "$$@" --ttl="$${OCLIV_TTL}"; \
 [ -n "$${OCLIV_STRICT:-}" ] && set -- "$$@" --strict-discovery; \
@@ -93,7 +93,7 @@ ProtectSystem=strict
 # enrollment (key + relay URL) and the lease store live in
 # ~ocliv/.config/ocliv (config.DataDir), and orderly cleanup REMOVES the
 # closed lease record there — a protected $HOME would break unpublish.
-ReadWritePaths=/var/lib/ocliv-mcp-publisher /var/lib/ocliv
+ReadWritePaths=/var/lib/ocliv-mcp-publisher /var/lib/ocliv /home/ocliv/.config/ocliv
 
 [Install]
 WantedBy=multi-user.target
