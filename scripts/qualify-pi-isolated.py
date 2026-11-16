@@ -79,12 +79,8 @@ def tally():
             start_child(["python3",UPSTREAM,"28099"],os.path.join(S,"upstream.log"),env=ENV,required=[UPSTREAM,"28099"]);time.sleep(1)
     return {"execs":-1}
 def db_routes():
-    q="import sqlite3;c=sqlite3.connect('"+DB+"/ocliv.db');print(' '.join(r[0] for r in c.execute(\"SELECT route_id FROM mcp_publications WHERE revoked_at IS NULL\")))"
+    q="import sqlite3;c=sqlite3.connect('file:"+DB+"/ocliv.db?mode=ro',uri=True);print(' '.join(r[0] for r in c.execute(\"SELECT route_id FROM mcp_publications WHERE revoked_at IS NULL AND verified_at IS NOT NULL ORDER BY pub_name\")))"
     return sh(["python3","-c",q]).stdout.split()
-def cli_routes(env):
-    out=sh([BIN,"mcp","list"],{**env,"OCLIV_RELAY_URL":BASE}).stdout
-    toks=re.findall(r'\b[A-Za-z0-9_-]{20,}\b', out)
-    return [t for t in toks if not t.startswith('lse-') and not t.startswith('key-') and not t.startswith('ocliv-')]
 ENV={"HOME":os.path.join(S,"qual-home"),"OCLIV_RELAY_URL":BASE};os.makedirs(ENV["HOME"],mode=0o700,exist_ok=True);os.chmod(ENV["HOME"],0o700)
 
 def assert_ports_free():
@@ -123,7 +119,7 @@ else: raise RuntimeError("isolated MCP upstream did not start")
 import sys
 print("== Phase A: routes ==")
 ra=rb=None
-cr=cli_routes(ENV)
+cr=db_routes()
 if len(cr)>=2: ra,rb=cr[0],cr[1]
 elif len(cr)==1: ra=cr[0]
 if not ra:
@@ -138,12 +134,12 @@ if not ra:
     login=sh([BIN,"login","--relay",BASE,"--code-file",code_path],ENV)
     if login.returncode: raise RuntimeError("staging login failed: "+login.stderr[:200])
     start_child([BIN,"mcp","publish","--local","http://127.0.0.1:28099/mcp","--auth","ocliv-managed","--name","qa","--ttl","30m","--relay",BASE],os.path.join(S,"pub-qa.log"),env=ENV,required=["mcp","publish","--name","qa"])
-    time.sleep(5); cr=cli_routes(ENV); ra=cr[0] if cr else None
+    time.sleep(5); cr=db_routes(); ra=cr[0] if cr else None
 if ra and not rb:
     start_child([BIN,"mcp","publish","--local","http://127.0.0.1:28099/mcp","--auth","ocliv-managed","--name","qb","--ttl","30m","--relay",BASE],os.path.join(S,"pub-qb.log"),env=ENV,required=["mcp","publish","--name","qb"])
-    time.sleep(5); cr=cli_routes(ENV); rb=cr[1] if len(cr)>1 else None
+    time.sleep(5); cr=db_routes(); rb=cr[1] if len(cr)>1 else None
 print("ra",ra,"rb",rb)
-check("A: two managed routes active",bool(ra and rb),"A=%s B=%s"%(ra,rb))
+check("A: two distinct managed routes active",bool(ra and rb and ra!=rb),"A=%s B=%s"%(ra,rb))
 import socket as _sk
 _sk_create=_sk.create_connection(("127.0.0.1",28085),3)
 _sk_create.sendall(b"GET /health/live HTTP/1.0\r\nHost: x\r\n\r\n")
