@@ -375,7 +375,8 @@ func decodeJSONRPC(resp *http.Response, raw []byte) (map[string]any, error) {
 		return nil, &mcpStatusError{code: resp.StatusCode}
 	}
 	body := raw
-	if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+	trimmed := strings.TrimSpace(string(raw))
+	if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") && !strings.HasPrefix(trimmed, "{") {
 		body = nil
 		for _, line := range strings.Split(string(raw), "\n") {
 			if d, ok := strings.CutPrefix(strings.TrimSpace(line), "data:"); ok {
