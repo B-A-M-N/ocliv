@@ -28,18 +28,17 @@ const (
 	// MaxPendingConsentsPerRoute bounds outstanding (unconsumed,
 	// unexpired) consent challenges per route.
 	MaxPendingConsentsPerRoute = 100
-	// MaxPendingClientAge bounds how long a registration that has never
-	// received operator approval stays durable. Public DCR is
-	// unauthenticated, so without a lifetime a full route's client table
-	// could be permanently exhausted by registrations nobody completes.
-	// Reclamation only ever touches clients with NO grant row: an
-	// approved (or revoked) identity carries authorization state and is
-	// never deleted to make room.
+	// MaxPendingClientAge bounds the normal retention of a registration
+	// that has never received operator approval. Public DCR is
+	// unauthenticated, so abandoned entries are pruned after this window.
+	// At quota, the oldest unrevoked no-grant entry may be evicted earlier;
+	// every identity with a grant row and every revoked ID reservation is
+	// retained.
 	MaxPendingClientAge = 24 * time.Hour
 )
 
-// ErrClientQuota reports a route whose durable client table is full. The
-// handler maps it to a bounded 429 after safe reclamation.
+// ErrClientQuota reports a route whose client table is full and contains
+// no safely evictable unapproved registration.
 var ErrClientQuota = fmt.Errorf("authz: route client quota exhausted")
 
 // GrantStatus is the operator approval state of a client grant.
@@ -193,10 +192,10 @@ type Store interface {
 	// CountPendingConsents reports unconsumed, unexpired consent
 	// challenges for a route.
 	CountPendingConsents(tenant, route string) (int, error)
-	// TryRegisterClient registers a client only if the route's client
-	// table still has room, as ONE atomic step: the bound check and the
-	// insert share a transaction, so concurrent public registrations
-	// cannot cross the quota. ErrClientQuota reports exhaustion.
+	// TryRegisterClient enforces the per-route client bound and inserts
+	// atomically. If full, it evicts the oldest unrevoked registration
+	// with no grant; granted identities and revoked ID reservations are
+	// retained. ErrClientQuota reports a full route with no safe eviction.
 	TryRegisterClient(c Client) error
 	// PruneAbandonedClients deletes registrations that are older than
 	// MaxPendingClientAge and have NO grant row on this route: pending
@@ -537,10 +536,10 @@ func (m *MemStore) CountClients(tenant, route string) (int, error) {
 	return n, nil
 }
 
-// TryRegisterClient is the in-memory bound check + insert under the store
-// mutex, so it is atomic by construction. It deliberately does NOT call
-// RegisterClient: sync.Mutex is not reentrant, so the insert is inlined
-// here under the same lock hold.
+// TryRegisterClient is the in-memory bound check, safe LRU eviction, and
+// insert under the store mutex, so the operation is atomic by construction.
+// It deliberately does NOT call RegisterClient: sync.Mutex is not
+// reentrant, so the insert is inlined here under the same lock hold.
 func (m *MemStore) TryRegisterClient(c Client) error {
 	if c.ID == "" {
 		return fmt.Errorf("authz: client id is required")
@@ -551,15 +550,33 @@ func (m *MemStore) TryRegisterClient(c Client) error {
 		return fmt.Errorf("authz: client %q already registered", c.ID)
 	}
 	n := 0
+	claimed := make(map[string]bool, len(m.grants))
+	for _, g := range m.grants {
+		claimed[grantKey(g.ClientID, g.Tenant, g.Route)] = true
+	}
+	oldestID := ""
+	var oldest time.Time
 	for _, existing := range m.clients {
 		if existing.Tenant == c.Tenant && existing.Route == c.Route {
 			n++
+			if existing.RevokedAt == nil && !claimed[grantKey(existing.ID, existing.Tenant, existing.Route)] &&
+				(oldestID == "" || existing.CreatedAt.Before(oldest) ||
+					existing.CreatedAt.Equal(oldest) && existing.ID < oldestID) {
+				oldestID = existing.ID
+				oldest = existing.CreatedAt
+			}
 		}
 	}
 	if n >= MaxClientsPerRoute {
-		return ErrClientQuota
+		if oldestID == "" {
+			return ErrClientQuota
+		}
+		delete(m.clients, oldestID)
 	}
 	cp := c
+	if cp.CreatedAt.IsZero() {
+		cp.CreatedAt = time.Now()
+	}
 	m.clients[c.ID] = &cp
 	return nil
 }

@@ -2,7 +2,9 @@ package authz
 
 import (
 	"database/sql"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -231,5 +233,103 @@ func TestRotateIssuerCreatesMissingIssuer(t *testing.T) {
 	}
 	if _, err := reopened.Verify(tok); err != nil {
 		t.Fatalf("reopened issuer cannot verify token from returned issuer: %v", err)
+	}
+}
+
+func TestSQLTryRegisterEvictsOldestUnusedAndPreservesAuthority(t *testing.T) {
+	db := openTestDB(t)
+	applySchema(t, db)
+	s := NewSQLStore(db)
+	now := time.Now().UTC()
+	for i := 0; i < MaxClientsPerRoute; i++ {
+		id := fmt.Sprintf("client-%03d", i)
+		if err := s.RegisterClient(Client{ID: id, CreatedAt: now.Add(time.Duration(i) * time.Second),
+			Tenant: "tenant", Route: "route"}); err != nil {
+			t.Fatal(err)
+		}
+		if i == 1 {
+			if _, err := db.Exec(`UPDATE authz_clients SET revoked_at=? WHERE id=?`, now.Format(time.RFC3339Nano), id); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if i == 0 || i == 2 {
+			status := GrantActive
+			if i == 2 {
+				status = GrantRevoked
+			}
+			if err := s.CreateGrant(Grant{ClientID: id, Tenant: "tenant", Route: "route",
+				Status: status, CreatedAt: now, UpdatedAt: now}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := s.TryRegisterClient(Client{ID: "replacement", CreatedAt: now, Tenant: "tenant", Route: "route"}); err != nil {
+		t.Fatalf("registration at full route quota: %v", err)
+	}
+	for _, id := range []string{"client-000", "client-001", "client-002", "replacement"} {
+		if _, err := s.GetClient(id); err != nil {
+			t.Fatalf("protected/new identity %s missing: %v", id, err)
+		}
+	}
+	if _, err := s.GetClient("client-003"); err == nil {
+		t.Fatal("oldest unapproved client was not evicted")
+	}
+	if n, err := s.CountClients("tenant", "route"); err != nil || n != MaxClientsPerRoute {
+		t.Fatalf("client count=%d err=%v, want bound %d", n, err, MaxClientsPerRoute)
+	}
+}
+
+func TestSQLTryRegisterQuotaFailsWhenAllIdentitiesCarryAuthority(t *testing.T) {
+	db := openTestDB(t)
+	applySchema(t, db)
+	s := NewSQLStore(db)
+	now := time.Now().UTC()
+	for i := 0; i < MaxClientsPerRoute; i++ {
+		id := fmt.Sprintf("client-%03d", i)
+		if err := s.RegisterClient(Client{ID: id, CreatedAt: now.Add(time.Duration(i) * time.Second),
+			Tenant: "tenant", Route: "route"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.CreateGrant(Grant{ClientID: id, Tenant: "tenant", Route: "route",
+			Status: GrantActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.TryRegisterClient(Client{ID: "replacement", CreatedAt: now, Tenant: "tenant", Route: "route"}); err != ErrClientQuota {
+		t.Fatalf("full route without an evictable client err=%v, want ErrClientQuota", err)
+	}
+	if n, err := s.CountClients("tenant", "route"); err != nil || n != MaxClientsPerRoute {
+		t.Fatalf("client count=%d err=%v after denied registration, want unchanged bound %d", n, err, MaxClientsPerRoute)
+	}
+}
+
+func TestSQLTryRegisterConcurrentEvictionKeepsRouteBound(t *testing.T) {
+	db := openTestDB(t)
+	db.SetMaxOpenConns(1) // matches the relay store's serialized SQLite writer
+	applySchema(t, db)
+	s := NewSQLStore(db)
+	const attempts = MaxClientsPerRoute + 20
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var failures []error
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			err := s.TryRegisterClient(Client{ID: fmt.Sprintf("concurrent-%03d", i),
+				CreatedAt: time.Now(), Tenant: "tenant", Route: "route"})
+			if err != nil {
+				mu.Lock()
+				failures = append(failures, err)
+				mu.Unlock()
+			}
+		}(i)
+	}
+	wg.Wait()
+	if len(failures) != 0 {
+		t.Fatalf("safe LRU registration failures: %v", failures)
+	}
+	if n, err := s.CountClients("tenant", "route"); err != nil || n != MaxClientsPerRoute {
+		t.Fatalf("concurrent client count=%d err=%v, want bound %d", n, err, MaxClientsPerRoute)
 	}
 }

@@ -293,13 +293,11 @@ func (s *Server) ServeRegister(w http.ResponseWriter, r *http.Request) {
 	// metadata is stored for display/audit only.
 
 	// Bounded registration: public DCR writes durable rows, so a route
-	// may hold at most MaxClientsPerRoute clients. Revoked clients still
-	// count: their id reservation is permanent. The bound check and the
-	// insert are ONE atomic store step, so concurrent registrations
-	// cannot cross the quota. At the bound, safe reclamation of
-	// abandoned registrations (never approved, past the pending
-	// lifetime) runs once and the attempt is retried, so a full table of
-	// dead registrations does not permanently deny a legitimate client.
+	// may hold at most MaxClientsPerRoute clients. The atomic store step
+	// evicts the oldest unrevoked registration with no grant when needed;
+	// granted identities and revoked ID reservations remain durable. Old
+	// abandoned registrations are also reclaimed on the maintenance
+	// interval, so a flood cannot grow the table without bound.
 	id, err := MintClientID()
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)

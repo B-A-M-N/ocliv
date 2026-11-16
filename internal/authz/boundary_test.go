@@ -229,7 +229,8 @@ func TestPKCEGrammarEnforced(t *testing.T) {
 	}
 }
 
-// P1 (registration bound): public DCR stops at the per-route quota.
+// P1 (registration bound): public DCR evicts an unused registration at
+// the per-route quota while the durable client count stays bounded.
 func TestRegistrationQuota(t *testing.T) {
 	s, _, _ := newTestServer(t)
 	for i := 0; i < MaxClientsPerRoute; i++ {
@@ -243,8 +244,12 @@ func TestRegistrationQuota(t *testing.T) {
 	body := `{"client_name":"q","redirect_uris":["https://client.example/cb"],"token_endpoint_auth_method":"none"}`
 	w := httptest.NewRecorder()
 	s.ServeRegister(w, httptest.NewRequest(http.MethodPost, "/oauth/register", strings.NewReader(body)))
-	if w.Code != http.StatusTooManyRequests {
-		t.Fatalf("over-quota registration status=%d, want 429", w.Code)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("registration with evictable clients at quota status=%d, want 201", w.Code)
+	}
+	n, err := s.Store.CountClients("tenant-test", "r-test")
+	if err != nil || n != MaxClientsPerRoute {
+		t.Fatalf("client count=%d err=%v, want bound %d", n, err, MaxClientsPerRoute)
 	}
 }
 

@@ -4,6 +4,7 @@ package authz
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -135,9 +136,54 @@ func TestRegistrationQuotaIsAtomicUnderConcurrency(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != MaxClientsPerRoute || created != MaxClientsPerRoute {
-		t.Fatalf("concurrent registration crossed the bound: created=%d stored=%d, want %d/%d",
-			created, n, MaxClientsPerRoute, MaxClientsPerRoute)
+	if n != MaxClientsPerRoute || created != attempts {
+		t.Fatalf("concurrent registration/eviction violated the bound: created=%d stored=%d, want %d/%d",
+			created, n, attempts, MaxClientsPerRoute)
+	}
+}
+
+func TestTryRegisterClientEvictsOldestUnapprovedOnly(t *testing.T) {
+	m := NewMemStore()
+	now := time.Now().UTC()
+	for i := 0; i < MaxClientsPerRoute; i++ {
+		id := fmt.Sprintf("client-%03d", i)
+		created := now.Add(time.Duration(i) * time.Second)
+		client := Client{ID: id, CreatedAt: created, Tenant: "tenant", Route: "route"}
+		if i == 1 {
+			revokedAt := now
+			client.RevokedAt = &revokedAt
+		}
+		if err := m.RegisterClient(client); err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 || i == 2 {
+			status := GrantActive
+			if i == 2 {
+				status = GrantRevoked
+			}
+			if err := m.CreateGrant(Grant{ClientID: id, Tenant: "tenant", Route: "route",
+				Status: status, CreatedAt: now, UpdatedAt: now}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := m.TryRegisterClient(Client{ID: "replacement", CreatedAt: now, Tenant: "tenant", Route: "route"}); err != nil {
+		t.Fatalf("registration at full route quota: %v", err)
+	}
+	if _, err := m.GetClient("client-000"); err != nil {
+		t.Fatalf("active-grant identity was evicted: %v", err)
+	}
+	if _, err := m.GetClient("client-001"); err != nil {
+		t.Fatalf("revoked ID reservation was evicted: %v", err)
+	}
+	if _, err := m.GetClient("client-002"); err != nil {
+		t.Fatalf("revoked-grant identity was evicted: %v", err)
+	}
+	if _, err := m.GetClient("client-003"); err == nil {
+		t.Fatal("oldest unapproved client was not evicted")
+	}
+	if n, err := m.CountClients("tenant", "route"); err != nil || n != MaxClientsPerRoute {
+		t.Fatalf("client count=%d err=%v, want bound %d", n, err, MaxClientsPerRoute)
 	}
 }
 

@@ -80,12 +80,11 @@ func (s *SQLStore) CountClients(tenant, route string) (int, error) {
 	return n, nil
 }
 
-// TryRegisterClient registers a client only if the route's client table
-// still has room, with the bound check and the insert inside ONE
-// transaction: two separate statements would let concurrent public
-// registrations both observe room for one and both insert, crossing the
-// bound. Revoked registrations still count: their id reservation is
-// permanent.
+// TryRegisterClient atomically enforces the per-route bound and inserts a
+// client. If full, it reclaims the oldest unrevoked registration that has
+// never received a grant. Granted identities and revoked ID reservations
+// are never evicted. The selection, deletion, quota check, and insert share
+// one transaction so concurrent DCR requests cannot cross the bound.
 func (s *SQLStore) TryRegisterClient(c Client) error {
 	if c.ID == "" {
 		return fmt.Errorf("authz: client id is required")
@@ -110,7 +109,31 @@ func (s *SQLStore) TryRegisterClient(c Client) error {
 		return fmt.Errorf("authz: count clients: %w", err)
 	}
 	if n >= MaxClientsPerRoute {
-		return ErrClientQuota
+		res, err := tx.Exec(
+			`DELETE FROM authz_clients
+			 WHERE id=(
+			   SELECT c.id FROM authz_clients c
+			   WHERE c.tenant_id=? AND c.route_id=? AND c.revoked_at IS NULL
+			     AND NOT EXISTS (
+			       SELECT 1 FROM authz_grants g
+			       WHERE g.client_id=c.id AND g.tenant_id=c.tenant_id AND g.route_id=c.route_id
+			     )
+			   ORDER BY c.created_at ASC, c.id ASC LIMIT 1
+			 ) AND tenant_id=? AND route_id=? AND revoked_at IS NULL
+			   AND NOT EXISTS (
+			     SELECT 1 FROM authz_grants g
+			     WHERE g.client_id=authz_clients.id
+			       AND g.tenant_id=authz_clients.tenant_id
+			       AND g.route_id=authz_clients.route_id
+			   )`,
+			c.Tenant, c.Route, c.Tenant, c.Route)
+		if err != nil {
+			return fmt.Errorf("authz: evict oldest unused client: %w", err)
+		}
+		deleted, _ := res.RowsAffected()
+		if deleted != 1 {
+			return ErrClientQuota
+		}
 	}
 	if _, err := tx.Exec(
 		`INSERT INTO authz_clients(id, name, redirect_uris, created_at, tenant_id, route_id) VALUES(?,?,?,?,?,?)`,
