@@ -159,7 +159,7 @@ Production is still HOLD: root-only schema/identity preflight, explicit
 promotion approval, off-LAN acceptance, and live ChatGPT acceptance remain
 outstanding. No production mutation was performed.
 
-### 2026-11-16 isolated Pi qualification — current candidate `efe3a8e`
+### 2026-11-16 isolated Pi qualification — superseded candidate `efe3a8e`
 
 The later isolated qualification supersedes the `d9ea67b` candidate above.
 Clean commit `efe3a8e972d48d7f9b1a111da31325a0e3a7842a` produced ARM64
@@ -170,12 +170,20 @@ separate build was verified byte-identical. The promotion runbook and
 `docs/qualification/pi-staging/PROVENANCE.txt` now name the exact qualified
 artifact and stage it under `/home/bamn/ocliv-stage`, not `/tmp`.
 
-The result proves isolated loopback behavior only. Clean-host installation,
-off-LAN access, ChatGPT acceptance, and a 24-hour soak remain NOT VERIFIED.
-The production schema and owner inventory and explicit migration/publication
-approvals remain outstanding; no production mutation was performed.
+The result proved isolated loopback behavior only. It was superseded by the
+clean `7674c4b` qualification below. Production remains unchanged.
 
-The current uncommitted source includes DCR eviction and qualification-script
-corrections made after that artifact was qualified. The `efe3a8e` artifact is
-therefore the last qualified binary, not a release of the current worktree;
-freeze, rebuild, and requalify before promotion.
+### 2026-11-16 isolated Pi qualification — current candidate `7674c4b`
+
+Clean commit `7674c4b4881b2824f6dc204206f51a46d4ff6ec4` produced ARM64
+artifact `e5cd410b52a66641dfdec65d23405f99d21e8978a9e5d49652e507bd61cf63f5`
+(13,697,186 bytes), qualified 29/29 on a fresh isolated Pi relay/database.
+Repository-wide Go tests, all internal race tests, Go vet, and Skybridge
+86/86 tests passed. Build and Pi evidence are recorded in
+`docs/qualification/PI-ISOLATED-RESULT-2026-11-16.md`,
+`docs/qualification/pi-staging/PROVENANCE.txt`, and the promotion runbook.
+
+This proves isolated loopback behavior only. Clean-host installation,
+off-LAN access, ChatGPT acceptance, and a 24-hour soak remain NOT VERIFIED.
+The production schema/owner inventory and explicit migration/publication
+approvals remain outstanding; no production mutation was performed.

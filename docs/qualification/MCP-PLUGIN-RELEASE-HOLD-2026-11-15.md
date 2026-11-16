@@ -76,17 +76,15 @@ for use.
 
 ## Latest isolated ARM64 candidate — 2026-11-16
 
-The current qualified candidate was built from clean source commit
-`efe3a8e972d48d7f9b1a111da31325a0e3a7842a`. Its ARM64 SHA-256 is
-`aef41e6acb06273f56e812d8785f148c29bcedb095e9e2b38aadba167246d08c`; it
+The qualified candidate was built from clean source commit
+`7674c4b4881b2824f6dc204206f51a46d4ff6ec4`. Its ARM64 SHA-256 is
+`e5cd410b52a66641dfdec65d23405f99d21e8978a9e5d49652e507bd61cf63f5`; it
 passed 29/29 isolated Pi loopback checks using a fresh database and publisher
-identity. The current `fc44a0b` repository tip adds only the result document,
-and its separately built ARM64 artifact was checked byte-identical. See
+identity. The exact source gates also passed: repository-wide Go tests, race
+tests for all internal packages, Go vet, and all 86 Skybridge tests. See
 `PI-ISOLATED-RESULT-2026-11-16.md`, `pi-staging/PROVENANCE.txt`, and the
-updated `PROMOTION-RUNBOOK-2026-11-14.md` for the artifact digest and exact
-operator steps. Subsequent DCR LRU and qualification-script changes in the
-current working tree are not in that artifact and require a fresh build and
-qualification before it can be treated as current.
+updated `PROMOTION-RUNBOOK-2026-11-14.md` for artifact evidence and operator
+steps.
 
 This qualifies the candidate for production preflight review only. The
 production DB schema and publication owner are still unknown because the
