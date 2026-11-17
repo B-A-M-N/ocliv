@@ -162,20 +162,21 @@ func stopServiceAuthoritatively(store *config.ServiceStore, rec config.ServiceRe
 	localStopped := true
 	var localErr string
 	if rec.SystemdUnit != "" {
-		stBefore := queryUnitState(rec.SystemdUnit, ops)
-		if stBefore != "not-found" && stBefore != "not-configured" {
-			_, stopErr := ops.systemctl("stop", rec.SystemdUnit)
-			act := queryUnitState(rec.SystemdUnit, ops)
-			if act == "active" || act == "activating" || act == "deactivating" {
-				localStopped = false
-				localErr = fmt.Sprintf("local publisher unit still %s (%v)", act, stopErr)
-			}
+		ev := stopAndVerifyUnit(rec.SystemdUnit, false, ops)
+		if !ev.StoppedNow {
+			localStopped = false
+			localErr = ev.Error
 		}
 	}
 	if rec.BackendMode == config.BackendManaged && rec.BackendUnit != "" {
-		stBe := queryUnitState(rec.BackendUnit, ops)
-		if stBe != "not-found" && stBe != "not-configured" {
-			_, _ = ops.systemctl("stop", rec.BackendUnit)
+		evBe := stopAndVerifyUnit(rec.BackendUnit, false, ops)
+		if !evBe.StoppedNow {
+			localStopped = false
+			if localErr != "" {
+				localErr += "; " + evBe.Error
+			} else {
+				localErr = evBe.Error
+			}
 		}
 	}
 
@@ -201,25 +202,15 @@ func stopServiceAuthoritatively(store *config.ServiceStore, rec config.ServiceRe
 
 func stopAndCleanupLocalService(store *config.ServiceStore, rec config.ServiceRecord, ops serviceOps) error {
 	if rec.SystemdUnit != "" {
-		st := queryUnitState(rec.SystemdUnit, ops)
-		if st != "not-found" && st != "not-configured" {
-			_, _ = ops.systemctl("stop", rec.SystemdUnit)
-			after := queryUnitState(rec.SystemdUnit, ops)
-			if after == "active" || after == "activating" || after == "deactivating" {
-				return fmt.Errorf("STOP_UNCONFIRMED: publisher unit %s is still %s", rec.SystemdUnit, after)
-			}
-			_, _ = ops.systemctl("disable", rec.SystemdUnit)
+		ev := stopAndVerifyUnit(rec.SystemdUnit, true, ops)
+		if !ev.StoppedNow || !ev.DisabledForReboot {
+			return fmt.Errorf("%s", ev.Error)
 		}
 	}
 	if rec.BackendMode == config.BackendManaged && rec.BackendUnit != "" {
-		st := queryUnitState(rec.BackendUnit, ops)
-		if st != "not-found" && st != "not-configured" {
-			_, _ = ops.systemctl("stop", rec.BackendUnit)
-			after := queryUnitState(rec.BackendUnit, ops)
-			if after == "active" || after == "activating" || after == "deactivating" {
-				return fmt.Errorf("STOP_UNCONFIRMED: backend unit %s is still %s", rec.BackendUnit, after)
-			}
-			_, _ = ops.systemctl("disable", rec.BackendUnit)
+		evBe := stopAndVerifyUnit(rec.BackendUnit, true, ops)
+		if !evBe.StoppedNow || !evBe.DisabledForReboot {
+			return fmt.Errorf("%s", evBe.Error)
 		}
 	}
 	if envPath, err := serviceEnvPath(rec); err == nil {

@@ -84,6 +84,7 @@ type OpaqueRefresh struct {
 	ClientID          string
 	Tenant            string
 	Route             string
+	Scope             string
 	ExpiresAt         time.Time
 	AbsoluteExpiresAt time.Time
 	LastUsedAt        time.Time
@@ -189,6 +190,7 @@ type Store interface {
 	CreateOpaqueRefresh(r OpaqueRefresh) error
 	RotateOpaqueRefresh(oldHash, newHash, clientID, tenant, route string, now time.Time, extendBy time.Duration) (*OpaqueRefresh, error)
 	ExtendOpaqueRefresh(tokenHash, clientID, tenant, route string, now time.Time, extendBy time.Duration) (*OpaqueRefresh, error)
+	RevokeOpaqueRefresh(tokenHash, tenant, route string, now time.Time) error
 	RevokeOpaqueRefreshForClient(clientID string) error
 
 	CreateGrant(g Grant) error
@@ -994,6 +996,7 @@ func (m *MemStore) RotateOpaqueRefresh(oldHash, newHash, clientID, tenant, route
 		ClientID:          clientID,
 		Tenant:            tenant,
 		Route:             route,
+		Scope:             r.Scope,
 		ExpiresAt:         nextExp,
 		AbsoluteExpiresAt: r.AbsoluteExpiresAt,
 		LastUsedAt:        now,
@@ -1027,6 +1030,19 @@ func (m *MemStore) ExtendOpaqueRefresh(tokenHash, clientID, tenant, route string
 	r.LastUsedAt = now
 	cp := *r
 	return &cp, nil
+}
+
+func (m *MemStore) RevokeOpaqueRefresh(tokenHash, tenant, route string, now time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.opaqueRefresh == nil {
+		return nil
+	}
+	if r, ok := m.opaqueRefresh[tokenHash]; ok && r.Tenant == tenant && r.Route == route && r.RevokedAt == nil {
+		t := now
+		r.RevokedAt = &t
+	}
+	return nil
 }
 
 func (m *MemStore) RevokeOpaqueRefreshForClient(clientID string) error {

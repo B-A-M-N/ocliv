@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"ocliv/internal/apperr"
 	"ocliv/internal/authz"
 	"ocliv/internal/config"
+	"ocliv/internal/store"
 )
 
 func cmdConnect(argv []string) int {
@@ -52,6 +54,37 @@ func googleBindingFingerprint(service, routeID, connType string, redirects []str
 	sort.Strings(sorted)
 	sum := sha256.Sum256([]byte(service + "\x00" + routeID + "\x00" + connType + "\x00" + strings.Join(sorted, ",")))
 	return hex.EncodeToString(sum[:8])
+}
+
+// openExistingAuthzDB requires an existing relay authorization database at
+// dataDir/ocliv.db so desktop runs never silently create an empty local DB.
+func openExistingAuthzDB(dataDir string) (*store.DB, error) {
+	dbPath := filepath.Join(dataDir, "ocliv.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, fmt.Errorf("authoritative relay database %q not found (pass --data DIR on the relay host): %w", dbPath, err)
+	}
+	return authzOpen(dataDir)
+}
+
+func writeExclusiveSecret0600(path, secret string) error {
+	if _, err := os.Lstat(path); err == nil {
+		return fmt.Errorf("refusing to overwrite existing file or symlink %q", path)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString(secret + "\n"); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return err
+	}
+	return f.Close()
 }
 
 func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
@@ -123,6 +156,10 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 		fmt.Fprintf(os.Stderr, "invalid --type %q (want connected-app|gemini)\n", connType)
 		return apperr.ExitCLIValidation
 	}
+	if asJSON && secretOut == "" {
+		fmt.Fprintln(os.Stderr, "error: --json requires --secret-out PATH so the one-time client secret is safely delivered")
+		return apperr.ExitCLIValidation
+	}
 	if profile == "" {
 		profile = config.ActiveProfile()
 	}
@@ -159,6 +196,9 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 		fmt.Fprintf(os.Stderr, "connect google: discovery preflight failed: %s\n", disc.Detail)
 		return apperr.ExitRelayTLS
 	}
+	now := time.Now().UTC()
+	timestamps := map[string]string{"CONFIGURED": now.Format(time.RFC3339)}
+	stage := "CONFIGURED"
 	if connType == "connected-app" {
 		u, uerr := safeDiscoveryURL(entry.URL)
 		if uerr != nil {
@@ -173,10 +213,20 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 		}
 		vBody, _ := io.ReadAll(io.LimitReader(vResp.Body, 32*1024))
 		_ = vResp.Body.Close()
-		if vResp.StatusCode != http.StatusOK || !json.Valid(vBody) {
+		if vResp.StatusCode != http.StatusOK {
 			fmt.Fprintf(os.Stderr, "connect google: %s returned HTTP %d (run `ocliv google verify-domain` first)\n", verifyURL, vResp.StatusCode)
 			return apperr.ExitRelayTLS
 		}
+		if ct := vResp.Header.Get("Content-Type"); ct != "" && !strings.Contains(strings.ToLower(ct), "application/json") {
+			fmt.Fprintf(os.Stderr, "connect google: %s returned Content-Type %q (want application/json)\n", verifyURL, ct)
+			return apperr.ExitRelayTLS
+		}
+		if verr := ValidateGoogleVerificationDocument(vBody, ""); verr != nil {
+			fmt.Fprintf(os.Stderr, "connect google: %s invalid verification document: %v\n", verifyURL, verr)
+			return apperr.ExitRelayTLS
+		}
+		stage = "DOMAIN_READY"
+		timestamps["DOMAIN_READY"] = now.Format(time.RFC3339)
 	}
 
 	svcStore, err := openServicesForProfile(profile)
@@ -185,8 +235,13 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 		return apperr.ExitInternal
 	}
 	fp := googleBindingFingerprint(serviceName, entry.RouteID, connType, redirects)
+	rec, hasRec, gerr := svcStore.Get(serviceName)
+	if gerr != nil {
+		fmt.Fprintln(os.Stderr, gerr)
+		return apperr.ExitInternal
+	}
 	var existing *config.ProviderBinding
-	if rec, ok, gerr := svcStore.Get(serviceName); gerr == nil && ok && rec.ProviderBindings != nil {
+	if hasRec && rec.ProviderBindings != nil {
 		if b, bok := rec.ProviderBindings["google"]; bok {
 			existing = &b
 		}
@@ -196,12 +251,12 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 			fmt.Fprintf(os.Stderr, "connect google: binding for %q was explicitly revoked; refusing to resurrect a revoked grant\n", serviceName)
 			return apperr.ExitAuth
 		}
-		if existing.Fingerprint == fp {
+		if existing.Fingerprint == fp && existing.Status != "CUTOVER_INCOMPLETE" {
 			if asJSON {
 				out, _ := json.MarshalIndent(existing, "", "  ")
 				fmt.Println(string(out))
 			} else {
-				fmt.Printf("✓ Google binding for %q already configured (idempotent; client_id=%s status=%s)\n", serviceName, existing.ClientID, existing.Status)
+				fmt.Printf("✓ Google binding for %q already configured (idempotent; client_id=%s status=%s stage=%s)\n", serviceName, existing.ClientID, existing.Status, existing.Stage)
 			}
 			return apperr.ExitOK
 		}
@@ -211,10 +266,10 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 		}
 	}
 
-	db, err := authzOpen(dataDir)
+	db, err := openExistingAuthzDB(dataDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "connect google: %v\n", err)
-		return apperr.ExitInternal
+		return apperr.ExitCLIValidation
 	}
 	defer db.Close()
 	st := authz.NewSQLStore(db.SQL())
@@ -229,7 +284,6 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 		fmt.Fprintln(os.Stderr, err)
 		return apperr.ExitInternal
 	}
-	now := time.Now().UTC()
 	client := authz.Client{
 		ID:               clientID,
 		Name:             "Google (" + connType + ")",
@@ -243,46 +297,100 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 	}
 	status := "pending"
 	nextAction := fmt.Sprintf("approve client explicitly: ocliv authz approve --data %s --tenant %s --route %s --client %s --direct", dataDir, tenant, entry.RouteID, clientID)
+	if err := st.TryRegisterClientWithPendingGrant(client, tenant, entry.RouteID); err != nil {
+		fmt.Fprintf(os.Stderr, "connect google: %v\n", err)
+		return apperr.ExitInternal
+	}
 	if approve {
-		if err := st.RegisterClient(client); err != nil {
-			fmt.Fprintf(os.Stderr, "connect google: %v\n", err)
-			return apperr.ExitInternal
-		}
 		if err := st.ApproveGrantDirect(clientID, tenant, entry.RouteID); err != nil {
-			fmt.Fprintf(os.Stderr, "connect google: %v\n", err)
+			_ = st.RevokeClient(clientID)
+			fmt.Fprintf(os.Stderr, "connect google: approve grant: %v\n", err)
 			return apperr.ExitInternal
 		}
 		status = "active"
+		stage = "CLIENT_APPROVED"
+		timestamps["CLIENT_APPROVED"] = now.Format(time.RFC3339)
 		nextAction = "paste client_id, client_secret, authorization_endpoint, and token_endpoint into Google console"
-	} else {
-		if err := st.TryRegisterClientWithPendingGrant(client, tenant, entry.RouteID); err != nil {
-			fmt.Fprintf(os.Stderr, "connect google: %v\n", err)
+	}
+
+	// Verify authoritative registration before proceeding.
+	if _, err := st.GetClient(clientID); err != nil {
+		fmt.Fprintf(os.Stderr, "connect google: authoritative verification failed: %v\n", err)
+		return apperr.ExitInternal
+	}
+
+	if secretOut != "" {
+		if werr := writeExclusiveSecret0600(secretOut, clientSecret); werr != nil {
+			_ = st.RevokeGrant(clientID, tenant, entry.RouteID)
+			_ = st.RevokeClient(clientID)
+			fmt.Fprintf(os.Stderr, "connect google: write --secret-out %s: %v\n", secretOut, werr)
 			return apperr.ExitInternal
 		}
 	}
 
-	binding := config.ProviderBinding{
-		Provider:       "google",
-		ConnectionType: connType,
-		ClientID:       clientID,
-		RedirectURIs:   redirects,
-		AuthMode:       "confidential+google_confidential",
-		Fingerprint:    fp,
-		Status:         status,
-		LastVerifiedAt: now.Format(time.RFC3339),
-		NextAction:     nextAction,
-		UpdatedAt:      now.Format(time.RFC3339),
+	// Two-identity cutover for --update: revoke old client only after new candidate is verified.
+	var revokedIDs []string
+	if existing != nil {
+		revokedIDs = append(revokedIDs, existing.RevokedClientIDs...)
+		if existing.ClientID != "" && existing.ClientID != clientID {
+			oldID := existing.ClientID
+			rErr := st.RevokeOpaqueRefreshForClient(oldID)
+			if rErr == nil {
+				rErr = st.RevokeGrant(oldID, tenant, entry.RouteID)
+			}
+			if rErr == nil {
+				rErr = st.RevokeClient(oldID)
+			}
+			cOld, gOldErr := st.GetClient(oldID)
+			if rErr != nil || gOldErr != nil || cOld.RevokedAt == nil {
+				if hasRec {
+					_, _ = svcStore.UpdateCAS(serviceName, rec.Revision, func(r *config.ServiceRecord) error {
+						if r.ProviderBindings == nil {
+							r.ProviderBindings = map[string]config.ProviderBinding{}
+						}
+						b := r.ProviderBindings["google"]
+						b.CandidateClientID = clientID
+						b.Status = "CUTOVER_INCOMPLETE"
+						b.NextAction = fmt.Sprintf("old client %s revocation incomplete; run `ocilv authz revoke --data %s --tenant %s --route %s --client %s`", oldID, dataDir, tenant, entry.RouteID, oldID)
+						r.ProviderBindings["google"] = b
+						return nil
+					})
+				}
+				fmt.Fprintf(os.Stderr, "connect google: cutover incomplete (failed to revoke previous client %s)\n", oldID)
+				return apperr.ExitInternal
+			}
+			revokedIDs = append(revokedIDs, oldID)
+		}
 	}
-	if _, ok, _ := svcStore.Get(serviceName); ok {
-		_, _ = svcStore.UpdateCAS(serviceName, 0, func(r *config.ServiceRecord) error {
+
+	binding := config.ProviderBinding{
+		Provider:         "google",
+		ConnectionType:   connType,
+		ClientID:         clientID,
+		RevokedClientIDs: revokedIDs,
+		RedirectURIs:     redirects,
+		AuthMode:         "confidential+google_confidential",
+		Fingerprint:      fp,
+		Status:           status,
+		Stage:            stage,
+		StageTimestamps:  timestamps,
+		LastVerifiedAt:   now.Format(time.RFC3339),
+		NextAction:       nextAction,
+		UpdatedAt:        now.Format(time.RFC3339),
+	}
+	if hasRec {
+		if _, err := svcStore.UpdateCAS(serviceName, rec.Revision, func(r *config.ServiceRecord) error {
 			if r.ProviderBindings == nil {
 				r.ProviderBindings = map[string]config.ProviderBinding{}
 			}
 			r.ProviderBindings["google"] = binding
 			return nil
-		})
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "connect google: save service binding: %v\n", err)
+			return apperr.ExitInternal
+		}
 	} else {
-		_ = svcStore.Put(config.ServiceRecord{
+		if err := svcStore.Put(config.ServiceRecord{
 			Name:             serviceName,
 			Type:             "mcp",
 			Auth:             entry.AuthMethod,
@@ -291,17 +399,14 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 			PublicURL:        entry.URL,
 			DesiredState:     config.DesiredConfigured,
 			ProviderBindings: map[string]config.ProviderBinding{"google": binding},
-		})
-	}
-
-	if secretOut != "" {
-		if werr := os.WriteFile(secretOut, []byte(clientSecret+"\n"), 0o600); werr != nil {
-			fmt.Fprintf(os.Stderr, "connect google: write --secret-out %s: %v\n", secretOut, werr)
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "connect google: save service record: %v\n", err)
 			return apperr.ExitInternal
 		}
 	}
-	authEP := disc.Issuer + "/authorize"
-	tokenEP := disc.Issuer + "/token"
+
+	authEP := disc.AuthorizationEP
+	tokenEP := disc.TokenEP
 	if asJSON {
 		out := map[string]any{
 			"service":                serviceName,
@@ -311,17 +416,16 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 			"authorization_endpoint": authEP,
 			"token_endpoint":         tokenEP,
 			"status":                 status,
+			"stage":                  stage,
 			"refresh_policy":         "google_confidential",
+			"client_secret_file":     secretOut,
 			"next_action":            nextAction,
-		}
-		if secretOut != "" {
-			out["client_secret_file"] = secretOut
 		}
 		b, _ := json.MarshalIndent(out, "", "  ")
 		fmt.Println(string(b))
 		return apperr.ExitOK
 	}
-	fmt.Printf("✓ Google %s client registered for %s (status=%s)\n", connType, serviceName, status)
+	fmt.Printf("✓ Google %s client registered for %s (status=%s stage=%s)\n", connType, serviceName, status, stage)
 	fmt.Printf("  MCP URL:                %s\n", entry.URL)
 	fmt.Printf("  Client ID:              %s\n", clientID)
 	fmt.Printf("  Authorization Endpoint: %s\n", authEP)
@@ -377,7 +481,7 @@ func cmdConnectGoogleStatus(argv []string, ops serviceOps) int {
 		fmt.Println(string(out))
 		return apperr.ExitOK
 	}
-	fmt.Printf("Service: %s  Provider: %s (%s)  Status: %s\n", serviceName, b.Provider, b.ConnectionType, b.Status)
+	fmt.Printf("Service: %s  Provider: %s (%s)  Status: %s  Stage: %s\n", serviceName, b.Provider, b.ConnectionType, b.Status, b.Stage)
 	fmt.Printf("Client ID: %s  Auth: %s\n", b.ClientID, b.AuthMode)
 	fmt.Printf("Redirects: %s\n", strings.Join(b.RedirectURIs, ", "))
 	if b.NextAction != "" {
@@ -430,26 +534,64 @@ func cmdConnectGoogleRevoke(argv []string, ops serviceOps) int {
 		return apperr.ExitCLIValidation
 	}
 	b, bok := rec.ProviderBindings["google"]
-	if !bok {
+	if !bok || b.ClientID == "" {
 		fmt.Fprintf(os.Stderr, "no Google connection binding recorded for %q\n", serviceName)
 		return apperr.ExitCLIValidation
 	}
-	if db, derr := authzOpen(dataDir); derr == nil {
-		defer db.Close()
-		st := authz.NewSQLStore(db.SQL())
-		if rec.PublicationID != "" && b.ClientID != "" {
-			_ = st.RevokeGrant(b.ClientID, tenant, rec.PublicationID)
-			_ = st.RevokeClient(b.ClientID)
-		}
+
+	markUnconfirmed := func(reason string) int {
+		_, _ = svcStore.UpdateCAS(serviceName, rec.Revision, func(r *config.ServiceRecord) error {
+			cur := r.ProviderBindings["google"]
+			cur.Status = "REVOCATION_UNCONFIRMED"
+			cur.NextAction = reason
+			cur.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+			r.ProviderBindings["google"] = cur
+			return nil
+		})
+		fmt.Fprintf(os.Stderr, "connect revoke: REVOCATION_UNCONFIRMED (%s)\n", reason)
+		return apperr.ExitInternal
 	}
-	_, _ = svcStore.UpdateCAS(serviceName, 0, func(r *config.ServiceRecord) error {
+
+	db, derr := openExistingAuthzDB(dataDir)
+	if derr != nil {
+		return markUnconfirmed(derr.Error())
+	}
+	defer db.Close()
+	st := authz.NewSQLStore(db.SQL())
+	if rec.PublicationID == "" {
+		return markUnconfirmed("missing publication_id on service record")
+	}
+	if err := st.RevokeOpaqueRefreshForClient(b.ClientID); err != nil {
+		return markUnconfirmed("revoke opaque refresh: " + err.Error())
+	}
+	if err := st.RevokeGrant(b.ClientID, tenant, rec.PublicationID); err != nil {
+		return markUnconfirmed("revoke grant: " + err.Error())
+	}
+	if err := st.RevokeClient(b.ClientID); err != nil {
+		return markUnconfirmed("revoke client: " + err.Error())
+	}
+	// Negative verification: confirm client is actually marked revoked in SQLite.
+	cliRec, gerr := st.GetClient(b.ClientID)
+	if gerr != nil || cliRec.RevokedAt == nil {
+		return markUnconfirmed("post-revocation negative check failed: client still active")
+	}
+
+	if _, uerr := svcStore.UpdateCAS(serviceName, rec.Revision, func(r *config.ServiceRecord) error {
 		cur := r.ProviderBindings["google"]
 		cur.Status = "revoked"
+		cur.Stage = "REVOKED"
+		if cur.StageTimestamps == nil {
+			cur.StageTimestamps = map[string]string{}
+		}
+		cur.StageTimestamps["REVOKED"] = time.Now().UTC().Format(time.RFC3339)
 		cur.NextAction = "binding revoked; register a new client if reconnecting"
 		cur.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 		r.ProviderBindings["google"] = cur
 		return nil
-	})
+	}); uerr != nil {
+		fmt.Fprintf(os.Stderr, "connect revoke: database revoked, but failed to persist local binding state: %v\n", uerr)
+		return apperr.ExitInternal
+	}
 	fmt.Printf("✓ revoked Google connection binding for %q (client_id=%s)\n", serviceName, b.ClientID)
 	return apperr.ExitOK
 }

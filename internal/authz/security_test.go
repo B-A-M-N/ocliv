@@ -127,7 +127,7 @@ func TestAudienceIsolation(t *testing.T) {
 	}
 	raw, err := s.Issuer.Mint(TokenClaims{
 		Issuer: s.IssuerURL, Subject: client, Audience: s.RouteURL,
-		Tenant: s.tenant(), Route: s.RouteID, Expiry: time.Now().Add(time.Hour).Unix(),
+		Tenant: s.tenant(), Route: s.RouteID, Scope: "mcp:tools", Expiry: time.Now().Add(time.Hour).Unix(),
 		ID: "jti-" + client,
 	})
 	if err != nil {
@@ -150,7 +150,7 @@ func TestImmediateRevocation(t *testing.T) {
 	}
 	raw, err := s.Issuer.Mint(TokenClaims{
 		Issuer: s.IssuerURL, Subject: client, Audience: s.RouteURL,
-		Tenant: s.tenant(), Route: s.RouteID, Expiry: time.Now().Add(time.Hour).Unix(),
+		Tenant: s.tenant(), Route: s.RouteID, Scope: "mcp:tools", Expiry: time.Now().Add(time.Hour).Unix(),
 		ID: "jti-" + client,
 	})
 	if err != nil {
@@ -212,7 +212,7 @@ func TestIssuerBinding(t *testing.T) {
 	}
 	raw, err := s.Issuer.Mint(TokenClaims{
 		Issuer: "https://evil.test", Subject: client, Audience: s.RouteURL,
-		Tenant: s.tenant(), Route: s.RouteID, Expiry: time.Now().Add(time.Hour).Unix(),
+		Tenant: s.tenant(), Route: s.RouteID, Scope: "mcp:tools", Expiry: time.Now().Add(time.Hour).Unix(),
 	})
 	if err != nil {
 		t.Fatalf("mint: %v", err)
@@ -250,7 +250,7 @@ func TestKeyRotation(t *testing.T) {
 	if err := auth.Authorize(req, "aud", "iss", "t", "r"); err == nil {
 		t.Fatal("old key accepted after rotation")
 	}
-	newTok, err := newIssuer.Mint(TokenClaims{Issuer: "iss", Subject: "cli_1", Audience: "aud", Tenant: "t", Route: "r", Expiry: time.Now().Add(time.Hour).Unix(), ID: "jti-new"})
+	newTok, err := newIssuer.Mint(TokenClaims{Issuer: "iss", Subject: "cli_1", Audience: "aud", Tenant: "t", Route: "r", Scope: "mcp:tools", Expiry: time.Now().Add(time.Hour).Unix(), ID: "jti-new"})
 	if err != nil {
 		t.Fatalf("new mint: %v", err)
 	}

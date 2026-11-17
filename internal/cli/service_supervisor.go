@@ -287,3 +287,78 @@ func inspectUnit(unit string, ops serviceOps) UnitInspection {
 func queryUnitState(unit string, ops serviceOps) string {
 	return inspectUnit(unit, ops).ActiveState
 }
+
+// UnitStopEvidence records authoritative systemd stop and disable proof so
+// local service records are never removed while a unit is active, enabled,
+// or unreachable.
+type UnitStopEvidence struct {
+	Unit              string `json:"unit"`
+	ActiveState       string `json:"active_state"`
+	StoppedNow        bool   `json:"stopped_now"`
+	DisabledForReboot bool   `json:"disabled_for_reboot"`
+	Error             string `json:"error,omitempty"`
+}
+
+func stopAndVerifyUnit(unit string, disable bool, ops serviceOps) UnitStopEvidence {
+	ev := UnitStopEvidence{Unit: unit}
+	if unit == "" {
+		ev.ActiveState = "not-configured"
+		ev.StoppedNow = true
+		ev.DisabledForReboot = true
+		return ev
+	}
+	before := inspectUnit(unit, ops)
+	ev.ActiveState = before.ActiveState
+	if !before.ManagerReachable {
+		ev.Error = "STOP_UNCONFIRMED: systemd manager unreachable (" + before.Error + ")"
+		return ev
+	}
+	if before.ActiveState == "not-found" {
+		ev.StoppedNow = true
+		ev.DisabledForReboot = true
+		return ev
+	}
+	if out, err := ops.systemctl("stop", unit); err != nil {
+		ev.Error = fmt.Sprintf("systemctl stop %s failed: %v (%s)", unit, err, strings.TrimSpace(out))
+	}
+	after := inspectUnit(unit, ops)
+	ev.ActiveState = after.ActiveState
+	if !after.ManagerReachable {
+		ev.Error = "STOP_UNCONFIRMED: systemd manager became unreachable after stop"
+		return ev
+	}
+	switch after.ActiveState {
+	case "inactive", "failed", "not-found":
+		ev.StoppedNow = true
+	default:
+		if ev.Error == "" {
+			ev.Error = fmt.Sprintf("STOP_UNCONFIRMED: unit %s is %s", unit, after.ActiveState)
+		}
+	}
+	if !disable {
+		ev.DisabledForReboot = !after.Enabled
+		return ev
+	}
+	if out, derr := ops.systemctl("disable", unit); derr != nil {
+		afterDis := inspectUnit(unit, ops)
+		if afterDis.ManagerReachable && afterDis.ActiveState == "not-found" {
+			ev.DisabledForReboot = true
+			return ev
+		}
+		ev.DisabledForReboot = false
+		if ev.Error == "" {
+			ev.Error = fmt.Sprintf("STOP_UNCONFIRMED: systemctl disable %s failed: %v (%s)", unit, derr, strings.TrimSpace(out))
+		}
+		return ev
+	}
+	afterDis := inspectUnit(unit, ops)
+	if !afterDis.ManagerReachable || afterDis.Enabled {
+		ev.DisabledForReboot = false
+		if ev.Error == "" {
+			ev.Error = fmt.Sprintf("STOP_UNCONFIRMED: unit %s still enabled after disable", unit)
+		}
+		return ev
+	}
+	ev.DisabledForReboot = true
+	return ev
+}

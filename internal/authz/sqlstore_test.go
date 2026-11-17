@@ -60,6 +60,7 @@ func applySchema(t *testing.T, db *sql.DB) {
 			   action TEXT NOT NULL, result TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '')`,
 		`CREATE TABLE authz_opaque_refresh (token_hash TEXT PRIMARY KEY,
 			   client_id TEXT NOT NULL, tenant_id TEXT NOT NULL, route_id TEXT NOT NULL,
+			   scope TEXT NOT NULL DEFAULT '',
 			   expires_at TEXT NOT NULL, absolute_expires_at TEXT NOT NULL,
 			   last_used_at TEXT NOT NULL, revoked_at TEXT)`,
 	} {

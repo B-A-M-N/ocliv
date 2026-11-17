@@ -199,6 +199,7 @@ func TestAccessTokenExpiresNaturally(t *testing.T) {
 		Audience: s.RouteURL,
 		Tenant:   s.tenant(),
 		Route:    s.RouteID,
+		Scope:    "mcp:tools",
 		Expiry:   time.Now().Add(s.TokenTTL).Unix(),
 		ID:       "jti-expiry",
 	})

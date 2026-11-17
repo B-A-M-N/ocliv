@@ -38,7 +38,7 @@ func TestServeRevokeInvalidatesToken(t *testing.T) {
 
 	mint := func(clientID string) string {
 		tok, err := issuer.Mint(TokenClaims{Issuer: s.IssuerURL, Subject: clientID,
-			Audience: s.RouteURL, Tenant: "tenant-test", Route: "r-test",
+			Audience: s.RouteURL, Tenant: "tenant-test", Route: "r-test", Scope: "mcp:tools",
 			Expiry: time.Now().Add(time.Hour).Unix(), ID: clientID + "-jti"})
 		if err != nil {
 			t.Fatal(err)

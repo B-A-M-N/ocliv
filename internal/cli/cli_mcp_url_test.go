@@ -105,7 +105,7 @@ func TestMCPCheckValidatesDiscoveryMetadata(t *testing.T) {
 			_, _ = w.Write([]byte(`{"issuer":"` + srvURL + `/r/r1/oauth","authorization_endpoint":"` + srvURL + `/r/r1/oauth/authorize","token_endpoint":"` + srvURL + `/r/r1/oauth/token","registration_endpoint":"` + srvURL + `/r/r1/oauth/register","code_challenge_methods_supported":["S256"]}`))
 		case "/.well-known/google-connected-apps":
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"connections":[{"app":"test"}]}`))
+			_, _ = w.Write([]byte(`{"verification_tokens":["tok-test-123"]}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}

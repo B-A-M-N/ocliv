@@ -58,16 +58,20 @@ type ReconcileStatus struct {
 // ProviderBinding records an operator-approved external client binding
 // (e.g. Google Connected App / Gemini / ChatGPT) beside the service URL.
 type ProviderBinding struct {
-	Provider       string   `json:"provider"`
-	ConnectionType string   `json:"connection_type,omitempty"`
-	ClientID       string   `json:"client_id,omitempty"`
-	RedirectURIs   []string `json:"redirect_uris,omitempty"`
-	AuthMode       string   `json:"auth_mode,omitempty"`
-	Fingerprint    string   `json:"fingerprint,omitempty"`
-	Status         string   `json:"status,omitempty"` // "pending" | "active" | "revoked"
-	LastVerifiedAt string   `json:"last_verified_at,omitempty"`
-	NextAction     string   `json:"next_action,omitempty"`
-	UpdatedAt      string   `json:"updated_at,omitempty"`
+	Provider          string            `json:"provider"`
+	ConnectionType    string            `json:"connection_type,omitempty"`
+	ClientID          string            `json:"client_id,omitempty"`
+	CandidateClientID string            `json:"candidate_client_id,omitempty"`
+	RevokedClientIDs  []string          `json:"revoked_client_ids,omitempty"`
+	RedirectURIs      []string          `json:"redirect_uris,omitempty"`
+	AuthMode          string            `json:"auth_mode,omitempty"`
+	Fingerprint       string            `json:"fingerprint,omitempty"`
+	Status            string            `json:"status,omitempty"` // "pending" | "active" | "revoked" | "REVOCATION_UNCONFIRMED" | "CUTOVER_INCOMPLETE"
+	Stage             string            `json:"stage,omitempty"`  // CONFIGURED | DOMAIN_READY | CLIENT_APPROVED | AUTH_TESTED | MCP_TESTED | PROVIDER_LINKED | REVOKED
+	StageTimestamps   map[string]string `json:"stage_timestamps,omitempty"`
+	LastVerifiedAt    string            `json:"last_verified_at,omitempty"`
+	NextAction        string            `json:"next_action,omitempty"`
+	UpdatedAt         string            `json:"updated_at,omitempty"`
 }
 
 // ServiceRecord is the durable operator-configured service definition.
@@ -208,6 +212,11 @@ func (s *ServiceStore) saveMap(m map[string]ServiceRecord) error {
 		os.Remove(tmpName)
 		return err
 	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmpName)
 		return err
@@ -216,7 +225,14 @@ func (s *ServiceStore) saveMap(m map[string]ServiceRecord) error {
 		os.Remove(tmpName)
 		return err
 	}
-	return os.Rename(tmpName, s.path)
+	if err := os.Rename(tmpName, s.path); err != nil {
+		return err
+	}
+	if dir, derr := os.Open(filepath.Dir(s.path)); derr == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	return nil
 }
 
 func (s *ServiceStore) List() ([]ServiceRecord, error) {

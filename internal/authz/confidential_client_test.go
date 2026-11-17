@@ -382,3 +382,151 @@ func TestAtomicDCRRollsBackOnGrantFailure(t *testing.T) {
 		t.Fatal("client row persisted despite pending-grant failure")
 	}
 }
+
+func TestConfidentialRefreshPreservesLimitedScopeAndRejectsEscalation(t *testing.T) {
+	db := openTestDB(t)
+	applySchema(t, db)
+	st := NewSQLStore(db)
+	issuer, err := NewIssuer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{
+		Issuer:    issuer,
+		Store:     st,
+		RouteID:   "route-scope",
+		RouteURL:  "https://relay.example/r/route-scope/mcp",
+		IssuerURL: "https://relay.example/r/route-scope/oauth",
+		Tenant:    "default",
+	}
+	secret := "sec_scope_only_12345"
+	clientID := "cli_scope_only"
+	if err := st.RegisterClient(Client{
+		ID:               clientID,
+		Name:             "Scope Limited",
+		RedirectURIs:     []string{"https://oauth-redirect.googleusercontent.com/r/app"},
+		Tenant:           "default",
+		Route:            "route-scope",
+		ClientMode:       "confidential",
+		ClientSecretHash: HashSecret(secret),
+		RefreshPolicy:    "google_confidential",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ApproveGrantDirect(clientID, "default", "route-scope"); err != nil {
+		t.Fatal(err)
+	}
+	verifier := "v" + strings.Repeat("s", 42)
+	if err := st.CreateCode(Code{
+		Code: "code-scope", ClientID: clientID, Tenant: "default", Route: "route-scope",
+		RedirectURI: "https://oauth-redirect.googleusercontent.com/r/app",
+		Challenge:   CodeChallengeS256(verifier), ChallengeMethod: "S256",
+		Scope: "offline_access", ExpiresAt: time.Now().Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(
+		"grant_type=authorization_code&code=code-scope&redirect_uri="+url.QueryEscape("https://oauth-redirect.googleusercontent.com/r/app")+"&code_verifier="+verifier))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth(clientID, secret)
+	s.ServeToken(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code exchange=%d body=%s", w.Code, w.Body.String())
+	}
+	var tokResp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &tokResp)
+	rtok, _ := tokResp["refresh_token"].(string)
+	if rtok == "" {
+		t.Fatal("missing refresh token")
+	}
+
+	// Refresh and verify mcp:tools is NOT granted.
+	w2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(
+		"grant_type=refresh_token&refresh_token="+url.QueryEscape(rtok)))
+	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req2.SetBasicAuth(clientID, secret)
+	s.ServeToken(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("refresh=%d body=%s", w2.Code, w2.Body.String())
+	}
+	var refResp map[string]any
+	_ = json.Unmarshal(w2.Body.Bytes(), &refResp)
+	if got, _ := refResp["scope"].(string); got != "offline_access" {
+		t.Fatalf("refreshed scope=%q, want offline_access only", got)
+	}
+	accessTok, _ := refResp["access_token"].(string)
+	az := NewAuthorizer(issuer, st)
+	mcpReq := httptest.NewRequest(http.MethodPost, "/r/route-scope/mcp", nil)
+	mcpReq.Header.Set("Authorization", "Bearer "+accessTok)
+	if err := az.Authorize(mcpReq, s.RouteURL, s.IssuerURL, "default", "route-scope"); err == nil {
+		t.Fatal("expected Authorizer to reject offline_access-only token")
+	}
+
+	// Empty-scope managed token must also be rejected.
+	emptyTok, err := issuer.Mint(TokenClaims{
+		Issuer: s.IssuerURL, Subject: clientID, Audience: s.RouteURL,
+		Tenant: "default", Route: "route-scope", Scope: "",
+		Expiry: time.Now().Add(time.Minute).Unix(), ID: "jti-empty",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyReq := httptest.NewRequest(http.MethodPost, "/r/route-scope/mcp", nil)
+	emptyReq.Header.Set("Authorization", "Bearer "+emptyTok)
+	if err := az.Authorize(emptyReq, s.RouteURL, s.IssuerURL, "default", "route-scope"); err == nil {
+		t.Fatal("expected Authorizer to reject empty-scope token")
+	}
+}
+
+func TestServeRevokeRevokesOpaqueRefreshToken(t *testing.T) {
+	db := openTestDB(t)
+	applySchema(t, db)
+	st := NewSQLStore(db)
+	issuer, err := NewIssuer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{
+		Issuer:    issuer,
+		Store:     st,
+		RouteID:   "route-rev",
+		RouteURL:  "https://relay.example/r/route-rev/mcp",
+		IssuerURL: "https://relay.example/r/route-rev/oauth",
+		Tenant:    "default",
+	}
+	secret := "sec_rev_12345"
+	clientID := "cli_rev"
+	_ = st.RegisterClient(Client{
+		ID: clientID, Name: "Rev", RedirectURIs: []string{"https://oauth-redirect.googleusercontent.com/r/app"},
+		Tenant: "default", Route: "route-rev", ClientMode: "confidential",
+		ClientSecretHash: HashSecret(secret), RefreshPolicy: "google_confidential",
+	})
+	_ = st.ApproveGrantDirect(clientID, "default", "route-rev")
+	rtok := "rtok_test_opaque_123456"
+	now := time.Now().UTC()
+	_ = st.CreateOpaqueRefresh(OpaqueRefresh{
+		TokenHash: HashSecret(rtok), ClientID: clientID, Tenant: "default", Route: "route-rev",
+		Scope: "mcp:tools offline_access", ExpiresAt: now.Add(time.Hour), AbsoluteExpiresAt: now.Add(24 * time.Hour), LastUsedAt: now,
+	})
+
+	// Google-initiated revocation of rtok_...
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/oauth/revoke", strings.NewReader("token="+url.QueryEscape(rtok)))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	s.ServeRevoke(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("ServeRevoke=%d, want 200", w.Code)
+	}
+
+	// Subsequent refresh must fail.
+	w2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader("grant_type=refresh_token&refresh_token="+url.QueryEscape(rtok)))
+	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req2.SetBasicAuth(clientID, secret)
+	s.ServeToken(w2, req2)
+	if w2.Code != http.StatusBadRequest {
+		t.Fatalf("refresh after ServeRevoke=%d, want 400", w2.Code)
+	}
+}

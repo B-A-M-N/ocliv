@@ -902,6 +902,7 @@ func (s *Server) serveCodeGrant(w http.ResponseWriter, r *http.Request) {
 				ClientID:          clientID,
 				Tenant:            s.tenant(),
 				Route:             s.RouteID,
+				Scope:             grantedScope,
 				ExpiresAt:         now.Add(s.refreshTTL()),
 				AbsoluteExpiresAt: now.Add(DefaultAbsoluteRefreshTTL),
 				LastUsedAt:        now,
@@ -989,11 +990,18 @@ func (s *Server) serveRefreshGrant(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if client.RefreshPolicy == "google_confidential" {
-			if _, err := s.Store.ExtendOpaqueRefresh(
+			rec, err := s.Store.ExtendOpaqueRefresh(
 				HashSecret(refreshStr), clientID, s.tenant(), s.RouteID, time.Now().UTC(), s.refreshTTL(),
-			); err != nil {
+			)
+			if err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant",
 					"error_description": "refresh token invalid, expired, or revoked"})
+				return
+			}
+			grantedScope := strings.TrimSpace(rec.Scope)
+			if grantedScope == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant",
+					"error_description": "refresh token has no stored scope; reauthorization required"})
 				return
 			}
 			accessJTI, err := MintJTI()
@@ -1007,7 +1015,7 @@ func (s *Server) serveRefreshGrant(w http.ResponseWriter, r *http.Request) {
 				Audience: s.RouteURL,
 				Tenant:   s.tenant(),
 				Route:    s.RouteID,
-				Scope:    "mcp:tools offline_access",
+				Scope:    grantedScope,
 				Expiry:   time.Now().Add(s.tokenTTL()).Unix(),
 				ID:       accessJTI,
 			})
@@ -1020,7 +1028,7 @@ func (s *Server) serveRefreshGrant(w http.ResponseWriter, r *http.Request) {
 				"token_type":    "Bearer",
 				"expires_in":    int(s.tokenTTL().Seconds()),
 				"refresh_token": refreshStr,
-				"scope":         "mcp:tools offline_access",
+				"scope":         grantedScope,
 			})
 			return
 		}
@@ -1029,11 +1037,18 @@ func (s *Server) serveRefreshGrant(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
-		if _, err := s.Store.RotateOpaqueRefresh(
+		rec, err := s.Store.RotateOpaqueRefresh(
 			HashSecret(refreshStr), HashSecret(newRtok), clientID, s.tenant(), s.RouteID, time.Now().UTC(), s.refreshTTL(),
-		); err != nil {
+		)
+		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant",
 				"error_description": "refresh token invalid, rotated, expired, or revoked"})
+			return
+		}
+		grantedScope := strings.TrimSpace(rec.Scope)
+		if grantedScope == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant",
+				"error_description": "refresh token has no stored scope; reauthorization required"})
 			return
 		}
 		accessJTI, err := MintJTI()
@@ -1047,7 +1062,7 @@ func (s *Server) serveRefreshGrant(w http.ResponseWriter, r *http.Request) {
 			Audience: s.RouteURL,
 			Tenant:   s.tenant(),
 			Route:    s.RouteID,
-			Scope:    "mcp:tools offline_access",
+			Scope:    grantedScope,
 			Expiry:   time.Now().Add(s.tokenTTL()).Unix(),
 			ID:       accessJTI,
 		})
@@ -1060,7 +1075,7 @@ func (s *Server) serveRefreshGrant(w http.ResponseWriter, r *http.Request) {
 			"token_type":    "Bearer",
 			"expires_in":    int(s.tokenTTL().Seconds()),
 			"refresh_token": newRtok,
-			"scope":         "mcp:tools offline_access",
+			"scope":         grantedScope,
 		})
 		return
 	}
@@ -1160,6 +1175,7 @@ func (s *Server) serveRefreshGrant(w http.ResponseWriter, r *http.Request) {
 				ClientID:          clientID,
 				Tenant:            s.tenant(),
 				Route:             s.RouteID,
+				Scope:             grantedScope,
 				ExpiresAt:         now.Add(s.refreshTTL()),
 				AbsoluteExpiresAt: now.Add(DefaultAbsoluteRefreshTTL),
 				LastUsedAt:        now,
@@ -1228,6 +1244,14 @@ func (s *Server) ServeRevoke(w http.ResponseWriter, r *http.Request) {
 	tokenStr := r.Form.Get("token")
 	if tokenStr == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	if strings.HasPrefix(tokenStr, "rtok_") {
+		if err := s.Store.RevokeOpaqueRefresh(HashSecret(tokenStr), s.tenant(), s.RouteID, time.Now().UTC()); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 	claims, err := s.Issuer.Verify(tokenStr)

@@ -14,6 +14,45 @@ import (
 	"ocliv/internal/apperr"
 )
 
+// ValidateGoogleVerificationDocument parses and validates a Google Connected
+// Apps domain verification JSON document (requiring a non-empty
+// verification_tokens array with unique non-empty entries and optional exact
+// token match).
+func ValidateGoogleVerificationDocument(raw []byte, expectedToken string) error {
+	if len(raw) == 0 || len(raw) > 32*1024 {
+		return fmt.Errorf("verification document size (%d bytes) out of bounds (1..32768)", len(raw))
+	}
+	var doc struct {
+		VerificationTokens []string `json:"verification_tokens"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&doc); err != nil {
+		return fmt.Errorf("invalid Google verification JSON schema: %w", err)
+	}
+	if len(doc.VerificationTokens) == 0 {
+		return fmt.Errorf("verification_tokens must contain at least one token")
+	}
+	seen := make(map[string]bool, len(doc.VerificationTokens))
+	matched := expectedToken == ""
+	for _, tok := range doc.VerificationTokens {
+		if strings.TrimSpace(tok) == "" || tok != strings.TrimSpace(tok) {
+			return fmt.Errorf("verification_tokens contains an empty or whitespace-padded token")
+		}
+		if seen[tok] {
+			return fmt.Errorf("verification_tokens contains duplicate token %q", tok)
+		}
+		seen[tok] = true
+		if expectedToken != "" && tok == expectedToken {
+			matched = true
+		}
+	}
+	if !matched {
+		return fmt.Errorf("expected verification token not found in verification_tokens")
+	}
+	return nil
+}
+
 func cmdGoogle(argv []string) int {
 	if len(argv) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: ocliv google verify-domain|check-domain ...")
@@ -61,8 +100,8 @@ func cmdGoogleVerifyDomain(argv []string) int {
 		fmt.Fprintf(os.Stderr, "google verify-domain: read %q: %v\n", tokenFile, err)
 		return apperr.ExitCLIValidation
 	}
-	if !json.Valid(raw) {
-		fmt.Fprintf(os.Stderr, "google verify-domain: %q must contain valid JSON\n", tokenFile)
+	if err := ValidateGoogleVerificationDocument(raw, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "google verify-domain: %q: %v\n", tokenFile, err)
 		return apperr.ExitCLIValidation
 	}
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
@@ -130,8 +169,12 @@ func cmdGoogleCheckDomainWithClient(argv []string, hc *http.Client) int {
 		fmt.Fprintf(os.Stderr, "google check-domain: GET %s returned HTTP %d (want 200 without redirect)\n", u, resp.StatusCode)
 		return apperr.ExitRelayTLS
 	}
-	if !json.Valid(body) {
-		fmt.Fprintf(os.Stderr, "google check-domain: %s did not return valid JSON\n", u)
+	if ct := resp.Header.Get("Content-Type"); ct != "" && !strings.Contains(strings.ToLower(ct), "application/json") {
+		fmt.Fprintf(os.Stderr, "google check-domain: %s returned Content-Type %q (want application/json)\n", u, ct)
+		return apperr.ExitRelayTLS
+	}
+	if err := ValidateGoogleVerificationDocument(body, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "google check-domain: %s invalid verification document: %v\n", u, err)
 		return apperr.ExitRelayTLS
 	}
 	if expectedFile != "" {

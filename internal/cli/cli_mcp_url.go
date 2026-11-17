@@ -173,11 +173,21 @@ func resolveCatalogEntry(name, profile string, ops serviceOps) (catalogEntry, in
 }
 
 type discoveryCheckResult struct {
-	Transport      string `json:"transport"` // PASS | FAIL
-	Discovery      string `json:"discovery"` // PASS | FAIL | UNKNOWN
-	Issuer         string `json:"issuer,omitempty"`
-	RegistrationEP string `json:"registration_endpoint,omitempty"`
-	Detail         string `json:"detail,omitempty"`
+	Transport       string `json:"transport"` // PASS | FAIL
+	Discovery       string `json:"discovery"` // PASS | FAIL | UNKNOWN
+	Issuer          string `json:"issuer,omitempty"`
+	AuthorizationEP string `json:"authorization_endpoint,omitempty"`
+	TokenEP         string `json:"token_endpoint,omitempty"`
+	RegistrationEP  string `json:"registration_endpoint,omitempty"`
+	Detail          string `json:"detail,omitempty"`
+}
+
+func wellKnownMetadataURL(u *url.URL, wellKnownName string) string {
+	path := strings.TrimSuffix(u.EscapedPath(), "/")
+	if path == "" || path == "/" {
+		return u.Scheme + "://" + u.Host + "/.well-known/" + wellKnownName
+	}
+	return u.Scheme + "://" + u.Host + "/.well-known/" + wellKnownName + path
 }
 
 func validatePublicIP(ip net.IP) error {
@@ -257,6 +267,10 @@ func wrapNoRedirectClient(base *http.Client) *http.Client {
 }
 
 func runReadOnlyDiscoveryCheck(hc *http.Client, pubURL string) discoveryCheckResult {
+	return runReadOnlyDiscoveryCheckWithAllowlist(hc, pubURL, nil)
+}
+
+func runReadOnlyDiscoveryCheckWithAllowlist(hc *http.Client, pubURL string, trustedIssuerOrigins []string) discoveryCheckResult {
 	res := discoveryCheckResult{Transport: "FAIL", Discovery: "FAIL"}
 	if pubURL == "" {
 		res.Detail = "missing public URL"
@@ -284,7 +298,7 @@ func runReadOnlyDiscoveryCheck(hc *http.Client, pubURL string) discoveryCheckRes
 	}
 	res.Transport = "PASS"
 
-	prURL := strings.Replace(pubURL, "/r/", "/.well-known/oauth-protected-resource/r/", 1)
+	prURL := wellKnownMetadataURL(pubParsed, "oauth-protected-resource")
 	if _, err := safeDiscoveryURL(prURL); err != nil {
 		res.Detail = "unsafe protected-resource URL: " + err.Error()
 		return res
@@ -315,11 +329,21 @@ func runReadOnlyDiscoveryCheck(hc *http.Client, pubURL string) discoveryCheckRes
 		return res
 	}
 	if !strings.EqualFold(issuerParsed.Scheme, pubParsed.Scheme) || !strings.EqualFold(issuerParsed.Host, pubParsed.Host) {
-		res.Detail = fmt.Sprintf("authorization_server origin %q does not match endpoint origin %q", issuerParsed.Host, pubParsed.Host)
-		return res
+		issuerOrigin := strings.ToLower(issuerParsed.Scheme + "://" + issuerParsed.Host)
+		allowed := false
+		for _, o := range trustedIssuerOrigins {
+			if strings.EqualFold(strings.TrimRight(o, "/"), issuerOrigin) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			res.Detail = fmt.Sprintf("authorization_server origin %q does not match endpoint origin %q", issuerParsed.Host, pubParsed.Host)
+			return res
+		}
 	}
 	res.Issuer = issuer
-	asURL := strings.Replace(issuer, "/r/", "/.well-known/oauth-authorization-server/r/", 1)
+	asURL := wellKnownMetadataURL(issuerParsed, "oauth-authorization-server")
 	if _, err := safeDiscoveryURL(asURL); err != nil {
 		res.Detail = "unsafe authorization-server metadata URL: " + err.Error()
 		return res
@@ -354,6 +378,8 @@ func runReadOnlyDiscoveryCheck(hc *http.Client, pubURL string) discoveryCheckRes
 		res.Detail = "unsafe token_endpoint: " + err.Error()
 		return res
 	}
+	res.AuthorizationEP = as.AuthorizationEP
+	res.TokenEP = as.TokenEP
 	if as.RegistrationEP != "" {
 		if _, err := safeDiscoveryURL(as.RegistrationEP); err != nil {
 			res.Detail = "unsafe registration_endpoint: " + err.Error()
@@ -691,10 +717,14 @@ func cmdMCPCheckWithOps(argv []string, ops serviceOps, hc *http.Client) int {
 				} else {
 					vBody, _ := io.ReadAll(io.LimitReader(vResp.Body, 32*1024))
 					_ = vResp.Body.Close()
-					if vResp.StatusCode != http.StatusOK || !json.Valid(vBody) {
+					if vResp.StatusCode != http.StatusOK {
 						profileCheck = "FAIL"
 						domainVerify = "FAIL"
 						profileDetail = fmt.Sprintf("%s returned HTTP %d (valid JSON 200 required)", verifyURL, vResp.StatusCode)
+					} else if verr := ValidateGoogleVerificationDocument(vBody, ""); verr != nil {
+						profileCheck = "FAIL"
+						domainVerify = "FAIL"
+						profileDetail = fmt.Sprintf("%s invalid verification document: %v", verifyURL, verr)
 					} else {
 						domainVerify = "PASS"
 					}

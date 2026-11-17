@@ -301,3 +301,43 @@ func TestReconcileServiceOnceRespectsTerminalFenceAndBackoff(t *testing.T) {
 		t.Fatalf("backoff was ignored: got %d starts", starts)
 	}
 }
+
+func TestStopAndVerifyUnitRejectsUnreachableAndDisableFailure(t *testing.T) {
+	// 1. Manager unreachable must return StoppedNow=false and retain record.
+	st := config.OpenServiceStore(t.TempDir())
+	rec := config.ServiceRecord{
+		Name: "unreach-svc", Type: "mcp", LocalURL: "http://127.0.0.1:8080/mcp",
+		Profile: "default", SystemdUnit: "ocliv-publisher@unreach-svc.service",
+	}
+	_ = st.Put(rec)
+	unreachOps := serviceOps{
+		systemctl: func(_ ...string) (string, error) {
+			return "Failed to connect to bus: No medium found", errors.New("exit 1")
+		},
+	}
+	if err := stopAndCleanupLocalService(st, rec, unreachOps); err == nil || !strings.Contains(err.Error(), "STOP_UNCONFIRMED") {
+		t.Fatalf("expected STOP_UNCONFIRMED on unreachable manager, got %v", err)
+	}
+	if _, ok, _ := st.Get("unreach-svc"); !ok {
+		t.Fatal("service record was deleted when systemd manager was unreachable")
+	}
+
+	// 2. Disable failure must return StoppedNow=true, DisabledForReboot=false, and retain record.
+	disFailOps := serviceOps{
+		systemctl: func(args ...string) (string, error) {
+			if len(args) > 0 && args[0] == "is-active" {
+				return "inactive", nil
+			}
+			if len(args) > 0 && args[0] == "disable" {
+				return "permission denied", errors.New("exit 1")
+			}
+			return "loaded", nil
+		},
+	}
+	if err := stopAndCleanupLocalService(st, rec, disFailOps); err == nil || !strings.Contains(err.Error(), "STOP_UNCONFIRMED") {
+		t.Fatalf("expected STOP_UNCONFIRMED on disable failure, got %v", err)
+	}
+	if _, ok, _ := st.Get("unreach-svc"); !ok {
+		t.Fatal("service record was deleted despite disable failure")
+	}
+}
