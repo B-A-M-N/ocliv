@@ -68,6 +68,23 @@ type Client struct {
 	// client_id minted for one route is not an identity on another.
 	Tenant string
 	Route  string
+	// ClientMode is "public" (default, DCR) or "confidential" (pre-registered
+	// with a secret hash, e.g. for Google persistent-linking opaque refresh).
+	ClientMode       string
+	ClientSecretHash string
+}
+
+// OpaqueRefresh represents a persistent, non-rotating opaque refresh token
+// bound to a confidential client, tenant, and route.
+type OpaqueRefresh struct {
+	TokenHash         string
+	ClientID          string
+	Tenant            string
+	Route             string
+	ExpiresAt         time.Time
+	AbsoluteExpiresAt time.Time
+	LastUsedAt        time.Time
+	RevokedAt         *time.Time
 }
 
 // Grant is an operator approval binding one client to one tenant + route.
@@ -119,6 +136,7 @@ type Consent struct {
 	CodeChallenge string
 	State         string
 	Resource      string
+	Scope         string
 	ExpiresAt     time.Time
 	ConsumedAt    *time.Time
 }
@@ -147,6 +165,7 @@ type Code struct {
 	RedirectURI     string
 	Challenge       string
 	ChallengeMethod string
+	Scope           string
 	ExpiresAt       time.Time
 	ConsumedAt      *time.Time
 }
@@ -161,6 +180,12 @@ type Store interface {
 	RegisterClient(c Client) error
 	GetClient(id string) (*Client, error)
 	RevokeClient(id string) error
+	// TryRegisterClientWithPendingGrant atomically registers a client and
+	// creates its initial GrantPending row in one transaction.
+	TryRegisterClientWithPendingGrant(c Client, tenant, route string) error
+	CreateOpaqueRefresh(r OpaqueRefresh) error
+	RotateOpaqueRefresh(oldHash, newHash, clientID, tenant, route string, now time.Time, extendBy time.Duration) (*OpaqueRefresh, error)
+	RevokeOpaqueRefreshForClient(clientID string) error
 
 	CreateGrant(g Grant) error
 	GetGrant(clientID, tenant, route string) (*Grant, error)
@@ -251,13 +276,14 @@ type Store interface {
 
 // MemStore is an in-memory Store for tests and local evaluation.
 type MemStore struct {
-	mu          sync.Mutex
-	clients     map[string]*Client
-	grants      map[string]*Grant // key: clientID + "\x00" + tenant + "\x00" + route
-	codes       map[string]*Code
-	revocations map[string]time.Time // key: jti\x00tenant\x00route -> revokedAt
-	consent     map[string]*Consent
-	audit       []AuthzAudit
+	mu            sync.Mutex
+	clients       map[string]*Client
+	grants        map[string]*Grant // key: clientID + "\x00" + tenant + "\x00" + route
+	codes         map[string]*Code
+	revocations   map[string]time.Time // key: jti\x00tenant\x00route -> revokedAt
+	consent       map[string]*Consent
+	audit         []AuthzAudit
+	opaqueRefresh map[string]*OpaqueRefresh
 }
 
 // NewMemStore returns an empty in-memory store.
@@ -885,4 +911,94 @@ func (m *MemStore) SortedGrants() []Grant {
 		return out[i].ClientID < out[j].ClientID
 	})
 	return out
+}
+
+func (m *MemStore) TryRegisterClientWithPendingGrant(c Client, tenant, route string) error {
+	if err := m.TryRegisterClient(c); err != nil {
+		return err
+	}
+	if err := m.CreateGrant(Grant{
+		ClientID:  c.ID,
+		Tenant:    tenant,
+		Route:     route,
+		Status:    GrantPending,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}); err != nil {
+		m.mu.Lock()
+		delete(m.clients, c.ID)
+		m.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (m *MemStore) CreateOpaqueRefresh(r OpaqueRefresh) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.opaqueRefresh == nil {
+		m.opaqueRefresh = map[string]*OpaqueRefresh{}
+	}
+	cp := r
+	m.opaqueRefresh[r.TokenHash] = &cp
+	return nil
+}
+
+func (m *MemStore) RotateOpaqueRefresh(oldHash, newHash, clientID, tenant, route string, now time.Time, extendBy time.Duration) (*OpaqueRefresh, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.opaqueRefresh == nil {
+		return nil, fmt.Errorf("authz: opaque refresh not found")
+	}
+	r, ok := m.opaqueRefresh[oldHash]
+	if !ok {
+		return nil, fmt.Errorf("authz: opaque refresh not found")
+	}
+	if r.ClientID != clientID || r.Tenant != tenant || r.Route != route {
+		return nil, fmt.Errorf("authz: opaque refresh binding mismatch")
+	}
+	if r.RevokedAt != nil {
+		// Replay detected: revoke the entire opaque refresh lineage for this client.
+		for _, tok := range m.opaqueRefresh {
+			if tok.ClientID == clientID && tok.Tenant == tenant && tok.Route == route && tok.RevokedAt == nil {
+				t := now
+				tok.RevokedAt = &t
+			}
+		}
+		return nil, fmt.Errorf("authz: opaque refresh replay detected")
+	}
+	if now.After(r.ExpiresAt) || now.After(r.AbsoluteExpiresAt) {
+		return nil, fmt.Errorf("authz: opaque refresh expired")
+	}
+	t := now
+	r.RevokedAt = &t
+	nextExp := now.Add(extendBy)
+	if nextExp.After(r.AbsoluteExpiresAt) {
+		nextExp = r.AbsoluteExpiresAt
+	}
+	next := &OpaqueRefresh{
+		TokenHash:         newHash,
+		ClientID:          clientID,
+		Tenant:            tenant,
+		Route:             route,
+		ExpiresAt:         nextExp,
+		AbsoluteExpiresAt: r.AbsoluteExpiresAt,
+		LastUsedAt:        now,
+	}
+	m.opaqueRefresh[newHash] = next
+	cp := *next
+	return &cp, nil
+}
+
+func (m *MemStore) RevokeOpaqueRefreshForClient(clientID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	for _, r := range m.opaqueRefresh {
+		if r.ClientID == clientID && r.RevokedAt == nil {
+			t := now
+			r.RevokedAt = &t
+		}
+	}
+	return nil
 }

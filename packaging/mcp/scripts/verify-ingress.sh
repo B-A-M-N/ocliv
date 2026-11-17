@@ -35,13 +35,34 @@ if [ -z "$TOKEN" ]; then
 fi
 TOOL="${EXPECTED_TOOL:-ping}"
 JSON='Content-Type: application/json'
-CURL="curl -sS --connect-timeout 5 --max-time 30"
 _session_id=""
 _protocol_version=""
 _session_mode="uninitialized"
-if [ -n "${MCP_CACERT:-}" ]; then
-  CURL="$CURL --cacert $MCP_CACERT"
-fi
+_auth_cfg=""
+_wrong_cfg=""
+
+_cleanup() {
+  rm -f "${_auth_cfg:-}" "${_wrong_cfg:-}"
+}
+trap _cleanup EXIT INT TERM
+
+_make_auth_cfg() {
+  _f=$(umask 077 && mktemp)
+  chmod 600 "$_f"
+  printf 'header = "Authorization: Bearer %s"\n' "$1" > "$_f"
+  printf '%s' "$_f"
+}
+
+_auth_cfg="$(_make_auth_cfg "$TOKEN")"
+_wrong_cfg="$(_make_auth_cfg "wrong-token")"
+
+_curl() {
+  if [ -n "${MCP_CACERT:-}" ]; then
+    curl -sS --connect-timeout 5 --max-time 30 --cacert "$MCP_CACERT" "$@"
+  else
+    curl -sS --connect-timeout 5 --max-time 30 "$@"
+  fi
+}
 
 if command -v jq >/dev/null 2>&1; then
   HAVE_JQ=1
@@ -129,23 +150,29 @@ else:
   fi
 }
 
-# _post <url> <data> <auth: yes|no>: print body, then "<http-code>" on last line.
+# _post <url> <data> <auth: yes|wrong|no>: print body, then "<http-code>" on last line.
 _post() {
-  if [ "${3:-no}" = "yes" ]; then
+  set -- "$1" "$2" "${3:-no}"
+  _cfg=""
+  case "$3" in
+    yes) _cfg="$_auth_cfg" ;;
+    wrong) _cfg="$_wrong_cfg" ;;
+  esac
+  if [ -n "$_cfg" ]; then
     if [ -n "${_session_id:-}" ]; then
-      $CURL -i -X POST "$1" -H "Authorization: Bearer $TOKEN" -H "MCP-Session-Id: $_session_id" \
+      _curl -i -X POST "$1" -K "$_cfg" -H "MCP-Session-Id: $_session_id" \
         -H "MCP-Protocol-Version: $_protocol_version" -H "Accept: application/json, text/event-stream" \
         -H "$JSON" -d "$2" -w '\n%{http_code}'
     elif [ -n "$_protocol_version" ]; then
-      $CURL -i -X POST "$1" -H "Authorization: Bearer $TOKEN" \
+      _curl -i -X POST "$1" -K "$_cfg" \
         -H "MCP-Protocol-Version: $_protocol_version" -H "Accept: application/json, text/event-stream" \
         -H "$JSON" -d "$2" -w '\n%{http_code}'
     else
-      $CURL -i -X POST "$1" -H "Authorization: Bearer $TOKEN" \
+      _curl -i -X POST "$1" -K "$_cfg" \
         -H "Accept: application/json, text/event-stream" -H "$JSON" -d "$2" -w '\n%{http_code}'
     fi
   else
-    $CURL -i -X POST "$1" -H "Accept: application/json, text/event-stream" -H "$JSON" -d "$2" -w '\n%{http_code}'
+    _curl -i -X POST "$1" -H "Accept: application/json, text/event-stream" -H "$JSON" -d "$2" -w '\n%{http_code}'
   fi
 }
 _split() { # $1: _post output; sets _body and _code
@@ -195,9 +222,9 @@ META="https://$HOST/.well-known/oauth-protected-resource/r/$RID/mcp"
 AS_META="https://$HOST/.well-known/oauth-authorization-server/r/$RID/oauth"
 AS_ISSUER="https://$HOST/r/$RID/oauth"
 
-meta=$($CURL "$META") || fail "metadata unreachable"
+meta=$(_curl "$META") || fail "metadata unreachable"
 [ "$(_json "$meta" '.resource')" = "$ROUTE" ] || fail "resource mismatch: $(short "$meta")"
-asmeta=$($CURL "$AS_META") || fail "authorization-server metadata unreachable"
+asmeta=$(_curl "$AS_META") || fail "authorization-server metadata unreachable"
 [ "$(_json "$asmeta" '.issuer')" = "$AS_ISSUER" ] || fail "authorization-server issuer mismatch: $(short "$asmeta")"
 
 # 1. Missing token must be rejected by harmless tools/list.
@@ -205,10 +232,7 @@ _split "$(_post "$ROUTE" '{"jsonrpc":"2.0","id":1,"method":"tools/list","params"
 [ "$_code" = "401" ] || fail "missing token -> $_code, want 401"
 
 # 2. Wrong token must be rejected by the same harmless method.
-_saved="$TOKEN"
-TOKEN="wrong-token"
-_split "$(_post "$ROUTE" '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' yes)"
-TOKEN="$_saved"
+_split "$(_post "$ROUTE" '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' wrong)"
 [ "$_code" = "401" ] || fail "invalid token -> $_code, want 401"
 
 # 3. Negotiate the MCP protocol/session before issuing authenticated calls.

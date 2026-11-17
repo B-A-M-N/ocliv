@@ -20,9 +20,7 @@ Wants=ocliv-backend@%i.service
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/ocliv/service-%i.env
-ExecStart=/bin/sh -c '\
-[ -n "$${OCLIV_LOCAL_URL:-}" ] || { echo "ocliv-publisher@%i: OCLIV_LOCAL_URL unset" >&2; exit 2; }; \
-exec $${OCLIV_BIN} service run-publisher --name="$${OCLIV_NAME:-%i}"'
+ExecStart=/bin/sh -c 'exec $${OCLIV_BIN} service run-publisher --name="$${OCLIV_NAME:-%i}" --profile="$${OCLIV_PROFILE:-default}"'
 Restart=on-failure
 RestartPreventExitStatus=2 4 6 7
 RestartSec=15
@@ -42,7 +40,7 @@ Description=Ocliv managed local backend (%i)
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/ocliv/service-%i.env
-ExecStart=/bin/sh -c 'exec $${OCLIV_BACKEND_EXEC} $${OCLIV_BACKEND_ARGS:-}'
+ExecStart=/bin/sh -c 'exec $${OCLIV_BIN} service run-backend --name="$${OCLIV_NAME:-%i}" --profile="$${OCLIV_PROFILE:-default}"'
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM
@@ -85,19 +83,60 @@ func userSystemdDir() (string, error) {
 	return filepath.Join(home, ".config", "systemd", "user"), nil
 }
 
+func validUnitComponent(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// serviceInstanceID returns the canonical systemd instance identity
+// (<profile>--<service-name>) so services with the same name in different
+// profiles never collide on unit names or environment files.
+func serviceInstanceID(profile, name string) (string, error) {
+	prof := strings.TrimSpace(profile)
+	if prof == "" {
+		prof = "default"
+	}
+	if !validUnitComponent(prof) {
+		return "", fmt.Errorf("invalid profile name %q for systemd unit", prof)
+	}
+	if !validUnitComponent(name) {
+		return "", fmt.Errorf("invalid service name %q for systemd unit", name)
+	}
+	return prof + "--" + name, nil
+}
+
+func serviceUnitInstance(rec config.ServiceRecord) (string, error) {
+	if strings.HasPrefix(rec.SystemdUnit, "ocliv-publisher@") && strings.HasSuffix(rec.SystemdUnit, ".service") {
+		inst := strings.TrimSuffix(strings.TrimPrefix(rec.SystemdUnit, "ocliv-publisher@"), ".service")
+		if validUnitComponent(inst) {
+			return inst, nil
+		}
+	}
+	return serviceInstanceID(rec.Profile, rec.Name)
+}
+
 func serviceEnvPath(rec config.ServiceRecord) (string, error) {
+	inst, err := serviceUnitInstance(rec)
+	if err != nil {
+		return "", err
+	}
+	home, herr := os.UserHomeDir()
+	if herr == nil && home != "" {
+		return filepath.Join(home, ".config", "ocliv", "service-"+inst+".env"), nil
+	}
 	dir, err := config.DataDirForProfile(rec.Profile)
 	if err != nil {
 		return "", err
 	}
-	root := dir
-	if rec.Profile != "" && rec.Profile != "default" {
-		home, herr := os.UserHomeDir()
-		if herr == nil && home != "" {
-			root = filepath.Join(home, ".config", "ocliv")
-		}
-	}
-	return filepath.Join(root, "service-"+rec.Name+".env"), nil
+	return filepath.Join(dir, "service-"+inst+".env"), nil
 }
 
 // sanitizeEnvValue rejects newlines/nulls so env-file writes cannot inject extra variables.
@@ -198,22 +237,44 @@ func provisionUserSupervisor(rec config.ServiceRecord, ops serviceOps) error {
 	return nil
 }
 
-// queryUnitState distinguishes "not-found", "active", "activating", "failed", and "inactive".
-func queryUnitState(unit string, ops serviceOps) string {
+// UnitInspection holds structured systemd user unit state without leaking
+// raw D-Bus/systemctl error strings as process states.
+type UnitInspection struct {
+	ManagerReachable bool   `json:"manager_reachable"`
+	LoadState        string `json:"load_state,omitempty"`
+	ActiveState      string `json:"active_state"`
+	Error            string `json:"error,omitempty"`
+}
+
+func inspectUnit(unit string, ops serviceOps) UnitInspection {
 	if unit == "" {
-		return "not-configured"
+		return UnitInspection{ManagerReachable: true, ActiveState: "not-configured"}
 	}
-	loadState, err := ops.systemctl("show", "-p", "LoadState", "--value", unit)
-	if err == nil && strings.TrimSpace(loadState) == "not-found" {
-		return "not-found"
+	loadState, lerr := ops.systemctl("show", "-p", "LoadState", "--value", unit)
+	ls := strings.TrimSpace(loadState)
+	if lerr != nil && (strings.Contains(ls, "Failed to connect") || strings.Contains(lerr.Error(), "Failed to connect")) {
+		return UnitInspection{ManagerReachable: false, ActiveState: "manager-unreachable", Error: ls}
 	}
-	act, err := ops.systemctl("is-active", unit)
+	if lerr == nil && ls == "not-found" {
+		return UnitInspection{ManagerReachable: true, LoadState: "not-found", ActiveState: "not-found"}
+	}
+	act, aerr := ops.systemctl("is-active", unit)
 	act = strings.TrimSpace(act)
-	if act != "" {
-		return act
+	if aerr != nil && (strings.Contains(act, "Failed to connect") || strings.Contains(aerr.Error(), "Failed to connect")) {
+		return UnitInspection{ManagerReachable: false, LoadState: ls, ActiveState: "manager-unreachable", Error: act}
 	}
-	if err != nil {
-		return "inactive"
+	switch act {
+	case "active", "activating", "deactivating", "reloading", "inactive", "failed", "not-found":
+		return UnitInspection{ManagerReachable: true, LoadState: ls, ActiveState: act}
 	}
-	return "unknown"
+	if aerr != nil {
+		return UnitInspection{ManagerReachable: true, LoadState: ls, ActiveState: "inactive", Error: aerr.Error()}
+	}
+	return UnitInspection{ManagerReachable: true, LoadState: ls, ActiveState: "unknown"}
+}
+
+// queryUnitState distinguishes "not-found", "active", "activating", "failed",
+// "inactive", and "manager-unreachable".
+func queryUnitState(unit string, ops serviceOps) string {
+	return inspectUnit(unit, ops).ActiveState
 }

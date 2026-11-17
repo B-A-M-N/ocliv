@@ -12,31 +12,33 @@ import (
 
 // ServiceStatusReport is the structured diagnostic output for `ocliv service status --json`.
 type ServiceStatusReport struct {
-	Name               string `json:"name"`
-	Type               string `json:"type"`
-	Profile            string `json:"profile"`
-	BackendMode        string `json:"backend_mode"`
-	DesiredState       string `json:"desired_state"`
-	Revision           int64  `json:"revision"`
-	StateGeneration    int64  `json:"state_generation,omitempty"`
-	State              string `json:"state"`
-	Health             string `json:"health"`
-	ProcessState       string `json:"process_state"`
-	BackendUnitState   string `json:"backend_unit_state,omitempty"`
-	RelayState         string `json:"relay_state"`
-	PublicationID      string `json:"publication_id,omitempty"`
-	LeaseID            string `json:"lease_id,omitempty"`
-	PublicURL          string `json:"public_url,omitempty"`
-	AuthProfile        string `json:"auth_profile"`
-	BackendAvailable   bool   `json:"backend_available"`
-	BackendDetail      string `json:"backend_detail,omitempty"`
-	PublicTransport    bool   `json:"public_transport"`
-	PublicVerified     bool   `json:"public_verified"`
-	IngressReady       bool   `json:"ingress_ready"`
-	IngressDetail      string `json:"ingress_detail,omitempty"`
-	LastVerifiedAt     string `json:"last_verified_at,omitempty"`
-	LastFailure        string `json:"last_failure,omitempty"`
-	LastRecoveryAction string `json:"last_recovery_action,omitempty"`
+	Name                 string                       `json:"name"`
+	Type                 string                       `json:"type"`
+	Profile              string                       `json:"profile"`
+	BackendMode          string                       `json:"backend_mode"`
+	DesiredState         string                       `json:"desired_state"`
+	Revision             int64                        `json:"revision"`
+	StateGeneration      int64                        `json:"state_generation,omitempty"`
+	State                string                       `json:"state"`
+	Health               string                       `json:"health"`
+	ProcessState         string                       `json:"process_state"`
+	BackendUnitState     string                       `json:"backend_unit_state,omitempty"`
+	RelayState           string                       `json:"relay_state"`
+	PublicationID        string                       `json:"publication_id,omitempty"`
+	LeaseID              string                       `json:"lease_id,omitempty"`
+	PublicURL            string                       `json:"public_url,omitempty"`
+	AuthProfile          string                       `json:"auth_profile"`
+	BackendAvailable     bool                         `json:"backend_available"`
+	BackendDetail        string                       `json:"backend_detail,omitempty"`
+	PublicTransport      bool                         `json:"public_transport"`
+	PublicVerified       bool                         `json:"public_verified"`
+	VerificationLevel    string                       `json:"verification_level,omitempty"`
+	VerificationEvidence *config.VerificationEvidence `json:"verification_evidence,omitempty"`
+	IngressReady         bool                         `json:"ingress_ready"`
+	IngressDetail        string                       `json:"ingress_detail,omitempty"`
+	LastVerifiedAt       string                       `json:"last_verified_at,omitempty"`
+	LastFailure          string                       `json:"last_failure,omitempty"`
+	LastRecoveryAction   string                       `json:"last_recovery_action,omitempty"`
 }
 
 func inspectServiceStatus(rec config.ServiceRecord, k *identity.KeyPair, keyID string, ops serviceOps) ServiceStatusReport {
@@ -69,8 +71,12 @@ func inspectServiceStatus(rec config.ServiceRecord, k *identity.KeyPair, keyID s
 		LastRecoveryAction: rec.LastRecoveryAction,
 	}
 
-	// 1. Supervisor process state (distinguishing not-found vs inactive vs failed).
-	rep.ProcessState = queryUnitState(rec.SystemdUnit, ops)
+	// 1. Supervisor process state (distinguishing not-found vs inactive vs failed vs manager-unreachable).
+	unitInfo := inspectUnit(rec.SystemdUnit, ops)
+	rep.ProcessState = unitInfo.ActiveState
+	if !unitInfo.ManagerReachable && unitInfo.Error != "" {
+		rep.LastFailure = unitInfo.Error
+	}
 	if bmode == config.BackendManaged && rec.BackendUnit != "" {
 		rep.BackendUnitState = queryUnitState(rec.BackendUnit, ops)
 	}
@@ -86,6 +92,37 @@ func inspectServiceStatus(rec config.ServiceRecord, k *identity.KeyPair, keyID s
 	} else {
 		rep.BackendAvailable = true
 		rep.BackendDetail = "reachable"
+	}
+	if rep.BackendAvailable {
+		rep.VerificationLevel = "LOCAL_READY"
+	}
+
+	// HTTP tunnel services have their own lifecycle independent of MCP route inventory.
+	if rec.Type == "http" {
+		rep.RelayState = "http-tunnel"
+		if rec.DesiredState == config.DesiredDisabled {
+			rep.State = ServiceStateDisabled
+			rep.Health = HealthReady
+			return rep
+		}
+		if rec.DesiredState == config.DesiredConfigured {
+			rep.State = ServiceStateConfigured
+			rep.Health = HealthReady
+			return rep
+		}
+		if rep.ProcessState == "active" && rep.BackendAvailable {
+			rep.State = ServiceStateServing
+			rep.Health = HealthReady
+			return rep
+		}
+		if rep.ProcessState == "activating" {
+			rep.State = ServiceStateStarting
+			rep.Health = HealthDegraded
+			return rep
+		}
+		rep.State = ServiceStateOffline
+		rep.Health = HealthFailed
+		return rep
 	}
 
 	// 3. Authenticated relay inventory using the service's bound profile & relay.
@@ -179,6 +216,9 @@ func inspectServiceStatus(rec config.ServiceRecord, k *identity.KeyPair, keyID s
 	}
 
 	rep.RelayState = pubState
+	if pubState != "" && pubState != "REVOKED" {
+		rep.VerificationLevel = "RELAY_READY"
+	}
 	if pubState == "REVOKED" {
 		rep.State = ServiceStateRevoked
 		rep.Health = HealthBlocked
@@ -197,25 +237,33 @@ func inspectServiceStatus(rec config.ServiceRecord, k *identity.KeyPair, keyID s
 		return rep
 	}
 
-	// Desired enabled: separate transport check from external PublicVerified.
+	// Desired enabled: separate transport check from structured verification evidence.
 	if admission == "READY" && sessionLive && rep.BackendAvailable {
-		if rep.PublicURL != "" {
-			code, err := ops.probePub(rep.PublicURL, 3*time.Second)
-			if err == nil && (code == http.StatusUnauthorized || code == http.StatusOK) {
-				rep.PublicTransport = true
-				rep.IngressReady = true
-				rep.IngressDetail = fmt.Sprintf("HTTP %d (transport ok; public_verified=%v)", code, rep.PublicVerified)
-				rep.State = ServiceStateServing
-				rep.Health = HealthReady
-				return rep
-			}
-			rep.IngressDetail = fmt.Sprintf("probe code=%d err=%v", code, err)
+		if rep.PublicURL == "" {
 			rep.State = ServiceStateOffline
 			rep.Health = HealthDegraded
+			rep.IngressDetail = "missing canonical public URL"
 			return rep
 		}
-		rep.State = ServiceStateServing
-		rep.Health = HealthReady
+		code, err := ops.probePub(rep.PublicURL, 3*time.Second)
+		if err == nil && (code == http.StatusUnauthorized || code == http.StatusOK) {
+			rep.PublicTransport = true
+			rep.VerificationLevel = "PUBLIC_TRANSPORT_READY"
+			if validEvidence(rec.VerificationEvidence, rep.PublicationID, rep.PublicURL, rep.StateGeneration) {
+				rep.VerificationEvidence = rec.VerificationEvidence
+				if rec.VerificationEvidence.Stage != "" {
+					rep.VerificationLevel = rec.VerificationEvidence.Stage
+				}
+			}
+			rep.IngressReady = true
+			rep.IngressDetail = fmt.Sprintf("HTTP %d (transport ok; stage=%s)", code, rep.VerificationLevel)
+			rep.State = ServiceStateServing
+			rep.Health = HealthReady
+			return rep
+		}
+		rep.IngressDetail = fmt.Sprintf("probe code=%d err=%v", code, err)
+		rep.State = ServiceStateOffline
+		rep.Health = HealthDegraded
 		return rep
 	}
 	if rep.ProcessState == "failed" || rep.ProcessState == "not-found" {
@@ -234,4 +282,22 @@ func inspectServiceStatus(rec config.ServiceRecord, k *identity.KeyPair, keyID s
 	rep.Health = HealthFailed
 	rep.IngressDetail = admissionReason
 	return rep
+}
+
+func validEvidence(ev *config.VerificationEvidence, routeID, publicURL string, gen int64) bool {
+	if ev == nil || ev.RouteID == "" || ev.PublicURL == "" {
+		return false
+	}
+	if ev.RouteID != routeID || ev.PublicURL != publicURL {
+		return false
+	}
+	if ev.StateGeneration > 0 && gen > 0 && ev.StateGeneration != gen {
+		return false
+	}
+	if ev.ExpiresAt != "" {
+		if exp, err := time.Parse(time.RFC3339, ev.ExpiresAt); err == nil && time.Now().After(exp) {
+			return false
+		}
+	}
+	return true
 }

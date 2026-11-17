@@ -2,12 +2,22 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
+	"runtime"
+	"runtime/debug"
 	"strings"
 
 	"ocliv/internal/apperr"
 	"ocliv/internal/protocol"
+	"ocliv/internal/store"
+)
+
+// BuildCommit and BuildTime can be overridden at link time via -ldflags.
+var (
+	BuildCommit = ""
+	BuildTime   = ""
 )
 
 // BinaryVersion is the client/relay build version reported by
@@ -22,6 +32,62 @@ func versionString() string {
 		BinaryVersion, protocol.Version, protocol.MinVersion, protocol.MaxVersion)
 }
 
+func buildVersionInfo() map[string]any {
+	commit := BuildCommit
+	buildTime := BuildTime
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			switch s.Key {
+			case "vcs.revision":
+				if commit == "" {
+					commit = s.Value
+				}
+			case "vcs.time":
+				if buildTime == "" {
+					buildTime = s.Value
+				}
+			}
+		}
+	}
+	return map[string]any{
+		"version":             BinaryVersion,
+		"commit":              commit,
+		"build_time":          buildTime,
+		"os":                  runtime.GOOS,
+		"arch":                runtime.GOARCH,
+		"go_version":          runtime.Version(),
+		"schema_version":      store.SchemaVersion,
+		"protocol_version":    protocol.Version,
+		"supported_protocols": protocol.MinVersion + "-" + protocol.MaxVersion,
+		"capabilities": []string{
+			"mcp_managed_oauth",
+			"appended_as_discovery",
+			"direct_grant_v13",
+			"confidential_refresh_v14",
+			"cors_mcp_headers",
+		},
+	}
+}
+
+func cmdVersion(argv []string) int {
+	asJSON := false
+	for _, a := range argv {
+		if a == "--json" {
+			asJSON = true
+		} else {
+			fmt.Fprintf(os.Stderr, "unknown version flag %q\n", a)
+			return apperr.ExitCLIValidation
+		}
+	}
+	if asJSON {
+		b, _ := json.MarshalIndent(buildVersionInfo(), "", "  ")
+		fmt.Println(string(b))
+		return apperr.ExitOK
+	}
+	fmt.Println(versionString())
+	return apperr.ExitOK
+}
+
 // Run dispatches argv. Exit codes follow the spec contract.
 func Run(argv []string) int {
 	if len(argv) == 0 {
@@ -29,8 +95,7 @@ func Run(argv []string) int {
 	}
 	switch argv[0] {
 	case "version", "--version", "-V":
-		fmt.Println(versionString())
-		return apperr.ExitOK
+		return cmdVersion(argv[1:])
 	case "help", "--help", "-h":
 		return usage(apperr.ExitOK)
 	case "login":

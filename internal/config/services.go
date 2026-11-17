@@ -28,35 +28,50 @@ const (
 	BackendManaged  = "managed"  // Ocliv supervises BackendExec -> LocalURL
 )
 
+// VerificationEvidence records the exact proven readiness stage for a
+// publication, bound to its identity, URL, generation, and expiration.
+type VerificationEvidence struct {
+	Stage           string `json:"stage"`
+	RouteID         string `json:"route_id,omitempty"`
+	PublicURL       string `json:"public_url,omitempty"`
+	Issuer          string `json:"issuer,omitempty"`
+	ProtocolVersion string `json:"protocol_version,omitempty"`
+	StateGeneration int64  `json:"state_generation,omitempty"`
+	VerifiedAt      string `json:"verified_at,omitempty"`
+	ExpiresAt       string `json:"expires_at,omitempty"`
+	FailureReason   string `json:"failure_reason,omitempty"`
+}
+
 // ServiceRecord is the durable operator-configured service definition.
 // Publication identity is bound to Name (never derived from a local TCP port)
 // and Profile/RelayURL (never silently switched by active-profile changes).
 type ServiceRecord struct {
-	Name               string   `json:"name"`
-	Type               string   `json:"type"`                   // "mcp" | "http"
-	BackendMode        string   `json:"backend_mode,omitempty"` // "attached" | "managed"
-	BackendExec        string   `json:"backend_exec,omitempty"`
-	BackendArgs        []string `json:"backend_args,omitempty"`
-	LocalURL           string   `json:"local_url,omitempty"`
-	StdioCmd           []string `json:"stdio_cmd,omitempty"`
-	StdioDir           string   `json:"stdio_dir,omitempty"`
-	StdioEnv           []string `json:"stdio_env,omitempty"`
-	Auth               string   `json:"auth"`
-	RelayURL           string   `json:"relay_url,omitempty"`
-	Profile            string   `json:"profile,omitempty"`
-	DesiredState       string   `json:"desired_state"`
-	Revision           int64    `json:"revision"`
-	StateGeneration    int64    `json:"state_generation,omitempty"`
-	PublicationID      string   `json:"publication_id,omitempty"`
-	PublicURL          string   `json:"public_url,omitempty"`
-	PublicVerified     bool     `json:"public_verified,omitempty"`
-	SystemdUnit        string   `json:"systemd_unit,omitempty"`
-	BackendUnit        string   `json:"backend_unit,omitempty"`
-	LastVerifiedAt     string   `json:"last_verified_at,omitempty"`
-	LastFailure        string   `json:"last_failure,omitempty"`
-	LastRecoveryAction string   `json:"last_recovery_action,omitempty"`
-	CreatedAt          string   `json:"created_at"`
-	UpdatedAt          string   `json:"updated_at"`
+	Name                 string                `json:"name"`
+	Type                 string                `json:"type"`                   // "mcp" | "http"
+	BackendMode          string                `json:"backend_mode,omitempty"` // "attached" | "managed"
+	BackendExec          string                `json:"backend_exec,omitempty"`
+	BackendArgs          []string              `json:"backend_args,omitempty"`
+	LocalURL             string                `json:"local_url,omitempty"`
+	StdioCmd             []string              `json:"stdio_cmd,omitempty"`
+	StdioDir             string                `json:"stdio_dir,omitempty"`
+	StdioEnv             []string              `json:"stdio_env,omitempty"`
+	Auth                 string                `json:"auth"`
+	RelayURL             string                `json:"relay_url,omitempty"`
+	Profile              string                `json:"profile,omitempty"`
+	DesiredState         string                `json:"desired_state"`
+	Revision             int64                 `json:"revision"`
+	StateGeneration      int64                 `json:"state_generation,omitempty"`
+	PublicationID        string                `json:"publication_id,omitempty"`
+	PublicURL            string                `json:"public_url,omitempty"`
+	PublicVerified       bool                  `json:"public_verified,omitempty"`
+	VerificationEvidence *VerificationEvidence `json:"verification_evidence,omitempty"`
+	SystemdUnit          string                `json:"systemd_unit,omitempty"`
+	BackendUnit          string                `json:"backend_unit,omitempty"`
+	LastVerifiedAt       string                `json:"last_verified_at,omitempty"`
+	LastFailure          string                `json:"last_failure,omitempty"`
+	LastRecoveryAction   string                `json:"last_recovery_action,omitempty"`
+	CreatedAt            string                `json:"created_at"`
+	UpdatedAt            string                `json:"updated_at"`
 }
 
 // ValidateServiceName enforces a safe, explicit service identifier.

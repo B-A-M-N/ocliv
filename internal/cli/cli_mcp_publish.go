@@ -731,10 +731,13 @@ func cmdMCPServe(argv []string) int {
 func cmdMCPList(argv []string) int {
 	name := ""
 	profile := ""
-	usage := "usage: ocliv mcp list [--profile NAME] [--name LABEL]"
+	asJSON := false
+	usage := "usage: ocliv mcp list [--profile NAME] [--name LABEL] [--json]"
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
-		if a == "--profile" || strings.HasPrefix(a, "--profile=") {
+		if a == "--json" {
+			asJSON = true
+		} else if a == "--profile" || strings.HasPrefix(a, "--profile=") {
 			v, ok := mcpFlagValue(argv, &i, "profile")
 			if !ok || v != "default" && !config.ValidProfileName(v) {
 				fmt.Fprintln(os.Stderr, usage)
@@ -812,6 +815,18 @@ func cmdMCPList(argv []string) int {
 	if err := json.Unmarshal(body, &list); err != nil || list.Publications == nil {
 		fmt.Fprintln(os.Stderr, "mcp list: relay reply unparseable")
 		return apperr.ExitInternal
+	}
+	if asJSON {
+		var out []any
+		for _, p := range list.Publications {
+			if name != "" && p.Name != name {
+				continue
+			}
+			out = append(out, p)
+		}
+		b, _ := json.MarshalIndent(map[string]any{"publications": out}, "", "  ")
+		fmt.Println(string(b))
+		return apperr.ExitOK
 	}
 	fmt.Printf("%-24s %-14s %-12s %-10s %-8s %-9s %-10s %-26s %s\n", "ROUTE ID", "PROFILE", "NAME", "PUBLICATION", "LEASE", "SESSION", "HOST", "ADMISSION", "URL")
 	shown := 0

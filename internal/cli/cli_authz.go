@@ -69,14 +69,15 @@ func authzOpenReadOnly(dataDir string) (*sql.DB, error) {
 // rejected instead of silently ignored — a misspelled --data could
 // otherwise target ./ocliv-relay-data and mutate the wrong database.
 type authzFlags struct {
-	dataDir  string
-	tenant   string
-	route    string
-	client   string
-	name     string
-	redirect string
-	asJSON   bool
-	direct   bool
+	dataDir      string
+	tenant       string
+	route        string
+	client       string
+	name         string
+	redirect     string
+	asJSON       bool
+	direct       bool
+	confidential bool
 }
 
 // authzFlagSpec lists the flags a subcommand accepts and which are required.
@@ -139,6 +140,17 @@ func parseAuthzFlags(argv []string, spec authzFlagSpec) (*authzFlags, error) {
 				return nil, fmt.Errorf("--direct given twice")
 			}
 			f.direct = true
+			seen[name] = "true"
+			continue
+		}
+		if name == "confidential" {
+			if hasVal {
+				return nil, fmt.Errorf("--confidential does not take a value")
+			}
+			if f.confidential {
+				return nil, fmt.Errorf("--confidential given twice")
+			}
+			f.confidential = true
 			seen[name] = "true"
 			continue
 		}
@@ -426,7 +438,7 @@ func cmdAuthzGrantRoute(argv []string) int {
 // cmdAuthzRegister pre-registers an OAuth client for a tenant + route and
 // optionally approves it directly (--direct).
 func cmdAuthzRegister(argv []string) int {
-	spec := authzSpecFor("tenant", "route", "name", "redirect", "direct")
+	spec := authzSpecFor("tenant", "route", "name", "redirect", "direct", "confidential")
 	spec.required["tenant"] = true
 	spec.required["route"] = true
 	spec.required["name"] = true
@@ -466,13 +478,27 @@ func cmdAuthzRegister(argv []string) int {
 	defer db.Close()
 	st := authz.NewSQLStore(db.SQL())
 	now := time.Now()
+	clientMode := "public"
+	var clientSecret, clientSecretHash string
+	if f.confidential {
+		sec, serr := authz.MintPairingSecret()
+		if serr != nil {
+			fmt.Fprintln(os.Stderr, "error: "+serr.Error())
+			return apperr.ExitInternal
+		}
+		clientMode = "confidential"
+		clientSecret = sec
+		clientSecretHash = authz.HashSecret(sec)
+	}
 	if err := st.RegisterClient(authz.Client{
-		ID:           id,
-		Name:         f.name,
-		RedirectURIs: redirects,
-		CreatedAt:    now,
-		Tenant:       f.tenant,
-		Route:        f.route,
+		ID:               id,
+		Name:             f.name,
+		RedirectURIs:     redirects,
+		CreatedAt:        now,
+		Tenant:           f.tenant,
+		Route:            f.route,
+		ClientMode:       clientMode,
+		ClientSecretHash: clientSecretHash,
 	}); err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return apperr.ExitInternal
@@ -483,7 +509,10 @@ func cmdAuthzRegister(argv []string) int {
 			return apperr.ExitInternal
 		}
 		authzAudit(st, f.tenant, f.route, id, "register", "ok", "pre-registered with direct grant")
-		fmt.Printf("registered and approved client %s (name=%q) for tenant=%s route=%s (direct)\n", id, f.name, f.tenant, f.route)
+		fmt.Printf("registered and approved client %s (name=%q mode=%s) for tenant=%s route=%s (direct)\n", id, f.name, clientMode, f.tenant, f.route)
+		if clientSecret != "" {
+			fmt.Printf("Client secret (show once; never stored in plaintext):\n%s\n", clientSecret)
+		}
 		return apperr.ExitOK
 	}
 	if err := st.CreateGrant(authz.Grant{
@@ -498,7 +527,10 @@ func cmdAuthzRegister(argv []string) int {
 		return apperr.ExitInternal
 	}
 	authzAudit(st, f.tenant, f.route, id, "register", "ok", "pre-registered pending grant")
-	fmt.Printf("registered client %s (name=%q) for tenant=%s route=%s (status=pending)\n", id, f.name, f.tenant, f.route)
+	fmt.Printf("registered client %s (name=%q mode=%s) for tenant=%s route=%s (status=pending)\n", id, f.name, clientMode, f.tenant, f.route)
+	if clientSecret != "" {
+		fmt.Printf("Client secret (show once; never stored in plaintext):\n%s\n", clientSecret)
+	}
 	return apperr.ExitOK
 }
 

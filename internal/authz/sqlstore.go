@@ -31,9 +31,13 @@ func (s *SQLStore) RegisterClient(c Client) error {
 		return fmt.Errorf("authz: redirect uris: %w", err)
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	mode := c.ClientMode
+	if mode == "" {
+		mode = "public"
+	}
 	_, err = s.db.Exec(
-		`INSERT INTO authz_clients(id, name, redirect_uris, created_at, tenant_id, route_id) VALUES(?,?,?,?,?,?)`,
-		c.ID, c.Name, string(uris), now, c.Tenant, c.Route)
+		`INSERT INTO authz_clients(id, name, redirect_uris, created_at, tenant_id, route_id, client_secret_hash, client_mode) VALUES(?,?,?,?,?,?,?,?)`,
+		c.ID, c.Name, string(uris), now, c.Tenant, c.Route, c.ClientSecretHash, mode)
 	if err != nil {
 		return fmt.Errorf("authz: register client: %w", err)
 	}
@@ -49,11 +53,14 @@ func (s *SQLStore) GetClient(id string) (*Client, error) {
 		revoked   sql.NullString
 	)
 	err := s.db.QueryRow(
-		`SELECT id, name, redirect_uris, created_at, revoked_at, tenant_id, route_id
+		`SELECT id, name, redirect_uris, created_at, revoked_at, tenant_id, route_id, client_secret_hash, client_mode
 		 FROM authz_clients WHERE id=?`, id).
-		Scan(&c.ID, &c.Name, &uris, &createdAt, &revoked, &c.Tenant, &c.Route)
+		Scan(&c.ID, &c.Name, &uris, &createdAt, &revoked, &c.Tenant, &c.Route, &c.ClientSecretHash, &c.ClientMode)
 	if err != nil {
 		return nil, fmt.Errorf("authz: get client: %w", err)
+	}
+	if c.ClientMode == "" {
+		c.ClientMode = "public"
 	}
 	_ = json.Unmarshal([]byte(uris), &c.RedirectURIs)
 	if c.RedirectURIs == nil {
@@ -151,12 +158,213 @@ func (s *SQLStore) TryRegisterClient(c Client) error {
 		}
 	}
 	if _, err := tx.Exec(
-		`INSERT INTO authz_clients(id, name, redirect_uris, created_at, tenant_id, route_id) VALUES(?,?,?,?,?,?)`,
-		c.ID, c.Name, string(uris), createdAt.UTC().Format(time.RFC3339Nano), c.Tenant, c.Route); err != nil {
+		`INSERT INTO authz_clients(id, name, redirect_uris, created_at, tenant_id, route_id, client_secret_hash, client_mode) VALUES(?,?,?,?,?,?,?,?)`,
+		c.ID, c.Name, string(uris), createdAt.UTC().Format(time.RFC3339Nano), c.Tenant, c.Route, c.ClientSecretHash, defaultClientMode(c.ClientMode)); err != nil {
 		return fmt.Errorf("authz: register client: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("authz: register commit: %w", err)
+	}
+	return nil
+}
+
+func defaultClientMode(m string) string {
+	if m == "" {
+		return "public"
+	}
+	return m
+}
+
+// TryRegisterClientWithPendingGrant atomically enforces the per-route quota,
+// inserts the client, AND seeds its initial GrantPending row in one transaction.
+func (s *SQLStore) TryRegisterClientWithPendingGrant(c Client, tenant, route string) error {
+	if c.ID == "" {
+		return fmt.Errorf("authz: client id is required")
+	}
+	if tenant == "" || route == "" {
+		return fmt.Errorf("authz: tenant and route are required for pending grant")
+	}
+	uris, err := json.Marshal(c.RedirectURIs)
+	if err != nil {
+		return fmt.Errorf("authz: redirect uris: %w", err)
+	}
+	createdAt := c.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	nowStr := createdAt.UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("authz: register tx: %w", err)
+	}
+	defer tx.Rollback()
+	var n int
+	if err := tx.QueryRow(
+		`SELECT COUNT(1) FROM authz_clients WHERE tenant_id=? AND route_id=?`,
+		c.Tenant, c.Route).Scan(&n); err != nil {
+		return fmt.Errorf("authz: count clients: %w", err)
+	}
+	if n >= MaxClientsPerRoute {
+		var victimID string
+		err := tx.QueryRow(
+			`SELECT c.id FROM authz_clients c
+			 WHERE c.tenant_id=? AND c.route_id=? AND c.revoked_at IS NULL
+			   AND NOT EXISTS (
+			     SELECT 1 FROM authz_grants g
+			     WHERE g.client_id=c.id AND g.tenant_id=c.tenant_id AND g.route_id=c.route_id
+			       AND g.status IN ('active', 'revoked')
+			   )
+			 ORDER BY c.created_at ASC, c.id ASC LIMIT 1`,
+			c.Tenant, c.Route).Scan(&victimID)
+		if err == sql.ErrNoRows {
+			return ErrClientQuota
+		}
+		if err != nil {
+			return fmt.Errorf("authz: select oldest unused client: %w", err)
+		}
+		if _, err := tx.Exec(
+			`DELETE FROM authz_grants WHERE client_id=? AND tenant_id=? AND route_id=? AND status='pending'`,
+			victimID, c.Tenant, c.Route); err != nil {
+			return fmt.Errorf("authz: delete pending grant for evicted client: %w", err)
+		}
+		res, err := tx.Exec(
+			`DELETE FROM authz_clients
+			 WHERE id=? AND tenant_id=? AND route_id=? AND revoked_at IS NULL
+			   AND NOT EXISTS (
+			     SELECT 1 FROM authz_grants g
+			     WHERE g.client_id=authz_clients.id
+			       AND g.tenant_id=authz_clients.tenant_id
+			       AND g.route_id=authz_clients.route_id
+			       AND g.status IN ('active', 'revoked')
+			   )`,
+			victimID, c.Tenant, c.Route)
+		if err != nil {
+			return fmt.Errorf("authz: evict oldest unused client: %w", err)
+		}
+		deleted, _ := res.RowsAffected()
+		if deleted != 1 {
+			return ErrClientQuota
+		}
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO authz_clients(id, name, redirect_uris, created_at, tenant_id, route_id, client_secret_hash, client_mode) VALUES(?,?,?,?,?,?,?,?)`,
+		c.ID, c.Name, string(uris), nowStr, c.Tenant, c.Route, c.ClientSecretHash, defaultClientMode(c.ClientMode)); err != nil {
+		return fmt.Errorf("authz: register client: %w", err)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO authz_grants(client_id, tenant_id, route_id, status, created_at, updated_at) VALUES(?,?,?,?,?,?)`,
+		c.ID, tenant, route, string(GrantPending), nowStr, nowStr); err != nil {
+		return fmt.Errorf("authz: seed pending grant: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("authz: register commit: %w", err)
+	}
+	return nil
+}
+
+// CreateOpaqueRefresh persists a hashed opaque refresh token for a confidential client.
+func (s *SQLStore) CreateOpaqueRefresh(r OpaqueRefresh) error {
+	_, err := s.db.Exec(
+		`INSERT INTO authz_opaque_refresh(token_hash, client_id, tenant_id, route_id, expires_at, absolute_expires_at, last_used_at)
+		 VALUES(?,?,?,?,?,?,?)`,
+		r.TokenHash, r.ClientID, r.Tenant, r.Route,
+		r.ExpiresAt.UTC().Format(time.RFC3339Nano),
+		r.AbsoluteExpiresAt.UTC().Format(time.RFC3339Nano),
+		r.LastUsedAt.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("authz: create opaque refresh: %w", err)
+	}
+	return nil
+}
+
+// RotateOpaqueRefresh atomically burns oldHash and inserts newHash for a
+// confidential client. If oldHash was already revoked/rotated, it treats that
+// as a replay and revokes the client's active opaque refresh lineage.
+func (s *SQLStore) RotateOpaqueRefresh(oldHash, newHash, clientID, tenant, route string, now time.Time, extendBy time.Duration) (*OpaqueRefresh, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("authz: opaque refresh tx: %w", err)
+	}
+	defer tx.Rollback()
+	var (
+		r          OpaqueRefresh
+		expStr     string
+		absExpStr  string
+		lastUsed   string
+		revokedStr sql.NullString
+	)
+	err = tx.QueryRow(
+		`SELECT token_hash, client_id, tenant_id, route_id, expires_at, absolute_expires_at, last_used_at, revoked_at
+		 FROM authz_opaque_refresh WHERE token_hash=?`, oldHash).
+		Scan(&r.TokenHash, &r.ClientID, &r.Tenant, &r.Route, &expStr, &absExpStr, &lastUsed, &revokedStr)
+	if err != nil {
+		return nil, fmt.Errorf("authz: opaque refresh not found: %w", err)
+	}
+	if r.ClientID != clientID || r.Tenant != tenant || r.Route != route {
+		return nil, fmt.Errorf("authz: opaque refresh binding mismatch")
+	}
+	nowStr := now.UTC().Format(time.RFC3339Nano)
+	if revokedStr.Valid {
+		// Replay detected: revoke the entire opaque refresh lineage for this client+route.
+		_, _ = tx.Exec(
+			`UPDATE authz_opaque_refresh SET revoked_at=? WHERE client_id=? AND tenant_id=? AND route_id=? AND revoked_at IS NULL`,
+			nowStr, clientID, tenant, route)
+		_ = tx.Commit()
+		return nil, fmt.Errorf("authz: opaque refresh replay detected")
+	}
+	r.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expStr)
+	r.AbsoluteExpiresAt, _ = time.Parse(time.RFC3339Nano, absExpStr)
+	if now.After(r.ExpiresAt) || now.After(r.AbsoluteExpiresAt) {
+		return nil, fmt.Errorf("authz: opaque refresh expired")
+	}
+	res, err := tx.Exec(
+		`UPDATE authz_opaque_refresh SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL`,
+		nowStr, oldHash)
+	if err != nil {
+		return nil, fmt.Errorf("authz: burn opaque refresh: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		_, _ = tx.Exec(
+			`UPDATE authz_opaque_refresh SET revoked_at=? WHERE client_id=? AND tenant_id=? AND route_id=? AND revoked_at IS NULL`,
+			nowStr, clientID, tenant, route)
+		_ = tx.Commit()
+		return nil, fmt.Errorf("authz: opaque refresh already rotated")
+	}
+	nextExp := now.Add(extendBy)
+	if nextExp.After(r.AbsoluteExpiresAt) {
+		nextExp = r.AbsoluteExpiresAt
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO authz_opaque_refresh(token_hash, client_id, tenant_id, route_id, expires_at, absolute_expires_at, last_used_at)
+		 VALUES(?,?,?,?,?,?,?)`,
+		newHash, clientID, tenant, route,
+		nextExp.UTC().Format(time.RFC3339Nano),
+		r.AbsoluteExpiresAt.UTC().Format(time.RFC3339Nano),
+		nowStr); err != nil {
+		return nil, fmt.Errorf("authz: insert rotated opaque refresh: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("authz: commit opaque refresh: %w", err)
+	}
+	return &OpaqueRefresh{
+		TokenHash:         newHash,
+		ClientID:          clientID,
+		Tenant:            tenant,
+		Route:             route,
+		ExpiresAt:         nextExp,
+		AbsoluteExpiresAt: r.AbsoluteExpiresAt,
+		LastUsedAt:        now,
+	}, nil
+}
+
+// RevokeOpaqueRefreshForClient revokes all opaque refresh tokens for a client.
+func (s *SQLStore) RevokeOpaqueRefreshForClient(clientID string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.Exec(
+		`UPDATE authz_opaque_refresh SET revoked_at=? WHERE client_id=? AND revoked_at IS NULL`,
+		now, clientID); err != nil {
+		return fmt.Errorf("authz: revoke opaque refresh: %w", err)
 	}
 	return nil
 }
@@ -205,6 +413,7 @@ func (s *SQLStore) RevokeClient(id string) error {
 	if n, _ := res.RowsAffected(); n == 0 {
 		return fmt.Errorf("authz: unknown client %q", id)
 	}
+	_ = s.RevokeOpaqueRefreshForClient(id)
 	return nil
 }
 
@@ -415,11 +624,15 @@ func (s *SQLStore) CreateConsent(c Consent) error {
 	if c.Challenge == "" {
 		return fmt.Errorf("authz: consent challenge is required")
 	}
+	scope := c.Scope
+	if scope == "" {
+		scope = "mcp:tools offline_access"
+	}
 	if _, err := s.db.Exec(
 		`INSERT INTO authz_consent(challenge, client_id, tenant_id, route_id, redirect_uri,
-		   code_challenge, state, resource, expires_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+		   code_challenge, state, resource, scope, expires_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
 		c.Challenge, c.ClientID, c.Tenant, c.Route, c.RedirectURI,
-		c.CodeChallenge, c.State, c.Resource, c.ExpiresAt.UTC().Format(time.RFC3339Nano)); err != nil {
+		c.CodeChallenge, c.State, c.Resource, scope, c.ExpiresAt.UTC().Format(time.RFC3339Nano)); err != nil {
 		return fmt.Errorf("authz: create consent: %w", err)
 	}
 	return nil
@@ -473,10 +686,10 @@ func (s *SQLStore) ConsumeConsent(challenge string) (*Consent, error) {
 	)
 	err = tx.QueryRow(
 		`SELECT challenge, client_id, tenant_id, route_id, redirect_uri, code_challenge,
-		        state, resource, expires_at, consumed_at FROM authz_consent WHERE challenge=?`,
+		        state, resource, scope, expires_at, consumed_at FROM authz_consent WHERE challenge=?`,
 		challenge).
 		Scan(&c.Challenge, &c.ClientID, &c.Tenant, &c.Route, &c.RedirectURI,
-			&c.CodeChallenge, &c.State, &c.Resource, &expires, &consumed)
+			&c.CodeChallenge, &c.State, &c.Resource, &c.Scope, &expires, &consumed)
 	if err != nil {
 		return nil, fmt.Errorf("authz: unknown consent challenge: %w", err)
 	}
@@ -698,10 +911,14 @@ func (s *SQLStore) CreateCode(c Code) error {
 	if c.Code == "" {
 		return fmt.Errorf("authz: code is required")
 	}
+	scope := c.Scope
+	if scope == "" {
+		scope = "mcp:tools offline_access"
+	}
 	_, err := s.db.Exec(
-		`INSERT INTO authz_codes(code, client_id, tenant_id, route_id, redirect_uri, challenge, challenge_method, expires_at)
-		 VALUES(?,?,?,?,?,?,?,?)`,
-		c.Code, c.ClientID, c.Tenant, c.Route, c.RedirectURI, c.Challenge, c.ChallengeMethod,
+		`INSERT INTO authz_codes(code, client_id, tenant_id, route_id, redirect_uri, challenge, challenge_method, scope, expires_at)
+		 VALUES(?,?,?,?,?,?,?,?,?)`,
+		c.Code, c.ClientID, c.Tenant, c.Route, c.RedirectURI, c.Challenge, c.ChallengeMethod, scope,
 		c.ExpiresAt.UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return fmt.Errorf("authz: create code: %w", err)
@@ -728,9 +945,9 @@ func (s *SQLStore) ConsumeCode(code, expectedClient, expectedTenant, expectedRou
 		consumed  sql.NullString
 	)
 	err = tx.QueryRow(
-		`SELECT code, client_id, tenant_id, route_id, redirect_uri, challenge, challenge_method, expires_at, consumed_at
+		`SELECT code, client_id, tenant_id, route_id, redirect_uri, challenge, challenge_method, scope, expires_at, consumed_at
 		 FROM authz_codes WHERE code=?`, code).
-		Scan(&c.Code, &c.ClientID, &c.Tenant, &c.Route, &c.RedirectURI, &c.Challenge, &c.ChallengeMethod, &expiresAt, &consumed)
+		Scan(&c.Code, &c.ClientID, &c.Tenant, &c.Route, &c.RedirectURI, &c.Challenge, &c.ChallengeMethod, &c.Scope, &expiresAt, &consumed)
 	if err != nil {
 		return nil, fmt.Errorf("authz: unknown authorization code")
 	}

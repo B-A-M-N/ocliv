@@ -227,6 +227,31 @@ const schemaV13 = `
 ALTER TABLE authz_grants ADD COLUMN skip_pairing INTEGER NOT NULL DEFAULT 0;
 `
 
+// schemaV14 adds confidential-client support (client_mode, client_secret_hash)
+// and opaque persistent refresh tokens (authz_opaque_refresh) for pre-registered
+// confidential clients (e.g. Google Connected Apps persistent linking).
+const schemaV14 = `
+ALTER TABLE authz_clients ADD COLUMN client_secret_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE authz_clients ADD COLUMN client_mode TEXT NOT NULL DEFAULT 'public';
+CREATE TABLE IF NOT EXISTS authz_opaque_refresh (
+	token_hash TEXT PRIMARY KEY,
+	client_id TEXT NOT NULL,
+	tenant_id TEXT NOT NULL,
+	route_id TEXT NOT NULL,
+	expires_at TEXT NOT NULL,
+	absolute_expires_at TEXT NOT NULL,
+	last_used_at TEXT NOT NULL,
+	revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_authz_opaque_refresh_client ON authz_opaque_refresh(client_id, tenant_id, route_id);
+`
+
+// schemaV15 persists granted OAuth scopes on authorization challenges and codes.
+const schemaV15 = `
+ALTER TABLE authz_codes ADD COLUMN scope TEXT NOT NULL DEFAULT 'mcp:tools offline_access';
+ALTER TABLE authz_consent ADD COLUMN scope TEXT NOT NULL DEFAULT 'mcp:tools offline_access';
+`
+
 // applyMigration runs one versioned migration body and its version
 // stamp in a single transaction: a failure anywhere rolls back the
 // body, so a version is never recorded for half-applied work (P1-2).
@@ -251,7 +276,7 @@ func applyMigration(sqldb *sql.DB, version int, body string) error {
 }
 
 // currentSchema is the newest version Open must reach.
-const currentSchema = 13
+const currentSchema = 15
 
 // SchemaVersion is the exported current schema version for tools that must
 // refuse unknown/newer databases without opening (and thereby migrating)
@@ -424,6 +449,8 @@ func Open(path string) (*DB, error) {
 		{11, schemaV11},
 		{12, schemaV12},
 		{13, schemaV13},
+		{14, schemaV14},
+		{15, schemaV15},
 	}
 	for _, m := range migrations {
 		var v int

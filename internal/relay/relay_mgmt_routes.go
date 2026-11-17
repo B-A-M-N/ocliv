@@ -179,11 +179,19 @@ func (s *Server) handleAgentPublications(w http.ResponseWriter, r *http.Request)
 			s.serveKeyPublicationDesiredState(w, tenant, keyID, routeID, true)
 			return
 		}
+		if idx := strings.Index(rest, "/authz/approve-direct/"); idx > 0 {
+			routeID := rest[:idx]
+			clientID := rest[idx+len("/authz/approve-direct/"):]
+			if validRouteID(routeID) && clientID != "" && !strings.Contains(clientID, "/") {
+				s.serveKeyPublicationAuthzApprove(w, r, tenant, keyID, routeID, clientID, true)
+				return
+			}
+		}
 		if idx := strings.Index(rest, "/authz/approve/"); idx > 0 {
 			routeID := rest[:idx]
 			clientID := rest[idx+len("/authz/approve/"):]
 			if validRouteID(routeID) && clientID != "" && !strings.Contains(clientID, "/") {
-				s.serveKeyPublicationAuthzApprove(w, r, tenant, keyID, routeID, clientID)
+				s.serveKeyPublicationAuthzApprove(w, r, tenant, keyID, routeID, clientID, false)
 				return
 			}
 		}
@@ -566,12 +574,12 @@ func (s *Server) serveKeyPublicationAuthzPending(w http.ResponseWriter, tenant, 
 	})
 }
 
-func (s *Server) serveKeyPublicationAuthzApprove(w http.ResponseWriter, r *http.Request, tenant, keyID, routeID, clientID string) {
+func (s *Server) serveKeyPublicationAuthzApprove(w http.ResponseWriter, r *http.Request, tenant, keyID, routeID, clientID string, directPath bool) {
 	if s.authz == nil {
 		http.Error(w, "managed authz unavailable", http.StatusConflict)
 		return
 	}
-	direct := r.URL.Query().Get("direct") == "1" || r.URL.Query().Get("direct") == "true"
+	direct := directPath
 	var exists int
 	if err := s.db.SQL().QueryRow(
 		`SELECT 1 FROM mcp_publications WHERE route_id=? AND tenant_id=? AND owner_key_id=? AND revoked_at IS NULL`,

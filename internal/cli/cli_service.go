@@ -1,14 +1,18 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"ocliv/internal/agent"
@@ -121,6 +125,8 @@ func cmdService(argv []string) int {
 		return cmdServiceApprove(argv[1:], ops)
 	case "run-publisher":
 		return cmdServiceRunPublisher(argv[1:])
+	case "run-backend":
+		return cmdServiceRunBackend(argv[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown service command %q\n", argv[0])
 		return apperr.ExitCLIValidation
@@ -292,12 +298,17 @@ func cmdServiceAdd(argv []string, ops serviceOps) int {
 		fmt.Fprintf(os.Stderr, "service %q already exists (use `ocliv service update %s`)\n", name, name)
 		return apperr.ExitCLIValidation
 	}
+	inst, ierr := serviceInstanceID(prof, name)
+	if ierr != nil {
+		fmt.Fprintln(os.Stderr, ierr)
+		return apperr.ExitCLIValidation
+	}
 	if unit == "" {
-		unit = "ocliv-publisher@" + name + ".service"
+		unit = "ocliv-publisher@" + inst + ".service"
 	}
 	backendUnit := ""
 	if backendMode == config.BackendManaged {
-		backendUnit = "ocliv-backend@" + name + ".service"
+		backendUnit = "ocliv-backend@" + inst + ".service"
 	}
 	rec := config.ServiceRecord{
 		Name:         name,
@@ -617,7 +628,7 @@ func startServiceForeground(rec config.ServiceRecord) int {
 }
 
 func cmdServiceRunPublisher(argv []string) int {
-	var name string
+	var name, profile string
 	for i := 0; i < len(argv); i++ {
 		if argv[i] == "--name" || strings.HasPrefix(argv[i], "--name=") {
 			v, ok := mcpFlagValue(argv, &i, "name")
@@ -625,27 +636,96 @@ func cmdServiceRunPublisher(argv []string) int {
 				return apperr.ExitCLIValidation
 			}
 			name = v
+		} else if argv[i] == "--profile" || strings.HasPrefix(argv[i], "--profile=") {
+			v, ok := mcpFlagValue(argv, &i, "profile")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			profile = v
 		}
 	}
 	if name == "" {
-		fmt.Fprintln(os.Stderr, "usage: ocliv service run-publisher --name NAME")
+		fmt.Fprintln(os.Stderr, "usage: ocliv service run-publisher --name NAME [--profile PROFILE]")
 		return apperr.ExitCLIValidation
 	}
-	store, err := openServices()
+	if profile == "" {
+		profile = config.ActiveProfile()
+	}
+	store, err := openServicesForProfile(profile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return apperr.ExitInternal
 	}
 	rec, ok, err := store.Get(name)
 	if err != nil || !ok {
-		fmt.Fprintf(os.Stderr, "unknown service %q\n", name)
+		fmt.Fprintf(os.Stderr, "unknown service %q in profile %q\n", name, profile)
 		return apperr.ExitCLIValidation
 	}
 	if rec.DesiredState == config.DesiredDisabled {
 		fmt.Fprintf(os.Stderr, "service %q is administratively disabled; refusing to publish\n", name)
 		return apperr.ExitAuth
 	}
+	if len(rec.StdioCmd) == 0 && rec.LocalURL == "" {
+		fmt.Fprintf(os.Stderr, "service %q has neither stdio command nor local URL\n", name)
+		return apperr.ExitCLIValidation
+	}
 	return startServiceForeground(rec)
+}
+
+// cmdServiceRunBackend executes a managed backend with exact argument
+// boundaries via exec.CommandContext (never flattened through a shell).
+func cmdServiceRunBackend(argv []string) int {
+	var name, profile string
+	for i := 0; i < len(argv); i++ {
+		if argv[i] == "--name" || strings.HasPrefix(argv[i], "--name=") {
+			v, ok := mcpFlagValue(argv, &i, "name")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			name = v
+		} else if argv[i] == "--profile" || strings.HasPrefix(argv[i], "--profile=") {
+			v, ok := mcpFlagValue(argv, &i, "profile")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			profile = v
+		}
+	}
+	if name == "" {
+		fmt.Fprintln(os.Stderr, "usage: ocliv service run-backend --name NAME [--profile PROFILE]")
+		return apperr.ExitCLIValidation
+	}
+	if profile == "" {
+		profile = config.ActiveProfile()
+	}
+	store, err := openServicesForProfile(profile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return apperr.ExitInternal
+	}
+	rec, ok, err := store.Get(name)
+	if err != nil || !ok {
+		fmt.Fprintf(os.Stderr, "unknown service %q in profile %q\n", name, profile)
+		return apperr.ExitCLIValidation
+	}
+	if rec.BackendMode != config.BackendManaged || rec.BackendExec == "" {
+		fmt.Fprintf(os.Stderr, "service %q is not a managed backend\n", name)
+		return apperr.ExitCLIValidation
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	cmd := exec.CommandContext(ctx, rec.BackendExec, rec.BackendArgs...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return exitErr.ExitCode()
+		}
+		fmt.Fprintln(os.Stderr, err)
+		return apperr.ExitInternal
+	}
+	return apperr.ExitOK
 }
 
 func cmdServiceStop(argv []string, ops serviceOps) int {
@@ -811,11 +891,12 @@ func cmdServiceList(argv []string, ops serviceOps) int {
 
 func cmdServiceRemove(argv []string, ops serviceOps) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ocliv service remove NAME --confirm NAME")
+		fmt.Fprintln(os.Stderr, "usage: ocliv service remove NAME --confirm NAME [--forget-local]")
 		return apperr.ExitCLIValidation
 	}
 	name := argv[0]
 	var confirm string
+	var forgetLocal bool
 	for i := 1; i < len(argv); i++ {
 		if argv[i] == "--confirm" || strings.HasPrefix(argv[i], "--confirm=") {
 			v, ok := mcpFlagValue(argv, &i, "confirm")
@@ -823,6 +904,8 @@ func cmdServiceRemove(argv []string, ops serviceOps) int {
 				return apperr.ExitCLIValidation
 			}
 			confirm = v
+		} else if argv[i] == "--forget-local" {
+			forgetLocal = true
 		} else {
 			fmt.Fprintf(os.Stderr, "unknown flag %q\n", argv[i])
 			return apperr.ExitCLIValidation
@@ -841,6 +924,14 @@ func cmdServiceRemove(argv []string, ops serviceOps) int {
 	if err != nil || !ok {
 		fmt.Fprintf(os.Stderr, "unknown service %q\n", name)
 		return apperr.ExitCLIValidation
+	}
+	if forgetLocal {
+		if err := forgetLocalService(store, rec, ops); err != nil {
+			fmt.Fprintf(os.Stderr, "service remove --forget-local: %v\n", err)
+			return apperr.ExitInternal
+		}
+		fmt.Printf("✓ forgot local service %s (remote route, if any, was not modified)\n", name)
+		return apperr.ExitOK
 	}
 	k, keyID, err := loadKeyForProfile(rec.Profile)
 	if err != nil {
@@ -1030,7 +1121,7 @@ func cmdServiceApprove(argv []string, ops serviceOps) int {
 	}
 	path := "/v1/agent/mcp-routes/" + pubID + "/authz/approve/" + clientID
 	if direct {
-		path += "?direct=1"
+		path = "/v1/agent/mcp-routes/" + pubID + "/authz/approve-direct/" + clientID
 	}
 	st, body, callErr := ops.mgmtCall(relayURL, k, keyID, http.MethodPost, path)
 	if callErr != nil {

@@ -34,7 +34,7 @@ func registerMulti(t *testing.T, s *Server, name string, redirects []string) str
 	return out.ClientID
 }
 
-func TestAutoApproveAllowlistedHTTPSHost(t *testing.T) {
+func TestUnapprovedTrustedHostRedirectCannotBypassPairing(t *testing.T) {
 	db := openTestDB(t)
 	applySchema(t, db)
 	st := NewSQLStore(db)
@@ -45,6 +45,7 @@ func TestAutoApproveAllowlistedHTTPSHost(t *testing.T) {
 	s := NewServer(issuer, st, "default", "r-auto", "https://relay.example/r/r-auto/mcp", "https://relay.example")
 	s.AutoApproveRedirectHosts = []string{"chatgpt.com"}
 
+	// Self-declared trusted-host redirect must NOT grant pairing-free access without explicit operator approval.
 	clientID := registerMulti(t, s, "ChatGPT", []string{"https://chatgpt.com/connector_platform_oauth_redirect"})
 	verifier := "v" + strings.Repeat("a", 42)
 	u := "/oauth/authorize?response_type=code&client_id=" + url.QueryEscape(clientID) +
@@ -55,23 +56,26 @@ func TestAutoApproveAllowlistedHTTPSHost(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	s.ServeAuthorize(w, httptest.NewRequest(http.MethodGet, u, nil))
-	if w.Code != http.StatusFound {
-		t.Fatalf("status=%d body=%s, want 302", w.Code, w.Body.String())
-	}
-	loc, err := url.Parse(w.Header().Get("Location"))
-	if err != nil || loc.Query().Get("code") == "" {
-		t.Fatalf("expected code in redirect, got %q (err=%v)", w.Header().Get("Location"), err)
+	if w.Code != http.StatusOK {
+		t.Fatalf("unapproved DCR client status=%d body=%s, want 200 consent form", w.Code, w.Body.String())
 	}
 	g, err := st.GetGrant(clientID, "default", "r-auto")
-	if err != nil || g.Status != GrantActive || !g.SkipPairing {
-		t.Fatalf("grant=%+v err=%v, want active + skip_pairing", g, err)
+	if err != nil || g.Status != GrantPending || g.SkipPairing {
+		t.Fatalf("grant=%+v err=%v, want pending + skip_pairing=false", g, err)
 	}
-	var auditCount int
-	if err := db.QueryRow(`SELECT COUNT(1) FROM authz_audit WHERE action='auto-approve' AND client_id=? AND result='ok'`, clientID).Scan(&auditCount); err != nil {
-		t.Fatalf("audit query: %v", err)
+
+	// Once explicitly operator-approved with ApproveGrantDirect, authorize succeeds in 0 clicks.
+	if err := st.ApproveGrantDirect(clientID, "default", "r-auto"); err != nil {
+		t.Fatalf("ApproveGrantDirect: %v", err)
 	}
-	if auditCount != 1 {
-		t.Fatalf("auditCount=%d, want 1", auditCount)
+	w2 := httptest.NewRecorder()
+	s.ServeAuthorize(w2, httptest.NewRequest(http.MethodGet, u, nil))
+	if w2.Code != http.StatusFound {
+		t.Fatalf("explicitly approved status=%d body=%s, want 302", w2.Code, w2.Body.String())
+	}
+	loc, err := url.Parse(w2.Header().Get("Location"))
+	if err != nil || loc.Query().Get("code") == "" {
+		t.Fatalf("expected code in redirect, got %q (err=%v)", w2.Header().Get("Location"), err)
 	}
 }
 
@@ -83,6 +87,9 @@ func TestAutoApproveRejectsMixedRedirectURIs(t *testing.T) {
 		"https://chatgpt.com/cb",
 		"https://untrusted.example/cb",
 	})
+	if err := s.Store.ApproveGrantDirect(clientID, s.tenant(), s.RouteID); err != nil {
+		t.Fatalf("ApproveGrantDirect: %v", err)
+	}
 	verifier := "v" + strings.Repeat("b", 42)
 	u := "/oauth/authorize?response_type=code&client_id=" + url.QueryEscape(clientID) +
 		"&redirect_uri=" + url.QueryEscape("https://chatgpt.com/cb") +
@@ -93,11 +100,7 @@ func TestAutoApproveRejectsMixedRedirectURIs(t *testing.T) {
 	w := httptest.NewRecorder()
 	s.ServeAuthorize(w, httptest.NewRequest(http.MethodGet, u, nil))
 	if w.Code != http.StatusOK {
-		t.Fatalf("mixed redirect URIs must fall through to consent form (200), got %d body=%s", w.Code, w.Body.String())
-	}
-	g, err := s.Store.GetGrant(clientID, s.tenant(), s.RouteID)
-	if err != nil || g.Status != GrantPending || g.SkipPairing {
-		t.Fatalf("grant=%+v err=%v, want pending without skip_pairing", g, err)
+		t.Fatalf("mixed redirect URIs must fall through to consent form (200) when host allowlist is enforced, got %d body=%s", w.Code, w.Body.String())
 	}
 }
 
@@ -105,7 +108,6 @@ func TestAutoApproveHTTPPublicRejectedAndLoopbackAllowed(t *testing.T) {
 	s, _, _ := newTestServer(t)
 	s.AutoApproveRedirectHosts = []string{"example.com", "127.0.0.1"}
 
-	// Plain HTTP on non-loopback host is rejected by ValidateRedirectURI / canAutoApproveClient.
 	pubClient := &Client{
 		ID:           "cli_http_pub",
 		RedirectURIs: []string{"http://example.com/cb"},
@@ -114,8 +116,10 @@ func TestAutoApproveHTTPPublicRejectedAndLoopbackAllowed(t *testing.T) {
 		t.Fatal("canAutoApproveClient allowed plain HTTP on non-loopback host")
 	}
 
-	// Loopback HTTP with port on allowlisted 127.0.0.1 succeeds.
 	loopID := registerMulti(t, s, "LocalCLI", []string{"http://127.0.0.1:54321/callback"})
+	if err := s.Store.ApproveGrantDirect(loopID, s.tenant(), s.RouteID); err != nil {
+		t.Fatalf("ApproveGrantDirect: %v", err)
+	}
 	verifier := "v" + strings.Repeat("c", 42)
 	u := "/oauth/authorize?response_type=code&client_id=" + url.QueryEscape(loopID) +
 		"&redirect_uri=" + url.QueryEscape("http://127.0.0.1:54321/callback") +
@@ -135,6 +139,9 @@ func TestAutoApproveNeverResurrectsRevokedGrant(t *testing.T) {
 	s.AutoApproveRedirectHosts = []string{"chatgpt.com"}
 
 	clientID := registerMulti(t, s, "ChatGPT", []string{"https://chatgpt.com/cb"})
+	if err := s.Store.ApproveGrantDirect(clientID, s.tenant(), s.RouteID); err != nil {
+		t.Fatalf("ApproveGrantDirect: %v", err)
+	}
 	verifier := "v" + strings.Repeat("d", 42)
 	u := "/oauth/authorize?response_type=code&client_id=" + url.QueryEscape(clientID) +
 		"&redirect_uri=" + url.QueryEscape("https://chatgpt.com/cb") +
@@ -142,19 +149,16 @@ func TestAutoApproveNeverResurrectsRevokedGrant(t *testing.T) {
 		"&code_challenge_method=S256&state=s4" +
 		"&resource=" + url.QueryEscape(s.RouteURL)
 
-	// First request auto-approves.
 	w1 := httptest.NewRecorder()
 	s.ServeAuthorize(w1, httptest.NewRequest(http.MethodGet, u, nil))
 	if w1.Code != http.StatusFound {
 		t.Fatalf("first authorize status=%d, want 302", w1.Code)
 	}
 
-	// Revoke the grant.
 	if err := s.Store.RevokeGrant(clientID, s.tenant(), s.RouteID); err != nil {
 		t.Fatalf("RevokeGrant: %v", err)
 	}
 
-	// Subsequent request must be denied and never resurrected.
 	w2 := httptest.NewRecorder()
 	s.ServeAuthorize(w2, httptest.NewRequest(http.MethodGet, u, nil))
 	if w2.Code != http.StatusBadRequest {

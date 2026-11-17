@@ -28,7 +28,8 @@ func applySchema(t *testing.T, db *sql.DB) {
 	for _, stmt := range []string{
 		`CREATE TABLE authz_clients (id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
 		   redirect_uris TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, revoked_at TEXT,
-		   tenant_id TEXT NOT NULL DEFAULT '', route_id TEXT NOT NULL DEFAULT '')`,
+		   tenant_id TEXT NOT NULL DEFAULT '', route_id TEXT NOT NULL DEFAULT '',
+		   client_secret_hash TEXT NOT NULL DEFAULT '', client_mode TEXT NOT NULL DEFAULT 'public')`,
 		`CREATE TABLE authz_grants (client_id TEXT NOT NULL, tenant_id TEXT NOT NULL,
 		   route_id TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL,
 		   updated_at TEXT NOT NULL, pairing_hash TEXT NOT NULL DEFAULT '',
@@ -40,11 +41,13 @@ func applySchema(t *testing.T, db *sql.DB) {
 		`CREATE TABLE authz_codes (code TEXT PRIMARY KEY, client_id TEXT NOT NULL,
 		   tenant_id TEXT NOT NULL, route_id TEXT NOT NULL, redirect_uri TEXT NOT NULL,
 		   challenge TEXT NOT NULL, challenge_method TEXT NOT NULL,
+		   scope TEXT NOT NULL DEFAULT 'mcp:tools offline_access',
 		   expires_at TEXT NOT NULL, consumed_at TEXT)`,
 		`CREATE TABLE authz_consent (challenge TEXT PRIMARY KEY, client_id TEXT NOT NULL,
 		   tenant_id TEXT NOT NULL, route_id TEXT NOT NULL, redirect_uri TEXT NOT NULL,
 		   code_challenge TEXT NOT NULL, state TEXT NOT NULL DEFAULT '',
 		   resource TEXT NOT NULL DEFAULT '',
+		   scope TEXT NOT NULL DEFAULT 'mcp:tools offline_access',
 		   expires_at TEXT NOT NULL, consumed_at TEXT)`,
 		`CREATE TABLE authz_issuer_key (id INTEGER PRIMARY KEY CHECK (id = 1),
 			   kid TEXT NOT NULL, priv BLOB NOT NULL, created_at TEXT NOT NULL)`,
@@ -54,6 +57,10 @@ func applySchema(t *testing.T, db *sql.DB) {
 			   time TEXT NOT NULL, actor TEXT NOT NULL, tenant_id TEXT NOT NULL DEFAULT '',
 			   route_id TEXT NOT NULL DEFAULT '', client_id TEXT NOT NULL DEFAULT '',
 			   action TEXT NOT NULL, result TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '')`,
+		`CREATE TABLE authz_opaque_refresh (token_hash TEXT PRIMARY KEY,
+			   client_id TEXT NOT NULL, tenant_id TEXT NOT NULL, route_id TEXT NOT NULL,
+			   expires_at TEXT NOT NULL, absolute_expires_at TEXT NOT NULL,
+			   last_used_at TEXT NOT NULL, revoked_at TEXT)`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			t.Fatalf("schema: %v", err)

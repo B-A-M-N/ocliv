@@ -2,6 +2,7 @@ package authz
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -170,7 +171,8 @@ func (s *Server) AuthorizationServerMetadata() map[string]any {
 		"response_modes_supported":                   []string{"query"},
 		"grant_types_supported":                      []string{"authorization_code", "refresh_token"},
 		"code_challenge_methods_supported":           []string{"S256"},
-		"token_endpoint_auth_methods_supported":      []string{"none"},
+		"scopes_supported":                           []string{"mcp:tools", "offline_access"},
+		"token_endpoint_auth_methods_supported":      []string{"none", "client_secret_basic", "client_secret_post"},
 		"revocation_endpoint_auth_methods_supported": []string{"none"},
 		"resource_indicators_supported":              true,
 	}
@@ -323,7 +325,7 @@ func (s *Server) ServeRegister(w http.ResponseWriter, r *http.Request) {
 		Tenant:       s.tenant(),
 		Route:        s.RouteID,
 	}
-	if err := s.Store.TryRegisterClient(client); err != nil {
+	if err := s.Store.TryRegisterClientWithPendingGrant(client, s.tenant(), s.RouteID); err != nil {
 		if err != ErrClientQuota {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_client_metadata", "error_description": err.Error()})
 			return
@@ -332,7 +334,7 @@ func (s *Server) ServeRegister(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
-		if err := s.Store.TryRegisterClient(client); err != nil {
+		if err := s.Store.TryRegisterClientWithPendingGrant(client, s.tenant(), s.RouteID); err != nil {
 			writeJSON(w, http.StatusTooManyRequests, map[string]string{
 				"error":             "invalid_client_metadata",
 				"error_description": "registration quota for this route is exhausted",
@@ -340,16 +342,6 @@ func (s *Server) ServeRegister(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// Seed a pending grant immediately on DCR so the client is visible in
-	// `ocliv authz pending` / `ocliv service pending` before /oauth/authorize.
-	_ = s.Store.CreateGrant(Grant{
-		ClientID:  id,
-		Tenant:    s.tenant(),
-		Route:     s.RouteID,
-		Status:    GrantPending,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	})
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"client_id":                  id,
 		"client_name":                req.ClientName,
@@ -382,6 +374,27 @@ func (s *Server) scopedClient(id string) (*Client, error) {
 		}
 	}
 	return client, nil
+}
+
+// exactOperatorApprovedBinding returns true only when an explicit, active,
+// non-revoked operator grant exists for this exact (client, tenant, route)
+// with SkipPairing enabled and the requested redirectURI is bound to client.
+func exactOperatorApprovedBinding(grant *Grant, client *Client, tenant, routeID, redirectURI string) bool {
+	if grant == nil || client == nil || client.RevokedAt != nil {
+		return false
+	}
+	if grant.Status != GrantActive || !grant.SkipPairing {
+		return false
+	}
+	if grant.Tenant != tenant || grant.Route != routeID || client.Tenant != tenant {
+		return false
+	}
+	for _, u := range client.RedirectURIs {
+		if u == redirectURI {
+			return true
+		}
+	}
+	return false
 }
 
 // canAutoApproveClient returns true when the relay operator has configured
@@ -444,6 +457,11 @@ func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported_response_type"})
 		return
 	}
+	grantedScope, err := normalizeGrantedScopes(q.Get("scope"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_scope", "error_description": err.Error()})
+		return
+	}
 	// MCP authorization spec + RFC 8707: the canonical resource is required
 	// and must be this route exactly. A token for another resource is never
 	// issued for this route.
@@ -484,19 +502,10 @@ func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "access_denied", "error_description": "client revoked"})
 		return
 	}
-	if (grant == nil || grant.Status == GrantPending) && s.canAutoApproveClient(client) {
-		if err := s.Store.ApproveGrantDirect(clientID, s.tenant(), s.RouteID); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
-			return
-		}
-		_ = s.Store.AuditAuthz("system", s.tenant(), s.RouteID, clientID, "auto-approve", "ok",
-			"auto-approved via trusted redirect host allowlist")
-		s.issueCode(w, r, clientID, redirectURI, challenge, "S256", state)
-		return
-	}
-	if grant != nil && grant.Status == GrantActive && grant.SkipPairing {
+	if exactOperatorApprovedBinding(grant, client, s.tenant(), s.RouteID, redirectURI) &&
+		(len(s.AutoApproveRedirectHosts) == 0 || s.canAutoApproveClient(client)) {
 		_ = s.Store.AuditAuthz("client", s.tenant(), s.RouteID, clientID, "authorize", "ok", "direct operator pre-approved grant")
-		s.issueCode(w, r, clientID, redirectURI, challenge, "S256", state)
+		s.issueCode(w, r, clientID, redirectURI, challenge, "S256", state, grantedScope)
 		return
 	}
 	// Approved AND consented: the ordinary OAuth authorization-code + PKCE
@@ -547,6 +556,7 @@ func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 		CodeChallenge: challenge,
 		State:         state,
 		Resource:      resource[0],
+		Scope:         grantedScope,
 		ExpiresAt:     time.Now().Add(s.consentTTL()),
 	}); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -584,11 +594,42 @@ func (s *Server) consentTTL() time.Duration {
 // The code, state, and the RFC 9207 issuer identifier are added through
 // url.Values so a redirect URI that already carries query parameters keeps
 // them: string concatenation would corrupt it.
-func (s *Server) issueCode(w http.ResponseWriter, r *http.Request, clientID, redirectURI, challenge, challengeMethod, state string) {
+func normalizeGrantedScopes(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "mcp:tools offline_access", nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, sc := range strings.Fields(raw) {
+		if sc != "mcp:tools" && sc != "offline_access" {
+			return "", fmt.Errorf("unsupported scope %q", sc)
+		}
+		if !seen[sc] {
+			seen[sc] = true
+			out = append(out, sc)
+		}
+	}
+	return strings.Join(out, " "), nil
+}
+
+func hasScope(scopeStr, target string) bool {
+	for _, sc := range strings.Fields(scopeStr) {
+		if sc == target {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) issueCode(w http.ResponseWriter, r *http.Request, clientID, redirectURI, challenge, challengeMethod, state, scope string) {
 	code, err := MintCode()
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
+	}
+	if scope == "" {
+		scope = "mcp:tools offline_access"
 	}
 	if err := s.Store.CreateCode(Code{
 		Code:            code,
@@ -598,6 +639,7 @@ func (s *Server) issueCode(w http.ResponseWriter, r *http.Request, clientID, red
 		RedirectURI:     redirectURI,
 		Challenge:       challenge,
 		ChallengeMethod: challengeMethod,
+		Scope:           scope,
 		ExpiresAt:       time.Now().Add(s.codeTTL()),
 	}); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -703,7 +745,7 @@ func (s *Server) ServeConsent(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	s.issueCode(w, r, clientID, redirectURI, challenge, "S256", state)
+	s.issueCode(w, r, clientID, redirectURI, challenge, "S256", state, cons.Scope)
 }
 
 // DefaultRefreshTTL bounds a refresh token. It is deliberately short of
@@ -737,10 +779,37 @@ func (s *Server) ServeToken(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// DefaultAbsoluteRefreshTTL caps the maximum lifetime of a confidential
+// client's persistent opaque refresh token.
+var DefaultAbsoluteRefreshTTL = 90 * 24 * time.Hour
+
+func extractClientCredentials(r *http.Request) (clientID, clientSecret string) {
+	if id, sec, ok := r.BasicAuth(); ok {
+		return id, sec
+	}
+	return r.Form.Get("client_id"), r.Form.Get("client_secret")
+}
+
+func authenticateConfidentialClient(client *Client, secret string) bool {
+	if client == nil || client.ClientSecretHash == "" || secret == "" {
+		return false
+	}
+	got := HashSecret(secret)
+	return subtle.ConstantTimeCompare([]byte(got), []byte(client.ClientSecretHash)) == 1
+}
+
+func mintOpaqueRefreshToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return "rtok_" + base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
 // serveCodeGrant exchanges an authorization code for tokens.
 func (s *Server) serveCodeGrant(w http.ResponseWriter, r *http.Request) {
 	codeStr := r.Form.Get("code")
-	clientID := r.Form.Get("client_id")
+	clientID, clientSecret := extractClientCredentials(r)
 	redirectURI := r.Form.Get("redirect_uri")
 	verifier := r.Form.Get("code_verifier")
 	resourceValues := r.Form["resource"]
@@ -760,6 +829,11 @@ func (s *Server) serveCodeGrant(w http.ResponseWriter, r *http.Request) {
 	if cerr != nil || client.RevokedAt != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_client",
 			"error_description": "client revoked"})
+		return
+	}
+	if client.ClientMode == "confidential" && !authenticateConfidentialClient(client, clientSecret) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid_client",
+			"error_description": "client authentication failed"})
 		return
 	}
 
@@ -789,12 +863,17 @@ func (s *Server) serveCodeGrant(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	grantedScope := code.Scope
+	if grantedScope == "" {
+		grantedScope = "mcp:tools offline_access"
+	}
 	access, err := s.Issuer.Mint(TokenClaims{
 		Issuer:   s.IssuerURL,
 		Subject:  clientID,
 		Audience: s.RouteURL,
 		Tenant:   s.tenant(),
 		Route:    s.RouteID,
+		Scope:    grantedScope,
 		Expiry:   time.Now().Add(s.tokenTTL()).Unix(),
 		ID:       accessJTI,
 	})
@@ -802,32 +881,61 @@ func (s *Server) serveCodeGrant(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	refreshJTI, err := MintJTI()
-	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
+	var refresh string
+	if hasScope(grantedScope, "offline_access") {
+		if client.ClientMode == "confidential" {
+			rtok, rerr := mintOpaqueRefreshToken()
+			if rerr != nil {
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+			now := time.Now().UTC()
+			if err := s.Store.CreateOpaqueRefresh(OpaqueRefresh{
+				TokenHash:         HashSecret(rtok),
+				ClientID:          clientID,
+				Tenant:            s.tenant(),
+				Route:             s.RouteID,
+				ExpiresAt:         now.Add(s.refreshTTL()),
+				AbsoluteExpiresAt: now.Add(DefaultAbsoluteRefreshTTL),
+				LastUsedAt:        now,
+			}); err != nil {
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+			refresh = rtok
+		} else {
+			refreshJTI, err := MintJTI()
+			if err != nil {
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+			refresh, err = s.Issuer.Mint(TokenClaims{
+				Issuer:    s.IssuerURL,
+				Subject:   clientID,
+				Audience:  s.RouteURL,
+				Tenant:    s.tenant(),
+				Route:     s.RouteID,
+				Scope:     grantedScope,
+				Expiry:    time.Now().Add(s.refreshTTL()).Unix(),
+				ID:        refreshJTI,
+				TokenType: "refresh",
+			})
+			if err != nil {
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+		}
 	}
-	refresh, err := s.Issuer.Mint(TokenClaims{
-		Issuer:    s.IssuerURL,
-		Subject:   clientID,
-		Audience:  s.RouteURL,
-		Tenant:    s.tenant(),
-		Route:     s.RouteID,
-		Expiry:    time.Now().Add(s.refreshTTL()).Unix(),
-		ID:        refreshJTI,
-		TokenType: "refresh",
-	})
-	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
+	resp := map[string]any{
+		"access_token": access,
+		"token_type":   "Bearer",
+		"expires_in":   int(s.tokenTTL().Seconds()),
+		"scope":        grantedScope,
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"access_token":  access,
-		"token_type":    "Bearer",
-		"expires_in":    int(s.tokenTTL().Seconds()),
-		"refresh_token": refresh,
-		"scope":         "",
-	})
+	if refresh != "" {
+		resp["refresh_token"] = refresh
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // serveRefreshGrant rotates a refresh token. Every check the code grant
@@ -835,11 +943,82 @@ func (s *Server) serveCodeGrant(w http.ResponseWriter, r *http.Request) {
 // revoked and its grant must still be ACTIVE, so an operator's revocation
 // terminates the refresh lineage without hunting individual tokens.
 func (s *Server) serveRefreshGrant(w http.ResponseWriter, r *http.Request) {
-	clientID := r.Form.Get("client_id")
+	clientID, clientSecret := extractClientCredentials(r)
 	refreshStr := r.Form.Get("refresh_token")
 	resourceValues := r.Form["resource"]
 	if clientID == "" || refreshStr == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	// Any supplied resource must be exact and unambiguous, regardless of client mode.
+	if len(resourceValues) > 0 && !hasExactResource(resourceValues, s.RouteURL) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_target",
+			"error_description": "resource must be this route's canonical URL"})
+		return
+	}
+	client, cerr := s.scopedClient(clientID)
+	if cerr != nil || client.RevokedAt != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_client",
+			"error_description": "client revoked"})
+		return
+	}
+	if client.ClientMode == "confidential" {
+		if !authenticateConfidentialClient(client, clientSecret) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid_client",
+				"error_description": "client authentication failed"})
+			return
+		}
+		// Confidential clients may omit resource on refresh (derived from the
+		// bound grant), while any supplied foreign or ambiguous resource is rejected.
+		if len(resourceValues) > 0 && !hasExactResource(resourceValues, s.RouteURL) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_target",
+				"error_description": "resource must be this route's canonical URL"})
+			return
+		}
+		grant, err := s.Store.GetGrant(clientID, s.tenant(), s.RouteID)
+		if err != nil || grant.Status != GrantActive {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant",
+				"error_description": "client is not approved for this route"})
+			return
+		}
+		newRtok, rerr := mintOpaqueRefreshToken()
+		if rerr != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		if _, err := s.Store.RotateOpaqueRefresh(
+			HashSecret(refreshStr), HashSecret(newRtok), clientID, s.tenant(), s.RouteID, time.Now().UTC(), s.refreshTTL(),
+		); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant",
+				"error_description": "refresh token invalid, rotated, expired, or revoked"})
+			return
+		}
+		accessJTI, err := MintJTI()
+		if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		access, err := s.Issuer.Mint(TokenClaims{
+			Issuer:   s.IssuerURL,
+			Subject:  clientID,
+			Audience: s.RouteURL,
+			Tenant:   s.tenant(),
+			Route:    s.RouteID,
+			Scope:    "mcp:tools offline_access",
+			Expiry:   time.Now().Add(s.tokenTTL()).Unix(),
+			ID:       accessJTI,
+		})
+		if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"access_token":  access,
+			"token_type":    "Bearer",
+			"expires_in":    int(s.tokenTTL().Seconds()),
+			"refresh_token": newRtok,
+			"scope":         "mcp:tools offline_access",
+		})
 		return
 	}
 	if !hasExactResource(resourceValues, s.RouteURL) {
@@ -906,12 +1085,17 @@ func (s *Server) serveRefreshGrant(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	grantedScope := claims.Scope
+	if grantedScope == "" {
+		grantedScope = "mcp:tools offline_access"
+	}
 	access, err := s.Issuer.Mint(TokenClaims{
 		Issuer:   s.IssuerURL,
 		Subject:  clientID,
 		Audience: s.RouteURL,
 		Tenant:   s.tenant(),
 		Route:    s.RouteID,
+		Scope:    grantedScope,
 		Expiry:   time.Now().Add(s.tokenTTL()).Unix(),
 		ID:       accessJTI,
 	})
@@ -919,32 +1103,61 @@ func (s *Server) serveRefreshGrant(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	refreshJTI, err := MintJTI()
-	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
+	var refresh string
+	if hasScope(grantedScope, "offline_access") {
+		if client.ClientMode == "confidential" {
+			rtok, rerr := mintOpaqueRefreshToken()
+			if rerr != nil {
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+			now := time.Now().UTC()
+			if err := s.Store.CreateOpaqueRefresh(OpaqueRefresh{
+				TokenHash:         HashSecret(rtok),
+				ClientID:          clientID,
+				Tenant:            s.tenant(),
+				Route:             s.RouteID,
+				ExpiresAt:         now.Add(s.refreshTTL()),
+				AbsoluteExpiresAt: now.Add(DefaultAbsoluteRefreshTTL),
+				LastUsedAt:        now,
+			}); err != nil {
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+			refresh = rtok
+		} else {
+			refreshJTI, err := MintJTI()
+			if err != nil {
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+			refresh, err = s.Issuer.Mint(TokenClaims{
+				Issuer:    s.IssuerURL,
+				Subject:   clientID,
+				Audience:  s.RouteURL,
+				Tenant:    s.tenant(),
+				Route:     s.RouteID,
+				Scope:     grantedScope,
+				Expiry:    time.Now().Add(s.refreshTTL()).Unix(),
+				ID:        refreshJTI,
+				TokenType: "refresh",
+			})
+			if err != nil {
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+		}
 	}
-	refresh, err := s.Issuer.Mint(TokenClaims{
-		Issuer:    s.IssuerURL,
-		Subject:   clientID,
-		Audience:  s.RouteURL,
-		Tenant:    s.tenant(),
-		Route:     s.RouteID,
-		Expiry:    time.Now().Add(s.refreshTTL()).Unix(),
-		ID:        refreshJTI,
-		TokenType: "refresh",
-	})
-	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
+	resp := map[string]any{
+		"access_token": access,
+		"token_type":   "Bearer",
+		"expires_in":   int(s.tokenTTL().Seconds()),
+		"scope":        grantedScope,
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"access_token":  access,
-		"token_type":    "Bearer",
-		"expires_in":    int(s.tokenTTL().Seconds()),
-		"refresh_token": refresh,
-		"scope":         "",
-	})
+	if refresh != "" {
+		resp["refresh_token"] = refresh
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // refreshTTL bounds a refresh token. Zero selects DefaultRefreshTTL.

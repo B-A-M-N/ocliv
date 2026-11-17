@@ -188,6 +188,9 @@ func TestRemoveResolvesMissingPublicationIDAndFailsClosedWhenUnreachable(t *test
 		systemctl: func(_ ...string) (string, error) { return "inactive", nil },
 		mgmtCall: func(_ string, _ *identity.KeyPair, _, method, path string) (int, []byte, error) {
 			if method == http.MethodGet && path == "/v1/agent/mcp-routes" {
+				if deletedRemote {
+					return 200, []byte(`{"publications":[]}`), nil
+				}
 				return 200, []byte(`{"publications":[{"route_id":"pub-fg-1","pub_name":"svc-fg","profile":"managed-oauth"}]}`), nil
 			}
 			if method == http.MethodDelete && path == "/v1/agent/mcp-routes/pub-fg-1" {
@@ -238,7 +241,7 @@ func TestProvisionUserSupervisorWritesRestrictedUnitAndEnv(t *testing.T) {
 	if !reloaded {
 		t.Fatal("expected systemctl daemon-reload to run")
 	}
-	envPath := filepath.Join(home, ".config", "ocliv", "service-agentgateway.env")
+	envPath := filepath.Join(home, ".config", "ocliv", "service-default--agentgateway.env")
 	fi, err := os.Stat(envPath)
 	if err != nil {
 		t.Fatalf("missing env file: %v", err)

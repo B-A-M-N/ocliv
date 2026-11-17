@@ -88,6 +88,9 @@ func (a *Authorizer) AuthorizeClaims(r *http.Request, routeURL, issuerURL, tenan
 	if claims.ID == "" {
 		return nil, fmt.Errorf("authz: token has no jti; refusing unmanaged token")
 	}
+	if claims.Scope != "" && !hasScope(claims.Scope, "mcp:tools") {
+		return nil, fmt.Errorf("authz: token lacks required mcp:tools scope")
+	}
 	// Token-specific revocation (RFC 7009), scoped to this tenant + route.
 	// Checked on every request so a revoked token is denied immediately.
 	revoked, err := a.store.IsTokenRevoked(claims.ID, tenant, routeID)

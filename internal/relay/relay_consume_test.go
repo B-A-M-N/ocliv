@@ -57,50 +57,65 @@ func TestRevokeDuringUseDeniesAfterCommit(t *testing.T) {
 	tgt := &routeTarget{LeaseID: leaseID}
 
 	var preOK atomic.Int64
-	var violations atomic.Int64
-	var revokeNano atomic.Int64
-	revokeNano.Store(-1)
-	// Completions after the commit: any success here consumed a revoked
-	// token. The window covers in-flight checks plus scheduling margin;
-	// a pre-commit authorization timestamped 100ms late is negligible.
-	const drain = 100 * time.Millisecond
+	var totalOK atomic.Int64
+	var revokeCommitted atomic.Bool
+	var postRevokeOK atomic.Int64
 	var wg sync.WaitGroup
 	for w := 0; w < 32; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 20; i++ {
-				ok := s.checkVisitorToken(tgt, target.Raw)
-				end := time.Now().UnixNano()
-				if !ok {
+				startedAfter := revokeCommitted.Load()
+				if !s.checkVisitorToken(tgt, target.Raw) {
 					continue
 				}
-				if rt := revokeNano.Load(); rt < 0 || end <= rt {
+				totalOK.Add(1)
+				if startedAfter {
+					postRevokeOK.Add(1)
+				} else if !revokeCommitted.Load() {
 					preOK.Add(1)
-				} else if time.Duration(end-rt) <= drain {
-					violations.Add(1)
 				}
 			}
 		}()
 	}
 	// Wait for steady pre-revoke traffic so the race is exercised no
-	// matter how slow the machine is; bounding the wait keeps the suite
-	// fast when authorization itself is broken (preOK stays zero).
+	// matter how slow the machine is.
 	ready := time.Now().Add(30 * time.Second)
 	for preOK.Load() < 20 && time.Now().Before(ready) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if _, err := s.db.SQL().Exec(
-		`UPDATE access_tokens SET revoked_at=? WHERE lease_id=? AND revoked_at IS NULL`,
-		time.Now().UTC().Format(time.RFC3339Nano), leaseID); err != nil {
+	tx, err := s.db.SQL().Begin()
+	if err != nil {
 		t.Fatal(err)
 	}
-	revokeNano.Store(time.Now().UnixNano())
+	if _, err := tx.Exec(
+		`UPDATE access_tokens SET revoked_at=? WHERE lease_id=? AND revoked_at IS NULL`,
+		time.Now().UTC().Format(time.RFC3339Nano), leaseID); err != nil {
+		tx.Rollback()
+		t.Fatal(err)
+	}
+	var usesAtRevoke int64
+	if err := tx.QueryRow(`SELECT uses FROM access_tokens WHERE id='tok-target'`).Scan(&usesAtRevoke); err != nil {
+		tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	revokeCommitted.Store(true)
 	wg.Wait()
 	if preOK.Load() < 20 {
 		t.Fatalf("only %d pre-revoke authorizations; race never exercised", preOK.Load())
 	}
-	if got := violations.Load(); got != 0 {
-		t.Fatalf("%d authorizations succeeded after revocation committed", got)
+	if got := postRevokeOK.Load(); got != 0 {
+		t.Fatalf("%d authorizations started after revocation committed succeeded", got)
+	}
+	var finalUses int64
+	if err := s.db.SQL().QueryRow(`SELECT uses FROM access_tokens WHERE id='tok-target'`).Scan(&finalUses); err != nil {
+		t.Fatal(err)
+	}
+	if finalUses != usesAtRevoke || finalUses != totalOK.Load() {
+		t.Fatalf("linearizability violation: finalUses=%d usesAtRevoke=%d totalOK=%d", finalUses, usesAtRevoke, totalOK.Load())
 	}
 }
