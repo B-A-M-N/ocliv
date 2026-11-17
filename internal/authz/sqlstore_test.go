@@ -35,6 +35,7 @@ func applySchema(t *testing.T, db *sql.DB) {
 		   pairing_issued_at TEXT NOT NULL DEFAULT '',
 		   pairing_expires_at TEXT NOT NULL DEFAULT '',
 		   pairing_consumed_at TEXT, consented_at TEXT,
+		   skip_pairing INTEGER NOT NULL DEFAULT 0,
 		   PRIMARY KEY (client_id, tenant_id, route_id))`,
 		`CREATE TABLE authz_codes (code TEXT PRIMARY KEY, client_id TEXT NOT NULL,
 		   tenant_id TEXT NOT NULL, route_id TEXT NOT NULL, redirect_uri TEXT NOT NULL,

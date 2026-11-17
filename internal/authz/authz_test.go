@@ -389,7 +389,7 @@ func TestAuthorizeRejectsWrongResource(t *testing.T) {
 func TestTokenExchangeAndVerify(t *testing.T) {
 	s, issuer, _ := newTestServer(t)
 	client := register(t, s, "https://client.example/cb")
-	if err := s.Store.CreateGrant(Grant{ClientID: client, Tenant: s.tenant(), Route: s.RouteID, Status: GrantActive}); err != nil {
+	if err := s.Store.ApproveGrant(client, s.tenant(), s.RouteID); err != nil {
 		t.Fatalf("grant: %v", err)
 	}
 	verifier := "v" + strings.Repeat("b", 42)
@@ -430,7 +430,7 @@ func TestTokenExchangeAndVerify(t *testing.T) {
 func TestTokenExchangeRejectsBadPKCE(t *testing.T) {
 	s, _, _ := newTestServer(t)
 	client := register(t, s, "https://client.example/cb")
-	if err := s.Store.CreateGrant(Grant{ClientID: client, Tenant: s.tenant(), Route: s.RouteID, Status: GrantActive}); err != nil {
+	if err := s.Store.ApproveGrant(client, s.tenant(), s.RouteID); err != nil {
 		t.Fatalf("grant: %v", err)
 	}
 	if err := s.Store.CreateCode(Code{

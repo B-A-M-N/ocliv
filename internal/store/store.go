@@ -220,6 +220,13 @@ ALTER TABLE mcp_publications ADD COLUMN desired_enabled INTEGER NOT NULL DEFAULT
 ALTER TABLE mcp_publications ADD COLUMN state_generation INTEGER NOT NULL DEFAULT 1;
 `
 
+// schemaV13 adds skip_pairing to authz_grants so an operator-approved
+// direct grant (--direct) can bypass the interactive browser pairing_secret
+// consent form while keeping pairing_secret mandatory for standard grants.
+const schemaV13 = `
+ALTER TABLE authz_grants ADD COLUMN skip_pairing INTEGER NOT NULL DEFAULT 0;
+`
+
 // applyMigration runs one versioned migration body and its version
 // stamp in a single transaction: a failure anywhere rolls back the
 // body, so a version is never recorded for half-applied work (P1-2).
@@ -244,7 +251,7 @@ func applyMigration(sqldb *sql.DB, version int, body string) error {
 }
 
 // currentSchema is the newest version Open must reach.
-const currentSchema = 12
+const currentSchema = 13
 
 // SchemaVersion is the exported current schema version for tools that must
 // refuse unknown/newer databases without opening (and thereby migrating)
@@ -416,6 +423,7 @@ func Open(path string) (*DB, error) {
 		{10, schemaV10},
 		{11, schemaV11},
 		{12, schemaV12},
+		{13, schemaV13},
 	}
 	for _, m := range migrations {
 		var v int

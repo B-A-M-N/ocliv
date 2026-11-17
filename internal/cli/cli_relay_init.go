@@ -56,9 +56,10 @@ type initConfig struct {
 	// allowReserved permits RFC-reserved/never-public domains on the
 	// wildcard edge for lab prep; without it such a deployment is
 	// refused because public DNS-01 can never complete.
-	dnsProvider   string
-	dnsEnv        string
-	allowReserved bool
+	dnsProvider              string
+	dnsEnv                   string
+	allowReserved            bool
+	autoApproveRedirectHosts string
 }
 
 func parseRelayInit(argv []string) (initConfig, int) {
@@ -91,6 +92,11 @@ func parseRelayInit(argv []string) (initConfig, int) {
 		case a == "--edge" && i+1 < len(argv):
 			i++
 			c.edge = argv[i]
+		case strings.HasPrefix(a, "--auto-approve-redirect-hosts="):
+			c.autoApproveRedirectHosts = strings.TrimPrefix(a, "--auto-approve-redirect-hosts=")
+		case a == "--auto-approve-redirect-hosts" && i+1 < len(argv):
+			i++
+			c.autoApproveRedirectHosts = argv[i]
 		case strings.HasPrefix(a, "--out="):
 			c.outDir = strings.TrimPrefix(a, "--out=")
 		case a == "--out" && i+1 < len(argv):
@@ -348,6 +354,9 @@ func buildInitFiles(cfg initConfig) map[string]string {
 		fmt.Fprintf(&env, "OCLIV_MCP_HOST=%s\n", cfg.mcpHost)
 	} else if cfg.mcpHost != "" {
 		fmt.Fprintf(&env, "OCLIV_MCP_HOST=%s\n", cfg.mcpHost)
+	}
+	if cfg.autoApproveRedirectHosts != "" {
+		fmt.Fprintf(&env, "OCLIV_AUTO_APPROVE_REDIRECT_HOSTS=%s\n", cfg.autoApproveRedirectHosts)
 	}
 	files["relay.env"] = env.String()
 	caddy := edgecaddy.SingleHost()

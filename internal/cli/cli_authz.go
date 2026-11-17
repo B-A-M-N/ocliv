@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"ocliv/internal/apperr"
 	"ocliv/internal/authz"
@@ -22,7 +23,7 @@ import (
 // to exactly one tenant + route. It is not tool-level permissioning.
 func cmdAuthz(argv []string) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ocliv authz pending|list|approve|revoke|rotate-key [--data DIR] ...")
+		fmt.Fprintln(os.Stderr, "usage: ocliv authz pending|list|approve|refresh|grant-route|register|revoke|rotate-key [--data DIR] ...")
 		return apperr.ExitCLIValidation
 	}
 	switch argv[0] {
@@ -32,6 +33,12 @@ func cmdAuthz(argv []string) int {
 		return cmdAuthzList(argv[1:])
 	case "approve":
 		return cmdAuthzApprove(argv[1:])
+	case "refresh":
+		return cmdAuthzRefresh(argv[1:])
+	case "grant-route":
+		return cmdAuthzGrantRoute(argv[1:])
+	case "register":
+		return cmdAuthzRegister(argv[1:])
 	case "revoke":
 		return cmdAuthzRevoke(argv[1:])
 	case "rotate-key":
@@ -62,11 +69,14 @@ func authzOpenReadOnly(dataDir string) (*sql.DB, error) {
 // rejected instead of silently ignored — a misspelled --data could
 // otherwise target ./ocliv-relay-data and mutate the wrong database.
 type authzFlags struct {
-	dataDir string
-	tenant  string
-	route   string
-	client  string
-	asJSON  bool
+	dataDir  string
+	tenant   string
+	route    string
+	client   string
+	name     string
+	redirect string
+	asJSON   bool
+	direct   bool
 }
 
 // authzFlagSpec lists the flags a subcommand accepts and which are required.
@@ -121,6 +131,17 @@ func parseAuthzFlags(argv []string, spec authzFlagSpec) (*authzFlags, error) {
 			seen[name] = "true"
 			continue
 		}
+		if name == "direct" {
+			if hasVal {
+				return nil, fmt.Errorf("--direct does not take a value")
+			}
+			if f.direct {
+				return nil, fmt.Errorf("--direct given twice")
+			}
+			f.direct = true
+			seen[name] = "true"
+			continue
+		}
 		if !hasVal {
 			if i+1 >= len(argv) || strings.HasPrefix(argv[i+1], "-") {
 				return nil, fmt.Errorf("--%s requires a value", name)
@@ -144,6 +165,10 @@ func parseAuthzFlags(argv []string, spec authzFlagSpec) (*authzFlags, error) {
 			f.route = val
 		case "client":
 			f.client = val
+		case "name":
+			f.name = val
+		case "redirect":
+			f.redirect = val
 		}
 	}
 	for name := range spec.required {
@@ -169,12 +194,29 @@ func authzListFlags(argv []string) (dataDir, tenant, route string, asJSON bool, 
 }
 
 type authzGrantRow struct {
-	Client  string `json:"client"`
-	Tenant  string `json:"tenant"`
-	Route   string `json:"route"`
-	Status  string `json:"status"`
-	Created string `json:"created_at"`
-	Updated string `json:"updated_at"`
+	Client       string   `json:"client"`
+	Name         string   `json:"name,omitempty"`
+	RedirectURIs []string `json:"redirect_uris,omitempty"`
+	Tenant       string   `json:"tenant"`
+	Route        string   `json:"route"`
+	Status       string   `json:"status"`
+	SkipPairing  bool     `json:"skip_pairing,omitempty"`
+	Created      string   `json:"created_at"`
+	Updated      string   `json:"updated_at"`
+}
+
+func authzGrantRowFromGrant(g authz.Grant) authzGrantRow {
+	return authzGrantRow{
+		Client:       g.ClientID,
+		Name:         g.ClientName,
+		RedirectURIs: g.RedirectURIs,
+		Tenant:       g.Tenant,
+		Route:        g.Route,
+		Status:       string(g.Status),
+		SkipPairing:  g.SkipPairing,
+		Created:      g.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+		Updated:      g.UpdatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+	}
 }
 
 func authzRender(rows []authzGrantRow, asJSON bool, emptyMsg string) int {
@@ -188,8 +230,12 @@ func authzRender(rows []authzGrantRow, asJSON bool, emptyMsg string) int {
 		return apperr.ExitOK
 	}
 	for _, r := range rows {
-		fmt.Printf("%s  tenant=%s route=%s status=%s created=%s updated=%s\n",
-			r.Client, r.Tenant, r.Route, r.Status, r.Created, r.Updated)
+		redirects := "[]"
+		if len(r.RedirectURIs) > 0 {
+			redirects = "[" + strings.Join(r.RedirectURIs, ",") + "]"
+		}
+		fmt.Printf("%s  name=%q redirects=%s tenant=%s route=%s status=%s direct=%t created=%s updated=%s\n",
+			r.Client, r.Name, redirects, r.Tenant, r.Route, r.Status, r.SkipPairing, r.Created, r.Updated)
 	}
 	return apperr.ExitOK
 }
@@ -224,8 +270,7 @@ func cmdAuthzPending(argv []string) int {
 		if route != "" && g.Route != route {
 			continue
 		}
-		out = append(out, authzGrantRow{g.ClientID, g.Tenant, g.Route, string(g.Status),
-			g.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"), g.UpdatedAt.UTC().Format("2006-01-02T15:04:05Z")})
+		out = append(out, authzGrantRowFromGrant(g))
 	}
 	return authzRender(out, asJSON, "no pending client approvals")
 }
@@ -256,8 +301,7 @@ func cmdAuthzList(argv []string) int {
 		if route != "" && g.Route != route {
 			continue
 		}
-		out = append(out, authzGrantRow{g.ClientID, g.Tenant, g.Route, string(g.Status),
-			g.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"), g.UpdatedAt.UTC().Format("2006-01-02T15:04:05Z")})
+		out = append(out, authzGrantRowFromGrant(g))
 	}
 	return authzRender(out, asJSON, "no client grants")
 }
@@ -286,12 +330,17 @@ func authzAudit(st *authz.SQLStore, tenant, route, client, action, result, detai
 }
 
 // cmdAuthzApprove approves a registered client for a tenant + route and
-// issues the pairing secret the client must present to obtain a code.
+// issues the pairing secret the client must present to obtain a code, or
+// activates a direct grant (--direct) that skips the pairing consent form.
 func cmdAuthzApprove(argv []string) int {
-	dataDir, client, tenant, route, ok := authzClientFlags(argv)
-	if !ok {
+	spec := authzSpecFor("tenant", "route", "client", "direct")
+	spec.required["client"] = true
+	f, ferr := parseAuthzFlags(argv, spec)
+	if ferr != nil {
+		fmt.Fprintln(os.Stderr, "error: "+ferr.Error())
 		return apperr.ExitCLIValidation
 	}
+	dataDir, client, tenant, route, direct := f.dataDir, f.client, f.tenant, f.route, f.direct
 	// Tenant and route must be named explicitly. Approving by client alone
 	// could silently cover several grants; ambiguity is an error, never a
 	// guess.
@@ -306,6 +355,15 @@ func cmdAuthzApprove(argv []string) int {
 	}
 	defer db.Close()
 	st := authz.NewSQLStore(db.SQL())
+	if direct {
+		if err := st.ApproveGrantDirect(client, tenant, route); err != nil {
+			fmt.Fprintln(os.Stderr, "error: "+err.Error())
+			return apperr.ExitInternal
+		}
+		authzAudit(st, tenant, route, client, "approve", "ok", "direct grant active; pairing bypassed")
+		fmt.Printf("approved client %s for tenant=%s route=%s (direct; pairing bypassed)\n", client, tenant, route)
+		return apperr.ExitOK
+	}
 	grant, gerr := st.GetGrant(client, tenant, route)
 	if gerr != nil {
 		fmt.Fprintf(os.Stderr, "no pending grant for client %s tenant=%s route=%s; the client must initiate authorization first\n", client, tenant, route)
@@ -334,6 +392,168 @@ func cmdAuthzApprove(argv []string) int {
 	fmt.Println("The client must present it in the consent form (pairing_secret) when the")
 	fmt.Println("authorization page is shown. It is single-use and expires; run this command")
 	fmt.Println("again to authorize another authorization flow.")
+	return apperr.ExitOK
+}
+
+// cmdAuthzGrantRoute grants an existing tenant-scoped client direct access to
+// an additional route in the same tenant without re-registering.
+func cmdAuthzGrantRoute(argv []string) int {
+	spec := authzSpecFor("tenant", "route", "client")
+	spec.required["client"] = true
+	spec.required["tenant"] = true
+	spec.required["route"] = true
+	f, ferr := parseAuthzFlags(argv, spec)
+	if ferr != nil {
+		fmt.Fprintln(os.Stderr, "error: "+ferr.Error())
+		return apperr.ExitCLIValidation
+	}
+	db, err := authzOpen(f.dataDir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
+	}
+	defer db.Close()
+	st := authz.NewSQLStore(db.SQL())
+	if err := st.ApproveGrantDirect(f.client, f.tenant, f.route); err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
+	}
+	authzAudit(st, f.tenant, f.route, f.client, "grant-route", "ok", "cross-route direct grant active")
+	fmt.Printf("granted client %s direct access to tenant=%s route=%s\n", f.client, f.tenant, f.route)
+	return apperr.ExitOK
+}
+
+// cmdAuthzRegister pre-registers an OAuth client for a tenant + route and
+// optionally approves it directly (--direct).
+func cmdAuthzRegister(argv []string) int {
+	spec := authzSpecFor("tenant", "route", "name", "redirect", "direct")
+	spec.required["tenant"] = true
+	spec.required["route"] = true
+	spec.required["name"] = true
+	spec.required["redirect"] = true
+	f, ferr := parseAuthzFlags(argv, spec)
+	if ferr != nil {
+		fmt.Fprintln(os.Stderr, "error: "+ferr.Error())
+		return apperr.ExitCLIValidation
+	}
+	var redirects []string
+	for _, r := range strings.Split(f.redirect, ",") {
+		r = strings.TrimSpace(r)
+		if r != "" {
+			redirects = append(redirects, r)
+		}
+	}
+	if len(redirects) == 0 {
+		fmt.Fprintln(os.Stderr, "error: --redirect must contain at least one URI")
+		return apperr.ExitCLIValidation
+	}
+	for _, uri := range redirects {
+		if err := authz.ValidateRedirectURI(uri, redirects); err != nil {
+			fmt.Fprintf(os.Stderr, "error: invalid --redirect %q: %v\n", uri, err)
+			return apperr.ExitCLIValidation
+		}
+	}
+	id, err := authz.MintClientID()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
+	}
+	db, err := authzOpen(f.dataDir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
+	}
+	defer db.Close()
+	st := authz.NewSQLStore(db.SQL())
+	now := time.Now()
+	if err := st.RegisterClient(authz.Client{
+		ID:           id,
+		Name:         f.name,
+		RedirectURIs: redirects,
+		CreatedAt:    now,
+		Tenant:       f.tenant,
+		Route:        f.route,
+	}); err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
+	}
+	if f.direct {
+		if err := st.ApproveGrantDirect(id, f.tenant, f.route); err != nil {
+			fmt.Fprintln(os.Stderr, "error: "+err.Error())
+			return apperr.ExitInternal
+		}
+		authzAudit(st, f.tenant, f.route, id, "register", "ok", "pre-registered with direct grant")
+		fmt.Printf("registered and approved client %s (name=%q) for tenant=%s route=%s (direct)\n", id, f.name, f.tenant, f.route)
+		return apperr.ExitOK
+	}
+	if err := st.CreateGrant(authz.Grant{
+		ClientID:  id,
+		Tenant:    f.tenant,
+		Route:     f.route,
+		Status:    authz.GrantPending,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
+	}
+	authzAudit(st, f.tenant, f.route, id, "register", "ok", "pre-registered pending grant")
+	fmt.Printf("registered client %s (name=%q) for tenant=%s route=%s (status=pending)\n", id, f.name, f.tenant, f.route)
+	return apperr.ExitOK
+}
+
+// cmdAuthzRefresh refreshes an existing client grant without forcing the client
+// to re-register: if --direct is set (or skip_pairing is already enabled), it
+// keeps the grant active for immediate re-auth; otherwise it rotates a fresh
+// pairing_secret.
+func cmdAuthzRefresh(argv []string) int {
+	spec := authzSpecFor("tenant", "route", "client", "direct")
+	spec.required["client"] = true
+	spec.required["tenant"] = true
+	spec.required["route"] = true
+	f, ferr := parseAuthzFlags(argv, spec)
+	if ferr != nil {
+		fmt.Fprintln(os.Stderr, "error: "+ferr.Error())
+		return apperr.ExitCLIValidation
+	}
+	db, err := authzOpen(f.dataDir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
+	}
+	defer db.Close()
+	st := authz.NewSQLStore(db.SQL())
+	grant, gerr := st.GetGrant(f.client, f.tenant, f.route)
+	if gerr != nil {
+		fmt.Fprintf(os.Stderr, "no grant for client %s tenant=%s route=%s\n", f.client, f.tenant, f.route)
+		return apperr.ExitCLIValidation
+	}
+	if grant.Status == authz.GrantRevoked {
+		fmt.Fprintf(os.Stderr, "client %s is revoked for tenant=%s route=%s; revocation is terminal\n", f.client, f.tenant, f.route)
+		return apperr.ExitCLIValidation
+	}
+	if f.direct || grant.SkipPairing {
+		if err := st.ApproveGrantDirect(f.client, f.tenant, f.route); err != nil {
+			fmt.Fprintln(os.Stderr, "error: "+err.Error())
+			return apperr.ExitInternal
+		}
+		authzAudit(st, f.tenant, f.route, f.client, "refresh", "ok", "direct grant refreshed")
+		fmt.Printf("refreshed client %s for tenant=%s route=%s (direct; pairing bypassed)\n", f.client, f.tenant, f.route)
+		return apperr.ExitOK
+	}
+	secret, err := authz.MintPairingSecret()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
+	}
+	if err := st.ApproveGrantWithPairingSecret(f.client, f.tenant, f.route, secret, authz.DefaultPairingTTL); err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
+	}
+	authzAudit(st, f.tenant, f.route, f.client, "refresh", "ok", "pairing secret rotated")
+	fmt.Printf("refreshed client %s for tenant=%s route=%s\n", f.client, f.tenant, f.route)
+	fmt.Println("Pairing secret (show once; deliver it to the client operator over a private channel):")
+	fmt.Println(secret)
 	return apperr.ExitOK
 }
 

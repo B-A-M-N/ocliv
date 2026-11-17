@@ -962,11 +962,12 @@ func cmdServicePending(argv []string, ops serviceOps) int {
 
 func cmdServiceApprove(argv []string, ops serviceOps) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ocliv service approve NAME [--client CLIENT_ID]")
+		fmt.Fprintln(os.Stderr, "usage: ocliv service approve NAME [--client CLIENT_ID] [--direct]")
 		return apperr.ExitCLIValidation
 	}
 	name := argv[0]
 	var clientID string
+	var direct bool
 	for i := 1; i < len(argv); i++ {
 		if argv[i] == "--client" || strings.HasPrefix(argv[i], "--client=") {
 			v, ok := mcpFlagValue(argv, &i, "client")
@@ -974,6 +975,8 @@ func cmdServiceApprove(argv []string, ops serviceOps) int {
 				return apperr.ExitCLIValidation
 			}
 			clientID = v
+		} else if argv[i] == "--direct" {
+			direct = true
 		} else {
 			fmt.Fprintf(os.Stderr, "unknown flag %q\n", argv[i])
 			return apperr.ExitCLIValidation
@@ -1025,7 +1028,11 @@ func cmdServiceApprove(argv []string, ops serviceOps) int {
 		}
 		clientID = out.Pending[0].ClientID
 	}
-	st, body, callErr := ops.mgmtCall(relayURL, k, keyID, http.MethodPost, "/v1/agent/mcp-routes/"+pubID+"/authz/approve/"+clientID)
+	path := "/v1/agent/mcp-routes/" + pubID + "/authz/approve/" + clientID
+	if direct {
+		path += "?direct=1"
+	}
+	st, body, callErr := ops.mgmtCall(relayURL, k, keyID, http.MethodPost, path)
 	if callErr != nil {
 		fmt.Fprintf(os.Stderr, "service approve: %v\n", callErr)
 		return apperr.ExitRelayTLS
@@ -1037,10 +1044,15 @@ func cmdServiceApprove(argv []string, ops serviceOps) int {
 	var res struct {
 		ClientID      string `json:"client_id"`
 		PairingSecret string `json:"pairing_secret"`
+		Direct        bool   `json:"direct"`
 	}
-	if err := json.Unmarshal(body, &res); err != nil || res.PairingSecret == "" {
+	if err := json.Unmarshal(body, &res); err != nil || (!direct && res.PairingSecret == "") {
 		fmt.Fprintln(os.Stderr, "invalid relay approve response")
 		return apperr.ExitInternal
+	}
+	if direct || res.Direct {
+		fmt.Printf("✓ approved client %s for %s (route=%s, direct; pairing bypassed)\n", res.ClientID, name, pubID)
+		return apperr.ExitOK
 	}
 	fmt.Printf("✓ approved client %s for %s (route=%s)\n", res.ClientID, name, pubID)
 	fmt.Printf("Pairing secret (single-use; enter in consent form):\n%s\n", res.PairingSecret)

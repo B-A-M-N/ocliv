@@ -34,7 +34,7 @@ const (
 	// At quota, the oldest unrevoked no-grant entry may be evicted earlier;
 	// every identity with a grant row and every revoked ID reservation is
 	// retained.
-	MaxPendingClientAge = 24 * time.Hour
+	MaxPendingClientAge = 7 * 24 * time.Hour
 )
 
 // ErrClientQuota reports a route whose client table is full and contains
@@ -97,6 +97,14 @@ type Grant struct {
 	// PairingConsumedAt is set once the secret has been used; a consumed
 	// secret never authorizes a second transaction.
 	PairingConsumedAt *time.Time
+	// SkipPairing is true when an operator explicitly approved this grant
+	// with --direct, allowing /oauth/authorize to issue an authorization code
+	// without showing the interactive pairing_secret consent form.
+	SkipPairing bool
+	// ClientName and RedirectURIs are populated by ListGrants from
+	// authz_clients for operator display.
+	ClientName   string
+	RedirectURIs []string
 }
 
 // Consent is a one-time, expiring, transaction-bound pairing challenge.
@@ -164,6 +172,10 @@ type Store interface {
 	// credential must not leave an ACTIVE grant that no consent can ever
 	// complete. It refuses a revoked grant.
 	ApproveGrantWithPairingSecret(clientID, tenant, route, secret string, ttl time.Duration) error
+	// ApproveGrantDirect activates a grant with skip_pairing=true for a
+	// client belonging to the same tenant (including cross-route grants).
+	// It refuses unknown clients, cross-tenant clients, and revoked grants.
+	ApproveGrantDirect(clientID, tenant, route string) error
 	RevokeGrant(clientID, tenant, route string) error
 	// RevokeGrantsForRoute revokes every grant of one route in a single
 	// step and returns how many rows changed. Removing a route must
@@ -442,6 +454,44 @@ func (m *MemStore) ApproveGrantWithPairingSecret(clientID, tenant, route, secret
 	return nil
 }
 
+// ApproveGrantDirect activates a grant with SkipPairing=true for a client
+// registered in the same tenant (allowing cross-route grants).
+func (m *MemStore) ApproveGrantDirect(clientID, tenant, route string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, cok := m.clients[clientID]
+	if !cok {
+		return fmt.Errorf("authz: approve grant for unknown client %q", clientID)
+	}
+	if c.Tenant == "" {
+		return fmt.Errorf("authz: client %q has no tenant registration scope; refusing approval", clientID)
+	}
+	if c.Tenant != tenant {
+		return fmt.Errorf("authz: client %q is registered for tenant %q, not tenant %q",
+			clientID, c.Tenant, tenant)
+	}
+	k := grantKey(clientID, tenant, route)
+	now := time.Now()
+	g, ok := m.grants[k]
+	if !ok {
+		g = &Grant{
+			ClientID:  clientID,
+			Tenant:    tenant,
+			Route:     route,
+			Status:    GrantActive,
+			CreatedAt: now,
+		}
+		m.grants[k] = g
+	}
+	if g.Status == GrantRevoked {
+		return fmt.Errorf("authz: grant for client %q route %q is revoked; revocation is terminal", clientID, route)
+	}
+	g.Status = GrantActive
+	g.SkipPairing = true
+	g.UpdatedAt = now
+	return nil
+}
+
 // RevokeGrantsForRoute revokes every grant of one route.
 func (m *MemStore) RevokeGrantsForRoute(tenant, route string) (int, error) {
 	m.mu.Lock()
@@ -552,7 +602,9 @@ func (m *MemStore) TryRegisterClient(c Client) error {
 	n := 0
 	claimed := make(map[string]bool, len(m.grants))
 	for _, g := range m.grants {
-		claimed[grantKey(g.ClientID, g.Tenant, g.Route)] = true
+		if g.Status == GrantActive || g.Status == GrantRevoked {
+			claimed[grantKey(g.ClientID, g.Tenant, g.Route)] = true
+		}
 	}
 	oldestID := ""
 	var oldest time.Time
@@ -570,6 +622,9 @@ func (m *MemStore) TryRegisterClient(c Client) error {
 	if n >= MaxClientsPerRoute {
 		if oldestID == "" {
 			return ErrClientQuota
+		}
+		if victim, ok := m.clients[oldestID]; ok {
+			delete(m.grants, grantKey(oldestID, victim.Tenant, victim.Route))
 		}
 		delete(m.clients, oldestID)
 	}
@@ -590,7 +645,9 @@ func (m *MemStore) PruneAbandonedClients(now time.Time) (int, error) {
 	cutoff := now.Add(-MaxPendingClientAge)
 	claimed := make(map[string]bool, len(m.grants))
 	for _, g := range m.grants {
-		claimed[grantKey(g.ClientID, g.Tenant, g.Route)] = true
+		if g.Status == GrantActive || g.Status == GrantRevoked {
+			claimed[grantKey(g.ClientID, g.Tenant, g.Route)] = true
+		}
 	}
 	n := 0
 	for id, c := range m.clients {
@@ -598,6 +655,7 @@ func (m *MemStore) PruneAbandonedClients(now time.Time) (int, error) {
 			continue
 		}
 		if c.CreatedAt.Before(cutoff) {
+			delete(m.grants, grantKey(id, c.Tenant, c.Route))
 			delete(m.clients, id)
 			n++
 		}

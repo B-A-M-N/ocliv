@@ -79,9 +79,9 @@ func (a *Authorizer) AuthorizeClaims(r *http.Request, routeURL, issuerURL, tenan
 	if client.Tenant == "" || client.Route == "" {
 		return nil, fmt.Errorf("authz: client %q has no route registration scope", claims.Subject)
 	}
-	if client.Tenant != tenant || client.Route != routeID {
-		return nil, fmt.Errorf("authz: client %q is registered for tenant %q route %q, not tenant %q route %q",
-			claims.Subject, client.Tenant, client.Route, tenant, routeID)
+	if client.Tenant != tenant {
+		return nil, fmt.Errorf("authz: client %q is registered for tenant %q, not tenant %q",
+			claims.Subject, client.Tenant, tenant)
 	}
 	// Every managed token must carry a jti. A token without one cannot be
 	// individually revoked, so it is refused rather than admitted.

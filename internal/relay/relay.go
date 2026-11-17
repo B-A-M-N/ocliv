@@ -37,6 +37,9 @@ type Options struct {
 	MCPExternalPort int
 	ServerKey       []byte // HMAC key for visitor sessions; random per relay
 	Logger          Logger
+	// AutoApproveRedirectHosts lists trusted redirect hostnames that may
+	// auto-approve managed OAuth clients with skip_pairing=true.
+	AutoApproveRedirectHosts []string
 }
 
 // Logger is a minimal structured logger to avoid import cycles.
@@ -124,9 +127,10 @@ type Server struct {
 	// mcpPort is the normalized public HTTPS port (443 default), minted
 	// into route URLs when non-443. Host authority matching strips ports
 	// (canonicalHost), so this affects only advertised URLs, never admission.
-	mcpPort  int
-	visitors visitorAccess // HMAC key + verifier for visitor sessions
-	log      Logger
+	mcpPort                  int
+	autoApproveRedirectHosts []string
+	visitors                 visitorAccess // HMAC key + verifier for visitor sessions
+	log                      Logger
 
 	registry     sessionRegistry // live sessions + expiry timers (relay_sessions.go only)
 	nonces       nonceCache      // challenge/handshake replay cache (relay_nonce.go only)
@@ -165,21 +169,32 @@ func New(o Options) (*Server, error) {
 	if port == 0 {
 		port = 443
 	}
+	var autoApprove []string
+	seenAuto := make(map[string]struct{}, len(o.AutoApproveRedirectHosts))
+	for _, raw := range o.AutoApproveRedirectHosts {
+		if h := strings.ToLower(strings.TrimSpace(raw)); h != "" {
+			if _, ok := seenAuto[h]; !ok {
+				seenAuto[h] = struct{}{}
+				autoApprove = append(autoApprove, h)
+			}
+		}
+	}
 	s := &Server{
-		db:           o.DB,
-		namespace:    strings.ToLower(o.Namespace),
-		relayHost:    strings.ToLower(o.RelayHost),
-		mcpHost:      strings.ToLower(o.MCPExternalHost),
-		mcpPort:      port,
-		visitors:     newVisitorAccess(o.ServerKey),
-		log:          o.Logger,
-		registry:     newSessionRegistry(),
-		nonces:       newNonceCache(),
-		throttle:     limits.NewThrottle(limits.MaxBurstReg, time.Minute),
-		preAuth:      limits.NewThrottle(limits.PreAuthBurst, time.Minute),
-		mcpAdmission: limits.NewThrottle(limits.MCPAdmissionBurst, time.Minute),
-		budgets:      limits.NewRegistry(),
-		mux:          http.NewServeMux(),
+		db:                       o.DB,
+		namespace:                strings.ToLower(o.Namespace),
+		relayHost:                strings.ToLower(o.RelayHost),
+		mcpHost:                  strings.ToLower(o.MCPExternalHost),
+		mcpPort:                  port,
+		autoApproveRedirectHosts: autoApprove,
+		visitors:                 newVisitorAccess(o.ServerKey),
+		log:                      o.Logger,
+		registry:                 newSessionRegistry(),
+		nonces:                   newNonceCache(),
+		throttle:                 limits.NewThrottle(limits.MaxBurstReg, time.Minute),
+		preAuth:                  limits.NewThrottle(limits.PreAuthBurst, time.Minute),
+		mcpAdmission:             limits.NewThrottle(limits.MCPAdmissionBurst, time.Minute),
+		budgets:                  limits.NewRegistry(),
+		mux:                      http.NewServeMux(),
 	}
 	if s.log == nil {
 		s.log = noopLog{}

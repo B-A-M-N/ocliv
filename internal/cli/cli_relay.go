@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -34,7 +35,7 @@ func restrictFileCreation() {
 // cmdRelay handles relay-side operations.
 func cmdRelay(argv []string) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ocliv relay init|serve|doctor|issue-enroll|keys|revoke-key|tenants|backup|validate-backup|restore ...")
+		fmt.Fprintln(os.Stderr, "usage: ocliv relay init|serve|doctor|issue-enroll|enroll-ssh|keys|revoke-key|tenants|backup|validate-backup|restore ...")
 		return apperr.ExitCLIValidation
 	}
 	switch argv[0] {
@@ -46,6 +47,8 @@ func cmdRelay(argv []string) int {
 		return cmdRelayDoctor(argv[1:])
 	case "issue-enroll":
 		return cmdIssueEnroll(argv[1:])
+	case "enroll-ssh":
+		return cmdRelayEnrollSSH(argv[1:])
 	case "keys":
 		return cmdRelayKeys(argv[1:])
 	case "revoke-key":
@@ -276,6 +279,38 @@ func startHealthListener(addr string, h http.Handler) (*http.Server, error) {
 	return srv, nil
 }
 
+// parseAutoApproveRedirectHosts parses and validates a comma-separated list
+// of exact hostnames/IPs for --auto-approve-redirect-hosts. Wildcards,
+// schemes, paths, and ports are rejected so typos fail closed at startup.
+func parseAutoApproveRedirectHosts(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var out []string
+	seen := map[string]struct{}{}
+	for _, part := range strings.Split(raw, ",") {
+		h := strings.ToLower(strings.TrimSpace(part))
+		if h == "" {
+			return nil, fmt.Errorf("--auto-approve-redirect-hosts contains an empty entry")
+		}
+		if strings.Contains(h, "*") || strings.Contains(h, "://") || strings.Contains(h, "/") || strings.Contains(h, ":") {
+			return nil, fmt.Errorf("--auto-approve-redirect-hosts entry %q must be an exact hostname or IP literal (no wildcards, scheme, port, or path)", part)
+		}
+		if h != "localhost" && net.ParseIP(h) == nil {
+			norm, err := parseHostname(h, "--auto-approve-redirect-hosts")
+			if err != nil {
+				return nil, err
+			}
+			h = norm
+		}
+		if _, ok := seen[h]; !ok {
+			seen[h] = struct{}{}
+			out = append(out, h)
+		}
+	}
+	return out, nil
+}
+
 // cmdRelayServe runs the relay in the foreground (systemd runs this).
 func cmdRelayServe(argv []string) int {
 	addr, dataDir, rawDomain := relayFlags(argv)
@@ -334,6 +369,15 @@ func cmdRelayServe(argv []string) int {
 		}
 		mcpPort = p
 	}
+	rawAutoApprove := os.Getenv("OCLIV_AUTO_APPROVE_REDIRECT_HOSTS")
+	if v, seen := explicitRelayFlag(argv, "--auto-approve-redirect-hosts"); seen {
+		rawAutoApprove = v
+	}
+	autoApproveHosts, err := parseAutoApproveRedirectHosts(rawAutoApprove)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitCLIValidation
+	}
 	restrictFileCreation()
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
@@ -348,6 +392,7 @@ func cmdRelayServe(argv []string) int {
 	srv, err := relay.New(relay.Options{
 		DB: db, Namespace: "t." + domain, RelayHost: relayHost,
 		MCPExternalHost: mcpHost, MCPExternalPort: mcpPort,
+		AutoApproveRedirectHosts: autoApproveHosts,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
@@ -518,10 +563,11 @@ func cmdIssueEnroll(argv []string) int {
 	_, dataDir, _ := relayFlags(argv)
 	var tenant string
 	tenantSet := false
+	ttl := 24 * time.Hour
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
 		if a == "--help" || a == "-h" {
-			fmt.Fprintln(os.Stderr, "usage: ocliv relay issue-enroll [--data DIR] [--tenant NAME]")
+			fmt.Fprintln(os.Stderr, "usage: ocliv relay issue-enroll [--data DIR] [--tenant NAME] [--ttl DURATION]")
 			return apperr.ExitCLIValidation
 		}
 		if a == "--tenant" {
@@ -541,6 +587,19 @@ func cmdIssueEnroll(argv []string) int {
 		if strings.HasPrefix(a, "--tenant=") {
 			tenant = strings.TrimPrefix(a, "--tenant=")
 			tenantSet = true
+			continue
+		}
+		if a == "--ttl" || strings.HasPrefix(a, "--ttl=") {
+			v, ok := mcpFlagValue(argv, &i, "ttl")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			d, derr := time.ParseDuration(v)
+			if derr != nil || d <= 0 || d > 168*time.Hour {
+				fmt.Fprintf(os.Stderr, "issue-enroll: invalid --ttl %q (want 1s..168h)\n", v)
+				return apperr.ExitCLIValidation
+			}
+			ttl = d
 		}
 	}
 	if tenantSet && strings.TrimSpace(tenant) == "" {
@@ -556,7 +615,7 @@ func cmdIssueEnroll(argv []string) int {
 	defer db.Close()
 	// Narrow operator operation only: never construct a relay Server here,
 	// its boot reconciliation would disturb live leases (P0-01).
-	code, err := relay.IssueEnrollmentCode(db, tenant, 24*time.Hour, "operator")
+	code, err := relay.IssueEnrollmentCode(db, tenant, ttl, "operator")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return apperr.ExitInternal
@@ -785,6 +844,87 @@ func cmdRelayRestore(argv []string) int {
 		fmt.Println("restore complete with reset-authority: all keys, leases, publications, and managed OAuth clients/grants revoked, and the managed signing key retired; re-enroll publishers and re-register/re-approve managed clients, then start the relay")
 	} else {
 		fmt.Println("restore complete: start the relay (restored image takes effect at next start)")
+	}
+	return apperr.ExitOK
+}
+
+// cmdRelayEnrollSSH mints a one-time enrollment code on the relay host and
+// pipes it over SSH stdin to `ocliv login --relay URL --code-file -` on the
+// target node so the operator never has to copy/paste a code.
+func cmdRelayEnrollSSH(argv []string) int {
+	_, dataDir, _ := relayFlags(argv)
+	var target, relayURL, tenant, profile string
+	for i := 0; i < len(argv); i++ {
+		switch {
+		case argv[i] == "--help" || argv[i] == "-h":
+			fmt.Fprintln(os.Stderr, "usage: ocliv relay enroll-ssh --target USER@HOST --relay URL [--data DIR] [--tenant NAME] [--profile NAME]")
+			return apperr.ExitCLIValidation
+		case argv[i] == "--target" || strings.HasPrefix(argv[i], "--target="):
+			v, ok := mcpFlagValue(argv, &i, "target")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			target = v
+		case argv[i] == "--relay" || strings.HasPrefix(argv[i], "--relay="):
+			v, ok := mcpFlagValue(argv, &i, "relay")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			relayURL = v
+		case argv[i] == "--tenant" || strings.HasPrefix(argv[i], "--tenant="):
+			v, ok := mcpFlagValue(argv, &i, "tenant")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			tenant = v
+		case argv[i] == "--profile" || strings.HasPrefix(argv[i], "--profile="):
+			v, ok := mcpFlagValue(argv, &i, "profile")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			profile = v
+		case argv[i] == "--data" || strings.HasPrefix(argv[i], "--data="):
+			_, _ = mcpFlagValue(argv, &i, "data")
+		default:
+			fmt.Fprintf(os.Stderr, "enroll-ssh: unknown flag %q\n", argv[i])
+			return apperr.ExitCLIValidation
+		}
+	}
+	if target == "" || relayURL == "" {
+		fmt.Fprintln(os.Stderr, "usage: ocliv relay enroll-ssh --target USER@HOST --relay URL [--data DIR] [--tenant NAME] [--profile NAME]")
+		return apperr.ExitCLIValidation
+	}
+	if strings.HasPrefix(target, "-") || strings.ContainsAny(target, " \t\r\n") {
+		fmt.Fprintln(os.Stderr, "enroll-ssh: --target must be USER@HOST without leading '-' or whitespace")
+		return apperr.ExitCLIValidation
+	}
+	if profile != "" && (strings.HasPrefix(profile, "-") || strings.ContainsAny(profile, " \t\r\n")) {
+		fmt.Fprintln(os.Stderr, "enroll-ssh: invalid --profile")
+		return apperr.ExitCLIValidation
+	}
+	restrictFileCreation()
+	db, err := store.Open(filepath.Join(dataDir, "ocliv.db"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
+	}
+	defer db.Close()
+	code, err := relay.IssueEnrollmentCode(db, tenant, 15*time.Minute, "operator")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return exitForRelayErr(err)
+	}
+	remoteArgs := []string{"--", target, "ocliv", "login", "--relay", relayURL, "--code-file", "-"}
+	if profile != "" {
+		remoteArgs = append(remoteArgs, "--profile", profile)
+	}
+	cmd := exec.Command("ssh", remoteArgs...)
+	cmd.Stdin = strings.NewReader(code + "\n")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "enroll-ssh: remote login failed: %v\n", err)
+		return apperr.ExitInternal
 	}
 	return apperr.ExitOK
 }

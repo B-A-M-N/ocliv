@@ -178,6 +178,7 @@ func (s *Server) serveManagedAuthz(w http.ResponseWriter, r *http.Request, t *ro
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	srv.AutoApproveRedirectHosts = s.autoApproveRedirectHosts
 	// Public endpoints are UNAUTHENTICATED by protocol (DCR, authorize,
 	// consent, token, revoke), so each one is rate limited per tenant +
 	// endpoint KIND + ROUTE and per source IP. The route is part of the key: a flood

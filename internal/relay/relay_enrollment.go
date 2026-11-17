@@ -136,7 +136,12 @@ func IssueEnrollmentCode(db *store.DB, tenantID string, ttl time.Duration, issue
 	now := time.Now().UTC()
 	id := fmt.Sprintf("enr-%d", now.UnixNano())
 	if tenantID == "" {
-		tenantID = "tenant-" + id
+		var existing string
+		if err := db.SQL().QueryRow(`SELECT id FROM tenants WHERE status='active' ORDER BY created_at LIMIT 1`).Scan(&existing); err == nil && existing != "" {
+			tenantID = existing
+		} else {
+			tenantID = "default"
+		}
 	}
 	_, err = db.SQL().Exec(
 		`INSERT INTO enrollment_codes(id, verifier, tenant_id, expires_at, issued_by) VALUES(?,?,?,?,?)`,

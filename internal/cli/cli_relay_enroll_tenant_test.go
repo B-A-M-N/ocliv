@@ -14,7 +14,6 @@ package cli
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"ocliv/internal/store"
@@ -106,12 +105,10 @@ func TestIssueEnrollRejectsMissingTenantValue(t *testing.T) {
 	}
 }
 
-// TestIssueEnrollWithoutTenantKeepsFreshNamespace documents the OTHER
-// half: with NO --tenant at all, the operator asked for a brand-new
-// enrollment, so a generated tenant namespace is correct. This test exists
-// so the refusal of an invalid explicit tenant can never be "fixed" by
-// silently generating a namespace for every call.
-func TestIssueEnrollWithoutTenantKeepsFreshNamespace(t *testing.T) {
+// TestIssueEnrollWithoutTenantUsesDefaultSingleOperatorTenant verifies
+// that with no --tenant and no active tenant yet, IssueEnrollmentCode binds
+// to the single-operator "default" tenant instead of minting a random one.
+func TestIssueEnrollWithoutTenantUsesDefaultSingleOperatorTenant(t *testing.T) {
 	dir := t.TempDir()
 	if code := cmdRelay([]string{"issue-enroll", "--data", dir}); code != 0 {
 		t.Fatalf("issue-enroll (no tenant): exit=%d", code)
@@ -120,7 +117,7 @@ func TestIssueEnrollWithoutTenantKeepsFreshNamespace(t *testing.T) {
 	if len(tenants) != 1 {
 		t.Fatalf("want one enrollment code, got %v", tenants)
 	}
-	if !strings.HasPrefix(tenants[0], "tenant-enr-") {
-		t.Fatalf("no-tenant enrollment bound to %q, want a generated tenant-enr-* namespace", tenants[0])
+	if tenants[0] != "default" {
+		t.Fatalf("no-tenant enrollment bound to %q, want \"default\"", tenants[0])
 	}
 }

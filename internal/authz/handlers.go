@@ -64,6 +64,10 @@ type Server struct {
 	// ConsentTTL bounds a pending consent challenge. Zero selects
 	// DefaultConsentTTL.
 	ConsentTTL time.Duration
+	// AutoApproveRedirectHosts lists normalized lowercase hostnames whose
+	// registered redirect URIs (all of them) are trusted for direct
+	// zero-click authorization without an interactive pairing_secret form.
+	AutoApproveRedirectHosts []string
 }
 
 // NewServer builds a route-scoped authorization server.
@@ -336,6 +340,16 @@ func (s *Server) ServeRegister(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Seed a pending grant immediately on DCR so the client is visible in
+	// `ocliv authz pending` / `ocliv service pending` before /oauth/authorize.
+	_ = s.Store.CreateGrant(Grant{
+		ClientID:  id,
+		Tenant:    s.tenant(),
+		Route:     s.RouteID,
+		Status:    GrantPending,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	})
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"client_id":                  id,
 		"client_name":                req.ClientName,
@@ -356,11 +370,53 @@ func (s *Server) scopedClient(id string) (*Client, error) {
 	if client.Tenant == "" || client.Route == "" {
 		return nil, fmt.Errorf("authz: client %q has no route registration scope", id)
 	}
-	if client.Tenant != s.tenant() || client.Route != s.RouteID {
-		return nil, fmt.Errorf("authz: client %q is registered for tenant %q route %q, not tenant %q route %q",
-			id, client.Tenant, client.Route, s.tenant(), s.RouteID)
+	if client.Tenant != s.tenant() {
+		return nil, fmt.Errorf("authz: client %q is registered for tenant %q, not tenant %q",
+			id, client.Tenant, s.tenant())
+	}
+	if client.Route != s.RouteID {
+		g, gerr := s.Store.GetGrant(id, s.tenant(), s.RouteID)
+		if gerr != nil || g == nil {
+			return nil, fmt.Errorf("authz: client %q is registered for tenant %q route %q, not tenant %q route %q",
+				id, client.Tenant, client.Route, s.tenant(), s.RouteID)
+		}
 	}
 	return client, nil
+}
+
+// canAutoApproveClient returns true when the relay operator has configured
+// AutoApproveRedirectHosts AND every redirect URI registered on c uses
+// HTTPS (or HTTP for a canonical loopback host) and matches an allowlisted host.
+func (s *Server) canAutoApproveClient(c *Client) bool {
+	if len(s.AutoApproveRedirectHosts) == 0 || len(c.RedirectURIs) == 0 {
+		return false
+	}
+	allowed := make(map[string]struct{}, len(s.AutoApproveRedirectHosts))
+	for _, h := range s.AutoApproveRedirectHosts {
+		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+			allowed[h] = struct{}{}
+		}
+	}
+	if len(allowed) == 0 {
+		return false
+	}
+	for _, rawURI := range c.RedirectURIs {
+		u, err := url.Parse(rawURI)
+		if err != nil || u.Host == "" {
+			return false
+		}
+		host := strings.ToLower(u.Hostname())
+		if _, ok := allowed[host]; !ok {
+			return false
+		}
+		if u.Scheme == "http" && !isCanonicalLoopbackHost(host) {
+			return false
+		}
+		if u.Scheme != "https" && u.Scheme != "http" {
+			return false
+		}
+	}
+	return true
 }
 
 // ServeAuthorize starts the authorization code flow. It NEVER issues a code
@@ -426,6 +482,21 @@ func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 	}
 	if grant != nil && grant.Status == GrantRevoked {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "access_denied", "error_description": "client revoked"})
+		return
+	}
+	if (grant == nil || grant.Status == GrantPending) && s.canAutoApproveClient(client) {
+		if err := s.Store.ApproveGrantDirect(clientID, s.tenant(), s.RouteID); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
+			return
+		}
+		_ = s.Store.AuditAuthz("system", s.tenant(), s.RouteID, clientID, "auto-approve", "ok",
+			"auto-approved via trusted redirect host allowlist")
+		s.issueCode(w, r, clientID, redirectURI, challenge, "S256", state)
+		return
+	}
+	if grant != nil && grant.Status == GrantActive && grant.SkipPairing {
+		_ = s.Store.AuditAuthz("client", s.tenant(), s.RouteID, clientID, "authorize", "ok", "direct operator pre-approved grant")
+		s.issueCode(w, r, clientID, redirectURI, challenge, "S256", state)
 		return
 	}
 	// Approved AND consented: the ordinary OAuth authorization-code + PKCE

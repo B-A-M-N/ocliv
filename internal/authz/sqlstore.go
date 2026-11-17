@@ -109,24 +109,39 @@ func (s *SQLStore) TryRegisterClient(c Client) error {
 		return fmt.Errorf("authz: count clients: %w", err)
 	}
 	if n >= MaxClientsPerRoute {
+		var victimID string
+		err := tx.QueryRow(
+			`SELECT c.id FROM authz_clients c
+			 WHERE c.tenant_id=? AND c.route_id=? AND c.revoked_at IS NULL
+			   AND NOT EXISTS (
+			     SELECT 1 FROM authz_grants g
+			     WHERE g.client_id=c.id AND g.tenant_id=c.tenant_id AND g.route_id=c.route_id
+			       AND g.status IN ('active', 'revoked')
+			   )
+			 ORDER BY c.created_at ASC, c.id ASC LIMIT 1`,
+			c.Tenant, c.Route).Scan(&victimID)
+		if err == sql.ErrNoRows {
+			return ErrClientQuota
+		}
+		if err != nil {
+			return fmt.Errorf("authz: select oldest unused client: %w", err)
+		}
+		if _, err := tx.Exec(
+			`DELETE FROM authz_grants WHERE client_id=? AND tenant_id=? AND route_id=? AND status='pending'`,
+			victimID, c.Tenant, c.Route); err != nil {
+			return fmt.Errorf("authz: delete pending grant for evicted client: %w", err)
+		}
 		res, err := tx.Exec(
 			`DELETE FROM authz_clients
-			 WHERE id=(
-			   SELECT c.id FROM authz_clients c
-			   WHERE c.tenant_id=? AND c.route_id=? AND c.revoked_at IS NULL
-			     AND NOT EXISTS (
-			       SELECT 1 FROM authz_grants g
-			       WHERE g.client_id=c.id AND g.tenant_id=c.tenant_id AND g.route_id=c.route_id
-			     )
-			   ORDER BY c.created_at ASC, c.id ASC LIMIT 1
-			 ) AND tenant_id=? AND route_id=? AND revoked_at IS NULL
+			 WHERE id=? AND tenant_id=? AND route_id=? AND revoked_at IS NULL
 			   AND NOT EXISTS (
 			     SELECT 1 FROM authz_grants g
 			     WHERE g.client_id=authz_clients.id
 			       AND g.tenant_id=authz_clients.tenant_id
 			       AND g.route_id=authz_clients.route_id
+			       AND g.status IN ('active', 'revoked')
 			   )`,
-			c.Tenant, c.Route, c.Tenant, c.Route)
+			victimID, c.Tenant, c.Route)
 		if err != nil {
 			return fmt.Errorf("authz: evict oldest unused client: %w", err)
 		}
@@ -154,13 +169,23 @@ func (s *SQLStore) TryRegisterClient(c Client) error {
 // identity over retained authority.
 func (s *SQLStore) PruneAbandonedClients(now time.Time) (int, error) {
 	cutoff := now.Add(-MaxPendingClientAge).UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.Exec(
+		`DELETE FROM authz_grants
+		 WHERE status='pending'
+		   AND client_id IN (
+		     SELECT id FROM authz_clients WHERE created_at < ? AND revoked_at IS NULL
+		   )`,
+		cutoff); err != nil {
+		return 0, fmt.Errorf("authz: prune pending grants: %w", err)
+	}
 	res, err := s.db.Exec(
 		`DELETE FROM authz_clients
 		 WHERE created_at < ? AND revoked_at IS NULL
 		   AND NOT EXISTS (SELECT 1 FROM authz_grants g
 		                    WHERE g.client_id=authz_clients.id
 		                      AND g.tenant_id=authz_clients.tenant_id
-		                      AND g.route_id=authz_clients.route_id)`,
+		                      AND g.route_id=authz_clients.route_id
+		                      AND g.status IN ('active', 'revoked'))`,
 		cutoff)
 	if err != nil {
 		return 0, fmt.Errorf("authz: prune abandoned clients: %w", err)
@@ -221,18 +246,21 @@ func (s *SQLStore) GetGrant(clientID, tenant, route string) (*Grant, error) {
 		pairingIssued  string
 		pairingExpires string
 		pairingUsed    sql.NullString
+		skipPairing    int
 	)
 	err := s.db.QueryRow(
 		`SELECT client_id, tenant_id, route_id, status, created_at, updated_at,
-		        pairing_hash, pairing_issued_at, pairing_expires_at, pairing_consumed_at
+		        pairing_hash, pairing_issued_at, pairing_expires_at, pairing_consumed_at,
+		        skip_pairing
 		 FROM authz_grants WHERE client_id=? AND tenant_id=? AND route_id=?`,
 		clientID, tenant, route).
 		Scan(&g.ClientID, &g.Tenant, &g.Route, &status, &createdAt, &updatedAt,
-			&pairingHash, &pairingIssued, &pairingExpires, &pairingUsed)
+			&pairingHash, &pairingIssued, &pairingExpires, &pairingUsed, &skipPairing)
 	if err != nil {
 		return nil, fmt.Errorf("authz: get grant: %w", err)
 	}
 	g.Status = GrantStatus(status)
+	g.SkipPairing = skipPairing != 0
 	g.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
 	g.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
 	g.PairingHash = pairingHash
@@ -591,6 +619,51 @@ func (s *SQLStore) ApproveGrantWithPairingSecret(clientID, tenant, route, secret
 	return nil
 }
 
+// ApproveGrantDirect activates a grant with skip_pairing=1 for a client
+// registered in the same tenant (including cross-route grants).
+func (s *SQLStore) ApproveGrantDirect(clientID, tenant, route string) error {
+	client, cerr := s.GetClient(clientID)
+	if cerr != nil {
+		return fmt.Errorf("authz: approve grant for unknown client %q: %w", clientID, cerr)
+	}
+	if client.Tenant == "" {
+		return fmt.Errorf("authz: client %q has no tenant registration scope; refusing approval", clientID)
+	}
+	if client.Tenant != tenant {
+		return fmt.Errorf("authz: client %q is registered for tenant %q, not tenant %q",
+			clientID, client.Tenant, tenant)
+	}
+	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("authz: approve direct tx: %w", err)
+	}
+	defer tx.Rollback()
+	var status string
+	err = tx.QueryRow(
+		`SELECT status FROM authz_grants WHERE client_id=? AND tenant_id=? AND route_id=?`,
+		clientID, tenant, route).Scan(&status)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("authz: approve direct grant: %w", err)
+	}
+	if err == nil && status == string(GrantRevoked) {
+		return fmt.Errorf("authz: grant for client %q route %q is revoked; revocation is terminal", clientID, route)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO authz_grants(client_id, tenant_id, route_id, status, created_at, updated_at, skip_pairing)
+		 VALUES(?,?,?,?,?,?,1)
+		 ON CONFLICT(client_id, tenant_id, route_id)
+		 DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at, skip_pairing=1
+		 WHERE authz_grants.status <> 'revoked'`,
+		clientID, tenant, route, string(GrantActive), nowStr, nowStr); err != nil {
+		return fmt.Errorf("authz: approve direct grant: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("authz: approve direct commit: %w", err)
+	}
+	return nil
+}
+
 // RevokeGrant sets a grant revoked. It is immediate and permanent.
 // RevokeGrantsForRoute revokes every grant of one route in one statement.
 func (s *SQLStore) RevokeGrantsForRoute(tenant, route string) (int, error) {
@@ -687,10 +760,14 @@ func (s *SQLStore) ConsumeCode(code, expectedClient, expectedTenant, expectedRou
 	return &c, nil
 }
 
-// ListGrants returns every grant, newest first.
+// ListGrants returns every grant, newest first, joined with client metadata.
 func (s *SQLStore) ListGrants() ([]Grant, error) {
 	rows, err := s.db.Query(
-		`SELECT client_id, tenant_id, route_id, status, created_at, updated_at FROM authz_grants ORDER BY created_at DESC`)
+		`SELECT g.client_id, COALESCE(c.name, ''), COALESCE(c.redirect_uris, '[]'),
+		        g.tenant_id, g.route_id, g.status, g.created_at, g.updated_at, g.skip_pairing
+		 FROM authz_grants g
+		 LEFT JOIN authz_clients c ON c.id = g.client_id
+		 ORDER BY g.created_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("authz: list grants: %w", err)
 	}
@@ -698,11 +775,15 @@ func (s *SQLStore) ListGrants() ([]Grant, error) {
 	var out []Grant
 	for rows.Next() {
 		var g Grant
-		var status, createdAt, updatedAt string
-		if err := rows.Scan(&g.ClientID, &g.Tenant, &g.Route, &status, &createdAt, &updatedAt); err != nil {
+		var status, createdAt, updatedAt, redirectsJSON string
+		var skipPairing int
+		if err := rows.Scan(&g.ClientID, &g.ClientName, &redirectsJSON,
+			&g.Tenant, &g.Route, &status, &createdAt, &updatedAt, &skipPairing); err != nil {
 			return nil, fmt.Errorf("authz: scan grant: %w", err)
 		}
 		g.Status = GrantStatus(status)
+		g.SkipPairing = skipPairing != 0
+		_ = json.Unmarshal([]byte(redirectsJSON), &g.RedirectURIs)
 		if t, err := time.Parse(time.RFC3339Nano, createdAt); err == nil {
 			g.CreatedAt = t
 		}
