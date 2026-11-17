@@ -96,7 +96,7 @@ func TestApprovedClientReachesRoute(t *testing.T) {
 	if err := s.Store.CreateCode(Code{
 		Code: "c1", ClientID: client, Tenant: s.tenant(), Route: s.RouteID,
 		RedirectURI: "https://client.example/cb", Challenge: CodeChallengeS256(verifier),
-		ChallengeMethod: "S256", ExpiresAt: time.Now().Add(time.Minute),
+		ChallengeMethod: "S256", Scope: "mcp:tools offline_access", ExpiresAt: time.Now().Add(time.Minute),
 	}); err != nil {
 		t.Fatalf("code: %v", err)
 	}

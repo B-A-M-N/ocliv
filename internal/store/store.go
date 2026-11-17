@@ -252,6 +252,13 @@ ALTER TABLE authz_codes ADD COLUMN scope TEXT NOT NULL DEFAULT 'mcp:tools offlin
 ALTER TABLE authz_consent ADD COLUMN scope TEXT NOT NULL DEFAULT 'mcp:tools offline_access';
 `
 
+// schemaV16 adds explicit refresh_policy to authz_clients so pre-registered
+// confidential Google Connected App clients can opt into stable-token refresh
+// without weakening public-client rotation.
+const schemaV16 = `
+ALTER TABLE authz_clients ADD COLUMN refresh_policy TEXT NOT NULL DEFAULT '';
+`
+
 // applyMigration runs one versioned migration body and its version
 // stamp in a single transaction: a failure anywhere rolls back the
 // body, so a version is never recorded for half-applied work (P1-2).
@@ -276,7 +283,7 @@ func applyMigration(sqldb *sql.DB, version int, body string) error {
 }
 
 // currentSchema is the newest version Open must reach.
-const currentSchema = 15
+const currentSchema = 16
 
 // SchemaVersion is the exported current schema version for tools that must
 // refuse unknown/newer databases without opening (and thereby migrating)
@@ -451,6 +458,7 @@ func Open(path string) (*DB, error) {
 		{13, schemaV13},
 		{14, schemaV14},
 		{15, schemaV15},
+		{16, schemaV16},
 	}
 	for _, m := range migrations {
 		var v int

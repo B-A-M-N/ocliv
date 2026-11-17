@@ -22,6 +22,7 @@ type ServiceStatusReport struct {
 	State                string                       `json:"state"`
 	Health               string                       `json:"health"`
 	ProcessState         string                       `json:"process_state"`
+	UnitEnabled          bool                         `json:"unit_enabled"`
 	BackendUnitState     string                       `json:"backend_unit_state,omitempty"`
 	RelayState           string                       `json:"relay_state"`
 	PublicationID        string                       `json:"publication_id,omitempty"`
@@ -39,6 +40,7 @@ type ServiceStatusReport struct {
 	LastVerifiedAt       string                       `json:"last_verified_at,omitempty"`
 	LastFailure          string                       `json:"last_failure,omitempty"`
 	LastRecoveryAction   string                       `json:"last_recovery_action,omitempty"`
+	Reconcile            *config.ReconcileStatus      `json:"reconcile,omitempty"`
 }
 
 func inspectServiceStatus(rec config.ServiceRecord, k *identity.KeyPair, keyID string, ops serviceOps) ServiceStatusReport {
@@ -69,11 +71,13 @@ func inspectServiceStatus(rec config.ServiceRecord, k *identity.KeyPair, keyID s
 		LastVerifiedAt:     rec.LastVerifiedAt,
 		LastFailure:        rec.LastFailure,
 		LastRecoveryAction: rec.LastRecoveryAction,
+		Reconcile:          rec.Reconcile,
 	}
 
 	// 1. Supervisor process state (distinguishing not-found vs inactive vs failed vs manager-unreachable).
 	unitInfo := inspectUnit(rec.SystemdUnit, ops)
 	rep.ProcessState = unitInfo.ActiveState
+	rep.UnitEnabled = unitInfo.Enabled
 	if !unitInfo.ManagerReachable && unitInfo.Error != "" {
 		rep.LastFailure = unitInfo.Error
 	}
@@ -285,19 +289,24 @@ func inspectServiceStatus(rec config.ServiceRecord, k *identity.KeyPair, keyID s
 }
 
 func validEvidence(ev *config.VerificationEvidence, routeID, publicURL string, gen int64) bool {
-	if ev == nil || ev.RouteID == "" || ev.PublicURL == "" {
+	if ev == nil || ev.RouteID == "" || ev.PublicURL == "" || ev.Stage == "" {
 		return false
 	}
 	if ev.RouteID != routeID || ev.PublicURL != publicURL {
 		return false
 	}
-	if ev.StateGeneration > 0 && gen > 0 && ev.StateGeneration != gen {
+	if gen <= 0 || ev.StateGeneration <= 0 || ev.StateGeneration != gen {
 		return false
 	}
-	if ev.ExpiresAt != "" {
-		if exp, err := time.Parse(time.RFC3339, ev.ExpiresAt); err == nil && time.Now().After(exp) {
-			return false
-		}
+	if ev.VerifiedAt == "" || ev.ExpiresAt == "" {
+		return false
+	}
+	if _, err := time.Parse(time.RFC3339, ev.VerifiedAt); err != nil {
+		return false
+	}
+	exp, err := time.Parse(time.RFC3339, ev.ExpiresAt)
+	if err != nil || time.Now().After(exp) {
+		return false
 	}
 	return true
 }

@@ -1,10 +1,13 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -170,10 +173,87 @@ func resolveCatalogEntry(name, profile string, ops serviceOps) (catalogEntry, in
 }
 
 type discoveryCheckResult struct {
-	Transport string `json:"transport"` // PASS | FAIL
-	Discovery string `json:"discovery"` // PASS | FAIL | UNKNOWN
-	Issuer    string `json:"issuer,omitempty"`
-	Detail    string `json:"detail,omitempty"`
+	Transport      string `json:"transport"` // PASS | FAIL
+	Discovery      string `json:"discovery"` // PASS | FAIL | UNKNOWN
+	Issuer         string `json:"issuer,omitempty"`
+	RegistrationEP string `json:"registration_endpoint,omitempty"`
+	Detail         string `json:"detail,omitempty"`
+}
+
+func validatePublicIP(ip net.IP) error {
+	if ip == nil {
+		return fmt.Errorf("empty IP address")
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return fmt.Errorf("non-public IP %s blocked by egress policy", ip.String())
+	}
+	return nil
+}
+
+func safeDiscoveryURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return nil, fmt.Errorf("invalid URL: %w", err)
+	}
+	if !strings.EqualFold(u.Scheme, "https") {
+		return nil, fmt.Errorf("unsafe scheme %q (https required)", u.Scheme)
+	}
+	if u.User != nil {
+		return nil, fmt.Errorf("userinfo in URL is forbidden")
+	}
+	if u.Hostname() == "" {
+		return nil, fmt.Errorf("missing hostname")
+	}
+	return u, nil
+}
+
+func safeEgressDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if err := validatePublicIP(ip); err != nil {
+			return nil, err
+		}
+		return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+	}
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no IP addresses resolved for %q", host)
+	}
+	for _, ipa := range ips {
+		if err := validatePublicIP(ipa.IP); err != nil {
+			return nil, fmt.Errorf("%s: %w", host, err)
+		}
+	}
+	return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+}
+
+func safeEgressHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext: safeEgressDialContext,
+		},
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return fmt.Errorf("redirects blocked during discovery check")
+		},
+	}
+}
+
+func wrapNoRedirectClient(base *http.Client) *http.Client {
+	if base == nil {
+		return safeEgressHTTPClient()
+	}
+	cp := *base
+	cp.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return fmt.Errorf("redirects blocked during discovery check")
+	}
+	return &cp
 }
 
 func runReadOnlyDiscoveryCheck(hc *http.Client, pubURL string) discoveryCheckResult {
@@ -182,6 +262,13 @@ func runReadOnlyDiscoveryCheck(hc *http.Client, pubURL string) discoveryCheckRes
 		res.Detail = "missing public URL"
 		return res
 	}
+	pubParsed, err := safeDiscoveryURL(pubURL)
+	if err != nil {
+		res.Detail = "unsafe public URL: " + err.Error()
+		return res
+	}
+	hc = wrapNoRedirectClient(hc)
+
 	req, _ := http.NewRequest(http.MethodPost, pubURL, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
@@ -198,6 +285,10 @@ func runReadOnlyDiscoveryCheck(hc *http.Client, pubURL string) discoveryCheckRes
 	res.Transport = "PASS"
 
 	prURL := strings.Replace(pubURL, "/r/", "/.well-known/oauth-protected-resource/r/", 1)
+	if _, err := safeDiscoveryURL(prURL); err != nil {
+		res.Detail = "unsafe protected-resource URL: " + err.Error()
+		return res
+	}
 	prResp, err := hc.Get(prURL)
 	if err != nil {
 		res.Detail = "protected-resource metadata unreachable: " + err.Error()
@@ -218,8 +309,21 @@ func runReadOnlyDiscoveryCheck(hc *http.Client, pubURL string) discoveryCheckRes
 		return res
 	}
 	issuer := pr.AuthorizationServers[0]
+	issuerParsed, err := safeDiscoveryURL(issuer)
+	if err != nil {
+		res.Detail = "unsafe authorization_server issuer: " + err.Error()
+		return res
+	}
+	if !strings.EqualFold(issuerParsed.Scheme, pubParsed.Scheme) || !strings.EqualFold(issuerParsed.Host, pubParsed.Host) {
+		res.Detail = fmt.Sprintf("authorization_server origin %q does not match endpoint origin %q", issuerParsed.Host, pubParsed.Host)
+		return res
+	}
 	res.Issuer = issuer
 	asURL := strings.Replace(issuer, "/r/", "/.well-known/oauth-authorization-server/r/", 1)
+	if _, err := safeDiscoveryURL(asURL); err != nil {
+		res.Detail = "unsafe authorization-server metadata URL: " + err.Error()
+		return res
+	}
 	asResp, err := hc.Get(asURL)
 	if err != nil {
 		res.Detail = "authorization-server metadata unreachable: " + err.Error()
@@ -235,11 +339,27 @@ func runReadOnlyDiscoveryCheck(hc *http.Client, pubURL string) discoveryCheckRes
 		Issuer              string   `json:"issuer"`
 		AuthorizationEP     string   `json:"authorization_endpoint"`
 		TokenEP             string   `json:"token_endpoint"`
+		RegistrationEP      string   `json:"registration_endpoint"`
 		CodeChallengeMethod []string `json:"code_challenge_methods_supported"`
 	}
 	if err := json.Unmarshal(asBody, &as); err != nil || as.Issuer != issuer || as.AuthorizationEP == "" || as.TokenEP == "" {
 		res.Detail = fmt.Sprintf("invalid AS metadata (issuer=%q)", as.Issuer)
 		return res
+	}
+	if _, err := safeDiscoveryURL(as.AuthorizationEP); err != nil {
+		res.Detail = "unsafe authorization_endpoint: " + err.Error()
+		return res
+	}
+	if _, err := safeDiscoveryURL(as.TokenEP); err != nil {
+		res.Detail = "unsafe token_endpoint: " + err.Error()
+		return res
+	}
+	if as.RegistrationEP != "" {
+		if _, err := safeDiscoveryURL(as.RegistrationEP); err != nil {
+			res.Detail = "unsafe registration_endpoint: " + err.Error()
+			return res
+		}
+		res.RegistrationEP = as.RegistrationEP
 	}
 	hasS256 := false
 	for _, m := range as.CodeChallengeMethod {
@@ -258,7 +378,7 @@ func runReadOnlyDiscoveryCheck(hc *http.Client, pubURL string) discoveryCheckRes
 // cmdMCPURL prints the canonical client-facing URL for a named service or
 // publication, supporting --copy, --verify, and --json.
 func cmdMCPURL(argv []string) int {
-	return cmdMCPURLWithOps(argv, defaultServiceOps(), copyToClipboard, &http.Client{Timeout: 5 * time.Second})
+	return cmdMCPURLWithOps(argv, defaultServiceOps(), copyToClipboard, safeEgressHTTPClient())
 }
 
 func cmdMCPURLWithOps(argv []string, ops serviceOps, clipper func(string) error, hc *http.Client) int {
@@ -382,15 +502,118 @@ func cmdMCPURLWithOps(argv []string, ops serviceOps, clipper func(string) error,
 	return apperr.ExitOK
 }
 
+// cmdMCPURLs prints the authoritative MCP URL catalog for all publications in a profile.
+func cmdMCPURLs(argv []string) int {
+	return cmdMCPURLsWithOps(argv, defaultServiceOps())
+}
+
+func cmdMCPURLsWithOps(argv []string, ops serviceOps) int {
+	profile := ""
+	asJSON := false
+	for i := 0; i < len(argv); i++ {
+		switch {
+		case argv[i] == "--json":
+			asJSON = true
+		case argv[i] == "--profile" || strings.HasPrefix(argv[i], "--profile="):
+			v, ok := mcpFlagValue(argv, &i, "profile")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			profile = v
+		default:
+			fmt.Fprintf(os.Stderr, "unknown flag %q\n", argv[i])
+			return apperr.ExitCLIValidation
+		}
+	}
+	if profile == "" {
+		profile = config.ActiveProfile()
+	}
+	k, keyID, err := loadKeyForProfile(profile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "not enrolled in profile %q: run `ocliv login` first\n", profile)
+		return apperr.ExitAuth
+	}
+	relayURL := agentRelayURLForProfile(profile)
+	if _, rerr := validateRelayTarget(relayURL); rerr != nil {
+		fmt.Fprintf(os.Stderr, "mcp urls: %v\n", rerr)
+		return apperr.ExitCLIValidation
+	}
+	stCode, body, err := ops.mgmtCall(relayURL, k, keyID, http.MethodGet, "/v1/agent/mcp-routes")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mcp urls: %v\n", err)
+		return apperr.ExitRelayTLS
+	}
+	if stCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "mcp urls: relay returned HTTP %d\n", stCode)
+		return apperr.ExitRelayTLS
+	}
+	var inv struct {
+		Publications []struct {
+			RouteID          string  `json:"route_id"`
+			Name             string  `json:"pub_name"`
+			Profile          string  `json:"profile"`
+			URL              *string `json:"url"`
+			DesiredEnabled   bool    `json:"desired_enabled"`
+			StateGeneration  int64   `json:"state_generation"`
+			SessionLive      bool    `json:"session_live"`
+			PublicationState string  `json:"publication_state"`
+			RevokedAt        *string `json:"revoked_at"`
+		} `json:"publications"`
+	}
+	if err := json.Unmarshal(body, &inv); err != nil {
+		fmt.Fprintf(os.Stderr, "mcp urls: unparseable relay inventory: %v\n", err)
+		return apperr.ExitInternal
+	}
+	entries := make([]catalogEntry, 0, len(inv.Publications))
+	for _, p := range inv.Publications {
+		fresh := "AUTHORITATIVE"
+		if p.PublicationState == "REVOKED" || p.RevokedAt != nil {
+			fresh = "REVOKED"
+		} else if !p.DesiredEnabled {
+			fresh = "DISABLED"
+		}
+		u := ""
+		if p.URL != nil {
+			u = *p.URL
+		}
+		entries = append(entries, catalogEntry{
+			Name:            p.Name,
+			Profile:         profile,
+			RouteID:         p.RouteID,
+			URL:             u,
+			AuthMethod:      p.Profile,
+			Freshness:       fresh,
+			RelayState:      p.PublicationState,
+			DesiredEnabled:  p.DesiredEnabled,
+			SessionLive:     p.SessionLive,
+			StateGeneration: p.StateGeneration,
+		})
+	}
+	if asJSON {
+		b, _ := json.MarshalIndent(entries, "", "  ")
+		fmt.Println(string(b))
+		return apperr.ExitOK
+	}
+	if len(entries) == 0 {
+		fmt.Printf("No MCP publications found for profile %q.\n", profile)
+		return apperr.ExitOK
+	}
+	fmt.Printf("%-20s %-12s %-18s %-14s %s\n", "NAME", "STATUS", "AUTH", "FRESHNESS", "URL")
+	for _, e := range entries {
+		fmt.Printf("%-20s %-12s %-18s %-14s %s\n", e.Name, e.RelayState, e.AuthMethod, e.Freshness, e.URL)
+	}
+	return apperr.ExitOK
+}
+
 // cmdMCPCheck performs read-only registration diagnostics for a named service
 // or publication without creating OAuth clients, grants, or credentials.
 func cmdMCPCheck(argv []string) int {
-	return cmdMCPCheckWithOps(argv, defaultServiceOps(), &http.Client{Timeout: 5 * time.Second})
+	return cmdMCPCheckWithOps(argv, defaultServiceOps(), safeEgressHTTPClient())
 }
 
 func cmdMCPCheckWithOps(argv []string, ops serviceOps, hc *http.Client) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ocliv mcp check NAME [--client chatgpt|gemini|claude|generic] [--profile PROFILE] [--json]")
+		fmt.Fprintln(os.Stderr, "usage: ocliv mcp check NAME [--client generic|chatgpt|gemini|google-connected-app] [--profile PROFILE] [--json]")
 		return apperr.ExitCLIValidation
 	}
 	name := argv[0]
@@ -418,6 +641,12 @@ func cmdMCPCheckWithOps(argv []string, ops serviceOps, hc *http.Client) int {
 			return apperr.ExitCLIValidation
 		}
 	}
+	switch clientKind {
+	case "generic", "chatgpt", "gemini", "google-connected-app", "claude":
+	default:
+		fmt.Fprintf(os.Stderr, "unknown --client %q (want generic|chatgpt|gemini|google-connected-app)\n", clientKind)
+		return apperr.ExitCLIValidation
+	}
 	if profile == "" {
 		profile = config.ActiveProfile()
 	}
@@ -437,29 +666,80 @@ func cmdMCPCheckWithOps(argv []string, ops serviceOps, hc *http.Client) int {
 		return apperr.ExitRelayTLS
 	}
 	disc := runReadOnlyDiscoveryCheck(hc, entry.URL)
+	profileCheck := "PASS"
+	profileDetail := ""
+	domainVerify := "SKIPPED"
+	if disc.Discovery == "PASS" {
+		switch clientKind {
+		case "chatgpt":
+			if disc.RegistrationEP == "" {
+				profileCheck = "FAIL"
+				profileDetail = "chatgpt requires dynamic client registration_endpoint in AS metadata"
+			}
+		case "google-connected-app":
+			parsed, perr := safeDiscoveryURL(entry.URL)
+			if perr != nil {
+				profileCheck = "FAIL"
+				profileDetail = perr.Error()
+			} else {
+				verifyURL := parsed.Scheme + "://" + parsed.Host + "/.well-known/google-connected-apps"
+				vResp, verr := wrapNoRedirectClient(hc).Get(verifyURL)
+				if verr != nil {
+					profileCheck = "FAIL"
+					domainVerify = "FAIL"
+					profileDetail = "google-connected-apps verification unreachable: " + verr.Error()
+				} else {
+					vBody, _ := io.ReadAll(io.LimitReader(vResp.Body, 32*1024))
+					_ = vResp.Body.Close()
+					if vResp.StatusCode != http.StatusOK || !json.Valid(vBody) {
+						profileCheck = "FAIL"
+						domainVerify = "FAIL"
+						profileDetail = fmt.Sprintf("%s returned HTTP %d (valid JSON 200 required)", verifyURL, vResp.StatusCode)
+					} else {
+						domainVerify = "PASS"
+					}
+				}
+			}
+		}
+	}
 	if asJSON {
-		b, _ := json.MarshalIndent(map[string]any{
+		out := map[string]any{
 			"url":                 entry.URL,
 			"endpoint":            disc.Transport,
 			"oauth_metadata":      disc.Discovery,
+			"client_profile":      profileCheck,
 			"client_registration": "UNKNOWN",
 			"authenticated_mcp":   "UNKNOWN",
 			"external_acceptance": "UNKNOWN",
 			"client":              clientKind,
 			"detail":              disc.Detail,
-		}, "", "  ")
+		}
+		if domainVerify != "SKIPPED" {
+			out["google_domain_verification"] = domainVerify
+		}
+		if profileDetail != "" {
+			out["profile_detail"] = profileDetail
+		}
+		b, _ := json.MarshalIndent(out, "", "  ")
 		fmt.Println(string(b))
 	} else {
 		fmt.Printf("Endpoint:            %s\n", disc.Transport)
 		fmt.Printf("OAuth metadata:      %s\n", disc.Discovery)
+		fmt.Printf("Client profile (%s): %s\n", clientKind, profileCheck)
+		if domainVerify != "SKIPPED" {
+			fmt.Printf("Google verification: %s\n", domainVerify)
+		}
 		fmt.Printf("Client registration: UNKNOWN (read-only check; no DCR client created)\n")
 		fmt.Printf("Authenticated MCP:   UNKNOWN (no bearer credential supplied)\n")
 		fmt.Printf("External acceptance: UNKNOWN (off-LAN client %s not executed)\n", clientKind)
 		if disc.Detail != "" {
 			fmt.Printf("Detail:              %s\n", disc.Detail)
 		}
+		if profileDetail != "" {
+			fmt.Printf("Profile detail:      %s\n", profileDetail)
+		}
 	}
-	if disc.Transport != "PASS" || disc.Discovery != "PASS" {
+	if disc.Transport != "PASS" || disc.Discovery != "PASS" || profileCheck != "PASS" {
 		return apperr.ExitRelayTLS
 	}
 	return apperr.ExitOK

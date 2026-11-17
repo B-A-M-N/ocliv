@@ -241,7 +241,11 @@ func TestProvisionUserSupervisorWritesRestrictedUnitAndEnv(t *testing.T) {
 	if !reloaded {
 		t.Fatal("expected systemctl daemon-reload to run")
 	}
-	envPath := filepath.Join(home, ".config", "ocliv", "service-default--agentgateway.env")
+	inst, err := serviceInstanceID("default", "agentgateway")
+	if err != nil {
+		t.Fatalf("serviceInstanceID: %v", err)
+	}
+	envPath := filepath.Join(home, ".config", "ocliv", "service-"+inst+".env")
 	fi, err := os.Stat(envPath)
 	if err != nil {
 		t.Fatalf("missing env file: %v", err)

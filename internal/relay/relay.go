@@ -40,6 +40,9 @@ type Options struct {
 	// AutoApproveRedirectHosts lists trusted redirect hostnames that may
 	// auto-approve managed OAuth clients with skip_pairing=true.
 	AutoApproveRedirectHosts []string
+	// GoogleVerificationJSON is the operator-configured JSON payload served at
+	// GET /.well-known/google-connected-apps on MCPExternalHost (HTTP 200, no redirect).
+	GoogleVerificationJSON []byte
 }
 
 // Logger is a minimal structured logger to avoid import cycles.
@@ -129,6 +132,7 @@ type Server struct {
 	// (canonicalHost), so this affects only advertised URLs, never admission.
 	mcpPort                  int
 	autoApproveRedirectHosts []string
+	googleVerificationJSON   []byte
 	visitors                 visitorAccess // HMAC key + verifier for visitor sessions
 	log                      Logger
 
@@ -186,6 +190,7 @@ func New(o Options) (*Server, error) {
 		mcpHost:                  strings.ToLower(o.MCPExternalHost),
 		mcpPort:                  port,
 		autoApproveRedirectHosts: autoApprove,
+		googleVerificationJSON:   append([]byte(nil), o.GoogleVerificationJSON...),
 		visitors:                 newVisitorAccess(o.ServerKey),
 		log:                      o.Logger,
 		registry:                 newSessionRegistry(),

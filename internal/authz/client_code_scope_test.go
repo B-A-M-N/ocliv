@@ -186,7 +186,7 @@ func TestCrossRouteCodeRedemptionRefused(t *testing.T) {
 	if err := store.CreateCode(Code{Code: codeStr, ClientID: client, Tenant: "tenant-a",
 		Route: "route-a", RedirectURI: "https://client.example/cb",
 		Challenge: CodeChallengeS256(pkceVerifier), ChallengeMethod: "S256",
-		ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+		Scope: "mcp:tools offline_access", ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
 		t.Fatal(err)
 	}
 	// Redeem at B: pre-fix, this consumes A's code and mints B tokens.
@@ -250,7 +250,7 @@ func TestCrossTenantCodeRedemptionRefused(t *testing.T) {
 	if err := store.CreateCode(Code{Code: codeStr, ClientID: client, Tenant: "tenant-a",
 		Route: "route-a", RedirectURI: "https://client.example/cb",
 		Challenge: CodeChallengeS256(pkceVerifier), ChallengeMethod: "S256",
-		ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+		Scope: "mcp:tools offline_access", ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
 		t.Fatal(err)
 	}
 	form := url.Values{}
@@ -302,7 +302,7 @@ func TestConcurrentCodeRedemptionSingleWinner(t *testing.T) {
 	if err := store.CreateCode(Code{Code: codeStr, ClientID: client, Tenant: "tenant-a",
 		Route: "route-a", RedirectURI: "https://client.example/cb",
 		Challenge: CodeChallengeS256(pkceVerifier), ChallengeMethod: "S256",
-		ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+		Scope: "mcp:tools offline_access", ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
 		t.Fatal(err)
 	}
 	grant := func() int {

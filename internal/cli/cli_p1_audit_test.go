@@ -18,15 +18,26 @@ func TestServiceInstanceIsolationAndUnitTemplates(t *testing.T) {
 	t.Setenv("OCLIV_CONFIG_DIR", "")
 
 	i1, err := serviceInstanceID("default", "kontrol")
-	if err != nil || i1 != "default--kontrol" {
+	if err != nil || !strings.HasPrefix(i1, "default--kontrol-") {
 		t.Fatalf("i1=%q err=%v", i1, err)
 	}
 	i2, err := serviceInstanceID("staging", "kontrol")
-	if err != nil || i2 != "staging--kontrol" {
+	if err != nil || !strings.HasPrefix(i2, "staging--kontrol-") {
 		t.Fatalf("i2=%q err=%v", i2, err)
 	}
 	if i1 == i2 {
 		t.Fatal("default and staging instances collided")
+	}
+	c1, err := serviceInstanceID("a--b", "c")
+	if err != nil {
+		t.Fatalf("c1 err=%v", err)
+	}
+	c2, err := serviceInstanceID("a", "b--c")
+	if err != nil {
+		t.Fatalf("c2 err=%v", err)
+	}
+	if c1 == c2 {
+		t.Fatalf("delimiter collision between (a--b, c) and (a, b--c): %q", c1)
 	}
 	if strings.Contains(userPublisherUnitTemplate, "OCLIV_LOCAL_URL") {
 		t.Fatal("publisher unit template must not require OCLIV_LOCAL_URL (breaks stdio services)")
@@ -155,4 +166,138 @@ func TestHTTPServiceLifecycleAndStructuredUnitError(t *testing.T) {
 		t.Fatalf("ProcessState=%q, want manager-unreachable", rep.ProcessState)
 	}
 	_ = filepath.Join
+}
+
+func TestStopAndCleanupRefusesDeletionWhenStopUnconfirmed(t *testing.T) {
+	st := config.OpenServiceStore(t.TempDir())
+	rec := config.ServiceRecord{
+		Name:        "sticky-svc",
+		Type:        "mcp",
+		LocalURL:    "http://127.0.0.1:8080/mcp",
+		Profile:     "default",
+		SystemdUnit: "ocliv-publisher@default--sticky-svc.service",
+	}
+	if err := st.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	ops := serviceOps{
+		systemctl: func(args ...string) (string, error) {
+			if len(args) >= 1 && args[0] == "is-active" {
+				return "active", nil
+			}
+			return "", nil
+		},
+	}
+	err := stopAndCleanupLocalService(st, rec, ops)
+	if err == nil || !strings.Contains(err.Error(), "STOP_UNCONFIRMED") {
+		t.Fatalf("expected STOP_UNCONFIRMED error, got %v", err)
+	}
+	if _, ok, gerr := st.Get("sticky-svc"); gerr != nil || !ok {
+		t.Fatalf("service record was deleted despite STOP_UNCONFIRMED (ok=%v err=%v)", ok, gerr)
+	}
+}
+
+func TestRunPublisherRefusesDesiredConfigured(t *testing.T) {
+	cfgDir := t.TempDir()
+	t.Setenv("OCLIV_CONFIG_DIR", cfgDir)
+	st := config.OpenServiceStore(cfgDir)
+	if err := st.Put(config.ServiceRecord{
+		Name:         "cfg-only",
+		Type:         "mcp",
+		LocalURL:     "http://127.0.0.1:8080/mcp",
+		Profile:      "default",
+		DesiredState: config.DesiredConfigured,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	code := cmdServiceRunPublisher([]string{"--name", "cfg-only", "--profile", "default"})
+	if code == 0 {
+		t.Fatalf("expected non-zero refusal for DesiredConfigured, got %d", code)
+	}
+}
+
+func TestValidEvidenceFailsClosed(t *testing.T) {
+	now := time.Now().UTC()
+	base := config.VerificationEvidence{
+		RouteID:         "r1",
+		PublicURL:       "https://relay.example/r/r1/mcp",
+		Stage:           "TOOLS_VERIFIED",
+		StateGeneration: 3,
+		VerifiedAt:      now.Add(-time.Minute).Format(time.RFC3339),
+		ExpiresAt:       now.Add(time.Hour).Format(time.RFC3339),
+	}
+	if !validEvidence(&base, "r1", "https://relay.example/r/r1/mcp", 3) {
+		t.Fatal("expected valid evidence to pass")
+	}
+	noStage := base
+	noStage.Stage = ""
+	if validEvidence(&noStage, "r1", "https://relay.example/r/r1/mcp", 3) {
+		t.Fatal("expected missing Stage to fail")
+	}
+	zeroGen := base
+	zeroGen.StateGeneration = 0
+	if validEvidence(&zeroGen, "r1", "https://relay.example/r/r1/mcp", 3) {
+		t.Fatal("expected zero StateGeneration to fail")
+	}
+	noExpiry := base
+	noExpiry.ExpiresAt = ""
+	if validEvidence(&noExpiry, "r1", "https://relay.example/r/r1/mcp", 3) {
+		t.Fatal("expected missing ExpiresAt to fail")
+	}
+	badVerified := base
+	badVerified.VerifiedAt = "not-a-time"
+	if validEvidence(&badVerified, "r1", "https://relay.example/r/r1/mcp", 3) {
+		t.Fatal("expected unparsable VerifiedAt to fail")
+	}
+}
+
+func TestReconcileServiceOnceRespectsTerminalFenceAndBackoff(t *testing.T) {
+	st := config.OpenServiceStore(t.TempDir())
+	kp, _ := identity.Generate()
+	now := time.Now().UTC()
+
+	// 1. Disabled service must never be restarted.
+	_ = st.Put(config.ServiceRecord{
+		Name: "svc-dis", Type: "mcp", LocalURL: "http://127.0.0.1:8080/mcp",
+		Profile: "default", RelayURL: "https://relay.example",
+		DesiredState: config.DesiredDisabled, SystemdUnit: "ocliv-publisher@svc-dis.service",
+	})
+	starts := 0
+	ops := serviceOps{
+		probeLoc: func(_ string, _ time.Duration) error { return nil },
+		systemctl: func(args ...string) (string, error) {
+			if len(args) > 0 && args[0] == "start" {
+				starts++
+			}
+			return "inactive", nil
+		},
+		mgmtCall: func(_ string, _ *identity.KeyPair, _, _, _ string) (int, []byte, error) {
+			return 200, []byte(`{"publications":[]}`), nil
+		},
+	}
+	if _, err := reconcileServiceOnce(st, "svc-dis", kp, "k1", ops, now); err != nil {
+		t.Fatal(err)
+	}
+	if starts != 0 {
+		t.Fatalf("disabled service was restarted (%d starts)", starts)
+	}
+
+	// 2. Enabled but inactive service restarts once, then respects backoff.
+	_ = st.Put(config.ServiceRecord{
+		Name: "svc-en", Type: "mcp", LocalURL: "http://127.0.0.1:8080/mcp",
+		Profile: "default", RelayURL: "https://relay.example", PublicationID: "pub-123",
+		DesiredState: config.DesiredEnabled, SystemdUnit: "ocliv-publisher@svc-en.service",
+	})
+	if _, err := reconcileServiceOnce(st, "svc-en", kp, "k1", ops, now); err != nil {
+		t.Fatal(err)
+	}
+	if starts != 1 {
+		t.Fatalf("expected 1 restart attempt, got %d", starts)
+	}
+	if _, err := reconcileServiceOnce(st, "svc-en", kp, "k1", ops, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if starts != 1 {
+		t.Fatalf("backoff was ignored: got %d starts", starts)
+	}
 }

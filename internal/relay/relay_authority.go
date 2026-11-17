@@ -74,6 +74,9 @@ func (s *Server) authorizeHost(w http.ResponseWriter, r *http.Request) bool {
 		if _, _, ok := parseMCPRouteAppendedASMetadataPath(r.URL.EscapedPath()); ok {
 			return true
 		}
+		if r.URL.EscapedPath() == "/.well-known/google-connected-apps" {
+			return true
+		}
 	}
 	if host == s.relayHost {
 		http.Error(w, "misdirected: visitor traffic requires a tunnel hostname", http.StatusMisdirectedRequest)

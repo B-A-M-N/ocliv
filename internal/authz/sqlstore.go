@@ -36,8 +36,8 @@ func (s *SQLStore) RegisterClient(c Client) error {
 		mode = "public"
 	}
 	_, err = s.db.Exec(
-		`INSERT INTO authz_clients(id, name, redirect_uris, created_at, tenant_id, route_id, client_secret_hash, client_mode) VALUES(?,?,?,?,?,?,?,?)`,
-		c.ID, c.Name, string(uris), now, c.Tenant, c.Route, c.ClientSecretHash, mode)
+		`INSERT INTO authz_clients(id, name, redirect_uris, created_at, tenant_id, route_id, client_secret_hash, client_mode, refresh_policy) VALUES(?,?,?,?,?,?,?,?,?)`,
+		c.ID, c.Name, string(uris), now, c.Tenant, c.Route, c.ClientSecretHash, mode, c.RefreshPolicy)
 	if err != nil {
 		return fmt.Errorf("authz: register client: %w", err)
 	}
@@ -53,9 +53,9 @@ func (s *SQLStore) GetClient(id string) (*Client, error) {
 		revoked   sql.NullString
 	)
 	err := s.db.QueryRow(
-		`SELECT id, name, redirect_uris, created_at, revoked_at, tenant_id, route_id, client_secret_hash, client_mode
+		`SELECT id, name, redirect_uris, created_at, revoked_at, tenant_id, route_id, client_secret_hash, client_mode, refresh_policy
 		 FROM authz_clients WHERE id=?`, id).
-		Scan(&c.ID, &c.Name, &uris, &createdAt, &revoked, &c.Tenant, &c.Route, &c.ClientSecretHash, &c.ClientMode)
+		Scan(&c.ID, &c.Name, &uris, &createdAt, &revoked, &c.Tenant, &c.Route, &c.ClientSecretHash, &c.ClientMode, &c.RefreshPolicy)
 	if err != nil {
 		return nil, fmt.Errorf("authz: get client: %w", err)
 	}
@@ -158,8 +158,8 @@ func (s *SQLStore) TryRegisterClient(c Client) error {
 		}
 	}
 	if _, err := tx.Exec(
-		`INSERT INTO authz_clients(id, name, redirect_uris, created_at, tenant_id, route_id, client_secret_hash, client_mode) VALUES(?,?,?,?,?,?,?,?)`,
-		c.ID, c.Name, string(uris), createdAt.UTC().Format(time.RFC3339Nano), c.Tenant, c.Route, c.ClientSecretHash, defaultClientMode(c.ClientMode)); err != nil {
+		`INSERT INTO authz_clients(id, name, redirect_uris, created_at, tenant_id, route_id, client_secret_hash, client_mode, refresh_policy) VALUES(?,?,?,?,?,?,?,?,?)`,
+		c.ID, c.Name, string(uris), createdAt.UTC().Format(time.RFC3339Nano), c.Tenant, c.Route, c.ClientSecretHash, defaultClientMode(c.ClientMode), c.RefreshPolicy); err != nil {
 		return fmt.Errorf("authz: register client: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -356,6 +356,62 @@ func (s *SQLStore) RotateOpaqueRefresh(oldHash, newHash, clientID, tenant, route
 		AbsoluteExpiresAt: r.AbsoluteExpiresAt,
 		LastUsedAt:        now,
 	}, nil
+}
+
+// ExtendOpaqueRefresh atomically validates an opaque refresh token for an
+// explicitly configured google_confidential client and extends its sliding
+// expiration bounded by absolute_expires_at without rotating the token.
+func (s *SQLStore) ExtendOpaqueRefresh(tokenHash, clientID, tenant, route string, now time.Time, extendBy time.Duration) (*OpaqueRefresh, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("authz: extend opaque refresh tx: %w", err)
+	}
+	defer tx.Rollback()
+	var (
+		r          OpaqueRefresh
+		expStr     string
+		absExpStr  string
+		lastUsed   string
+		revokedStr sql.NullString
+	)
+	err = tx.QueryRow(
+		`SELECT token_hash, client_id, tenant_id, route_id, expires_at, absolute_expires_at, last_used_at, revoked_at
+		 FROM authz_opaque_refresh WHERE token_hash=?`, tokenHash).
+		Scan(&r.TokenHash, &r.ClientID, &r.Tenant, &r.Route, &expStr, &absExpStr, &lastUsed, &revokedStr)
+	if err != nil {
+		return nil, fmt.Errorf("authz: opaque refresh not found: %w", err)
+	}
+	if revokedStr.Valid {
+		return nil, fmt.Errorf("authz: opaque refresh revoked")
+	}
+	if r.ClientID != clientID || r.Tenant != tenant || r.Route != route {
+		return nil, fmt.Errorf("authz: opaque refresh binding mismatch")
+	}
+	r.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expStr)
+	r.AbsoluteExpiresAt, _ = time.Parse(time.RFC3339Nano, absExpStr)
+	if now.After(r.ExpiresAt) || now.After(r.AbsoluteExpiresAt) {
+		return nil, fmt.Errorf("authz: opaque refresh expired")
+	}
+	nextExp := now.Add(extendBy)
+	if nextExp.After(r.AbsoluteExpiresAt) {
+		nextExp = r.AbsoluteExpiresAt
+	}
+	nowStr := now.UTC().Format(time.RFC3339Nano)
+	res, err := tx.Exec(
+		`UPDATE authz_opaque_refresh SET expires_at=?, last_used_at=? WHERE token_hash=? AND revoked_at IS NULL`,
+		nextExp.UTC().Format(time.RFC3339Nano), nowStr, tokenHash)
+	if err != nil {
+		return nil, fmt.Errorf("authz: extend opaque refresh: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return nil, fmt.Errorf("authz: opaque refresh revoked concurrently")
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("authz: commit extend opaque refresh: %w", err)
+	}
+	r.ExpiresAt = nextExp
+	r.LastUsedAt = now
+	return &r, nil
 }
 
 // RevokeOpaqueRefreshForClient revokes all opaque refresh tokens for a client.

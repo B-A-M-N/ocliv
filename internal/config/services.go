@@ -42,36 +42,66 @@ type VerificationEvidence struct {
 	FailureReason   string `json:"failure_reason,omitempty"`
 }
 
+// ReconcileStatus tracks durable recovery attempts, bounded backoff, and
+// terminal revocation/auth fences for a managed service.
+type ReconcileStatus struct {
+	ObservedGeneration int64  `json:"observed_generation,omitempty"`
+	Attempt            uint32 `json:"attempt,omitempty"`
+	NextRetryAt        string `json:"next_retry_at,omitempty"`
+	LastTransitionAt   string `json:"last_transition_at,omitempty"`
+	LastErrorCode      string `json:"last_error_code,omitempty"`
+	LastErrorDetail    string `json:"last_error_detail,omitempty"`
+	LastConfirmedStage string `json:"last_confirmed_stage,omitempty"`
+	Terminal           bool   `json:"terminal,omitempty"`
+}
+
+// ProviderBinding records an operator-approved external client binding
+// (e.g. Google Connected App / Gemini / ChatGPT) beside the service URL.
+type ProviderBinding struct {
+	Provider       string   `json:"provider"`
+	ConnectionType string   `json:"connection_type,omitempty"`
+	ClientID       string   `json:"client_id,omitempty"`
+	RedirectURIs   []string `json:"redirect_uris,omitempty"`
+	AuthMode       string   `json:"auth_mode,omitempty"`
+	Fingerprint    string   `json:"fingerprint,omitempty"`
+	Status         string   `json:"status,omitempty"` // "pending" | "active" | "revoked"
+	LastVerifiedAt string   `json:"last_verified_at,omitempty"`
+	NextAction     string   `json:"next_action,omitempty"`
+	UpdatedAt      string   `json:"updated_at,omitempty"`
+}
+
 // ServiceRecord is the durable operator-configured service definition.
 // Publication identity is bound to Name (never derived from a local TCP port)
 // and Profile/RelayURL (never silently switched by active-profile changes).
 type ServiceRecord struct {
-	Name                 string                `json:"name"`
-	Type                 string                `json:"type"`                   // "mcp" | "http"
-	BackendMode          string                `json:"backend_mode,omitempty"` // "attached" | "managed"
-	BackendExec          string                `json:"backend_exec,omitempty"`
-	BackendArgs          []string              `json:"backend_args,omitempty"`
-	LocalURL             string                `json:"local_url,omitempty"`
-	StdioCmd             []string              `json:"stdio_cmd,omitempty"`
-	StdioDir             string                `json:"stdio_dir,omitempty"`
-	StdioEnv             []string              `json:"stdio_env,omitempty"`
-	Auth                 string                `json:"auth"`
-	RelayURL             string                `json:"relay_url,omitempty"`
-	Profile              string                `json:"profile,omitempty"`
-	DesiredState         string                `json:"desired_state"`
-	Revision             int64                 `json:"revision"`
-	StateGeneration      int64                 `json:"state_generation,omitempty"`
-	PublicationID        string                `json:"publication_id,omitempty"`
-	PublicURL            string                `json:"public_url,omitempty"`
-	PublicVerified       bool                  `json:"public_verified,omitempty"`
-	VerificationEvidence *VerificationEvidence `json:"verification_evidence,omitempty"`
-	SystemdUnit          string                `json:"systemd_unit,omitempty"`
-	BackendUnit          string                `json:"backend_unit,omitempty"`
-	LastVerifiedAt       string                `json:"last_verified_at,omitempty"`
-	LastFailure          string                `json:"last_failure,omitempty"`
-	LastRecoveryAction   string                `json:"last_recovery_action,omitempty"`
-	CreatedAt            string                `json:"created_at"`
-	UpdatedAt            string                `json:"updated_at"`
+	Name                 string                     `json:"name"`
+	Type                 string                     `json:"type"`                   // "mcp" | "http"
+	BackendMode          string                     `json:"backend_mode,omitempty"` // "attached" | "managed"
+	BackendExec          string                     `json:"backend_exec,omitempty"`
+	BackendArgs          []string                   `json:"backend_args,omitempty"`
+	LocalURL             string                     `json:"local_url,omitempty"`
+	StdioCmd             []string                   `json:"stdio_cmd,omitempty"`
+	StdioDir             string                     `json:"stdio_dir,omitempty"`
+	StdioEnv             []string                   `json:"stdio_env,omitempty"`
+	Auth                 string                     `json:"auth"`
+	RelayURL             string                     `json:"relay_url,omitempty"`
+	Profile              string                     `json:"profile,omitempty"`
+	DesiredState         string                     `json:"desired_state"`
+	Revision             int64                      `json:"revision"`
+	StateGeneration      int64                      `json:"state_generation,omitempty"`
+	PublicationID        string                     `json:"publication_id,omitempty"`
+	PublicURL            string                     `json:"public_url,omitempty"`
+	PublicVerified       bool                       `json:"public_verified,omitempty"`
+	VerificationEvidence *VerificationEvidence      `json:"verification_evidence,omitempty"`
+	Reconcile            *ReconcileStatus           `json:"reconcile,omitempty"`
+	ProviderBindings     map[string]ProviderBinding `json:"provider_bindings,omitempty"`
+	SystemdUnit          string                     `json:"systemd_unit,omitempty"`
+	BackendUnit          string                     `json:"backend_unit,omitempty"`
+	LastVerifiedAt       string                     `json:"last_verified_at,omitempty"`
+	LastFailure          string                     `json:"last_failure,omitempty"`
+	LastRecoveryAction   string                     `json:"last_recovery_action,omitempty"`
+	CreatedAt            string                     `json:"created_at"`
+	UpdatedAt            string                     `json:"updated_at"`
 }
 
 // ValidateServiceName enforces a safe, explicit service identifier.

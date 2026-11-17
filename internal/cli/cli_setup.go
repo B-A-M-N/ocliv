@@ -68,11 +68,6 @@ func cmdSetup(argv []string) int {
 	zone := ""
 	confirmCreate := false
 	refreshDNS := false
-	// edge selects the ingress shape the rendered deployment uses. The
-	// default stays "tunnel" (the per-tunnel wildcard namespace) so
-	// existing behaviour is unchanged; MCP hosting on ONE public apex
-	// hostname needs --edge single-host, which does not require a
-	// wildcard record.
 	edge := "tunnel"
 	echoV4, echoV6 := defaultEchoV4, defaultEchoV6
 	for i := 0; i < len(argv); i++ {
@@ -761,8 +756,18 @@ func verifyDNSResolution(ctx context.Context, hostname string, want []string) (m
 	return false, addrs, nil
 }
 
+func recommendedEdgeMode(d setup.Detection) string {
+	switch d.Path {
+	case setup.PathDirectV6, setup.PathDirectV4, setup.PathNATV4:
+		return "single-host"
+	default:
+		return "single-host"
+	}
+}
+
 func printSetupReport(d setup.Detection) {
 	fmt.Printf("path: %s\n", d.Path)
+	fmt.Printf("recommended edge: %s\n", recommendedEdgeMode(d))
 	fmt.Printf("egress v4: %s  egress v6: %s\n", nonEmpty(d.EgressV4), nonEmpty(d.EgressV6))
 	fmt.Printf("local v4: %s\n", strings.Join(d.LocalV4, ", "))
 	fmt.Printf("local v6: %s\n", strings.Join(d.LocalV6, ", "))

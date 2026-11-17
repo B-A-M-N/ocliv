@@ -35,7 +35,7 @@ var manageTools = []string{"ocliv_status", "ocliv_share", "ocliv_revoke"}
 
 func cmdMCP(argv []string) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ocliv mcp expose|manage|publish|serve|doctor|list|url|check|unpublish|revoke ...")
+		fmt.Fprintln(os.Stderr, "usage: ocliv mcp expose|manage|publish|serve|doctor|list|url|urls|check|unpublish|revoke ...")
 		return apperr.ExitCLIValidation
 	}
 	switch argv[0] {
@@ -53,6 +53,8 @@ func cmdMCP(argv []string) int {
 		return cmdMCPList(argv[1:])
 	case "url":
 		return cmdMCPURL(argv[1:])
+	case "urls":
+		return cmdMCPURLs(argv[1:])
 	case "check":
 		return cmdMCPCheck(argv[1:])
 	case "unpublish":

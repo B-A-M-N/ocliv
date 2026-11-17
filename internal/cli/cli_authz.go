@@ -69,15 +69,17 @@ func authzOpenReadOnly(dataDir string) (*sql.DB, error) {
 // rejected instead of silently ignored — a misspelled --data could
 // otherwise target ./ocliv-relay-data and mutate the wrong database.
 type authzFlags struct {
-	dataDir      string
-	tenant       string
-	route        string
-	client       string
-	name         string
-	redirect     string
-	asJSON       bool
-	direct       bool
-	confidential bool
+	dataDir       string
+	tenant        string
+	route         string
+	client        string
+	name          string
+	redirect      string
+	refreshPolicy string
+	secretOut     string
+	asJSON        bool
+	direct        bool
+	confidential  bool
 }
 
 // authzFlagSpec lists the flags a subcommand accepts and which are required.
@@ -181,6 +183,10 @@ func parseAuthzFlags(argv []string, spec authzFlagSpec) (*authzFlags, error) {
 			f.name = val
 		case "redirect":
 			f.redirect = val
+		case "refresh-policy":
+			f.refreshPolicy = val
+		case "secret-out":
+			f.secretOut = val
 		}
 	}
 	for name := range spec.required {
@@ -438,7 +444,7 @@ func cmdAuthzGrantRoute(argv []string) int {
 // cmdAuthzRegister pre-registers an OAuth client for a tenant + route and
 // optionally approves it directly (--direct).
 func cmdAuthzRegister(argv []string) int {
-	spec := authzSpecFor("tenant", "route", "name", "redirect", "direct", "confidential")
+	spec := authzSpecFor("tenant", "route", "name", "redirect", "direct", "confidential", "refresh-policy", "secret-out")
 	spec.required["tenant"] = true
 	spec.required["route"] = true
 	spec.required["name"] = true
@@ -446,6 +452,23 @@ func cmdAuthzRegister(argv []string) int {
 	f, ferr := parseAuthzFlags(argv, spec)
 	if ferr != nil {
 		fmt.Fprintln(os.Stderr, "error: "+ferr.Error())
+		return apperr.ExitCLIValidation
+	}
+	refreshPolicy := strings.TrimSpace(f.refreshPolicy)
+	switch refreshPolicy {
+	case "", "default":
+		refreshPolicy = ""
+	case "google_confidential":
+		if !f.confidential {
+			fmt.Fprintln(os.Stderr, "error: --refresh-policy google_confidential requires --confidential")
+			return apperr.ExitCLIValidation
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "error: invalid --refresh-policy %q (must be default or google_confidential)\n", f.refreshPolicy)
+		return apperr.ExitCLIValidation
+	}
+	if f.secretOut != "" && !f.confidential {
+		fmt.Fprintln(os.Stderr, "error: --secret-out requires --confidential")
 		return apperr.ExitCLIValidation
 	}
 	var redirects []string
@@ -490,7 +513,7 @@ func cmdAuthzRegister(argv []string) int {
 		clientSecret = sec
 		clientSecretHash = authz.HashSecret(sec)
 	}
-	if err := st.RegisterClient(authz.Client{
+	client := authz.Client{
 		ID:               id,
 		Name:             f.name,
 		RedirectURIs:     redirects,
@@ -499,37 +522,48 @@ func cmdAuthzRegister(argv []string) int {
 		Route:            f.route,
 		ClientMode:       clientMode,
 		ClientSecretHash: clientSecretHash,
-	}); err != nil {
-		fmt.Fprintln(os.Stderr, "error: "+err.Error())
-		return apperr.ExitInternal
+		RefreshPolicy:    refreshPolicy,
+	}
+	writeSecret := func() error {
+		if clientSecret == "" {
+			return nil
+		}
+		if f.secretOut != "" {
+			if werr := os.WriteFile(f.secretOut, []byte(clientSecret+"\n"), 0o600); werr != nil {
+				return fmt.Errorf("write --secret-out %s: %w", f.secretOut, werr)
+			}
+			fmt.Printf("Client secret written to %s (mode 0600; never stored in plaintext in database)\n", f.secretOut)
+			return nil
+		}
+		fmt.Printf("Client secret (show once; never stored in plaintext):\n%s\n", clientSecret)
+		return nil
 	}
 	if f.direct {
+		if err := st.RegisterClient(client); err != nil {
+			fmt.Fprintln(os.Stderr, "error: "+err.Error())
+			return apperr.ExitInternal
+		}
 		if err := st.ApproveGrantDirect(id, f.tenant, f.route); err != nil {
 			fmt.Fprintln(os.Stderr, "error: "+err.Error())
 			return apperr.ExitInternal
 		}
 		authzAudit(st, f.tenant, f.route, id, "register", "ok", "pre-registered with direct grant")
 		fmt.Printf("registered and approved client %s (name=%q mode=%s) for tenant=%s route=%s (direct)\n", id, f.name, clientMode, f.tenant, f.route)
-		if clientSecret != "" {
-			fmt.Printf("Client secret (show once; never stored in plaintext):\n%s\n", clientSecret)
+		if err := writeSecret(); err != nil {
+			fmt.Fprintln(os.Stderr, "error: "+err.Error())
+			return apperr.ExitInternal
 		}
 		return apperr.ExitOK
 	}
-	if err := st.CreateGrant(authz.Grant{
-		ClientID:  id,
-		Tenant:    f.tenant,
-		Route:     f.route,
-		Status:    authz.GrantPending,
-		CreatedAt: now,
-		UpdatedAt: now,
-	}); err != nil {
+	if err := st.TryRegisterClientWithPendingGrant(client, f.tenant, f.route); err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return apperr.ExitInternal
 	}
 	authzAudit(st, f.tenant, f.route, id, "register", "ok", "pre-registered pending grant")
 	fmt.Printf("registered client %s (name=%q mode=%s) for tenant=%s route=%s (status=pending)\n", id, f.name, clientMode, f.tenant, f.route)
-	if clientSecret != "" {
-		fmt.Printf("Client secret (show once; never stored in plaintext):\n%s\n", clientSecret)
+	if err := writeSecret(); err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
 	}
 	return apperr.ExitOK
 }

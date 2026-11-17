@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -97,8 +99,8 @@ func validUnitComponent(s string) bool {
 }
 
 // serviceInstanceID returns the canonical systemd instance identity
-// (<profile>--<service-name>) so services with the same name in different
-// profiles never collide on unit names or environment files.
+// (<profile>--<service-name>-<hash6>) so services with the same name in
+// different profiles or containing "--" never collide on unit names or env files.
 func serviceInstanceID(profile, name string) (string, error) {
 	prof := strings.TrimSpace(profile)
 	if prof == "" {
@@ -110,7 +112,8 @@ func serviceInstanceID(profile, name string) (string, error) {
 	if !validUnitComponent(name) {
 		return "", fmt.Errorf("invalid service name %q for systemd unit", name)
 	}
-	return prof + "--" + name, nil
+	sum := sha256.Sum256([]byte(prof + "\x00" + name))
+	return prof + "--" + name + "-" + hex.EncodeToString(sum[:3]), nil
 }
 
 func serviceUnitInstance(rec config.ServiceRecord) (string, error) {
@@ -243,6 +246,7 @@ type UnitInspection struct {
 	ManagerReachable bool   `json:"manager_reachable"`
 	LoadState        string `json:"load_state,omitempty"`
 	ActiveState      string `json:"active_state"`
+	Enabled          bool   `json:"enabled,omitempty"`
 	Error            string `json:"error,omitempty"`
 }
 
@@ -258,19 +262,24 @@ func inspectUnit(unit string, ops serviceOps) UnitInspection {
 	if lerr == nil && ls == "not-found" {
 		return UnitInspection{ManagerReachable: true, LoadState: "not-found", ActiveState: "not-found"}
 	}
+	enabled := false
+	if en, eerr := ops.systemctl("is-enabled", unit); eerr == nil {
+		en = strings.TrimSpace(en)
+		enabled = en == "enabled" || en == "enabled-runtime" || en == "static"
+	}
 	act, aerr := ops.systemctl("is-active", unit)
 	act = strings.TrimSpace(act)
 	if aerr != nil && (strings.Contains(act, "Failed to connect") || strings.Contains(aerr.Error(), "Failed to connect")) {
-		return UnitInspection{ManagerReachable: false, LoadState: ls, ActiveState: "manager-unreachable", Error: act}
+		return UnitInspection{ManagerReachable: false, LoadState: ls, ActiveState: "manager-unreachable", Enabled: enabled, Error: act}
 	}
 	switch act {
 	case "active", "activating", "deactivating", "reloading", "inactive", "failed", "not-found":
-		return UnitInspection{ManagerReachable: true, LoadState: ls, ActiveState: act}
+		return UnitInspection{ManagerReachable: true, LoadState: ls, ActiveState: act, Enabled: enabled}
 	}
 	if aerr != nil {
-		return UnitInspection{ManagerReachable: true, LoadState: ls, ActiveState: "inactive", Error: aerr.Error()}
+		return UnitInspection{ManagerReachable: true, LoadState: ls, ActiveState: "inactive", Enabled: enabled, Error: aerr.Error()}
 	}
-	return UnitInspection{ManagerReachable: true, LoadState: ls, ActiveState: "unknown"}
+	return UnitInspection{ManagerReachable: true, LoadState: ls, ActiveState: "unknown", Enabled: enabled}
 }
 
 // queryUnitState distinguishes "not-found", "active", "activating", "failed",

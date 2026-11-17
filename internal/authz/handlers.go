@@ -814,9 +814,10 @@ func (s *Server) serveCodeGrant(w http.ResponseWriter, r *http.Request) {
 	verifier := r.Form.Get("code_verifier")
 	resourceValues := r.Form["resource"]
 
-	// RFC 8707: the token request's resource must be this route, so the
-	// issued token's audience is bound exactly.
-	if !hasExactResource(resourceValues, s.RouteURL) {
+	// Any supplied resource must be exact and unambiguous. Public clients always
+	// require resource; google_confidential clients may omit it on code exchange
+	// (derived from the already route-bound authorization code).
+	if len(resourceValues) > 0 && !hasExactResource(resourceValues, s.RouteURL) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_target",
 			"error_description": "resource must be this route's canonical URL"})
 		return
@@ -834,6 +835,11 @@ func (s *Server) serveCodeGrant(w http.ResponseWriter, r *http.Request) {
 	if client.ClientMode == "confidential" && !authenticateConfidentialClient(client, clientSecret) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid_client",
 			"error_description": "client authentication failed"})
+		return
+	}
+	if !(client.ClientMode == "confidential" && client.RefreshPolicy == "google_confidential") && !hasExactResource(resourceValues, s.RouteURL) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_target",
+			"error_description": "resource must be this route's canonical URL"})
 		return
 	}
 
@@ -863,9 +869,10 @@ func (s *Server) serveCodeGrant(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	grantedScope := code.Scope
+	grantedScope := strings.TrimSpace(code.Scope)
 	if grantedScope == "" {
-		grantedScope = "mcp:tools offline_access"
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant", "error_description": "authorization code is missing granted scope"})
+		return
 	}
 	access, err := s.Issuer.Mint(TokenClaims{
 		Issuer:   s.IssuerURL,
@@ -979,6 +986,42 @@ func (s *Server) serveRefreshGrant(w http.ResponseWriter, r *http.Request) {
 		if err != nil || grant.Status != GrantActive {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant",
 				"error_description": "client is not approved for this route"})
+			return
+		}
+		if client.RefreshPolicy == "google_confidential" {
+			if _, err := s.Store.ExtendOpaqueRefresh(
+				HashSecret(refreshStr), clientID, s.tenant(), s.RouteID, time.Now().UTC(), s.refreshTTL(),
+			); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant",
+					"error_description": "refresh token invalid, expired, or revoked"})
+				return
+			}
+			accessJTI, err := MintJTI()
+			if err != nil {
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+			access, err := s.Issuer.Mint(TokenClaims{
+				Issuer:   s.IssuerURL,
+				Subject:  clientID,
+				Audience: s.RouteURL,
+				Tenant:   s.tenant(),
+				Route:    s.RouteID,
+				Scope:    "mcp:tools offline_access",
+				Expiry:   time.Now().Add(s.tokenTTL()).Unix(),
+				ID:       accessJTI,
+			})
+			if err != nil {
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"access_token":  access,
+				"token_type":    "Bearer",
+				"expires_in":    int(s.tokenTTL().Seconds()),
+				"refresh_token": refreshStr,
+				"scope":         "mcp:tools offline_access",
+			})
 			return
 		}
 		newRtok, rerr := mintOpaqueRefreshToken()

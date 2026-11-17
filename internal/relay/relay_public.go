@@ -142,6 +142,23 @@ func (s *Server) handlePublic(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		if r.URL.EscapedPath() == "/.well-known/google-connected-apps" {
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			if len(s.googleVerificationJSON) == 0 {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusOK)
+			if r.Method == http.MethodGet {
+				_, _ = w.Write(s.googleVerificationJSON)
+			}
+			return
+		}
 		// Tool and discovery route shapes share one admission point
 		// (admitPathRoute): the mount prefix is stripped exactly once,
 		// after admission, and the request is aimed at the matching

@@ -409,14 +409,17 @@ func cmdServiceUpdate(argv []string) int {
 
 func cmdServiceStart(argv []string, ops serviceOps) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ocliv service start NAME [--foreground]")
+		fmt.Fprintln(os.Stderr, "usage: ocliv service start NAME [--foreground] [--wait-ready]")
 		return apperr.ExitCLIValidation
 	}
 	name := argv[0]
 	foreground := false
+	waitReady := false
 	for _, a := range argv[1:] {
 		if a == "--foreground" {
 			foreground = true
+		} else if a == "--wait-ready" {
+			waitReady = true
 		} else {
 			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
 			return apperr.ExitCLIValidation
@@ -486,8 +489,11 @@ func cmdServiceStart(argv []string, ops serviceOps) int {
 		}
 	}
 
-	// 2. If managed backend, start it before enabling/publishing.
+	// 2. If managed backend, enable and start it before enabling/publishing.
 	if rec.BackendMode == config.BackendManaged && rec.BackendUnit != "" {
+		if out, berr := ops.systemctl("enable", rec.BackendUnit); berr != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not enable backend unit %s for reboot persistence: %v (%s)\n", rec.BackendUnit, berr, strings.TrimSpace(out))
+		}
 		if out, berr := ops.systemctl("start", rec.BackendUnit); berr != nil {
 			fmt.Fprintf(os.Stderr, "service start: managed backend %s failed: %v (%s)\n", rec.BackendUnit, berr, out)
 			return apperr.ExitLocalTarget
@@ -544,7 +550,17 @@ func cmdServiceStart(argv []string, ops serviceOps) int {
 	}
 	rec = updated
 
-	// 5. Start the publisher unit; on failure roll back desired state.
+	// 5. Enable for reboot persistence and start the publisher unit; on failure roll back desired state.
+	if out, eerr := ops.systemctl("enable", rec.SystemdUnit); eerr != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not enable publisher unit %s for reboot persistence: %v (%s)\n", rec.SystemdUnit, eerr, strings.TrimSpace(out))
+	}
+	if u := strings.TrimSpace(os.Getenv("USER")); u != "" {
+		if lout, lerr := exec.Command("loginctl", "show-user", u, "-p", "Linger", "--value").Output(); lerr == nil {
+			if strings.TrimSpace(string(lout)) == "no" {
+				fmt.Fprintf(os.Stderr, "warning: systemd user lingering is disabled for %q; service will stop on logout unless you run `sudo loginctl enable-linger %s`\n", u, u)
+			}
+		}
+	}
 	if out, err := ops.systemctl("start", rec.SystemdUnit); err != nil {
 		if prevDesired != config.DesiredEnabled && rec.PublicationID != "" {
 			_, _, _ = ops.mgmtCall(relayURL, k, keyID, http.MethodPost, "/v1/agent/mcp-routes/"+rec.PublicationID+"/disable")
@@ -592,7 +608,7 @@ func cmdServiceStart(argv []string, ops serviceOps) int {
 		fmt.Printf(" url=%s", rep.PublicURL)
 	}
 	fmt.Println()
-	if rep.State == ServiceStateServing || rep.State == ServiceStateStarting {
+	if rep.State == ServiceStateServing || (!waitReady && rep.State == ServiceStateStarting) {
 		return apperr.ExitOK
 	}
 	return apperr.ExitInternal
@@ -661,8 +677,8 @@ func cmdServiceRunPublisher(argv []string) int {
 		fmt.Fprintf(os.Stderr, "unknown service %q in profile %q\n", name, profile)
 		return apperr.ExitCLIValidation
 	}
-	if rec.DesiredState == config.DesiredDisabled {
-		fmt.Fprintf(os.Stderr, "service %q is administratively disabled; refusing to publish\n", name)
+	if rec.DesiredState != config.DesiredEnabled {
+		fmt.Fprintf(os.Stderr, "service %q desired state is %q (must be enabled); refusing to publish\n", name, rec.DesiredState)
 		return apperr.ExitAuth
 	}
 	if len(rec.StdioCmd) == 0 && rec.LocalURL == "" {

@@ -109,6 +109,38 @@ func TestCORSPreflightAllowsModernMCPHeaders(t *testing.T) {
 	}
 }
 
+func TestGoogleDomainVerificationEndpoint(t *testing.T) {
+	s, _ := newMCPServer(t)
+	s.googleVerificationJSON = []byte(`{"verification_token":"tok-123"}`)
+
+	// Exact host + exact path -> 200 JSON, no redirect.
+	reqOK := httptest.NewRequest(http.MethodGet, "https://"+s.mcpHost+"/.well-known/google-connected-apps", nil)
+	reqOK.Host = s.mcpHost
+	wOK := httptest.NewRecorder()
+	s.Handler().ServeHTTP(wOK, reqOK)
+	if wOK.Code != http.StatusOK || wOK.Body.String() != `{"verification_token":"tok-123"}` {
+		t.Fatalf("google verification status=%d body=%q", wOK.Code, wOK.Body.String())
+	}
+
+	// Unrelated .well-known path must NOT be admitted as a wildcard bypass.
+	reqOther := httptest.NewRequest(http.MethodGet, "https://"+s.mcpHost+"/.well-known/security.txt", nil)
+	reqOther.Host = s.mcpHost
+	wOther := httptest.NewRecorder()
+	s.Handler().ServeHTTP(wOther, reqOther)
+	if wOther.Code == http.StatusOK {
+		t.Fatalf("unexpected 200 on /.well-known/security.txt")
+	}
+
+	// Wrong host must be rejected with 421.
+	reqBadHost := httptest.NewRequest(http.MethodGet, "https://"+s.relayHost+"/.well-known/google-connected-apps", nil)
+	reqBadHost.Host = s.relayHost
+	wBadHost := httptest.NewRecorder()
+	s.Handler().ServeHTTP(wBadHost, reqBadHost)
+	if wBadHost.Code != http.StatusMisdirectedRequest {
+		t.Fatalf("wrong host status=%d, want 421", wBadHost.Code)
+	}
+}
+
 func containsFold(haystack, needle string) bool {
 	return len(needle) == 0 || (len(haystack) >= len(needle) &&
 		(func() bool {

@@ -241,7 +241,7 @@ func TestRevokedClientCannotRedeemCode(t *testing.T) {
 	if err := store.CreateCode(Code{Code: code, ClientID: clientID, Tenant: "tenant-test",
 		Route: "r-test", RedirectURI: "http://127.0.0.1:59999/cb",
 		Challenge: CodeChallengeS256("0123456789abcdefghijklmnopqrstuvwxyzABCDEFG"), ChallengeMethod: "S256",
-		ExpiresAt: time.Now().Add(5 * time.Minute)}); err != nil {
+		Scope: "mcp:tools offline_access", ExpiresAt: time.Now().Add(5 * time.Minute)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.RevokeClient(clientID); err != nil {

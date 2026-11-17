@@ -3,6 +3,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -378,6 +379,23 @@ func cmdRelayServe(argv []string) int {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return apperr.ExitCLIValidation
 	}
+	var googleVerifyJSON []byte
+	rawGoogleFile := os.Getenv("OCLIV_GOOGLE_VERIFICATION_FILE")
+	if v, seen := explicitRelayFlag(argv, "--google-verification-file"); seen {
+		rawGoogleFile = v
+	}
+	if strings.TrimSpace(rawGoogleFile) != "" {
+		b, rerr := os.ReadFile(rawGoogleFile)
+		if rerr != nil {
+			fmt.Fprintf(os.Stderr, "error: reading --google-verification-file %q: %v\n", rawGoogleFile, rerr)
+			return apperr.ExitCLIValidation
+		}
+		if !json.Valid(b) {
+			fmt.Fprintf(os.Stderr, "error: --google-verification-file %q is not valid JSON\n", rawGoogleFile)
+			return apperr.ExitCLIValidation
+		}
+		googleVerifyJSON = b
+	}
 	restrictFileCreation()
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
@@ -393,6 +411,7 @@ func cmdRelayServe(argv []string) int {
 		DB: db, Namespace: "t." + domain, RelayHost: relayHost,
 		MCPExternalHost: mcpHost, MCPExternalPort: mcpPort,
 		AutoApproveRedirectHosts: autoApproveHosts,
+		GoogleVerificationJSON:   googleVerifyJSON,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())

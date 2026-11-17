@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"ocliv/internal/apperr"
@@ -99,7 +102,10 @@ func TestMCPCheckValidatesDiscoveryMetadata(t *testing.T) {
 			_, _ = w.Write([]byte(`{"resource":"` + srvURL + `/r/r1/mcp","authorization_servers":["` + srvURL + `/r/r1/oauth"]}`))
 		case "/.well-known/oauth-authorization-server/r/r1/oauth":
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"issuer":"` + srvURL + `/r/r1/oauth","authorization_endpoint":"` + srvURL + `/r/r1/oauth/authorize","token_endpoint":"` + srvURL + `/r/r1/oauth/token","code_challenge_methods_supported":["S256"]}`))
+			_, _ = w.Write([]byte(`{"issuer":"` + srvURL + `/r/r1/oauth","authorization_endpoint":"` + srvURL + `/r/r1/oauth/authorize","token_endpoint":"` + srvURL + `/r/r1/oauth/token","registration_endpoint":"` + srvURL + `/r/r1/oauth/register","code_challenge_methods_supported":["S256"]}`))
+		case "/.well-known/google-connected-apps":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"connections":[{"app":"test"}]}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -110,10 +116,57 @@ func TestMCPCheckValidatesDiscoveryMetadata(t *testing.T) {
 	seedEnrolledProfileForTest(t, srvURL)
 	ops := serviceOps{
 		mgmtCall: func(_ string, _ *identity.KeyPair, _, _, _ string) (int, []byte, error) {
-			return 200, []byte(`{"publications":[{"route_id":"r1","pub_name":"kontrol","profile":"managed-oauth","url":"` + srvURL + `/r/r1/mcp","publication_state":"ACTIVE"}]}`), nil
+			return 200, []byte(`{"publications":[{"route_id":"r1","pub_name":"kontrol","profile":"managed-oauth","url":"` + srvURL + `/r/r1/mcp","publication_state":"ACTIVE","desired_enabled":true}]}`), nil
 		},
 	}
 	if code := cmdMCPCheckWithOps([]string{"kontrol", "--client", "chatgpt"}, ops, srv.Client()); code != apperr.ExitOK {
 		t.Fatalf("mcp check valid discovery exit=%d, want 0", code)
 	}
+	if code := cmdMCPCheckWithOps([]string{"kontrol", "--client", "google-connected-app"}, ops, srv.Client()); code != apperr.ExitOK {
+		t.Fatalf("mcp check google-connected-app exit=%d, want 0", code)
+	}
+	if code := cmdMCPURLsWithOps([]string{"--json"}, ops); code != apperr.ExitOK {
+		t.Fatalf("mcp urls exit=%d, want 0", code)
+	}
+}
+
+func TestDiscoveryEgressHardeningBlocksSSRF(t *testing.T) {
+	// 1. Non-HTTPS, userinfo, and private/loopback/link-local IPs must be rejected.
+	if res := runReadOnlyDiscoveryCheck(http.DefaultClient, "http://example.com/r/r1/mcp"); res.Transport != "FAIL" {
+		t.Fatalf("expected http:// to fail, got %+v", res)
+	}
+	if res := runReadOnlyDiscoveryCheck(http.DefaultClient, "https://user:pass@example.com/r/r1/mcp"); res.Transport != "FAIL" {
+		t.Fatalf("expected userinfo URL to fail, got %+v", res)
+	}
+	for _, addr := range []string{"127.0.0.1:443", "10.0.0.1:443", "169.254.169.254:443", "[::1]:443", "[fe80::1]:443"} {
+		if _, err := safeEgressDialContext(context.Background(), "tcp", addr); err == nil || !strings.Contains(err.Error(), "egress policy") {
+			t.Fatalf("expected egress policy block for %s, got %v", addr, err)
+		}
+	}
+
+	// 2. Redirects and cross-origin authorization_servers must be rejected.
+	var srvURL string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/r/r1/mcp":
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/.well-known/oauth-protected-resource/r/r1/mcp":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"resource":"` + srvURL + `/r/r1/mcp","authorization_servers":["https://evil.example/r/r1/oauth"]}`))
+		case "/r/redir/mcp":
+			http.Redirect(w, r, srvURL+"/r/r1/mcp", http.StatusFound)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	srvURL = srv.URL
+
+	if res := runReadOnlyDiscoveryCheck(srv.Client(), srvURL+"/r/r1/mcp"); res.Discovery != "FAIL" {
+		t.Fatalf("expected cross-origin authorization_server to fail, got %+v", res)
+	}
+	if res := runReadOnlyDiscoveryCheck(srv.Client(), srvURL+"/r/redir/mcp"); res.Transport != "FAIL" {
+		t.Fatalf("expected redirect during discovery to fail, got %+v", res)
+	}
+	_ = net.IPv4zero
 }

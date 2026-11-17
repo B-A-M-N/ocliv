@@ -201,10 +201,26 @@ func stopServiceAuthoritatively(store *config.ServiceStore, rec config.ServiceRe
 
 func stopAndCleanupLocalService(store *config.ServiceStore, rec config.ServiceRecord, ops serviceOps) error {
 	if rec.SystemdUnit != "" {
-		_, _ = ops.systemctl("stop", rec.SystemdUnit)
+		st := queryUnitState(rec.SystemdUnit, ops)
+		if st != "not-found" && st != "not-configured" {
+			_, _ = ops.systemctl("stop", rec.SystemdUnit)
+			after := queryUnitState(rec.SystemdUnit, ops)
+			if after == "active" || after == "activating" || after == "deactivating" {
+				return fmt.Errorf("STOP_UNCONFIRMED: publisher unit %s is still %s", rec.SystemdUnit, after)
+			}
+			_, _ = ops.systemctl("disable", rec.SystemdUnit)
+		}
 	}
 	if rec.BackendMode == config.BackendManaged && rec.BackendUnit != "" {
-		_, _ = ops.systemctl("stop", rec.BackendUnit)
+		st := queryUnitState(rec.BackendUnit, ops)
+		if st != "not-found" && st != "not-configured" {
+			_, _ = ops.systemctl("stop", rec.BackendUnit)
+			after := queryUnitState(rec.BackendUnit, ops)
+			if after == "active" || after == "activating" || after == "deactivating" {
+				return fmt.Errorf("STOP_UNCONFIRMED: backend unit %s is still %s", rec.BackendUnit, after)
+			}
+			_, _ = ops.systemctl("disable", rec.BackendUnit)
+		}
 	}
 	if envPath, err := serviceEnvPath(rec); err == nil {
 		_ = os.Remove(envPath)
@@ -214,6 +230,7 @@ func stopAndCleanupLocalService(store *config.ServiceStore, rec config.ServiceRe
 }
 
 func forgetLocalService(store *config.ServiceStore, rec config.ServiceRecord, ops serviceOps) error {
+	fmt.Fprintf(os.Stderr, "warning: --forget-local deletes local service %q without verifying or removing remote relay publication %q\n", rec.Name, rec.PublicationID)
 	return stopAndCleanupLocalService(store, rec, ops)
 }
 
@@ -259,4 +276,122 @@ func removeServiceAuthoritatively(store *config.ServiceStore, rec config.Service
 		return pubID, err
 	}
 	return pubID, nil
+}
+
+// reconcileBackoff computes bounded exponential backoff (5s base, capped at 5m)
+// with deterministic bounded jitter (up to +20%).
+func reconcileBackoff(attempt uint32, jitterSeed int64) time.Duration {
+	shift := attempt
+	if shift > 6 {
+		shift = 6
+	}
+	d := (5 * time.Second) << shift
+	if d > 5*time.Minute {
+		d = 5 * time.Minute
+	}
+	if jitterSeed < 0 {
+		jitterSeed = -jitterSeed
+	}
+	jitter := time.Duration(jitterSeed % int64(d/5+1))
+	return d + jitter
+}
+
+// reconcileServiceOnce reconciles a single service's runtime state against its
+// persisted DesiredState under CAS discipline. It never restarts disabled or
+// revoked services, never reapproves OAuth grants, and preserves PublicationID.
+func reconcileServiceOnce(store *config.ServiceStore, name string, k *identity.KeyPair, keyID string, ops serviceOps, now time.Time) (ServiceStatusReport, error) {
+	rec, ok, err := store.Get(name)
+	if err != nil || !ok {
+		return ServiceStatusReport{}, fmt.Errorf("unknown service %q", name)
+	}
+	rep := inspectServiceStatus(rec, k, keyID, ops)
+	if rec.DesiredState != config.DesiredEnabled {
+		_, _ = store.UpdateCAS(rec.Name, rec.Revision, func(r *config.ServiceRecord) error {
+			r.Reconcile = &config.ReconcileStatus{
+				ObservedGeneration: rep.StateGeneration,
+				LastTransitionAt:   now.UTC().Format(time.RFC3339),
+				LastErrorCode:      "DESIRED_NOT_ENABLED",
+				LastConfirmedStage: rep.VerificationLevel,
+				Terminal:           true,
+			}
+			return nil
+		})
+		return rep, nil
+	}
+
+	// Terminal fence: never restart or reauthorize revoked/auth-failed services.
+	if rep.State == ServiceStateRevoked || rep.RelayState == "REVOKED" ||
+		strings.Contains(strings.ToLower(rep.LastFailure), "ownership") ||
+		strings.Contains(strings.ToLower(rep.LastFailure), "unauthorized") {
+		_, _ = store.UpdateCAS(rec.Name, rec.Revision, func(r *config.ServiceRecord) error {
+			r.Reconcile = &config.ReconcileStatus{
+				ObservedGeneration: rep.StateGeneration,
+				LastTransitionAt:   now.UTC().Format(time.RFC3339),
+				LastErrorCode:      "TERMINAL_REVOKED_OR_AUTH",
+				LastErrorDetail:    rep.LastFailure,
+				LastConfirmedStage: rep.VerificationLevel,
+				Terminal:           true,
+			}
+			return nil
+		})
+		return rep, nil
+	}
+
+	if rep.State == ServiceStateServing {
+		_, _ = store.UpdateCAS(rec.Name, rec.Revision, func(r *config.ServiceRecord) error {
+			if rep.PublicationID != "" && r.PublicationID == "" {
+				r.PublicationID = rep.PublicationID
+			}
+			if rep.PublicURL != "" {
+				r.PublicURL = rep.PublicURL
+			}
+			r.Reconcile = &config.ReconcileStatus{
+				ObservedGeneration: rep.StateGeneration,
+				Attempt:            0,
+				LastTransitionAt:   now.UTC().Format(time.RFC3339),
+				LastConfirmedStage: "SERVING",
+				Terminal:           false,
+			}
+			return nil
+		})
+		return rep, nil
+	}
+
+	// Check bounded backoff before attempting restart.
+	if rec.Reconcile != nil && rec.Reconcile.NextRetryAt != "" {
+		if nextAt, perr := time.Parse(time.RFC3339, rec.Reconcile.NextRetryAt); perr == nil && now.Before(nextAt) {
+			return rep, nil
+		}
+	}
+
+	var attempt uint32
+	if rec.Reconcile != nil {
+		attempt = rec.Reconcile.Attempt
+	}
+	errCode := "TRANSIENT_NOT_SERVING"
+	errDetail := rep.LastFailure
+	if rep.ProcessState != "active" && rec.SystemdUnit != "" {
+		if rec.BackendMode == config.BackendManaged && rec.BackendUnit != "" {
+			_, _ = ops.systemctl("start", rec.BackendUnit)
+		}
+		if out, serr := ops.systemctl("start", rec.SystemdUnit); serr != nil {
+			errCode = "SYSTEMD_START_FAILED"
+			errDetail = fmt.Sprintf("%v (%s)", serr, strings.TrimSpace(out))
+		}
+	}
+	nextRetry := now.Add(reconcileBackoff(attempt, now.UnixNano()))
+	_, _ = store.UpdateCAS(rec.Name, rec.Revision, func(r *config.ServiceRecord) error {
+		r.Reconcile = &config.ReconcileStatus{
+			ObservedGeneration: rep.StateGeneration,
+			Attempt:            attempt + 1,
+			NextRetryAt:        nextRetry.UTC().Format(time.RFC3339),
+			LastTransitionAt:   now.UTC().Format(time.RFC3339),
+			LastErrorCode:      errCode,
+			LastErrorDetail:    errDetail,
+			LastConfirmedStage: rep.VerificationLevel,
+			Terminal:           false,
+		}
+		return nil
+	})
+	return rep, nil
 }
