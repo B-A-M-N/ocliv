@@ -49,11 +49,27 @@ func cmdConnectWithOps(argv []string, ops serviceOps, hc *http.Client) int {
 	}
 }
 
-func googleBindingFingerprint(service, routeID, connType string, redirects []string) string {
+func googleBindingFingerprint(service, tenant, issuer, routeID, connType string, redirects []string) string {
 	sorted := append([]string(nil), redirects...)
 	sort.Strings(sorted)
-	sum := sha256.Sum256([]byte(service + "\x00" + routeID + "\x00" + connType + "\x00" + strings.Join(sorted, ",")))
+	sum := sha256.Sum256([]byte(service + "\x00" + tenant + "\x00" + issuer + "\x00" + routeID + "\x00" + connType + "\x00" + strings.Join(sorted, ",")))
 	return hex.EncodeToString(sum[:8])
+}
+
+func sameStringSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	sa := append([]string(nil), a...)
+	sb := append([]string(nil), b...)
+	sort.Strings(sa)
+	sort.Strings(sb)
+	for i := range sa {
+		if sa[i] != sb[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // openExistingAuthzDB requires an existing relay authorization database at
@@ -234,7 +250,7 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 		fmt.Fprintln(os.Stderr, err)
 		return apperr.ExitInternal
 	}
-	fp := googleBindingFingerprint(serviceName, entry.RouteID, connType, redirects)
+	fp := googleBindingFingerprint(serviceName, tenant, disc.Issuer, entry.RouteID, connType, redirects)
 	rec, hasRec, gerr := svcStore.Get(serviceName)
 	if gerr != nil {
 		fmt.Fprintln(os.Stderr, gerr)
@@ -246,12 +262,34 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 			existing = &b
 		}
 	}
+	db, err := openExistingAuthzDB(dataDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "connect google: %v\n", err)
+		return apperr.ExitCLIValidation
+	}
+	defer db.Close()
+	st := authz.NewSQLStore(db.SQL())
+
 	if existing != nil {
 		if existing.Status == "revoked" {
 			fmt.Fprintf(os.Stderr, "connect google: binding for %q was explicitly revoked; refusing to resurrect a revoked grant\n", serviceName)
 			return apperr.ExitAuth
 		}
 		if existing.Fingerprint == fp && existing.Status != "CUTOVER_INCOMPLETE" {
+			cliRec, cerr := st.GetClient(existing.ClientID)
+			grantRec, grErr := st.GetGrant(existing.ClientID, tenant, entry.RouteID)
+			if cerr != nil || grErr != nil {
+				fmt.Fprintf(os.Stderr, "connect google: local binding for %q is stale (client %s missing on authoritative database); pass --update to re-register\n", serviceName, existing.ClientID)
+				return apperr.ExitCLIValidation
+			}
+			if cliRec.RevokedAt != nil || grantRec.Status == authz.GrantRevoked {
+				fmt.Fprintf(os.Stderr, "connect google: client %s is revoked in authoritative database; refusing to resurrect a revoked grant\n", existing.ClientID)
+				return apperr.ExitAuth
+			}
+			if cliRec.Tenant != tenant || cliRec.Route != entry.RouteID || cliRec.RefreshPolicy != "google_confidential" || !sameStringSet(cliRec.RedirectURIs, redirects) {
+				fmt.Fprintf(os.Stderr, "connect google: authoritative client %s does not match requested tenant/route/redirects; pass --update to replace\n", existing.ClientID)
+				return apperr.ExitCLIValidation
+			}
 			if asJSON {
 				out, _ := json.MarshalIndent(existing, "", "  ")
 				fmt.Println(string(out))
@@ -261,18 +299,10 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 			return apperr.ExitOK
 		}
 		if !update {
-			fmt.Fprintf(os.Stderr, "connect google: %q already has a Google binding with different callbacks/type; pass --update to replace intentionally\n", serviceName)
+			fmt.Fprintf(os.Stderr, "connect google: %q already has a Google binding with different callbacks/tenant/issuer/type; pass --update to replace intentionally\n", serviceName)
 			return apperr.ExitCLIValidation
 		}
 	}
-
-	db, err := openExistingAuthzDB(dataDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "connect google: %v\n", err)
-		return apperr.ExitCLIValidation
-	}
-	defer db.Close()
-	st := authz.NewSQLStore(db.SQL())
 
 	clientID, err := authz.MintClientID()
 	if err != nil {
@@ -351,7 +381,7 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 						b := r.ProviderBindings["google"]
 						b.CandidateClientID = clientID
 						b.Status = "CUTOVER_INCOMPLETE"
-						b.NextAction = fmt.Sprintf("old client %s revocation incomplete; run `ocilv authz revoke --data %s --tenant %s --route %s --client %s`", oldID, dataDir, tenant, entry.RouteID, oldID)
+						b.NextAction = fmt.Sprintf("old client %s revocation incomplete; run `ocliv authz revoke --data %s --tenant %s --route %s --client %s`", oldID, dataDir, tenant, entry.RouteID, oldID)
 						r.ProviderBindings["google"] = b
 						return nil
 					})

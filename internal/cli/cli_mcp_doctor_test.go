@@ -160,8 +160,8 @@ func TestProbeSSEReturnsBeforeStreamEOF(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{}}\n\n")
-		w.(http.Flusher).Flush()
 		flushed.Store(true)
+		w.(http.Flusher).Flush()
 		<-release // keep the HTTP body open after the matching event
 	}))
 	var err error

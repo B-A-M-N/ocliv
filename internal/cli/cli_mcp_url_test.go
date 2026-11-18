@@ -138,7 +138,7 @@ func TestDiscoveryEgressHardeningBlocksSSRF(t *testing.T) {
 	if res := runReadOnlyDiscoveryCheck(http.DefaultClient, "https://user:pass@example.com/r/r1/mcp"); res.Transport != "FAIL" {
 		t.Fatalf("expected userinfo URL to fail, got %+v", res)
 	}
-	for _, addr := range []string{"127.0.0.1:443", "10.0.0.1:443", "169.254.169.254:443", "[::1]:443", "[fe80::1]:443"} {
+	for _, addr := range []string{"127.0.0.1:443", "10.0.0.1:443", "100.64.0.1:443", "169.254.169.254:443", "[::1]:443", "[fe80::1]:443"} {
 		if _, err := safeEgressDialContext(context.Background(), "tcp", addr); err == nil || !strings.Contains(err.Error(), "egress policy") {
 			t.Fatalf("expected egress policy block for %s, got %v", addr, err)
 		}

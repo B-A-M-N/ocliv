@@ -201,3 +201,75 @@ func TestValidateGoogleVerificationDocumentStrict(t *testing.T) {
 		t.Fatal("expected mismatch rejection")
 	}
 }
+
+func TestConnectGoogleIdempotenceChecksTenantAndAuthoritativeDB(t *testing.T) {
+	var srvURL string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/r/r-idemp/mcp":
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/.well-known/oauth-protected-resource/r/r-idemp/mcp":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"resource":"` + srvURL + `/r/r-idemp/mcp","authorization_servers":["` + srvURL + `/r/r-idemp/oauth"]}`))
+		case "/.well-known/oauth-authorization-server/r/r-idemp/oauth":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"issuer":"` + srvURL + `/r/r-idemp/oauth","authorization_endpoint":"` + srvURL + `/r/r-idemp/oauth/authorize","token_endpoint":"` + srvURL + `/r/r-idemp/oauth/token","code_challenge_methods_supported":["S256"]}`))
+		case "/.well-known/google-connected-apps":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"verification_tokens":["tok-idemp"]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	srvURL = srv.URL
+
+	seedEnrolledProfileForTest(t, srvURL)
+	dataDir := t.TempDir()
+	db, err := store.Open(filepath.Join(dataDir, "ocliv.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	ops := serviceOps{
+		mgmtCall: func(_ string, _ *identity.KeyPair, _, _, _ string) (int, []byte, error) {
+			return 200, []byte(`{"publications":[{"route_id":"r-idemp","pub_name":"my-mcp","profile":"managed-oauth","url":"` + srvURL + `/r/r-idemp/mcp","publication_state":"ACTIVE","desired_enabled":true}]}`), nil
+		},
+	}
+
+	sec := filepath.Join(t.TempDir(), "sec.txt")
+	cb := "https://oauth-redirect.googleusercontent.com/r/app1"
+	if code := cmdConnectWithOps([]string{"google", "my-mcp", "--redirect", cb, "--data", dataDir, "--secret-out", sec, "--approve"}, ops, srv.Client()); code != apperr.ExitOK {
+		t.Fatalf("initial connect=%d", code)
+	}
+
+	// 1. Different tenant without --update must NOT return idempotent success.
+	if code := cmdConnectWithOps([]string{"google", "my-mcp", "--tenant", "other-tenant", "--redirect", cb, "--data", dataDir}, ops, srv.Client()); code != apperr.ExitCLIValidation {
+		t.Fatalf("expected ExitCLIValidation for mismatched tenant, got %d", code)
+	}
+
+	// 2. Wrong/empty DB must NOT return idempotent success.
+	otherDir := t.TempDir()
+	dbOther, err := store.Open(filepath.Join(otherDir, "ocliv.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = dbOther.Close()
+	if code := cmdConnectWithOps([]string{"google", "my-mcp", "--redirect", cb, "--data", otherDir}, ops, srv.Client()); code != apperr.ExitCLIValidation {
+		t.Fatalf("expected ExitCLIValidation when client missing from DB, got %d", code)
+	}
+
+	// 3. Client revoked directly in DB must refuse idempotent success.
+	db2, err := authzOpen(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := authz.NewSQLStore(db2.SQL())
+	grants, _ := st.ListGrants()
+	_ = st.RevokeClient(grants[0].ClientID)
+	_ = db2.Close()
+	if code := cmdConnectWithOps([]string{"google", "my-mcp", "--redirect", cb, "--data", dataDir}, ops, srv.Client()); code != apperr.ExitAuth {
+		t.Fatalf("expected ExitAuth when client revoked in DB, got %d", code)
+	}
+}

@@ -190,11 +190,17 @@ func wellKnownMetadataURL(u *url.URL, wellKnownName string) string {
 	return u.Scheme + "://" + u.Host + "/.well-known/" + wellKnownName + path
 }
 
+var (
+	_, cgnatCIDR, _ = net.ParseCIDR("100.64.0.0/10")
+	_, nat64CIDR, _ = net.ParseCIDR("64:ff9b::/96")
+)
+
 func validatePublicIP(ip net.IP) error {
 	if ip == nil {
 		return fmt.Errorf("empty IP address")
 	}
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() ||
+		cgnatCIDR.Contains(ip) || nat64CIDR.Contains(ip) {
 		return fmt.Errorf("non-public IP %s blocked by egress policy", ip.String())
 	}
 	return nil
