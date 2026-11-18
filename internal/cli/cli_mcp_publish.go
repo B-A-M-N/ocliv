@@ -66,6 +66,7 @@ type mcpPublishConfig struct {
 	env      []string
 	cmd      []string
 	serve    bool // serve: lifecycle without route registration
+	persist  bool // persist: register & start systemd user service instead of foreground tunnel
 	// freshPublication asks for a NEW publication identity even when
 	// the service already has one. Without it, publishing the same
 	// service again reuses the durable identity derived from the
@@ -330,6 +331,8 @@ func parseMCPPublish(argv []string, serve bool) (mcpPublishConfig, int) {
 			c.freshPublication = true
 		} else if !seenDashDash && a == "--json-events" {
 			c.jsonEvents = true
+		} else if !seenDashDash && !serve && a == "--persist" {
+			c.persist = true
 		} else if !seenDashDash && (a == "--owner-key" || strings.HasPrefix(a, "--owner-key=")) {
 			v, ok := mcpFlagValue(argv, &i, "owner-key")
 			if !ok {
@@ -1076,10 +1079,37 @@ func cmdMCPUnpublish(argv []string) int {
 // runMCPPublish owns the full lifecycle: optional local adapter, tunnel in
 // the requested mode, optional route registration, steady state, and
 // ordered cleanup with independently recorded outcomes.
+func persistPublishedMCP(cfg mcpPublishConfig, ops serviceOps) int {
+	svcName := cfg.name
+	if svcName == "" && !cfg.stdio {
+		if p, _, perr := parseMCPLocalURL(cfg.localURL); perr == nil {
+			svcName = fmt.Sprintf("mcp-%d", p)
+		}
+	}
+	if svcName == "" {
+		fmt.Fprintln(os.Stderr, "mcp publish --persist --stdio requires --name NAME")
+		return apperr.ExitCLIValidation
+	}
+	addArgs := []string{svcName, "--type", "mcp", "--auth", cfg.auth}
+	if cfg.stdio {
+		addArgs = append(addArgs, "--stdio", "--")
+		addArgs = append(addArgs, cfg.cmd...)
+	} else {
+		addArgs = append(addArgs, "--local", cfg.localURL)
+	}
+	if c := cmdServiceAdd(addArgs, ops); c != apperr.ExitOK {
+		return c
+	}
+	return cmdServiceStart([]string{svcName}, ops)
+}
+
 func runMCPPublish(argv []string, serve bool) int {
 	cfg, code := parseMCPPublish(argv, serve)
 	if code != 0 {
 		return code
+	}
+	if cfg.persist {
+		return persistPublishedMCP(cfg, defaultServiceOps())
 	}
 	k, keyID, err := loadKey()
 	if err != nil {

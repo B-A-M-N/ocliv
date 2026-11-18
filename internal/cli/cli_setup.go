@@ -16,7 +16,9 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -68,7 +70,7 @@ func cmdSetup(argv []string) int {
 	zone := ""
 	confirmCreate := false
 	refreshDNS := false
-	edge := "tunnel"
+	edge := "single-host"
 	echoV4, echoV6 := defaultEchoV4, defaultEchoV6
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
@@ -321,7 +323,7 @@ func runSetupRender(ctx context.Context, d setup.Detection, hostname, dnsToken, 
 			return apperr.ExitRelayTLS
 		}
 	}
-	_, _, cfgPath, err := agentFiles()
+	_, _, cfgPath, uid, gid, err := setupAgentFiles()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return apperr.ExitInternal
@@ -340,6 +342,7 @@ func runSetupRender(ctx context.Context, d setup.Detection, hostname, dnsToken, 
 			fmt.Fprintln(os.Stderr, "error: "+err.Error())
 			return apperr.ExitInternal
 		}
+		chownIfSudo(cfgPath, uid, gid)
 		fmt.Printf("provisioning complete; relay_url now %s\n", relayURL)
 	} else if code == apperr.ExitOK && completed {
 		fmt.Printf("provisioning complete; relay_url unchanged\n")
@@ -630,8 +633,34 @@ func mintSetupCode(dataDir, tenant string) (string, error) {
 // Already-enrolled machines are left untouched and report success with
 // an empty key id. The enroll POST itself proves the full chain
 // (DNS → Caddy → loopback relay) works.
+func setupAgentFiles() (dir, keyPath, cfgPath string, uid, gid int, err error) {
+	uid, gid = -1, -1
+	if os.Geteuid() == 0 && os.Getenv("OCLIV_CONFIG_DIR") == "" {
+		if su := strings.TrimSpace(os.Getenv("SUDO_USER")); su != "" {
+			if u, lerr := user.Lookup(su); lerr == nil && u.HomeDir != "" {
+				uid, _ = strconv.Atoi(u.Uid)
+				gid, _ = strconv.Atoi(u.Gid)
+				dir = filepath.Join(u.HomeDir, ".config", "ocliv")
+				if prof := config.ActiveProfile(); prof != "" && prof != "default" {
+					dir = filepath.Join(dir, "profiles", prof)
+				}
+				return dir, filepath.Join(dir, config.AgentKeyFile), filepath.Join(dir, config.ConfigFile), uid, gid, nil
+			}
+		}
+	}
+	dir, keyPath, cfgPath, err = agentFiles()
+	return dir, keyPath, cfgPath, -1, -1, err
+}
+
+func chownIfSudo(path string, uid, gid int) {
+	if uid >= 0 && gid >= 0 {
+		_ = os.Chown(filepath.Dir(path), uid, gid)
+		_ = os.Chown(path, uid, gid)
+	}
+}
+
 func autoEnroll(relayURL, dataDir, tenant string) (string, int) {
-	_, keyPath, _, err := agentFiles()
+	dir, keyPath, cfgPath, uid, gid, err := setupAgentFiles()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return "", apperr.ExitInternal
@@ -642,7 +671,7 @@ func autoEnroll(relayURL, dataDir, tenant string) (string, int) {
 		// to a DIFFERENT relay would leave the operator with a key that
 		// cannot authenticate here. The key is never replaced; the
 		// conflict is reported so the operator can act.
-		_, cfgPath, _, cerr := agentFiles()
+		_, cfgPath, _, _, _, cerr := setupAgentFiles()
 		if cerr != nil {
 			fmt.Fprintln(os.Stderr, "error: cannot resolve agent config: "+cerr.Error())
 			return "", apperr.ExitInternal
@@ -677,7 +706,16 @@ func autoEnroll(relayURL, dataDir, tenant string) (string, int) {
 		fmt.Fprintln(os.Stderr, "error: cannot mint enrollment code: "+err.Error())
 		return "", apperr.ExitAuth
 	}
-	return performEnroll(relayURL, code, "")
+	if uid >= 0 && os.Getenv("OCLIV_CONFIG_DIR") == "" {
+		_ = os.Setenv("OCLIV_CONFIG_DIR", dir)
+		defer os.Unsetenv("OCLIV_CONFIG_DIR")
+	}
+	id, ecode := performEnroll(relayURL, code, "")
+	if ecode == apperr.ExitOK {
+		chownIfSudo(keyPath, uid, gid)
+		chownIfSudo(cfgPath, uid, gid)
+	}
+	return id, ecode
 }
 
 // runSetupProvider handles the provider-relay path for hosts with no

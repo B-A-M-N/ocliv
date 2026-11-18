@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"ocliv/internal/apperr"
 	"ocliv/internal/config"
 	"ocliv/internal/identity"
 )
@@ -482,5 +483,23 @@ func TestReconcileConcurrentDisableStopsRestartedUnit(t *testing.T) {
 	}
 	if !stoppedAfterStart {
 		t.Fatal("expected systemctl stop to be called when concurrent disable committed mid-start")
+	}
+}
+
+func TestHostAndPersistValidation(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OCLIV_CONFIG_DIR", filepath.Join(home, ".config", "ocliv"))
+	t.Setenv("OCLIV_PROFILE", "")
+
+	// Unenrolled `ocliv host 8765` must exit ExitAuth with setup/login guidance.
+	if code := cmdHost([]string{"8765"}); code != apperr.ExitAuth {
+		t.Fatalf("unenrolled ocliv host exit=%d, want ExitAuth (%d)", code, apperr.ExitAuth)
+	}
+
+	// `parseMCPPublish` accepts `--persist`.
+	cfg, pcode := parseMCPPublish([]string{"--local", "http://127.0.0.1:8765/mcp", "--auth", "ocliv-managed", "--name", "mytools", "--persist"}, false)
+	if pcode != 0 || !cfg.persist || cfg.name != "mytools" {
+		t.Fatalf("parseMCPPublish --persist failed: code=%d cfg=%+v", pcode, cfg)
 	}
 }

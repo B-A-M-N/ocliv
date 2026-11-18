@@ -124,6 +124,8 @@ func Run(argv []string) int {
 		return cmdGoogle(argv[1:])
 	case "connect":
 		return cmdConnect(argv[1:])
+	case "host":
+		return cmdHost(argv[1:])
 	default:
 		if strings.HasPrefix(argv[0], "-") {
 			fmt.Fprintf(os.Stderr, "unknown flag %q; see `ocliv help`\n", argv[0])

@@ -562,7 +562,9 @@ func cmdServiceStart(argv []string, ops serviceOps) int {
 	if u := strings.TrimSpace(os.Getenv("USER")); u != "" {
 		if lout, lerr := exec.Command("loginctl", "show-user", u, "-p", "Linger", "--value").Output(); lerr == nil {
 			if strings.TrimSpace(string(lout)) == "no" {
-				fmt.Fprintf(os.Stderr, "warning: systemd user lingering is disabled for %q; service will stop on logout unless you run `sudo loginctl enable-linger %s`\n", u, u)
+				if eerr := exec.Command("loginctl", "enable-linger", u).Run(); eerr != nil {
+					fmt.Fprintf(os.Stderr, "warning: systemd user lingering is disabled for %q; service will stop on logout unless you run `sudo loginctl enable-linger %s`\n", u, u)
+				}
 			}
 		}
 	}

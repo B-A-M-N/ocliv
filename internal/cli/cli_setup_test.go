@@ -56,7 +56,7 @@ func TestSetupDryRunSendsNothing(t *testing.T) {
 	t.Setenv("DYNV6_TOKEN", "TESTTOKEN")
 	var code int
 	out := captureStdout(t, func() {
-		code = cmdSetup([]string{"--auto", "--hostname", "lab.dynv6.net", "--dry-run", "--echo-v4", echo.URL, "--echo-v6", ""})
+		code = cmdSetup([]string{"--auto", "--edge", "tunnel", "--hostname", "lab.dynv6.net", "--dry-run", "--echo-v4", echo.URL, "--echo-v6", ""})
 	})
 	if code != apperr.ExitOK {
 		t.Fatalf("exit=%d", code)
@@ -90,7 +90,7 @@ func TestSetupLiveUpdateAgainstFixture(t *testing.T) {
 	t.Setenv("DYNV6_TOKEN", "TESTTOKEN")
 	var code int
 	_ = captureStdout(t, func() {
-		code = cmdSetup([]string{"--auto", "--hostname", "lab.dynv6.net", "--echo-v4", echo.URL, "--echo-v6", ""})
+		code = cmdSetup([]string{"--auto", "--edge", "tunnel", "--hostname", "lab.dynv6.net", "--echo-v4", echo.URL, "--echo-v6", ""})
 	})
 	if code != apperr.ExitOK {
 		t.Fatalf("exit=%d", code)
@@ -132,7 +132,7 @@ func TestSetupFreshInstallDoesNotPersistBeforeProvisioning(t *testing.T) {
 	out := t.TempDir()
 	var code int
 	captured := captureOutput(t, func() {
-		code = cmdSetup([]string{"--auto", "--hostname", "lab.dynv6.net",
+		code = cmdSetup([]string{"--auto", "--edge", "tunnel", "--hostname", "lab.dynv6.net",
 			"--acme-email", "ops@mailtest.invalid-test", "--out", out,
 			"--echo-v4", echo.URL, "--echo-v6", ""})
 	})
@@ -206,7 +206,7 @@ func TestSetupWildcardDNSBlocksWithoutRecord(t *testing.T) {
 	out := t.TempDir()
 	var code int
 	captured := captureOutput(t, func() {
-		code = cmdSetup([]string{"--auto", "--hostname", "lab.dynv6.net",
+		code = cmdSetup([]string{"--auto", "--edge", "tunnel", "--hostname", "lab.dynv6.net",
 			"--acme-email", "ops@mailtest.invalid-test", "--out", out,
 			"--echo-v4", echo.URL, "--echo-v6", ""})
 	})
@@ -256,7 +256,7 @@ func TestSetupKeepsWorkingRelayURLWhenBlocked(t *testing.T) {
 	out := t.TempDir()
 	var code int
 	_ = captureStdout(t, func() {
-		code = cmdSetup([]string{"--auto", "--hostname", "lab.dynv6.net",
+		code = cmdSetup([]string{"--auto", "--edge", "tunnel", "--hostname", "lab.dynv6.net",
 			"--acme-email", "ops@mailtest.invalid-test", "--out", out,
 			"--echo-v4", echo.URL, "--echo-v6", ""})
 	})
@@ -295,7 +295,7 @@ func TestSetupRenderRefusesOnDNSMismatch(t *testing.T) {
 	out := t.TempDir()
 	var code int
 	_ = captureStdout(t, func() {
-		code = cmdSetup([]string{"--auto", "--hostname", "lab.dynv6.net",
+		code = cmdSetup([]string{"--auto", "--edge", "tunnel", "--hostname", "lab.dynv6.net",
 			"--acme-email", "ops@mailtest.invalid-test", "--out", out,
 			"--echo-v4", echo.URL, "--echo-v6", ""})
 	})
@@ -561,7 +561,7 @@ func TestSetupSingleHostEdgeNeedsNoWildcardRecord(t *testing.T) {
 	out := t.TempDir()
 	var code int
 	captured := captureOutput(t, func() {
-		code = cmdSetup([]string{"--auto", "--hostname", "lab.dynv6.net", "--edge", "single-host",
+		code = cmdSetup([]string{"--auto", "--edge", "tunnel", "--hostname", "lab.dynv6.net", "--edge", "single-host",
 			"--acme-email", "ops@mailtest.invalid-test", "--out", out,
 			"--echo-v4", echo.URL, "--echo-v6", ""})
 	})
@@ -615,7 +615,7 @@ func TestSetupTunnelEdgeStillRequiresWildcard(t *testing.T) {
 		// so it must still demand the wildcard record. (The wildcard edge
 		// additionally needs a DNS plugin at init, so it is not reachable
 		// from setup without one.)
-		code = cmdSetup([]string{"--auto", "--hostname", "lab.dynv6.net", "--edge", "tunnel",
+		code = cmdSetup([]string{"--auto", "--edge", "tunnel", "--hostname", "lab.dynv6.net",
 			"--acme-email", "ops@mailtest.invalid-test", "--out", out,
 			"--echo-v4", echo.URL, "--echo-v6", ""})
 	})
