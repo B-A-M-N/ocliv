@@ -100,12 +100,93 @@ func writeExclusiveSecret0600(path, secret string) error {
 		_ = os.Remove(path)
 		return err
 	}
-	return f.Close()
+	if err := f.Close(); err != nil {
+		return err
+	}
+	dir, derr := os.Open(filepath.Dir(path))
+	if derr != nil {
+		return fmt.Errorf("secret written, but directory durability check failed: %w", derr)
+	}
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	if syncErr != nil {
+		return fmt.Errorf("secret written, but directory sync failed: %w", syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("secret written, but directory close failed: %w", closeErr)
+	}
+	return nil
+}
+
+// RecoverGoogleCutover completes or safely resolves interrupted PREPARED or
+// CUTOVER_INCOMPLETE Google client replacements before new mutations occur.
+func RecoverGoogleCutover(svcStore *config.ServiceStore, serviceName string, st *authz.SQLStore, now time.Time) error {
+	rec, ok, err := svcStore.Get(serviceName)
+	if err != nil || !ok || rec.ProviderBindings == nil {
+		return nil
+	}
+	b, bok := rec.ProviderBindings["google"]
+	if !bok || (b.Status != "PREPARED" && b.Status != "CUTOVER_INCOMPLETE") {
+		return nil
+	}
+	if b.Cutover == nil || b.Cutover.OldClientID == "" {
+		return fmt.Errorf("google binding for %q is in %s without cutover metadata", serviceName, b.Status)
+	}
+	oldID := b.Cutover.OldClientID
+	newID := b.Cutover.NewClientID
+	if newID != "" {
+		if _, cerr := st.GetClient(newID); cerr == nil {
+			// New candidate exists; ensure old client is revoked and promote newID.
+			if rerr := st.RevokeOpaqueRefreshForClient(oldID); rerr != nil {
+				return rerr
+			}
+			if rerr := st.RevokeGrant(oldID, b.Cutover.OldTenant, b.Cutover.RouteID); rerr != nil {
+				return rerr
+			}
+			if rerr := st.RevokeClient(oldID); rerr != nil {
+				return rerr
+			}
+			cOld, gerr := st.GetClient(oldID)
+			if gerr != nil || cOld.RevokedAt == nil {
+				return fmt.Errorf("failed to confirm revocation of old client %s during recovery", oldID)
+			}
+			_, uerr := svcStore.UpdateCAS(serviceName, rec.Revision, func(r *config.ServiceRecord) error {
+				cur := r.ProviderBindings["google"]
+				cur.ClientID = newID
+				cur.CandidateClientID = ""
+				cur.Status = "active"
+				cur.RevokedClientIDs = append(cur.RevokedClientIDs, oldID)
+				cur.Cutover.RecoveryState = "RECOVERED"
+				cur.NextAction = "cutover recovered; old client revoked"
+				cur.UpdatedAt = now.UTC().Format(time.RFC3339)
+				r.ProviderBindings["google"] = cur
+				return nil
+			})
+			return uerr
+		}
+	}
+	// Candidate missing from DB: clear incomplete cutover if old client is still active.
+	cOld, gerr := st.GetClient(oldID)
+	if gerr == nil && cOld.RevokedAt == nil {
+		_, uerr := svcStore.UpdateCAS(serviceName, rec.Revision, func(r *config.ServiceRecord) error {
+			cur := r.ProviderBindings["google"]
+			cur.ClientID = oldID
+			cur.CandidateClientID = ""
+			cur.Status = "active"
+			cur.Cutover.RecoveryState = "ROLLED_BACK_TO_OLD"
+			cur.NextAction = "abandoned candidate cleared; old client remains active"
+			cur.UpdatedAt = now.UTC().Format(time.RFC3339)
+			r.ProviderBindings["google"] = cur
+			return nil
+		})
+		return uerr
+	}
+	return fmt.Errorf("cannot recover cutover for %q: candidate %q missing and old %q unavailable", serviceName, newID, oldID)
 }
 
 func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ocliv connect google SERVICE --redirect URI[,URI] [--type connected-app|gemini] [--data DIR] [--tenant TENANT] [--secret-out PATH] [--approve] [--update] [--profile PROFILE] [--json]")
+		fmt.Fprintln(os.Stderr, "usage: ocliv connect google SERVICE --redirect URI[,URI] [--type connected-app|gemini] [--data DIR] [--tenant TENANT] [--secret-out PATH] [--verification-token-file PATH] [--approve] [--update] [--reconnect] [--profile PROFILE] [--json]")
 		return apperr.ExitCLIValidation
 	}
 	serviceName := argv[0]
@@ -115,8 +196,10 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 	profile := ""
 	redirectRaw := ""
 	secretOut := ""
+	verifyTokenFile := ""
 	approve := false
 	update := false
+	reconnect := false
 	asJSON := false
 
 	for i := 1; i < len(argv); i++ {
@@ -125,6 +208,8 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 			approve = true
 		case argv[i] == "--update":
 			update = true
+		case argv[i] == "--reconnect":
+			reconnect = true
 		case argv[i] == "--json":
 			asJSON = true
 		case argv[i] == "--type" || strings.HasPrefix(argv[i], "--type="):
@@ -163,6 +248,12 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 				return apperr.ExitCLIValidation
 			}
 			secretOut = v
+		case argv[i] == "--verification-token-file" || strings.HasPrefix(argv[i], "--verification-token-file="):
+			v, ok := mcpFlagValue(argv, &i, "verification-token-file")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			verifyTokenFile = v
 		default:
 			fmt.Fprintf(os.Stderr, "unknown flag %q\n", argv[i])
 			return apperr.ExitCLIValidation
@@ -207,6 +298,24 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 		return apperr.ExitRelayTLS
 	}
 
+	expectedToken := ""
+	if verifyTokenFile != "" {
+		tokBytes, terr := os.ReadFile(verifyTokenFile)
+		if terr != nil {
+			fmt.Fprintf(os.Stderr, "connect google: read --verification-token-file %q: %v\n", verifyTokenFile, terr)
+			return apperr.ExitCLIValidation
+		}
+		expectedToken = strings.TrimSpace(string(tokBytes))
+		if expectedToken == "" {
+			fmt.Fprintf(os.Stderr, "connect google: --verification-token-file %q is empty\n", verifyTokenFile)
+			return apperr.ExitCLIValidation
+		}
+	}
+	if entry.AuthMethod != "ocliv-managed" && entry.AuthMethod != "upstream-oauth" {
+		fmt.Fprintf(os.Stderr, "connect google: unsupported/unmapped auth mode %q for publication %q\n", entry.AuthMethod, serviceName)
+		return apperr.ExitCLIValidation
+	}
+
 	disc := runReadOnlyDiscoveryCheck(hc, entry.URL)
 	if disc.Transport != "PASS" || disc.Discovery != "PASS" {
 		fmt.Fprintf(os.Stderr, "connect google: discovery preflight failed: %s\n", disc.Detail)
@@ -237,12 +346,15 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 			fmt.Fprintf(os.Stderr, "connect google: %s returned Content-Type %q (want application/json)\n", verifyURL, ct)
 			return apperr.ExitRelayTLS
 		}
-		if verr := ValidateGoogleVerificationDocument(vBody, ""); verr != nil {
+		if verr := ValidateGoogleVerificationDocument(vBody, expectedToken); verr != nil {
 			fmt.Fprintf(os.Stderr, "connect google: %s invalid verification document: %v\n", verifyURL, verr)
 			return apperr.ExitRelayTLS
 		}
-		stage = "DOMAIN_READY"
-		timestamps["DOMAIN_READY"] = now.Format(time.RFC3339)
+		stage = "DOCUMENT_VALID"
+		if expectedToken != "" {
+			stage = "GOOGLE_TOKEN_MATCHED"
+		}
+		timestamps[stage] = now.Format(time.RFC3339)
 	}
 
 	svcStore, err := openServicesForProfile(profile)
@@ -270,12 +382,29 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 	defer db.Close()
 	st := authz.NewSQLStore(db.SQL())
 
+	if existing != nil && (existing.Status == "PREPARED" || existing.Status == "CUTOVER_INCOMPLETE") {
+		if rerr := RecoverGoogleCutover(svcStore, serviceName, st, now); rerr != nil {
+			fmt.Fprintf(os.Stderr, "connect google: cutover recovery failed: %v\n", rerr)
+			return apperr.ExitInternal
+		}
+		rec, hasRec, gerr = svcStore.Get(serviceName)
+		if gerr != nil {
+			fmt.Fprintln(os.Stderr, gerr)
+			return apperr.ExitInternal
+		}
+		if hasRec && rec.ProviderBindings != nil {
+			if b, bok := rec.ProviderBindings["google"]; bok {
+				existing = &b
+			}
+		}
+	}
+
 	if existing != nil {
-		if existing.Status == "revoked" {
-			fmt.Fprintf(os.Stderr, "connect google: binding for %q was explicitly revoked; refusing to resurrect a revoked grant\n", serviceName)
+		if existing.Status == "revoked" && !reconnect {
+			fmt.Fprintf(os.Stderr, "connect google: binding for %q was explicitly revoked; refusing to resurrect a revoked grant (pass --reconnect to create a new client)\n", serviceName)
 			return apperr.ExitAuth
 		}
-		if existing.Fingerprint == fp && existing.Status != "CUTOVER_INCOMPLETE" {
+		if existing.Status != "revoked" && existing.Fingerprint == fp && existing.Status != "CUTOVER_INCOMPLETE" && existing.Status != "PREPARED" {
 			cliRec, cerr := st.GetClient(existing.ClientID)
 			grantRec, grErr := st.GetGrant(existing.ClientID, tenant, entry.RouteID)
 			if cerr != nil || grErr != nil {
@@ -298,7 +427,7 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 			}
 			return apperr.ExitOK
 		}
-		if !update {
+		if existing.Status != "revoked" && !update {
 			fmt.Fprintf(os.Stderr, "connect google: %q already has a Google binding with different callbacks/tenant/issuer/type; pass --update to replace intentionally\n", serviceName)
 			return apperr.ExitCLIValidation
 		}
@@ -366,9 +495,12 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 	var oldID string
 	if existing != nil {
 		revokedIDs = append(revokedIDs, existing.RevokedClientIDs...)
-		if existing.ClientID != "" && existing.ClientID != clientID {
+		if existing.Status == "revoked" && existing.ClientID != "" {
+			revokedIDs = append(revokedIDs, existing.ClientID)
+		} else if existing.ClientID != "" && existing.ClientID != clientID {
 			oldID = existing.ClientID
 			if hasRec {
+				opID := fmt.Sprintf("cutover-%d", now.UnixNano())
 				updatedPrep, prepErr := svcStore.UpdateCAS(serviceName, rec.Revision, func(r *config.ServiceRecord) error {
 					if r.ProviderBindings == nil {
 						r.ProviderBindings = map[string]config.ProviderBinding{}
@@ -376,6 +508,16 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 					b := r.ProviderBindings["google"]
 					b.CandidateClientID = clientID
 					b.Status = "PREPARED"
+					b.Cutover = &config.GoogleCutoverRecord{
+						OperationID:     opID,
+						OldClientID:     oldID,
+						NewClientID:     clientID,
+						OldTenant:       tenant,
+						NewTenant:       tenant,
+						RouteID:         entry.RouteID,
+						CandidateStatus: status,
+						RecoveryState:   "PREPARED",
+					}
 					b.NextAction = fmt.Sprintf("cutover prepared for candidate %s; completing replacement of %s", clientID, oldID)
 					r.ProviderBindings["google"] = b
 					return nil

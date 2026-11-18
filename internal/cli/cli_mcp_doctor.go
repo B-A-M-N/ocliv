@@ -115,12 +115,18 @@ func runMCPProbe(target, mode string) mcpProbeOutcome {
 // operator-supplied upstream bearer. The token is used only in the request
 // header and is never included in probe output.
 func runMCPProbeWithBearer(target, mode, bearer string) mcpProbeOutcome {
+	return runMCPProbeWithClient(target, mode, bearer, &http.Client{Timeout: 5 * time.Second})
+}
+
+func runMCPProbeWithClient(target, mode, bearer string, client *http.Client) mcpProbeOutcome {
 	if mode != "mcp_upstream_oauth" && mode != "mcp_anonymous_fixture" && mode != "mcp_managed_oauth" {
 		return mcpProbeOutcome{Summary: "not-applicable (not an MCP lease)", Verified: true, Auth: "NOT_APPLICABLE"}
 	}
 	anon := mode == "mcp_anonymous_fixture"
 	managed := mode == "mcp_managed_oauth"
-	client := &http.Client{Timeout: 5 * time.Second}
+	if client == nil {
+		client = &http.Client{Timeout: 5 * time.Second}
+	}
 	var sessionID string
 	var sessionVersion string
 	post := func(body, version string) (*http.Response, []byte, error) {

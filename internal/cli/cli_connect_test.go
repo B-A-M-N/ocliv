@@ -273,3 +273,80 @@ func TestConnectGoogleIdempotenceChecksTenantAndAuthoritativeDB(t *testing.T) {
 		t.Fatalf("expected ExitAuth when client revoked in DB, got %d", code)
 	}
 }
+
+func TestConnectGoogleReconnectVerificationTokenAndCutoverRecovery(t *testing.T) {
+	var srvURL string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/r/r-rec/mcp":
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/.well-known/oauth-protected-resource/r/r-rec/mcp":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"resource":"` + srvURL + `/r/r-rec/mcp","authorization_servers":["` + srvURL + `/r/r-rec/oauth"]}`))
+		case "/.well-known/oauth-authorization-server/r/r-rec/oauth":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"issuer":"` + srvURL + `/r/r-rec/oauth","authorization_endpoint":"` + srvURL + `/r/r-rec/oauth/authorize","token_endpoint":"` + srvURL + `/r/r-rec/oauth/token","code_challenge_methods_supported":["S256"]}`))
+		case "/.well-known/google-connected-apps":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"verification_tokens":["tok-exact-99"]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	srvURL = srv.URL
+
+	seedEnrolledProfileForTest(t, srvURL)
+	dataDir := t.TempDir()
+	db, err := store.Open(filepath.Join(dataDir, "ocliv.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	ops := serviceOps{
+		mgmtCall: func(_ string, _ *identity.KeyPair, _, _, _ string) (int, []byte, error) {
+			return 200, []byte(`{"publications":[{"route_id":"r-rec","pub_name":"my-rec","profile":"managed-oauth","url":"` + srvURL + `/r/r-rec/mcp","publication_state":"ACTIVE","desired_enabled":true}]}`), nil
+		},
+	}
+
+	// Trailing JSON must be rejected.
+	if err := ValidateGoogleVerificationDocument([]byte(`{"verification_tokens":["a"]}{"extra":1}`), ""); err == nil {
+		t.Fatal("expected trailing JSON rejection")
+	}
+
+	// Wrong --verification-token-file must fail.
+	badTokFile := filepath.Join(t.TempDir(), "bad-tok.txt")
+	_ = os.WriteFile(badTokFile, []byte("wrong-tok\n"), 0o600)
+	cb := "https://oauth-redirect.googleusercontent.com/r/app1"
+	if code := cmdConnectWithOps([]string{"google", "my-rec", "--redirect", cb, "--data", dataDir, "--verification-token-file", badTokFile}, ops, srv.Client()); code != apperr.ExitRelayTLS {
+		t.Fatalf("expected ExitRelayTLS on mismatched verification token, got %d", code)
+	}
+
+	// Exact --verification-token-file succeeds and maps managed-oauth -> ocliv-managed.
+	goodTokFile := filepath.Join(t.TempDir(), "good-tok.txt")
+	_ = os.WriteFile(goodTokFile, []byte("tok-exact-99\n"), 0o600)
+	sec1 := filepath.Join(t.TempDir(), "sec1.txt")
+	if code := cmdConnectWithOps([]string{"google", "my-rec", "--redirect", cb, "--data", dataDir, "--verification-token-file", goodTokFile, "--secret-out", sec1, "--approve"}, ops, srv.Client()); code != apperr.ExitOK {
+		t.Fatalf("connect google=%d, want 0", code)
+	}
+	svcStore, _ := openServicesForProfile("default")
+	rec, ok, _ := svcStore.Get("my-rec")
+	if !ok || rec.Auth != "ocliv-managed" {
+		t.Fatalf("expected mapped Auth=ocliv-managed, got %q (ok=%v)", rec.Auth, ok)
+	}
+
+	// Revoke, then --reconnect creates a brand new client while old remains revoked.
+	if code := cmdConnectWithOps([]string{"revoke", "google", "my-rec", "--data", dataDir}, ops, srv.Client()); code != apperr.ExitOK {
+		t.Fatalf("revoke=%d", code)
+	}
+	sec2 := filepath.Join(t.TempDir(), "sec2.txt")
+	if code := cmdConnectWithOps([]string{"google", "my-rec", "--redirect", cb, "--data", dataDir, "--secret-out", sec2, "--approve", "--reconnect"}, ops, srv.Client()); code != apperr.ExitOK {
+		t.Fatalf("reconnect=%d, want 0", code)
+	}
+	rec2, _, _ := svcStore.Get("my-rec")
+	b2 := rec2.ProviderBindings["google"]
+	if b2.ClientID == rec.ProviderBindings["google"].ClientID || len(b2.RevokedClientIDs) != 1 {
+		t.Fatalf("expected new client ID + 1 revoked history, got %+v", b2)
+	}
+}

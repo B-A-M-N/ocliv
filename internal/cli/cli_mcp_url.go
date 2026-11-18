@@ -25,6 +25,7 @@ type catalogEntry struct {
 	Profile         string `json:"profile"`
 	RouteID         string `json:"route_id,omitempty"`
 	URL             string `json:"url,omitempty"`
+	IngressProfile  string `json:"ingress_profile,omitempty"`
 	AuthMethod      string `json:"auth_method,omitempty"`
 	Freshness       string `json:"freshness"` // "AUTHORITATIVE" | "CACHED_UNVERIFIED" | "REVOKED" | "MISSING"
 	RelayState      string `json:"relay_state,omitempty"`
@@ -32,6 +33,19 @@ type catalogEntry struct {
 	SessionLive     bool   `json:"session_live,omitempty"`
 	FailureReason   string `json:"failure_reason,omitempty"`
 	StateGeneration int64  `json:"state_generation,omitempty"`
+}
+
+func relayProfileToAuthMode(ingressProfile string) (string, error) {
+	switch strings.TrimSpace(ingressProfile) {
+	case "managed-oauth":
+		return "ocliv-managed", nil
+	case "upstream-oauth":
+		return "upstream-oauth", nil
+	case "ocliv-managed":
+		return "ocliv-managed", nil
+	default:
+		return "", fmt.Errorf("unknown relay ingress profile %q", ingressProfile)
+	}
 }
 
 func copyToClipboard(text string) error {
@@ -139,16 +153,23 @@ func resolveCatalogEntry(name, profile string, ops serviceOps) (catalogEntry, in
 		if p.PublicationState == "REVOKED" || p.RevokedAt != nil {
 			fresh = "REVOKED"
 		}
+		authMode, mapErr := relayProfileToAuthMode(p.Profile)
+		failReason := ""
+		if mapErr != nil {
+			failReason = mapErr.Error()
+		}
 		matches = append(matches, catalogEntry{
 			Name:            p.Name,
 			Profile:         profile,
 			RouteID:         p.RouteID,
 			URL:             u,
-			AuthMethod:      p.Profile,
+			IngressProfile:  p.Profile,
+			AuthMethod:      authMode,
 			Freshness:       fresh,
 			RelayState:      p.PublicationState,
 			DesiredEnabled:  p.DesiredEnabled,
 			SessionLive:     p.SessionLive,
+			FailureReason:   failReason,
 			StateGeneration: p.StateGeneration,
 		})
 	}
@@ -541,11 +562,18 @@ func cmdMCPURLs(argv []string) int {
 
 func cmdMCPURLsWithOps(argv []string, ops serviceOps) int {
 	profile := ""
+	copyName := ""
 	asJSON := false
 	for i := 0; i < len(argv); i++ {
 		switch {
 		case argv[i] == "--json":
 			asJSON = true
+		case argv[i] == "--copy" || strings.HasPrefix(argv[i], "--copy="):
+			v, ok := mcpFlagValue(argv, &i, "copy")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			copyName = v
 		case argv[i] == "--profile" || strings.HasPrefix(argv[i], "--profile="):
 			v, ok := mcpFlagValue(argv, &i, "profile")
 			if !ok {
@@ -556,6 +584,16 @@ func cmdMCPURLsWithOps(argv []string, ops serviceOps) int {
 			fmt.Fprintf(os.Stderr, "unknown flag %q\n", argv[i])
 			return apperr.ExitCLIValidation
 		}
+	}
+	if copyName != "" {
+		cargs := []string{copyName, "--copy"}
+		if profile != "" {
+			cargs = append(cargs, "--profile", profile)
+		}
+		if asJSON {
+			cargs = append(cargs, "--json")
+		}
+		return cmdMCPURLWithOps(cargs, ops, copyToClipboard, safeEgressHTTPClient())
 	}
 	if profile == "" {
 		profile = config.ActiveProfile()
@@ -608,12 +646,14 @@ func cmdMCPURLsWithOps(argv []string, ops serviceOps) int {
 		if p.URL != nil {
 			u = *p.URL
 		}
+		authMode, _ := relayProfileToAuthMode(p.Profile)
 		entries = append(entries, catalogEntry{
 			Name:            p.Name,
 			Profile:         profile,
 			RouteID:         p.RouteID,
 			URL:             u,
-			AuthMethod:      p.Profile,
+			IngressProfile:  p.Profile,
+			AuthMethod:      authMode,
 			Freshness:       fresh,
 			RelayState:      p.PublicationState,
 			DesiredEnabled:  p.DesiredEnabled,
@@ -645,12 +685,14 @@ func cmdMCPCheck(argv []string) int {
 
 func cmdMCPCheckWithOps(argv []string, ops serviceOps, hc *http.Client) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ocliv mcp check NAME [--client generic|chatgpt|gemini|google-connected-app] [--profile PROFILE] [--json]")
+		fmt.Fprintln(os.Stderr, "usage: ocliv mcp check NAME [--client generic|chatgpt|gemini|google-connected-app] [--trusted-issuer URL] [--token-file PATH] [--profile PROFILE] [--json]")
 		return apperr.ExitCLIValidation
 	}
 	name := argv[0]
 	clientKind := "generic"
 	profile := ""
+	tokenFile := ""
+	var trustedIssuers []string
 	asJSON := false
 	for i := 1; i < len(argv); i++ {
 		switch {
@@ -668,6 +710,18 @@ func cmdMCPCheckWithOps(argv []string, ops serviceOps, hc *http.Client) int {
 				return apperr.ExitCLIValidation
 			}
 			profile = v
+		case argv[i] == "--token-file" || strings.HasPrefix(argv[i], "--token-file="):
+			v, ok := mcpFlagValue(argv, &i, "token-file")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			tokenFile = v
+		case argv[i] == "--trusted-issuer" || strings.HasPrefix(argv[i], "--trusted-issuer="):
+			v, ok := mcpFlagValue(argv, &i, "trusted-issuer")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			trustedIssuers = append(trustedIssuers, v)
 		default:
 			fmt.Fprintf(os.Stderr, "unknown flag %q\n", argv[i])
 			return apperr.ExitCLIValidation
@@ -697,7 +751,50 @@ func cmdMCPCheckWithOps(argv []string, ops serviceOps, hc *http.Client) int {
 		}
 		return apperr.ExitRelayTLS
 	}
-	disc := runReadOnlyDiscoveryCheck(hc, entry.URL)
+	disc := runReadOnlyDiscoveryCheckWithAllowlist(hc, entry.URL, trustedIssuers)
+	authMCP := "UNKNOWN"
+	authMCPDetail := ""
+	if tokenFile != "" && disc.Transport == "PASS" {
+		tokBytes, terr := os.ReadFile(tokenFile)
+		if terr != nil {
+			authMCP = "FAIL"
+			authMCPDetail = "read --token-file: " + terr.Error()
+		} else if tok := strings.TrimSpace(string(tokBytes)); tok == "" {
+			authMCP = "FAIL"
+			authMCPDetail = "--token-file is empty"
+		} else {
+			probeMode := "mcp_managed_oauth"
+			if entry.AuthMethod == "upstream-oauth" {
+				probeMode = "mcp_upstream_oauth"
+			}
+			out := runMCPProbeWithClient(entry.URL, probeMode, tok, wrapNoRedirectClient(hc))
+			if !out.Verified {
+				authMCP = "FAIL"
+				authMCPDetail = out.Summary
+			} else {
+				authMCP = "PASS"
+				authMCPDetail = out.Summary
+				if svcStore, serr := openServicesForProfile(profile); serr == nil {
+					if rec, ok, _ := svcStore.Get(entry.Name); ok && entry.StateGeneration > 0 {
+						now := time.Now().UTC()
+						_, _ = svcStore.UpdateCAS(entry.Name, rec.Revision, func(r *config.ServiceRecord) error {
+							r.VerificationEvidence = &config.VerificationEvidence{
+								RouteID:         entry.RouteID,
+								PublicURL:       entry.URL,
+								Issuer:          disc.Issuer,
+								Stage:           "MCP_AUTHENTICATED",
+								StateGeneration: entry.StateGeneration,
+								VerifiedAt:      now.Format(time.RFC3339),
+								ExpiresAt:       now.Add(24 * time.Hour).Format(time.RFC3339),
+							}
+							r.LastVerifiedAt = now.Format(time.RFC3339)
+							return nil
+						})
+					}
+				}
+			}
+		}
+	}
 	profileCheck := "PASS"
 	profileDetail := ""
 	domainVerify := "SKIPPED"
@@ -745,10 +842,13 @@ func cmdMCPCheckWithOps(argv []string, ops serviceOps, hc *http.Client) int {
 			"oauth_metadata":      disc.Discovery,
 			"client_profile":      profileCheck,
 			"client_registration": "UNKNOWN",
-			"authenticated_mcp":   "UNKNOWN",
+			"authenticated_mcp":   authMCP,
 			"external_acceptance": "UNKNOWN",
 			"client":              clientKind,
 			"detail":              disc.Detail,
+		}
+		if authMCPDetail != "" {
+			out["authenticated_mcp_detail"] = authMCPDetail
 		}
 		if domainVerify != "SKIPPED" {
 			out["google_domain_verification"] = domainVerify
@@ -766,7 +866,11 @@ func cmdMCPCheckWithOps(argv []string, ops serviceOps, hc *http.Client) int {
 			fmt.Printf("Google verification: %s\n", domainVerify)
 		}
 		fmt.Printf("Client registration: UNKNOWN (read-only check; no DCR client created)\n")
-		fmt.Printf("Authenticated MCP:   UNKNOWN (no bearer credential supplied)\n")
+		if authMCPDetail != "" {
+			fmt.Printf("Authenticated MCP:   %s (%s)\n", authMCP, authMCPDetail)
+		} else {
+			fmt.Printf("Authenticated MCP:   %s\n", authMCP)
+		}
 		fmt.Printf("External acceptance: UNKNOWN (off-LAN client %s not executed)\n", clientKind)
 		if disc.Detail != "" {
 			fmt.Printf("Detail:              %s\n", disc.Detail)
@@ -775,7 +879,7 @@ func cmdMCPCheckWithOps(argv []string, ops serviceOps, hc *http.Client) int {
 			fmt.Printf("Profile detail:      %s\n", profileDetail)
 		}
 	}
-	if disc.Transport != "PASS" || disc.Discovery != "PASS" || profileCheck != "PASS" {
+	if disc.Transport != "PASS" || disc.Discovery != "PASS" || profileCheck != "PASS" || authMCP == "FAIL" {
 		return apperr.ExitRelayTLS
 	}
 	return apperr.ExitOK

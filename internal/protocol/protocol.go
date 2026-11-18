@@ -103,8 +103,9 @@ type Abort struct {
 // EndFrame terminates a body stream carrying trailers (correct trailer
 // semantics) or empty trailers when the application sent none.
 type EndFrame struct {
-	Type     string            `json:"type"` // "request_end" | "response_end"
-	Trailers map[string]string `json:"trailers,omitempty"`
+	Type           string            `json:"type"` // "request_end" | "response_end"
+	Trailers       map[string]string `json:"trailers,omitempty"`
+	RequestIgnored bool              `json:"request_ignored,omitempty"`
 }
 
 // UpgradeAccept confirms the local 101 with its accept value.

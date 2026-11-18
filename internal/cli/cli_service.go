@@ -44,14 +44,15 @@ const (
 )
 
 type serviceStopResult struct {
-	Name           string `json:"name"`
-	Stopped        bool   `json:"stopped"`
-	RemoteDisabled bool   `json:"remote_disabled"`
-	LocalStopped   bool   `json:"local_stopped"`
-	State          string `json:"state"`
-	PublicationID  string `json:"publication_id,omitempty"`
-	RetainedURL    string `json:"retained_url,omitempty"`
-	Detail         string `json:"detail,omitempty"`
+	Name                string `json:"name"`
+	Stopped             bool   `json:"stopped"`
+	RemoteDisabled      bool   `json:"remote_disabled"`
+	RemoteDisableStatus string `json:"remote_disable_status"` // CONFIRMED | UNCONFIRMED | NOT_APPLICABLE
+	LocalStopped        bool   `json:"local_stopped"`
+	State               string `json:"state"`
+	PublicationID       string `json:"publication_id,omitempty"`
+	RetainedURL         string `json:"retained_url,omitempty"`
+	Detail              string `json:"detail,omitempty"`
 }
 
 // serviceOps isolates external interactions (systemd --user, relay mgmt, probes)
@@ -885,7 +886,13 @@ func cmdServiceDisable(argv []string, ops serviceOps) int {
 		b, _ := json.MarshalIndent(res, "", "  ")
 		fmt.Println(string(b))
 	} else {
-		fmt.Printf("service=%s remote_disabled=%v local_stopped=%v state=%s detail=%s\n", res.Name, res.RemoteDisabled, res.LocalStopped, res.State, res.Detail)
+		fmt.Printf("service=%s remote_disable_status=%s local_stopped=%v state=%s detail=%s\n", res.Name, res.RemoteDisableStatus, res.LocalStopped, res.State, res.Detail)
+	}
+	if rec.Type == "http" {
+		if !res.LocalStopped {
+			return apperr.ExitInternal
+		}
+		return apperr.ExitOK
 	}
 	if !res.RemoteDisabled {
 		return apperr.ExitRelayTLS
@@ -906,14 +913,17 @@ func cmdServiceRestart(argv []string, ops serviceOps) int {
 
 func cmdServiceStatus(argv []string, ops serviceOps) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ocliv service status NAME [--json]")
+		fmt.Fprintln(os.Stderr, "usage: ocliv service status NAME [--json] [--strict-health]")
 		return apperr.ExitCLIValidation
 	}
 	name := argv[0]
 	jsonOut := false
+	strictHealth := false
 	for _, a := range argv[1:] {
 		if a == "--json" {
 			jsonOut = true
+		} else if a == "--strict-health" {
+			strictHealth = true
 		} else {
 			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
 			return apperr.ExitCLIValidation
@@ -961,7 +971,15 @@ func cmdServiceStatus(argv []string, ops serviceOps) int {
 			return apperr.ExitLocalTarget
 		}
 		return apperr.ExitInternal
+	case HealthDegraded:
+		if strictHealth {
+			return apperr.ExitInternal
+		}
+		return apperr.ExitOK
 	default:
+		if strictHealth {
+			return apperr.ExitInternal
+		}
 		return apperr.ExitOK
 	}
 }

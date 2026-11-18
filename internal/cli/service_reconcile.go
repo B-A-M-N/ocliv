@@ -182,7 +182,16 @@ func stopServiceAuthoritatively(store *config.ServiceStore, rec config.ServiceRe
 		}
 	}
 
-	res.RemoteDisabled = remoteErr == ""
+	if rec.Type == "http" {
+		res.RemoteDisabled = false
+		res.RemoteDisableStatus = "NOT_APPLICABLE"
+	} else if remoteErr == "" {
+		res.RemoteDisabled = true
+		res.RemoteDisableStatus = "CONFIRMED"
+	} else {
+		res.RemoteDisabled = false
+		res.RemoteDisableStatus = "UNCONFIRMED"
+	}
 	res.LocalStopped = localStopped
 
 	if remoteErr != "" {
@@ -292,10 +301,34 @@ func reconcileBackoff(attempt uint32, jitterSeed int64) time.Duration {
 	return d + jitter
 }
 
+var serviceTransitions struct {
+	mu sync.Mutex
+	m  map[string]*sync.Mutex
+}
+
+func serviceFence(name string) *sync.Mutex {
+	serviceTransitions.mu.Lock()
+	defer serviceTransitions.mu.Unlock()
+	if serviceTransitions.m == nil {
+		serviceTransitions.m = map[string]*sync.Mutex{}
+	}
+	l, ok := serviceTransitions.m[name]
+	if !ok {
+		l = &sync.Mutex{}
+		serviceTransitions.m[name] = l
+	}
+	return l
+}
+
 // reconcileServiceOnce reconciles a single service's runtime state against its
-// persisted DesiredState under CAS discipline. It never restarts disabled or
-// revoked services, never reapproves OAuth grants, and preserves PublicationID.
+// persisted DesiredState under CAS discipline and a per-service transition fence.
+// It never restarts disabled or revoked services, never reapproves OAuth grants,
+// and stops the unit if a concurrent disable committed during restart.
 func reconcileServiceOnce(store *config.ServiceStore, name string, k *identity.KeyPair, keyID string, ops serviceOps, now time.Time) (ServiceStatusReport, error) {
+	fence := serviceFence(name)
+	fence.Lock()
+	defer fence.Unlock()
+
 	rec, ok, err := store.Get(name)
 	if err != nil || !ok {
 		return ServiceStatusReport{}, fmt.Errorf("unknown service %q", name)
@@ -373,12 +406,26 @@ func reconcileServiceOnce(store *config.ServiceStore, name string, k *identity.K
 	errCode := "TRANSIENT_NOT_SERVING"
 	errDetail := rep.LastFailure
 	if rep.ProcessState != "active" && rec.SystemdUnit != "" {
+		// Re-read DesiredState immediately before external restart side effects.
+		freshRec, fok, ferr := store.Get(name)
+		if ferr != nil || !fok || freshRec.DesiredState != config.DesiredEnabled {
+			return rep, nil
+		}
 		if rec.BackendMode == config.BackendManaged && rec.BackendUnit != "" {
 			_, _ = ops.systemctl("start", rec.BackendUnit)
 		}
 		if out, serr := ops.systemctl("start", rec.SystemdUnit); serr != nil {
 			errCode = "SYSTEMD_START_FAILED"
 			errDetail = fmt.Sprintf("%v (%s)", serr, strings.TrimSpace(out))
+		} else {
+			// Recheck DesiredState after restart; stop immediately if concurrently disabled.
+			if afterRec, aok, _ := store.Get(name); aok && afterRec.DesiredState != config.DesiredEnabled {
+				_, _ = ops.systemctl("stop", rec.SystemdUnit)
+				if rec.BackendMode == config.BackendManaged && rec.BackendUnit != "" {
+					_, _ = ops.systemctl("stop", rec.BackendUnit)
+				}
+				return rep, fmt.Errorf("concurrent disable committed during restart for %q", name)
+			}
 		}
 	}
 	nextRetry := now.Add(reconcileBackoff(attempt, now.UnixNano()))

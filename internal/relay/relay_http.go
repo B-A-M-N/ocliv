@@ -659,7 +659,7 @@ func (x *httpExchange) streamBody() {
 			// stands on its own — the app refused the request regardless
 			// of the upload's fate — and a completed upload needs no wait.
 			if x.headStatus < 400 && !x.uploadClean {
-				if !x.awaitUploadOutcome() {
+				if !x.awaitUploadOutcome(end.RequestIgnored) {
 					x.markStopped()
 					tearDownResponse(x.w)
 					return
@@ -700,8 +700,22 @@ func (x *httpExchange) streamBody() {
 // progress extends the wait without bound (within the body cap), so a
 // merely slow client with an early-answering app is never penalized.
 
-func (x *httpExchange) awaitUploadOutcome() bool {
-	tick := time.NewTicker(100 * time.Millisecond)
+func (x *httpExchange) awaitUploadOutcome(requestIgnored bool) bool {
+	if requestIgnored {
+		select {
+		case <-x.uploadFailed:
+			return false
+		case <-x.ctx.Done():
+			return false
+		default:
+			if leaseExpired(x.t) {
+				x.abort("cancelled", "lease ttl expired")
+				return false
+			}
+			return true
+		}
+	}
+	tick := time.NewTicker(200 * time.Millisecond)
 	defer tick.Stop()
 	lastLeaseCheck := time.Now()
 	enteredAt := time.Now()
@@ -721,20 +735,11 @@ func (x *httpExchange) awaitUploadOutcome() bool {
 					return false
 				}
 			}
-			// App-side stall after FResponseEnd: if the visitor has data
-			// queued and the tunnel write is blocked because the app already
-			// finished responding without draining the request body, confirm
-			// after a brief 250ms grace window instead of stalling 30s.
-			if x.uploadWriting.Load() && now.Sub(enteredAt) >= 250*time.Millisecond &&
-				time.Since(time.Unix(0, x.lastProgress.Load())) >= 250*time.Millisecond {
+			if x.uploadWriting.Load() && now.Sub(enteredAt) >= 1500*time.Millisecond &&
+				time.Since(time.Unix(0, x.lastProgress.Load())) >= 1500*time.Millisecond {
 				return true
 			}
 			if x.uploadIdleExpired() {
-				// No upload progress for a full window. Release the
-				// terminal only for an app-side stall (the app is done
-				// and will never consume more); a client-side stall
-				// tears down rather than certifying an unreceived
-				// request.
 				return x.uploadWriting.Load()
 			}
 		}

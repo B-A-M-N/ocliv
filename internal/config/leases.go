@@ -172,9 +172,17 @@ func (s *LeaseStore) Save(rec LeaseRecord) error {
 		if err := os.Rename(tmpName, p); err != nil {
 			return err
 		}
-		if dfd, err := os.Open(s.dir); err == nil {
-			_ = dfd.Sync()
-			_ = dfd.Close()
+		dfd, err := os.Open(s.dir)
+		if err != nil {
+			return fmt.Errorf("rename succeeded, but directory durability check failed: %w", err)
+		}
+		syncErr := dfd.Sync()
+		closeErr := dfd.Close()
+		if syncErr != nil {
+			return fmt.Errorf("rename succeeded, but directory sync failed: %w", syncErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("rename succeeded, but directory close failed: %w", closeErr)
 		}
 		return nil
 	})

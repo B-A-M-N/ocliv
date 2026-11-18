@@ -424,4 +424,63 @@ func TestEmergencyDisableSucceedsRemotelyWhenSupervisorBroken(t *testing.T) {
 	if code := cmdServiceDisable([]string{"emerg-svc"}, ops); code != 0 {
 		t.Fatalf("emergency disable exit=%d, want 0 when remote disable confirmed despite broken local supervisor", code)
 	}
+
+	// HTTP service disable must report NOT_APPLICABLE (never RemoteDisabled=true).
+	_ = st.Put(config.ServiceRecord{
+		Name: "emerg-http", Type: "http", LocalURL: "http://127.0.0.1:3000",
+		Profile: "default", RelayURL: "https://relay.example",
+		DesiredState: config.DesiredEnabled, SystemdUnit: "ocliv-publisher@emerg-http.service",
+	})
+	recHTTP, _, _ := st.Get("emerg-http")
+	kp, _ := identity.Generate()
+	resHTTP := stopServiceAuthoritatively(st, recHTTP, kp, "k1", serviceOps{
+		systemctl: func(args ...string) (string, error) {
+			if len(args) > 0 && args[0] == "is-enabled" {
+				return "disabled", nil
+			}
+			return "inactive", nil
+		},
+	})
+	if resHTTP.RemoteDisableStatus != "NOT_APPLICABLE" || resHTTP.RemoteDisabled {
+		t.Fatalf("expected NOT_APPLICABLE / RemoteDisabled=false for HTTP service, got %+v", resHTTP)
+	}
+}
+
+func TestReconcileConcurrentDisableStopsRestartedUnit(t *testing.T) {
+	st := config.OpenServiceStore(t.TempDir())
+	kp, _ := identity.Generate()
+	_ = st.Put(config.ServiceRecord{
+		Name: "race-svc", Type: "mcp", LocalURL: "http://127.0.0.1:8080/mcp",
+		Profile: "default", RelayURL: "https://relay.example",
+		DesiredState: config.DesiredEnabled, SystemdUnit: "ocliv-publisher@race.service",
+	})
+	stoppedAfterStart := false
+	ops := serviceOps{
+		probeLoc: func(_ string, _ time.Duration) error { return nil },
+		mgmtCall: func(_ string, _ *identity.KeyPair, _, _, _ string) (int, []byte, error) {
+			return 200, []byte(`{"publications":[]}`), nil
+		},
+		systemctl: func(args ...string) (string, error) {
+			if len(args) > 0 && args[0] == "start" {
+				// Simulate concurrent disable committed mid-start.
+				_, _ = st.UpdateCAS("race-svc", 0, func(r *config.ServiceRecord) error {
+					r.DesiredState = config.DesiredDisabled
+					return nil
+				})
+				return "", nil
+			}
+			if len(args) > 0 && args[0] == "stop" {
+				stoppedAfterStart = true
+				return "", nil
+			}
+			return "inactive", nil
+		},
+	}
+	_, err := reconcileServiceOnce(st, "race-svc", kp, "k1", ops, time.Now())
+	if err == nil || !strings.Contains(err.Error(), "concurrent disable") {
+		t.Fatalf("expected concurrent disable error, got %v", err)
+	}
+	if !stoppedAfterStart {
+		t.Fatal("expected systemctl stop to be called when concurrent disable committed mid-start")
+	}
 }

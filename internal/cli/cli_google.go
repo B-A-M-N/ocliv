@@ -30,6 +30,10 @@ func ValidateGoogleVerificationDocument(raw []byte, expectedToken string) error 
 	if err := dec.Decode(&doc); err != nil {
 		return fmt.Errorf("invalid Google verification JSON schema: %w", err)
 	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return fmt.Errorf("unexpected trailing data after Google verification JSON document")
+	}
 	if len(doc.VerificationTokens) == 0 {
 		return fmt.Errorf("verification_tokens must contain at least one token")
 	}
@@ -129,6 +133,7 @@ func cmdGoogleCheckDomain(argv []string) int {
 func cmdGoogleCheckDomainWithClient(argv []string, hc *http.Client) int {
 	host := ""
 	expectedFile := ""
+	expectedTokenFile := ""
 	for i := 0; i < len(argv); i++ {
 		switch {
 		case argv[i] == "--host" || strings.HasPrefix(argv[i], "--host="):
@@ -143,14 +148,33 @@ func cmdGoogleCheckDomainWithClient(argv []string, hc *http.Client) int {
 				return apperr.ExitCLIValidation
 			}
 			expectedFile = v
+		case argv[i] == "--verification-token-file" || strings.HasPrefix(argv[i], "--verification-token-file="):
+			v, ok := mcpFlagValue(argv, &i, "verification-token-file")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			expectedTokenFile = v
 		default:
 			fmt.Fprintf(os.Stderr, "unknown flag %q\n", argv[i])
 			return apperr.ExitCLIValidation
 		}
 	}
 	if host == "" {
-		fmt.Fprintln(os.Stderr, "usage: ocliv google check-domain --host HOST [--expected-file PATH]")
+		fmt.Fprintln(os.Stderr, "usage: ocliv google check-domain --host HOST [--expected-file PATH] [--verification-token-file PATH]")
 		return apperr.ExitCLIValidation
+	}
+	expectedToken := ""
+	if expectedTokenFile != "" {
+		tokBytes, terr := os.ReadFile(expectedTokenFile)
+		if terr != nil {
+			fmt.Fprintf(os.Stderr, "google check-domain: read %q: %v\n", expectedTokenFile, terr)
+			return apperr.ExitCLIValidation
+		}
+		expectedToken = strings.TrimSpace(string(tokBytes))
+		if expectedToken == "" {
+			fmt.Fprintf(os.Stderr, "google check-domain: %q is empty\n", expectedTokenFile)
+			return apperr.ExitCLIValidation
+		}
 	}
 	normHost, err := parseHostname(host, "--host")
 	if err != nil {
@@ -173,7 +197,7 @@ func cmdGoogleCheckDomainWithClient(argv []string, hc *http.Client) int {
 		fmt.Fprintf(os.Stderr, "google check-domain: %s returned Content-Type %q (want application/json)\n", u, ct)
 		return apperr.ExitRelayTLS
 	}
-	if err := ValidateGoogleVerificationDocument(body, ""); err != nil {
+	if err := ValidateGoogleVerificationDocument(body, expectedToken); err != nil {
 		fmt.Fprintf(os.Stderr, "google check-domain: %s invalid verification document: %v\n", u, err)
 		return apperr.ExitRelayTLS
 	}

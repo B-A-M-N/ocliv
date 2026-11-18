@@ -17,7 +17,9 @@ import (
 	"crypto/ed25519"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -178,6 +180,18 @@ func (s *Server) handleAgentPublications(w http.ResponseWriter, r *http.Request)
 		if routeID, ok := strings.CutSuffix(rest, "/enable"); ok && validRouteID(routeID) {
 			s.serveKeyPublicationDesiredState(w, tenant, keyID, routeID, true)
 			return
+		}
+		if routeID, ok := strings.CutSuffix(rest, "/authz/register"); ok && validRouteID(routeID) {
+			s.serveKeyPublicationAuthzRegister(w, r, tenant, keyID, routeID)
+			return
+		}
+		if idx := strings.Index(rest, "/authz/revoke/"); idx > 0 {
+			routeID := rest[:idx]
+			clientID := rest[idx+len("/authz/revoke/"):]
+			if validRouteID(routeID) && clientID != "" && !strings.Contains(clientID, "/") {
+				s.serveKeyPublicationAuthzRevoke(w, tenant, keyID, routeID, clientID)
+				return
+			}
 		}
 		if idx := strings.Index(rest, "/authz/approve-direct/"); idx > 0 {
 			routeID := rest[:idx]
@@ -638,6 +652,132 @@ func (s *Server) serveKeyPublicationAuthzApprove(w http.ResponseWriter, r *http.
 		"client_id":      clientID,
 		"pairing_secret": secret,
 		"status":         "approved",
+	})
+}
+
+func (s *Server) serveKeyPublicationAuthzRegister(w http.ResponseWriter, r *http.Request, tenant, keyID, routeID string) {
+	if s.authz == nil {
+		http.Error(w, "managed authz unavailable", http.StatusConflict)
+		return
+	}
+	var exists int
+	if err := s.db.SQL().QueryRow(
+		`SELECT 1 FROM mcp_publications WHERE route_id=? AND tenant_id=? AND owner_key_id=? AND revoked_at IS NULL`,
+		routeID, tenant, keyID,
+	).Scan(&exists); err != nil {
+		http.Error(w, "unknown route", http.StatusNotFound)
+		return
+	}
+	var req struct {
+		Name          string   `json:"name"`
+		RedirectURIs  []string `json:"redirect_uris"`
+		RefreshPolicy string   `json:"refresh_policy"`
+		Approve       bool     `json:"approve"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 32*1024)).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if len(req.RedirectURIs) == 0 {
+		http.Error(w, "redirect_uris required", http.StatusBadRequest)
+		return
+	}
+	for _, uri := range req.RedirectURIs {
+		if err := authz.ValidateRedirectURI(uri, req.RedirectURIs); err != nil {
+			http.Error(w, "invalid redirect_uri: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	if req.RefreshPolicy != "" && req.RefreshPolicy != "google_confidential" {
+		http.Error(w, "invalid refresh_policy", http.StatusBadRequest)
+		return
+	}
+	clientID, err := authz.MintClientID()
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	secret, err := authz.MintPairingSecret()
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	now := time.Now().UTC()
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		name = "Remote Managed Client"
+	}
+	c := authz.Client{
+		ID:               clientID,
+		Name:             name,
+		RedirectURIs:     req.RedirectURIs,
+		CreatedAt:        now,
+		Tenant:           tenant,
+		Route:            routeID,
+		ClientMode:       "confidential",
+		ClientSecretHash: authz.HashSecret(secret),
+		RefreshPolicy:    req.RefreshPolicy,
+	}
+	if err := s.authz.Store().TryRegisterClientWithPendingGrant(c, tenant, routeID); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	status := "pending"
+	if req.Approve {
+		if err := s.authz.Store().ApproveGrantDirect(clientID, tenant, routeID); err != nil {
+			_ = s.authz.Store().RevokeClient(clientID)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		status = "approved"
+	}
+	s.db.AuditKey("agent", tenant, keyID, "", "authz-register", "ok", "client "+clientID+" route "+routeID+" status "+status)
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"route_id":       routeID,
+		"tenant_id":      tenant,
+		"client_id":      clientID,
+		"client_secret":  secret,
+		"refresh_policy": req.RefreshPolicy,
+		"status":         status,
+	})
+}
+
+func (s *Server) serveKeyPublicationAuthzRevoke(w http.ResponseWriter, tenant, keyID, routeID, clientID string) {
+	if s.authz == nil {
+		http.Error(w, "managed authz unavailable", http.StatusConflict)
+		return
+	}
+	var exists int
+	if err := s.db.SQL().QueryRow(
+		`SELECT 1 FROM mcp_publications WHERE route_id=? AND tenant_id=? AND owner_key_id=? AND revoked_at IS NULL`,
+		routeID, tenant, keyID,
+	).Scan(&exists); err != nil {
+		http.Error(w, "unknown route", http.StatusNotFound)
+		return
+	}
+	c, err := s.authz.Store().GetClient(clientID)
+	if err != nil || c == nil || c.Tenant != tenant || c.Route != routeID {
+		http.Error(w, "unknown client", http.StatusNotFound)
+		return
+	}
+	if err := s.authz.Store().RevokeOpaqueRefreshForClient(clientID); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if err := s.authz.Store().RevokeGrant(clientID, tenant, routeID); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if err := s.authz.Store().RevokeClient(clientID); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	s.db.AuditKey("agent", tenant, keyID, "", "authz-revoke", "ok", "client "+clientID+" route "+routeID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"route_id":  routeID,
+		"tenant_id": tenant,
+		"client_id": clientID,
+		"status":    "revoked",
 	})
 }
 

@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/yamux"
@@ -393,7 +394,11 @@ func (rn *Runner) serveLocalHTTP(ctx context.Context, stream net.Conn, head prot
 	for k, vs := range resp.Trailer {
 		trailers[k] = strings.Join(vs, ", ")
 	}
-	endRaw, _ := protocol.MarshalJSON(protocol.EndFrame{Type: "response_end", Trailers: trailers})
+	endRaw, _ := protocol.MarshalJSON(protocol.EndFrame{
+		Type:           "response_end",
+		Trailers:       trailers,
+		RequestIgnored: sr.closedByTransport.Load() && !sr.eofReached.Load(),
+	})
 	_ = protocol.WriteFrame(stream, protocol.FResponseEnd, endRaw)
 }
 
@@ -401,9 +406,16 @@ func (rn *Runner) serveLocalHTTP(ctx context.Context, stream net.Conn, head prot
 // frames until REQUEST_END (bounded by the relay's 64 MiB cap, E05).
 // Any frame error (ABORT, CLOSE, transport failure) ends the body (E06).
 type streamReader struct {
-	stream net.Conn
-	buf    []byte
-	done   bool
+	stream            net.Conn
+	buf               []byte
+	done              bool
+	eofReached        atomic.Bool
+	closedByTransport atomic.Bool
+}
+
+func (sr *streamReader) Close() error {
+	sr.closedByTransport.Store(true)
+	return nil
 }
 
 func (sr *streamReader) Read(p []byte) (int, error) {
@@ -426,6 +438,7 @@ func (sr *streamReader) Read(p []byte) (int, error) {
 			var end protocol.EndFrame
 			_ = json.Unmarshal(data, &end)
 			sr.done = true
+			sr.eofReached.Store(true)
 			return 0, io.EOF
 		case protocol.FAbort, protocol.FClose:
 			return 0, fmt.Errorf("stream aborted by relay")
