@@ -358,38 +358,34 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 		}
 	}
 
-	// Two-identity cutover for --update: revoke old client only after new candidate is verified.
+	// Crash-atomic two-identity cutover for --update:
+	// 1. Durably persist PREPARED with CandidateClientID before revoking anything.
+	// 2. Durably commit replacement ClientID before revoking oldID.
+	// 3. Revoke oldID and verify RevokedAt != nil; record CUTOVER_INCOMPLETE on failure.
 	var revokedIDs []string
+	var oldID string
 	if existing != nil {
 		revokedIDs = append(revokedIDs, existing.RevokedClientIDs...)
 		if existing.ClientID != "" && existing.ClientID != clientID {
-			oldID := existing.ClientID
-			rErr := st.RevokeOpaqueRefreshForClient(oldID)
-			if rErr == nil {
-				rErr = st.RevokeGrant(oldID, tenant, entry.RouteID)
-			}
-			if rErr == nil {
-				rErr = st.RevokeClient(oldID)
-			}
-			cOld, gOldErr := st.GetClient(oldID)
-			if rErr != nil || gOldErr != nil || cOld.RevokedAt == nil {
-				if hasRec {
-					_, _ = svcStore.UpdateCAS(serviceName, rec.Revision, func(r *config.ServiceRecord) error {
-						if r.ProviderBindings == nil {
-							r.ProviderBindings = map[string]config.ProviderBinding{}
-						}
-						b := r.ProviderBindings["google"]
-						b.CandidateClientID = clientID
-						b.Status = "CUTOVER_INCOMPLETE"
-						b.NextAction = fmt.Sprintf("old client %s revocation incomplete; run `ocliv authz revoke --data %s --tenant %s --route %s --client %s`", oldID, dataDir, tenant, entry.RouteID, oldID)
-						r.ProviderBindings["google"] = b
-						return nil
-					})
+			oldID = existing.ClientID
+			if hasRec {
+				updatedPrep, prepErr := svcStore.UpdateCAS(serviceName, rec.Revision, func(r *config.ServiceRecord) error {
+					if r.ProviderBindings == nil {
+						r.ProviderBindings = map[string]config.ProviderBinding{}
+					}
+					b := r.ProviderBindings["google"]
+					b.CandidateClientID = clientID
+					b.Status = "PREPARED"
+					b.NextAction = fmt.Sprintf("cutover prepared for candidate %s; completing replacement of %s", clientID, oldID)
+					r.ProviderBindings["google"] = b
+					return nil
+				})
+				if prepErr != nil {
+					fmt.Fprintf(os.Stderr, "connect google: persist PREPARED cutover: %v\n", prepErr)
+					return apperr.ExitInternal
 				}
-				fmt.Fprintf(os.Stderr, "connect google: cutover incomplete (failed to revoke previous client %s)\n", oldID)
-				return apperr.ExitInternal
+				rec = updatedPrep
 			}
-			revokedIDs = append(revokedIDs, oldID)
 		}
 	}
 
@@ -409,16 +405,18 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 		UpdatedAt:        now.Format(time.RFC3339),
 	}
 	if hasRec {
-		if _, err := svcStore.UpdateCAS(serviceName, rec.Revision, func(r *config.ServiceRecord) error {
+		updatedCommit, err := svcStore.UpdateCAS(serviceName, rec.Revision, func(r *config.ServiceRecord) error {
 			if r.ProviderBindings == nil {
 				r.ProviderBindings = map[string]config.ProviderBinding{}
 			}
 			r.ProviderBindings["google"] = binding
 			return nil
-		}); err != nil {
+		})
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "connect google: save service binding: %v\n", err)
 			return apperr.ExitInternal
 		}
+		rec = updatedCommit
 	} else {
 		if err := svcStore.Put(config.ServiceRecord{
 			Name:             serviceName,
@@ -432,6 +430,43 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 		}); err != nil {
 			fmt.Fprintf(os.Stderr, "connect google: save service record: %v\n", err)
 			return apperr.ExitInternal
+		}
+	}
+
+	if oldID != "" {
+		rErr := st.RevokeOpaqueRefreshForClient(oldID)
+		if rErr == nil {
+			rErr = st.RevokeGrant(oldID, tenant, entry.RouteID)
+		}
+		if rErr == nil {
+			rErr = st.RevokeClient(oldID)
+		}
+		cOld, gOldErr := st.GetClient(oldID)
+		if rErr != nil || gOldErr != nil || cOld.RevokedAt == nil {
+			if hasRec {
+				if _, uerr := svcStore.UpdateCAS(serviceName, rec.Revision, func(r *config.ServiceRecord) error {
+					b := r.ProviderBindings["google"]
+					b.Status = "CUTOVER_INCOMPLETE"
+					b.NextAction = fmt.Sprintf("old client %s revocation incomplete; run `ocliv authz revoke --data %s --tenant %s --route %s --client %s`", oldID, dataDir, tenant, entry.RouteID, oldID)
+					r.ProviderBindings["google"] = b
+					return nil
+				}); uerr != nil {
+					fmt.Fprintf(os.Stderr, "connect google: cutover incomplete AND failed to persist state: %v\n", uerr)
+				}
+			}
+			fmt.Fprintf(os.Stderr, "connect google: cutover incomplete (failed to revoke previous client %s)\n", oldID)
+			return apperr.ExitInternal
+		}
+		if hasRec {
+			if _, uerr := svcStore.UpdateCAS(serviceName, rec.Revision, func(r *config.ServiceRecord) error {
+				b := r.ProviderBindings["google"]
+				b.RevokedClientIDs = append(b.RevokedClientIDs, oldID)
+				r.ProviderBindings["google"] = b
+				return nil
+			}); uerr != nil {
+				fmt.Fprintf(os.Stderr, "connect google: old client revoked, but failed to record revoked_client_ids: %v\n", uerr)
+				return apperr.ExitInternal
+			}
 		}
 	}
 

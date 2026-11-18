@@ -66,7 +66,7 @@ func inspectServiceStatus(rec config.ServiceRecord, k *identity.KeyPair, keyID s
 		RelayState:         "unknown",
 		PublicationID:      rec.PublicationID,
 		PublicURL:          rec.PublicURL,
-		PublicVerified:     rec.PublicVerified,
+		PublicVerified:     false,
 		AuthProfile:        rec.Auth,
 		LastVerifiedAt:     rec.LastVerifiedAt,
 		LastFailure:        rec.LastFailure,
@@ -252,11 +252,12 @@ func inspectServiceStatus(rec config.ServiceRecord, k *identity.KeyPair, keyID s
 		code, err := ops.probePub(rep.PublicURL, 3*time.Second)
 		if err == nil && (code == http.StatusUnauthorized || code == http.StatusOK) {
 			rep.PublicTransport = true
-			rep.VerificationLevel = "PUBLIC_TRANSPORT_READY"
+			rep.VerificationLevel = "TRANSPORT_READY"
 			if validEvidence(rec.VerificationEvidence, rep.PublicationID, rep.PublicURL, rep.StateGeneration) {
 				rep.VerificationEvidence = rec.VerificationEvidence
-				if rec.VerificationEvidence.Stage != "" {
-					rep.VerificationLevel = rec.VerificationEvidence.Stage
+				rep.VerificationLevel = rec.VerificationEvidence.Stage
+				if rec.VerificationEvidence.Stage == "MCP_AUTHENTICATED" || rec.VerificationEvidence.Stage == "EXTERNAL_CLIENT_VERIFIED" {
+					rep.PublicVerified = true
 				}
 			}
 			rep.IngressReady = true
@@ -289,7 +290,12 @@ func inspectServiceStatus(rec config.ServiceRecord, k *identity.KeyPair, keyID s
 }
 
 func validEvidence(ev *config.VerificationEvidence, routeID, publicURL string, gen int64) bool {
-	if ev == nil || ev.RouteID == "" || ev.PublicURL == "" || ev.Stage == "" {
+	if ev == nil || ev.RouteID == "" || ev.PublicURL == "" {
+		return false
+	}
+	switch ev.Stage {
+	case "TRANSPORT_READY", "OAUTH_READY", "MCP_AUTHENTICATED", "EXTERNAL_CLIENT_VERIFIED":
+	default:
 		return false
 	}
 	if ev.RouteID != routeID || ev.PublicURL != publicURL {
@@ -301,11 +307,16 @@ func validEvidence(ev *config.VerificationEvidence, routeID, publicURL string, g
 	if ev.VerifiedAt == "" || ev.ExpiresAt == "" {
 		return false
 	}
-	if _, err := time.Parse(time.RFC3339, ev.VerifiedAt); err != nil {
+	verAt, err := time.Parse(time.RFC3339, ev.VerifiedAt)
+	if err != nil {
+		return false
+	}
+	now := time.Now()
+	if verAt.After(now.Add(30 * time.Second)) {
 		return false
 	}
 	exp, err := time.Parse(time.RFC3339, ev.ExpiresAt)
-	if err != nil || time.Now().After(exp) {
+	if err != nil || now.After(exp) || exp.Before(verAt) {
 		return false
 	}
 	return true

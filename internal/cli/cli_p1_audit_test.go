@@ -110,7 +110,12 @@ func TestRemoveFailsClosedOnMissingRemoteOwnershipAndForgetLocalWorks(t *testing
 	}
 	kp, _ := identity.Generate()
 	ops := serviceOps{
-		systemctl: func(_ ...string) (string, error) { return "inactive", nil },
+		systemctl: func(args ...string) (string, error) {
+			if len(args) > 0 && args[0] == "is-enabled" {
+				return "disabled", nil
+			}
+			return "inactive", nil
+		},
 		mgmtCall: func(_ string, _ *identity.KeyPair, _, method, path string) (int, []byte, error) {
 			if method == http.MethodGet && path == "/v1/agent/mcp-routes" {
 				return 200, []byte(`{"publications":[]}`), nil
@@ -221,7 +226,7 @@ func TestValidEvidenceFailsClosed(t *testing.T) {
 	base := config.VerificationEvidence{
 		RouteID:         "r1",
 		PublicURL:       "https://relay.example/r/r1/mcp",
-		Stage:           "TOOLS_VERIFIED",
+		Stage:           "MCP_AUTHENTICATED",
 		StateGeneration: 3,
 		VerifiedAt:      now.Add(-time.Minute).Format(time.RFC3339),
 		ExpiresAt:       now.Add(time.Hour).Format(time.RFC3339),
@@ -233,6 +238,16 @@ func TestValidEvidenceFailsClosed(t *testing.T) {
 	noStage.Stage = ""
 	if validEvidence(&noStage, "r1", "https://relay.example/r/r1/mcp", 3) {
 		t.Fatal("expected missing Stage to fail")
+	}
+	badStage := base
+	badStage.Stage = "INVENTED_STAGE"
+	if validEvidence(&badStage, "r1", "https://relay.example/r/r1/mcp", 3) {
+		t.Fatal("expected untrusted Stage to fail")
+	}
+	futureVer := base
+	futureVer.VerifiedAt = now.Add(2 * time.Minute).Format(time.RFC3339)
+	if validEvidence(&futureVer, "r1", "https://relay.example/r/r1/mcp", 3) {
+		t.Fatal("expected future-dated VerifiedAt to fail")
 	}
 	zeroGen := base
 	zeroGen.StateGeneration = 0
@@ -339,5 +354,74 @@ func TestStopAndVerifyUnitRejectsUnreachableAndDisableFailure(t *testing.T) {
 	}
 	if _, ok, _ := st.Get("unreach-svc"); !ok {
 		t.Fatal("service record was deleted despite disable failure")
+	}
+}
+
+func TestInspectUnitDoesNotTreatErrorsAsInactiveOrDisabled(t *testing.T) {
+	ops := serviceOps{
+		systemctl: func(args ...string) (string, error) {
+			if len(args) > 0 && args[0] == "is-active" {
+				return "garbage-output", errors.New("permission denied")
+			}
+			if len(args) > 0 && args[0] == "is-enabled" {
+				return "timeout", errors.New("dbus timeout")
+			}
+			return "loaded", nil
+		},
+	}
+	info := inspectUnit("ocliv-publisher@test.service", ops)
+	if info.ActiveState != "unknown" {
+		t.Fatalf("ActiveState=%q, want unknown on unexpected error", info.ActiveState)
+	}
+	if info.EnabledKnown {
+		t.Fatal("expected EnabledKnown=false on is-enabled failure")
+	}
+	ev := stopAndVerifyUnit("ocliv-publisher@test.service", true, ops)
+	if ev.StoppedNow || ev.DisabledForReboot {
+		t.Fatalf("expected StoppedNow=false and DisabledForReboot=false on uncertain inspection: %+v", ev)
+	}
+}
+
+func TestRunBackendRefusesDisabledAndConfigured(t *testing.T) {
+	cfgDir := t.TempDir()
+	t.Setenv("OCLIV_CONFIG_DIR", cfgDir)
+	st := config.OpenServiceStore(cfgDir)
+	for _, ds := range []string{config.DesiredConfigured, config.DesiredDisabled} {
+		_ = st.Put(config.ServiceRecord{
+			Name: "be-" + ds, Type: "mcp", BackendMode: config.BackendManaged,
+			BackendExec: "/bin/true", LocalURL: "http://127.0.0.1:8080/mcp",
+			Profile: "default", DesiredState: ds,
+		})
+		if code := cmdServiceRunBackend([]string{"--name", "be-" + ds, "--profile", "default"}); code == 0 {
+			t.Fatalf("expected non-zero refusal for backend desired_state=%q", ds)
+		}
+	}
+}
+
+func TestEmergencyDisableSucceedsRemotelyWhenSupervisorBroken(t *testing.T) {
+	cfgDir := t.TempDir()
+	t.Setenv("OCLIV_CONFIG_DIR", cfgDir)
+	seedEnrolledProfileForTest(t, "https://relay.example")
+	st, _ := openServicesForProfile("default")
+	_ = st.Put(config.ServiceRecord{
+		Name: "emerg-svc", Type: "mcp", LocalURL: "http://127.0.0.1:8080/mcp",
+		Profile: "default", RelayURL: "https://relay.example",
+		PublicationID: "pub-emerg", PublicURL: "https://relay.example/r/pub-emerg/mcp",
+		DesiredState: config.DesiredEnabled, SystemdUnit: "ocliv-publisher@emerg.service",
+	})
+	ops := serviceOps{
+		mgmtCall: func(_ string, _ *identity.KeyPair, _, method, path string) (int, []byte, error) {
+			if method == http.MethodPost && strings.HasSuffix(path, "/disable") {
+				return 200, []byte(`{"desired_enabled":false,"state_generation":4,"session_live":false}`), nil
+			}
+			return 200, nil, nil
+		},
+		probePub: func(_ string, _ time.Duration) (int, error) { return http.StatusNotFound, nil },
+		systemctl: func(_ ...string) (string, error) {
+			return "Failed to connect to bus", errors.New("exit 1")
+		},
+	}
+	if code := cmdServiceDisable([]string{"emerg-svc"}, ops); code != 0 {
+		t.Fatalf("emergency disable exit=%d, want 0 when remote disable confirmed despite broken local supervisor", code)
 	}
 }

@@ -44,12 +44,14 @@ const (
 )
 
 type serviceStopResult struct {
-	Name          string `json:"name"`
-	Stopped       bool   `json:"stopped"`
-	State         string `json:"state"`
-	PublicationID string `json:"publication_id,omitempty"`
-	RetainedURL   string `json:"retained_url,omitempty"`
-	Detail        string `json:"detail,omitempty"`
+	Name           string `json:"name"`
+	Stopped        bool   `json:"stopped"`
+	RemoteDisabled bool   `json:"remote_disabled"`
+	LocalStopped   bool   `json:"local_stopped"`
+	State          string `json:"state"`
+	PublicationID  string `json:"publication_id,omitempty"`
+	RetainedURL    string `json:"retained_url,omitempty"`
+	Detail         string `json:"detail,omitempty"`
 }
 
 // serviceOps isolates external interactions (systemd --user, relay mgmt, probes)
@@ -123,6 +125,8 @@ func cmdService(argv []string) int {
 		return cmdServicePending(argv[1:], ops)
 	case "approve":
 		return cmdServiceApprove(argv[1:], ops)
+	case "reconcile":
+		return cmdServiceReconcile(argv[1:], ops)
 	case "run-publisher":
 		return cmdServiceRunPublisher(argv[1:])
 	case "run-backend":
@@ -685,7 +689,58 @@ func cmdServiceRunPublisher(argv []string) int {
 		fmt.Fprintf(os.Stderr, "service %q has neither stdio command nor local URL\n", name)
 		return apperr.ExitCLIValidation
 	}
+	if k, keyID, kerr := loadKeyForProfile(profile); kerr == nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			_ = runServiceReconcilerLoop(ctx, store, name, k, keyID, defaultServiceOps(), 30*time.Second)
+		}()
+	}
 	return startServiceForeground(rec)
+}
+
+func cmdServiceReconcile(argv []string, ops serviceOps) int {
+	if len(argv) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: ocliv service reconcile NAME [--json]")
+		return apperr.ExitCLIValidation
+	}
+	name := argv[0]
+	jsonOut := false
+	for _, a := range argv[1:] {
+		if a == "--json" {
+			jsonOut = true
+		} else {
+			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
+			return apperr.ExitCLIValidation
+		}
+	}
+	store, err := openServices()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return apperr.ExitInternal
+	}
+	rec, ok, err := store.Get(name)
+	if err != nil || !ok {
+		fmt.Fprintf(os.Stderr, "unknown service %q\n", name)
+		return apperr.ExitCLIValidation
+	}
+	k, keyID, err := loadKeyForProfile(rec.Profile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "not enrolled in profile %q: run `ocliv login` first\n", rec.Profile)
+		return apperr.ExitAuth
+	}
+	rep, rerr := reconcileServiceOnce(store, name, k, keyID, ops, time.Now())
+	if jsonOut {
+		b, _ := json.MarshalIndent(rep, "", "  ")
+		fmt.Println(string(b))
+	} else {
+		fmt.Printf("service=%s state=%s health=%s\n", rep.Name, rep.State, rep.Health)
+	}
+	if rerr != nil {
+		fmt.Fprintln(os.Stderr, rerr)
+		return apperr.ExitInternal
+	}
+	return apperr.ExitOK
 }
 
 // cmdServiceRunBackend executes a managed backend with exact argument
@@ -727,6 +782,10 @@ func cmdServiceRunBackend(argv []string) int {
 	if rec.BackendMode != config.BackendManaged || rec.BackendExec == "" {
 		fmt.Fprintf(os.Stderr, "service %q is not a managed backend\n", name)
 		return apperr.ExitCLIValidation
+	}
+	if rec.DesiredState != config.DesiredEnabled {
+		fmt.Fprintf(os.Stderr, "service %q desired state is %q (must be enabled); refusing to start managed backend\n", name, rec.DesiredState)
+		return apperr.ExitAuth
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -792,7 +851,46 @@ func cmdServiceStop(argv []string, ops serviceOps) int {
 // cmdServiceDisable is the emergency remote-first disable path that revokes
 // public forwarding without depending on a functioning local supervisor.
 func cmdServiceDisable(argv []string, ops serviceOps) int {
-	return cmdServiceStop(argv, ops)
+	if len(argv) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: ocliv service disable NAME [--json]")
+		return apperr.ExitCLIValidation
+	}
+	name := argv[0]
+	jsonOut := false
+	for _, a := range argv[1:] {
+		if a == "--json" {
+			jsonOut = true
+		} else {
+			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
+			return apperr.ExitCLIValidation
+		}
+	}
+	store, err := openServices()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return apperr.ExitInternal
+	}
+	rec, ok, err := store.Get(name)
+	if err != nil || !ok {
+		fmt.Fprintf(os.Stderr, "unknown service %q\n", name)
+		return apperr.ExitCLIValidation
+	}
+	k, keyID, err := loadKeyForProfile(rec.Profile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "not enrolled in profile %q: run `ocliv login` first\n", rec.Profile)
+		return apperr.ExitAuth
+	}
+	res := stopServiceAuthoritatively(store, rec, k, keyID, ops)
+	if jsonOut {
+		b, _ := json.MarshalIndent(res, "", "  ")
+		fmt.Println(string(b))
+	} else {
+		fmt.Printf("service=%s remote_disabled=%v local_stopped=%v state=%s detail=%s\n", res.Name, res.RemoteDisabled, res.LocalStopped, res.State, res.Detail)
+	}
+	if !res.RemoteDisabled {
+		return apperr.ExitRelayTLS
+	}
+	return apperr.ExitOK
 }
 
 func cmdServiceRestart(argv []string, ops serviceOps) int {

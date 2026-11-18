@@ -247,39 +247,59 @@ type UnitInspection struct {
 	LoadState        string `json:"load_state,omitempty"`
 	ActiveState      string `json:"active_state"`
 	Enabled          bool   `json:"enabled,omitempty"`
+	EnabledKnown     bool   `json:"enabled_known"`
+	EnabledState     string `json:"enabled_state,omitempty"`
 	Error            string `json:"error,omitempty"`
 }
 
 func inspectUnit(unit string, ops serviceOps) UnitInspection {
 	if unit == "" {
-		return UnitInspection{ManagerReachable: true, ActiveState: "not-configured"}
+		return UnitInspection{ManagerReachable: true, ActiveState: "not-configured", EnabledKnown: true, EnabledState: "not-configured"}
 	}
 	loadState, lerr := ops.systemctl("show", "-p", "LoadState", "--value", unit)
 	ls := strings.TrimSpace(loadState)
 	if lerr != nil && (strings.Contains(ls, "Failed to connect") || strings.Contains(lerr.Error(), "Failed to connect")) {
-		return UnitInspection{ManagerReachable: false, ActiveState: "manager-unreachable", Error: ls}
+		return UnitInspection{ManagerReachable: false, ActiveState: "manager-unreachable", EnabledState: "enabled-unknown", Error: ls}
 	}
 	if lerr == nil && ls == "not-found" {
-		return UnitInspection{ManagerReachable: true, LoadState: "not-found", ActiveState: "not-found"}
+		return UnitInspection{ManagerReachable: true, LoadState: "not-found", ActiveState: "not-found", EnabledKnown: true, EnabledState: "not-found"}
 	}
 	enabled := false
-	if en, eerr := ops.systemctl("is-enabled", unit); eerr == nil {
-		en = strings.TrimSpace(en)
-		enabled = en == "enabled" || en == "enabled-runtime" || en == "static"
+	enabledKnown := false
+	enabledState := "enabled-unknown"
+	enOut, eerr := ops.systemctl("is-enabled", unit)
+	en := strings.TrimSpace(enOut)
+	if eerr != nil && (strings.Contains(en, "Failed to connect") || strings.Contains(eerr.Error(), "Failed to connect")) {
+		return UnitInspection{ManagerReachable: false, LoadState: ls, ActiveState: "manager-unreachable", EnabledState: "enabled-unknown", Error: en}
+	}
+	switch en {
+	case "enabled", "enabled-runtime", "static", "indirect":
+		enabled = true
+		enabledKnown = true
+		enabledState = en
+	case "disabled", "masked", "not-found":
+		enabled = false
+		enabledKnown = true
+		enabledState = en
+	default:
+		if eerr == nil && en != "" {
+			enabledState = en
+		}
 	}
 	act, aerr := ops.systemctl("is-active", unit)
 	act = strings.TrimSpace(act)
 	if aerr != nil && (strings.Contains(act, "Failed to connect") || strings.Contains(aerr.Error(), "Failed to connect")) {
-		return UnitInspection{ManagerReachable: false, LoadState: ls, ActiveState: "manager-unreachable", Enabled: enabled, Error: act}
+		return UnitInspection{ManagerReachable: false, LoadState: ls, ActiveState: "manager-unreachable", Enabled: enabled, EnabledKnown: enabledKnown, EnabledState: enabledState, Error: act}
 	}
 	switch act {
 	case "active", "activating", "deactivating", "reloading", "inactive", "failed", "not-found":
-		return UnitInspection{ManagerReachable: true, LoadState: ls, ActiveState: act, Enabled: enabled}
+		return UnitInspection{ManagerReachable: true, LoadState: ls, ActiveState: act, Enabled: enabled, EnabledKnown: enabledKnown, EnabledState: enabledState}
 	}
+	errMsg := "unknown active state"
 	if aerr != nil {
-		return UnitInspection{ManagerReachable: true, LoadState: ls, ActiveState: "inactive", Enabled: enabled, Error: aerr.Error()}
+		errMsg = aerr.Error()
 	}
-	return UnitInspection{ManagerReachable: true, LoadState: ls, ActiveState: "unknown", Enabled: enabled}
+	return UnitInspection{ManagerReachable: true, LoadState: ls, ActiveState: "unknown", Enabled: enabled, EnabledKnown: enabledKnown, EnabledState: enabledState, Error: errMsg}
 }
 
 // queryUnitState distinguishes "not-found", "active", "activating", "failed",
@@ -336,7 +356,7 @@ func stopAndVerifyUnit(unit string, disable bool, ops serviceOps) UnitStopEviden
 		}
 	}
 	if !disable {
-		ev.DisabledForReboot = !after.Enabled
+		ev.DisabledForReboot = after.EnabledKnown && !after.Enabled
 		return ev
 	}
 	if out, derr := ops.systemctl("disable", unit); derr != nil {
@@ -352,10 +372,10 @@ func stopAndVerifyUnit(unit string, disable bool, ops serviceOps) UnitStopEviden
 		return ev
 	}
 	afterDis := inspectUnit(unit, ops)
-	if !afterDis.ManagerReachable || afterDis.Enabled {
+	if !afterDis.ManagerReachable || !afterDis.EnabledKnown || afterDis.Enabled {
 		ev.DisabledForReboot = false
 		if ev.Error == "" {
-			ev.Error = fmt.Sprintf("STOP_UNCONFIRMED: unit %s still enabled after disable", unit)
+			ev.Error = fmt.Sprintf("STOP_UNCONFIRMED: unit %s enabled state after disable is %s", unit, afterDis.EnabledState)
 		}
 		return ev
 	}

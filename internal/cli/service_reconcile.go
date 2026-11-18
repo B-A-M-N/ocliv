@@ -1,11 +1,13 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"ocliv/internal/config"
@@ -180,6 +182,9 @@ func stopServiceAuthoritatively(store *config.ServiceStore, rec config.ServiceRe
 		}
 	}
 
+	res.RemoteDisabled = remoteErr == ""
+	res.LocalStopped = localStopped
+
 	if remoteErr != "" {
 		res.State = "STOP_UNCONFIRMED"
 		if localStopped {
@@ -297,7 +302,7 @@ func reconcileServiceOnce(store *config.ServiceStore, name string, k *identity.K
 	}
 	rep := inspectServiceStatus(rec, k, keyID, ops)
 	if rec.DesiredState != config.DesiredEnabled {
-		_, _ = store.UpdateCAS(rec.Name, rec.Revision, func(r *config.ServiceRecord) error {
+		if _, uerr := store.UpdateCAS(rec.Name, rec.Revision, func(r *config.ServiceRecord) error {
 			r.Reconcile = &config.ReconcileStatus{
 				ObservedGeneration: rep.StateGeneration,
 				LastTransitionAt:   now.UTC().Format(time.RFC3339),
@@ -306,7 +311,9 @@ func reconcileServiceOnce(store *config.ServiceStore, name string, k *identity.K
 				Terminal:           true,
 			}
 			return nil
-		})
+		}); uerr != nil {
+			return rep, uerr
+		}
 		return rep, nil
 	}
 
@@ -314,7 +321,7 @@ func reconcileServiceOnce(store *config.ServiceStore, name string, k *identity.K
 	if rep.State == ServiceStateRevoked || rep.RelayState == "REVOKED" ||
 		strings.Contains(strings.ToLower(rep.LastFailure), "ownership") ||
 		strings.Contains(strings.ToLower(rep.LastFailure), "unauthorized") {
-		_, _ = store.UpdateCAS(rec.Name, rec.Revision, func(r *config.ServiceRecord) error {
+		if _, uerr := store.UpdateCAS(rec.Name, rec.Revision, func(r *config.ServiceRecord) error {
 			r.Reconcile = &config.ReconcileStatus{
 				ObservedGeneration: rep.StateGeneration,
 				LastTransitionAt:   now.UTC().Format(time.RFC3339),
@@ -324,12 +331,14 @@ func reconcileServiceOnce(store *config.ServiceStore, name string, k *identity.K
 				Terminal:           true,
 			}
 			return nil
-		})
+		}); uerr != nil {
+			return rep, uerr
+		}
 		return rep, nil
 	}
 
 	if rep.State == ServiceStateServing {
-		_, _ = store.UpdateCAS(rec.Name, rec.Revision, func(r *config.ServiceRecord) error {
+		if _, uerr := store.UpdateCAS(rec.Name, rec.Revision, func(r *config.ServiceRecord) error {
 			if rep.PublicationID != "" && r.PublicationID == "" {
 				r.PublicationID = rep.PublicationID
 			}
@@ -344,7 +353,9 @@ func reconcileServiceOnce(store *config.ServiceStore, name string, k *identity.K
 				Terminal:           false,
 			}
 			return nil
-		})
+		}); uerr != nil {
+			return rep, uerr
+		}
 		return rep, nil
 	}
 
@@ -371,7 +382,7 @@ func reconcileServiceOnce(store *config.ServiceStore, name string, k *identity.K
 		}
 	}
 	nextRetry := now.Add(reconcileBackoff(attempt, now.UnixNano()))
-	_, _ = store.UpdateCAS(rec.Name, rec.Revision, func(r *config.ServiceRecord) error {
+	if _, uerr := store.UpdateCAS(rec.Name, rec.Revision, func(r *config.ServiceRecord) error {
 		r.Reconcile = &config.ReconcileStatus{
 			ObservedGeneration: rep.StateGeneration,
 			Attempt:            attempt + 1,
@@ -383,6 +394,57 @@ func reconcileServiceOnce(store *config.ServiceStore, name string, k *identity.K
 			Terminal:           false,
 		}
 		return nil
-	})
+	}); uerr != nil {
+		return rep, uerr
+	}
 	return rep, nil
+}
+
+var activeReconcilers struct {
+	mu sync.Mutex
+	m  map[string]bool
+}
+
+// runServiceReconcilerLoop runs an initial reconciliation pass and periodic
+// bounded passes until ctx is canceled, guaranteeing at most one active
+// reconciler per service name in this process.
+func runServiceReconcilerLoop(ctx context.Context, store *config.ServiceStore, name string, k *identity.KeyPair, keyID string, ops serviceOps, interval time.Duration) error {
+	if interval <= 0 {
+		interval = 15 * time.Second
+	}
+	activeReconcilers.mu.Lock()
+	if activeReconcilers.m == nil {
+		activeReconcilers.m = map[string]bool{}
+	}
+	if activeReconcilers.m[name] {
+		activeReconcilers.mu.Unlock()
+		return fmt.Errorf("reconciler already active for service %q", name)
+	}
+	activeReconcilers.m[name] = true
+	activeReconcilers.mu.Unlock()
+	defer func() {
+		activeReconcilers.mu.Lock()
+		delete(activeReconcilers.m, name)
+		activeReconcilers.mu.Unlock()
+	}()
+
+	runPass := func() {
+		rep, err := reconcileServiceOnce(store, name, k, keyID, ops, time.Now())
+		if err != nil && strings.Contains(err.Error(), "concurrent modification") {
+			// Reload freshly on CAS conflict.
+			rep, _ = reconcileServiceOnce(store, name, k, keyID, ops, time.Now())
+		}
+		_ = rep
+	}
+	runPass()
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-tick.C:
+			runPass()
+		}
+	}
 }
