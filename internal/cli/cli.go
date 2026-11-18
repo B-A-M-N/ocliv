@@ -139,6 +139,7 @@ func usage(code int) int {
 	fmt.Print(`Ocliv — secure instant HTTPS hosting.
 
 Everyday:
+  ocliv host PORT [--name N]  persistently host a local MCP server (systemd + reboot-safe)
   ocliv PORT                  share localhost:PORT over protected HTTPS
   ocliv mcp PORT [--name N]   publish the MCP server on localhost:PORT (OAuth enforced)
   ocliv status [--json]       tunnel state with the next action when unhealthy

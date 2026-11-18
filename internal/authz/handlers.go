@@ -113,6 +113,8 @@ type consentPageData struct {
 	Challenge     string
 	ClientID      string
 	ClientName    string
+	Tenant        string
+	RouteID       string
 	RedirectURI   string
 	CodeChallenge string
 	State         string
@@ -136,7 +138,9 @@ var consentPageTemplate = template.Must(template.New("consent").Parse(`<!DOCTYPE
 <p>Client <code>{{.ClientID}}</code> is requesting access to this MCP route.</p>
 <p>Approve only if you intend to grant it. The pairing credential is the
 operator's approval; it is single-use and expires.</p>
-<p>Direct CLI approval: <code>ocliv service approve &lt;service&gt; --client {{.ClientID}} --direct</code></p>
+<details><summary>Self-hosting on your own relay? Approve via CLI:</summary>
+<pre>ocliv authz approve --data /var/lib/ocliv --tenant {{.Tenant}} --route {{.RouteID}} --client {{.ClientID}} --direct</pre>
+</details>
 <form method="post" action="{{.ConsentURL}}">
 <input type="hidden" name="challenge" value="{{.Challenge}}">
 <input type="hidden" name="client_id" value="{{.ClientID}}">
@@ -567,6 +571,8 @@ func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 		Challenge:     challengeID,
 		ClientID:      clientID,
 		ClientName:    client.Name,
+		Tenant:        s.tenant(),
+		RouteID:       s.RouteID,
 		RedirectURI:   redirectURI,
 		CodeChallenge: challenge,
 		State:         state,

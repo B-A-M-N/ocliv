@@ -3,7 +3,9 @@ package cli
 
 import (
 	"os"
+	"os/user"
 	"path/filepath"
+	"strings"
 
 	"ocliv/internal/config"
 	"ocliv/internal/identity"
@@ -11,8 +13,25 @@ import (
 	"golang.org/x/term"
 )
 
-// agentFiles resolves key/config/lease paths.
+// agentFiles resolves key/config/lease paths. When invoked via sudo (euid == 0
+// with SUDO_USER set and no explicit OCLIV_CONFIG_DIR override), it resolves the
+// invoking user's ~/.config/ocliv so setup/enroll never strands credentials under /root.
 func agentFiles() (dir, keyPath, cfgPath string, err error) {
+	return agentFilesWithEuid(os.Geteuid())
+}
+
+func agentFilesWithEuid(euid int) (dir, keyPath, cfgPath string, err error) {
+	if euid == 0 && os.Getenv("OCLIV_CONFIG_DIR") == "" {
+		if su := strings.TrimSpace(os.Getenv("SUDO_USER")); su != "" && su != "root" {
+			if u, lerr := user.Lookup(su); lerr == nil && u.HomeDir != "" {
+				dir = filepath.Join(u.HomeDir, ".config", "ocliv")
+				if prof := config.ActiveProfile(); prof != "" && prof != "default" {
+					dir = filepath.Join(dir, "profiles", prof)
+				}
+				return dir, filepath.Join(dir, config.AgentKeyFile), filepath.Join(dir, config.ConfigFile), nil
+			}
+		}
+	}
 	dir, err = config.DataDir()
 	if err != nil {
 		return "", "", "", err

@@ -638,6 +638,19 @@ func TestSetupRejectsUnknownEdge(t *testing.T) {
 	}
 }
 
+func TestAgentFilesResolvesSudoUserHomeWhenRoot(t *testing.T) {
+	t.Setenv("OCLIV_CONFIG_DIR", "")
+	t.Setenv("OCLIV_PROFILE", "")
+	t.Setenv("SUDO_USER", "nobody")
+	dir, _, _, err := agentFilesWithEuid(0)
+	if err != nil {
+		t.Fatalf("agentFilesWithEuid: %v", err)
+	}
+	if strings.HasPrefix(dir, "/root") {
+		t.Fatalf("expected non-/root dir when SUDO_USER is set, got %q", dir)
+	}
+}
+
 // TestAutoEnrollRejectsDifferentRelay: an existing agent key bound to a
 // different relay must produce an explicit conflict (exit 4), never a silent
 // already-enrolled success, and the key must be preserved. Pre-fix, any
