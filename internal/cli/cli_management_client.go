@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/tls"
 	"encoding/base64"
@@ -43,15 +44,26 @@ func mgmtHTTPClient(timeout time.Duration) (*http.Client, error) {
 // one-time nonce the relay consumes; without a fresh nonce the relay
 // rejects the call as a potential replay (P1-07).
 func mgmtCall(relayURL string, k *identity.KeyPair, keyID, method, path string) (int, []byte, error) {
+	return mgmtCallBody(relayURL, k, keyID, method, path, nil)
+}
+
+func mgmtCallBody(relayURL string, k *identity.KeyPair, keyID, method, path string, reqBody []byte) (int, []byte, error) {
 	ts := time.Now().UTC()
 	nonce, err := agent.MgmtNonce()
 	if err != nil {
 		return 0, nil, fmt.Errorf("creating management nonce: %w", err)
 	}
 	sig := ed25519.Sign(k.Private(), agent.MgmtMessage(keyID, method, path, ts, nonce))
-	req, err := http.NewRequest(method, strings.TrimRight(relayURL, "/")+path, nil)
+	var bodyReader io.Reader
+	if len(reqBody) > 0 {
+		bodyReader = bytes.NewReader(reqBody)
+	}
+	req, err := http.NewRequest(method, strings.TrimRight(relayURL, "/")+path, bodyReader)
 	if err != nil {
 		return 0, nil, fmt.Errorf("building management request: %w", err)
+	}
+	if len(reqBody) > 0 {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("X-Ocliv-Key", keyID)
 	req.Header.Set("X-Ocliv-TS", ts.Format(time.RFC3339Nano))
