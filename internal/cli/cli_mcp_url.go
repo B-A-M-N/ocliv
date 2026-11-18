@@ -142,7 +142,8 @@ func resolveCatalogEntry(name, profile string, ops serviceOps) (catalogEntry, in
 	}
 	var matches []catalogEntry
 	for _, p := range inv.Publications {
-		if p.Name != name && (localRec == nil || localRec.PublicationID == "" || p.RouteID != localRec.PublicationID) {
+		exactID := p.RouteID == name || (localRec != nil && localRec.PublicationID != "" && p.RouteID == localRec.PublicationID)
+		if !exactID && p.Name != name {
 			continue
 		}
 		u := ""
