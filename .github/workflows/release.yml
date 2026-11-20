@@ -1,0 +1,39 @@
+name: Release Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Exact commit SHA to build (defaults to current ref)"
+        required: false
+        default: ""
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install Pinned Release Tools
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.8.0
+      - name: Build Clean Detached-Worktree Release Bundle
+        run: |
+          TARGET_SHA="${{ github.event.inputs.sha }}"
+          if [ -z "$TARGET_SHA" ]; then
+            TARGET_SHA="${{ github.sha }}"
+          fi
+          ./scripts/release/build-release.sh "$TARGET_SHA"
+      - name: Upload Release Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocliv-release-${{ github.sha }}
+          path: dist/
