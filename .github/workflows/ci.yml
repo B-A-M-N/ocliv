@@ -13,6 +13,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Repository Hygiene
+        run: ./scripts/check-repo-hygiene.sh
       - name: Formatting
         run: |
           unformatted=$(gofmt -l cmd internal packaging tests)
@@ -34,7 +36,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: packaging/mcp/skybridge
+        working-directory: integrations/skybridge
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

@@ -37,8 +37,9 @@ def load(path):
         fail("%s: invalid JSON: %s" % (path, e))
         return None
 
-plugin = load("plugin/plugin.json")
-mcp = load("plugin/mcp.json")
+PLUGIN_SRC="../../integrations/chatgpt-plugin"
+plugin = load(PLUGIN_SRC + "/plugin.json")
+mcp = load(PLUGIN_SRC + "/mcp.json")
 
 # --- plugin.json identity ---
 if plugin is not None:
@@ -121,7 +122,7 @@ if mcp is not None:
 
 # --- skill frontmatter ---
 try:
-    with open("plugin/skills/setup/SKILL.md", encoding="utf-8") as f:
+    with open("../../integrations/chatgpt-plugin/skills/setup/SKILL.md", encoding="utf-8") as f:
         skill = f.read()
 except OSError as e:
     fail("skills/setup/SKILL.md: unreadable: %s" % e)
@@ -149,14 +150,15 @@ print("manifest validation OK (release=%s)" % ("yes" if release else "no"))
 EOF
 
 # --- relative layout: expected files, no absolute paths ---
+PLUGIN_SRC="../../integrations/chatgpt-plugin"
 for f in plugin.json mcp.json README.md skills/setup/SKILL.md; do
-  [ -f "plugin/$f" ] || { echo "error: plugin/$f missing" >&2; exit 1; }
+  [ -f "$PLUGIN_SRC/$f" ] || { echo "error: $PLUGIN_SRC/$f missing" >&2; exit 1; }
 done
 
 mkdir -p "$ABS_OUT"
 rm -f "$ABS_OUT/ocliv-chatgpt-plugin.zip"
 EPOCH="${SOURCE_DATE_EPOCH:-1700000000}"
-rm -rf stage-plugin && cp -r plugin stage-plugin
+rm -rf stage-plugin && cp -r "$PLUGIN_SRC" stage-plugin
 if [ "$RELEASE" = 1 ]; then
   python3 - "$OCLIV_QUALIFIED_MCP_URL" <<'EOF'
 import json, sys

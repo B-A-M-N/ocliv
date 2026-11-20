@@ -1,0 +1,27 @@
+# Ocliv Current Qualification Status
+
+**Production Promotion Status:** **HOLD**
+
+This document is the single entry point for current verification status. Dated
+historical qualification records live under `docs/qualification/history/`, and
+structured evidence/receipts live under `docs/qualification/receipts/`.
+
+## Verified Gates (Source & Isolated Staging)
+
+| Gate | Status | Notes |
+|---|---|---|
+| Full repository Go tests (`go test ./... -count=1 -timeout=420s`) | **PASS** | Includes `tests/integration` and all internal/packaging/staging packages |
+| Race detector matrix (`internal/relay` standalone + core internal packages) | **PASS** | Zero data races across `relay`, `cli`, `agent`, `config`, `identity`, `protocol`, `store`, `lease`, `setup` |
+| Static checks (`gofmt`, `go vet`, `git diff --check`, `check-repo-hygiene.sh`) | **PASS** | Enforced in CI |
+| Isolated ARM64 Pi staging & real machine reboot recovery (`10.9.66.170`) | **PASS** | Same lease, same visitor HMAC key, same cookie after reboot; production `ocliv-relay` untouched |
+
+## Outstanding Gates (Required Before Lifting HOLD)
+
+| Gate | Status |
+|---|---|
+| Clean detached-worktree release build + `govulncheck` + SBOM + `release-manifest.json` | **NOT VERIFIED** |
+| Exact-hash staging qualification of the clean release artifact | **NOT VERIFIED** |
+| Off-LAN trusted-TLS public ingress verification | **NOT VERIFIED** |
+| Official ChatGPT OAuth end-to-end acceptance | **NOT VERIFIED** |
+| 24-hour soak test | **NOT VERIFIED** |
+| Production schema/owner inventory & explicit promotion approval | **HOLD** |
