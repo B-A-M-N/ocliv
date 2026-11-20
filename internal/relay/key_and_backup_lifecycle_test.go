@@ -212,3 +212,23 @@ func TestPass6P2RestoreBackupInvalidatesSessionsOnFingerprintMismatch(t *testing
 		t.Fatalf("P2 REGRESSION: restored visitor session was not invalidated despite visitor-hmac.key fingerprint mismatch")
 	}
 }
+
+func TestCapabilitiesEndpointBoundToRelayAuthority(t *testing.T) {
+	s, _ := newLifecycleServer(t)
+	// Relay authority MUST return 200 with mgmt_body_sig_v2.
+	req := httptest.NewRequest(http.MethodGet, "https://"+s.relayHost+"/v1/agent/capabilities", nil)
+	req.Host = s.relayHost
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 on relay host /v1/agent/capabilities, got %d body=%s", w.Code, w.Body.String())
+	}
+	// Tunnel host MUST fail closed with 421 Misdirected Request.
+	req2 := httptest.NewRequest(http.MethodGet, "https://app.t."+s.relayHost+"/v1/agent/capabilities", nil)
+	req2.Host = "app.t." + s.relayHost
+	w2 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w2, req2)
+	if w2.Code != http.StatusMisdirectedRequest {
+		t.Fatalf("expected 421 on tunnel host /v1/agent/capabilities, got %d", w2.Code)
+	}
+}

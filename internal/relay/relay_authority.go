@@ -113,7 +113,7 @@ func isNumericPort(s string) bool {
 // authority (enrollment, challenge, connect, signed lease management).
 func isAgentPath(p string) bool {
 	switch p {
-	case "/v1/agent/enroll", "/v1/agent/challenge", "/v1/agent/connect",
+	case "/v1/agent/enroll", "/v1/agent/capabilities", "/v1/agent/challenge", "/v1/agent/connect",
 		"/v1/agent/key/rotate", "/v1/agent/key/revoke":
 		return true
 	}
