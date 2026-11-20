@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -325,6 +326,59 @@ func (s *ServiceStore) Get(name string) (ServiceRecord, bool, error) {
 		return nil
 	})
 	return rec, ok, err
+}
+
+// Sentinel errors for atomic service creation (A8).
+var (
+	ErrServiceAlreadyExists  = errors.New("service already exists")
+	ErrServiceLabelCollision = errors.New("service canonical wire label collision")
+)
+
+// CreateAtomic creates rec under a single flock transaction, atomically
+// checking exact-name uniqueness, canonical wire-label collision, assigning
+// timestamps and initial revision, and saving durably (A8).
+func (s *ServiceStore) CreateAtomic(rec ServiceRecord) (ServiceRecord, error) {
+	if err := ValidateServiceName(rec.Name); err != nil {
+		return ServiceRecord{}, err
+	}
+	var created ServiceRecord
+	err := s.withLock(func() error {
+		m, err := s.loadMap()
+		if err != nil {
+			return err
+		}
+		if _, exists := m[rec.Name]; exists {
+			return fmt.Errorf("%w: service %q already exists (use `ocliv service update %s`)", ErrServiceAlreadyExists, rec.Name, rec.Name)
+		}
+		wantWire := strings.ToLower(strings.TrimSpace(rec.Name))
+		if rec.Identity != nil && rec.Identity.WireLabel != "" {
+			wantWire = strings.ToLower(strings.TrimSpace(rec.Identity.WireLabel))
+		}
+		for _, other := range m {
+			otherWire := strings.ToLower(strings.TrimSpace(other.Name))
+			if other.Identity != nil && other.Identity.WireLabel != "" {
+				otherWire = strings.ToLower(strings.TrimSpace(other.Identity.WireLabel))
+			}
+			if otherWire == wantWire && other.Type == rec.Type {
+				return fmt.Errorf("%w: service name %q collides on canonical wire label %q with existing service %q", ErrServiceLabelCollision, rec.Name, wantWire, other.Name)
+			}
+		}
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		if rec.CreatedAt == "" {
+			rec.CreatedAt = now
+		}
+		rec.UpdatedAt = now
+		if rec.Revision <= 0 {
+			rec.Revision = 1
+		}
+		m[rec.Name] = rec
+		if err := s.saveMap(m); err != nil {
+			return err
+		}
+		created = rec
+		return nil
+	})
+	return created, err
 }
 
 // Put writes rec under flock, incrementing Revision monotonically.

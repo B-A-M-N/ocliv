@@ -57,7 +57,47 @@ const (
 	defaultEchoV4           = "https://api4.ipify.org"
 	defaultEchoV6           = "https://api6.ipify.org"
 	setupStateSchemaVersion = 2
+	defaultEdgeMode         = "tunnel"
 )
+
+// DefaultEdgeMode is the single-source default edge topology used by setup
+// execution, recommendations, help text, and documentation (A11).
+func DefaultEdgeMode() string { return defaultEdgeMode }
+
+// Explicit setup state-machine stages (A9).
+const (
+	stageDetected           = "DETECTED"
+	stageDNSUpdated         = "DNS_UPDATED"
+	stageDNSVerified        = "DNS_VERIFIED"
+	stageArtifactsRendered  = "ARTIFACTS_RENDERED"
+	stageSystemInstalled    = "SYSTEM_INSTALLED"
+	stageRelayReady         = "RELAY_READY"
+	stageEnrollmentComplete = "ENROLLMENT_COMPLETE"
+	stageRefreshTimerReady  = "REFRESH_TIMER_READY"
+	stageComplete           = "COMPLETE"
+)
+
+var setupStageOrder = []string{
+	stageDetected,
+	stageDNSUpdated,
+	stageDNSVerified,
+	stageArtifactsRendered,
+	stageSystemInstalled,
+	stageRelayReady,
+	stageEnrollmentComplete,
+	stageRefreshTimerReady,
+	stageComplete,
+}
+
+func setupStageIndex(stage string) int {
+	s := strings.ToUpper(strings.TrimSpace(stage))
+	for i, candidate := range setupStageOrder {
+		if candidate == s {
+			return i
+		}
+	}
+	return -1
+}
 
 // setupState persists versioned non-secret setup progress at
 // <configDir>/setup-state.json so an interrupted `ocliv setup` can revalidate
@@ -114,23 +154,66 @@ func checkSafeUserConfigDir(path string) error {
 	return nil
 }
 
-func loadSetupState() (setupState, bool) {
+// loadSetupStateStrict reads and validates setup-state.json, rejecting
+// unsupported/newer schema versions rather than silently ignoring them (A9).
+func loadSetupStateStrict() (setupState, bool, error) {
 	p, err := setupStatePath()
 	if err != nil {
-		return setupState{}, false
+		return setupState{}, false, err
 	}
 	if err := checkSafeUserConfigDir(p); err != nil {
-		return setupState{}, false
+		return setupState{}, false, err
 	}
 	b, err := os.ReadFile(p)
 	if err != nil {
-		return setupState{}, false
+		if os.IsNotExist(err) {
+			return setupState{}, false, nil
+		}
+		return setupState{}, false, err
 	}
 	var st setupState
-	if json.Unmarshal(b, &st) != nil {
+	if err := json.Unmarshal(b, &st); err != nil {
+		return setupState{}, false, fmt.Errorf("corrupt setup state %s: %w", p, err)
+	}
+	if st.SchemaVersion != 0 && st.SchemaVersion != setupStateSchemaVersion {
+		return setupState{}, false, fmt.Errorf("unsupported setup state schema version %d at %s (supported: %d)", st.SchemaVersion, p, setupStateSchemaVersion)
+	}
+	return st, true, nil
+}
+
+func loadSetupState() (setupState, bool) {
+	st, ok, err := loadSetupStateStrict()
+	if err != nil || !ok {
 		return setupState{}, false
 	}
 	return st, true
+}
+
+// planSetupResume computes the exact stage to resume from by validating the
+// deployment fingerprint and revalidating external evidence for each completed
+// stage up to st.CompletedStage (A9).
+func planSetupResume(st setupState, wantFingerprint string, revalidate func(stage string) bool) (resumeStage string, revalidated []string) {
+	if wantFingerprint == "" || st.Fingerprint != wantFingerprint {
+		return stageDetected, nil
+	}
+	completedIdx := setupStageIndex(st.CompletedStage)
+	if completedIdx < 0 {
+		return stageDetected, nil
+	}
+	for i := 0; i <= completedIdx && i < len(setupStageOrder); i++ {
+		stage := setupStageOrder[i]
+		if stage == stageComplete {
+			return stageComplete, revalidated
+		}
+		if revalidate != nil && !revalidate(stage) {
+			return stage, revalidated
+		}
+		revalidated = append(revalidated, stage)
+	}
+	if completedIdx+1 < len(setupStageOrder) {
+		return setupStageOrder[completedIdx+1], revalidated
+	}
+	return stageComplete, revalidated
 }
 
 func saveSetupState(st setupState) error {
@@ -289,10 +372,19 @@ func cmdSetup(argv []string) int {
 		fmt.Fprintln(os.Stderr, "error: --edge must be auto, single-host, wildcard, or tunnel")
 		return apperr.ExitCLIValidation
 	}
-	// Default edge "auto" selects a hosting-capable topology ("tunnel") so the
-	// default setup + default `ocliv host PORT` workflow succeeds out of the box.
+	// A11: Default edge "auto" uses the single-source DefaultEdgeMode() ("tunnel").
 	if edge == "auto" {
-		edge = "tunnel"
+		edge = DefaultEdgeMode()
+	}
+	// A9: Validate persisted setup-state schema strictly before resuming.
+	if prevState, hasPrev, serr := loadSetupStateStrict(); serr != nil {
+		fmt.Fprintln(os.Stderr, "error: "+serr.Error())
+		return apperr.ExitInternal
+	} else if hasPrev && !check && !dryRun && !refreshDNS {
+		wantFP := setupFingerprint(hostname, edge, acmeEmail)
+		_, _ = planSetupResume(prevState, wantFP, func(stage string) bool {
+			return prevState.StageEvidence[stage] != ""
+		})
 	}
 	if dryRun && hostname == "" {
 		fmt.Fprintln(os.Stderr, "--dry-run needs --hostname ZONE.dynv6.net (or ZONE.duckdns.org)")
@@ -311,8 +403,8 @@ func cmdSetup(argv []string) int {
 			Hostname:       hostname,
 			EdgeMode:       edge,
 			ACMEEmail:      acmeEmail,
-			CompletedStage: "detected",
-			StageEvidence:  map[string]string{"path": d.Path.String()},
+			CompletedStage: stageDetected,
+			StageEvidence:  map[string]string{stageDetected: d.Path.String()},
 			Blocker:        blocker,
 		}); serr != nil {
 			fmt.Fprintln(os.Stderr, "error: cannot persist setup state: "+serr.Error())
@@ -947,19 +1039,100 @@ func mintSetupCode(dataDir, tenant string) (string, error) {
 // Already-enrolled machines are left untouched and report success with
 // an empty key id. The enroll POST itself proves the full chain
 // (DNS → Caddy → loopback relay) works.
+// sudoTarget represents a strictly validated invoking user under sudo (A6).
+type sudoTarget struct {
+	Username string
+	UID      uint32
+	GID      uint32
+	HomeDir  string
+}
+
+// parseSudoTarget strictly parses SUDO_USER, SUDO_UID, and SUDO_GID (A6).
+// Returns (target, true, nil) when running under sudo with valid non-root IDs,
+// (zero, false, nil) when not under sudo, or an error if SUDO_UID/SUDO_GID are
+// malformed, negative, or inconsistent with user.Lookup(SUDO_USER).
+func parseSudoTarget() (sudoTarget, bool, error) {
+	su := strings.TrimSpace(os.Getenv("SUDO_USER"))
+	suUID := strings.TrimSpace(os.Getenv("SUDO_UID"))
+	suGID := strings.TrimSpace(os.Getenv("SUDO_GID"))
+	if su == "" && suUID == "" && suGID == "" {
+		return sudoTarget{}, false, nil
+	}
+	if su == "" || su == "root" {
+		return sudoTarget{}, false, fmt.Errorf("invalid SUDO_USER %q for unprivileged enrollment", su)
+	}
+	u, err := user.Lookup(su)
+	if err != nil || u.HomeDir == "" {
+		return sudoTarget{}, false, fmt.Errorf("cannot resolve SUDO_USER %q: %v", su, err)
+	}
+	uid64, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil || uid64 == 0 {
+		return sudoTarget{}, false, fmt.Errorf("invalid resolved UID %q for SUDO_USER %q", u.Uid, su)
+	}
+	gid64, err := strconv.ParseUint(u.Gid, 10, 32)
+	if err != nil || gid64 == 0 {
+		return sudoTarget{}, false, fmt.Errorf("invalid resolved GID %q for SUDO_USER %q", u.Gid, su)
+	}
+	if suUID != "" {
+		envUID, perr := strconv.ParseUint(suUID, 10, 32)
+		if perr != nil || envUID != uid64 {
+			return sudoTarget{}, false, fmt.Errorf("malformed or mismatched SUDO_UID %q (user %q has uid %d)", suUID, su, uid64)
+		}
+	}
+	if suGID != "" {
+		envGID, perr := strconv.ParseUint(suGID, 10, 32)
+		if perr != nil || envGID != gid64 {
+			return sudoTarget{}, false, fmt.Errorf("malformed or mismatched SUDO_GID %q (user %q has gid %d)", suGID, su, gid64)
+		}
+	}
+	return sudoTarget{
+		Username: su,
+		UID:      uint32(uid64),
+		GID:      uint32(gid64),
+		HomeDir:  u.HomeDir,
+	}, true, nil
+}
+
+// buildUnprivilegedEnrollCmd builds a tightly scoped child process running as
+// target.UID/target.GID with a curated environment and enrollment code passed
+// via stdin (--code-file -), so root never writes into the user's home (A6).
+func buildUnprivilegedEnrollCmd(exe, relayURL, code string, target sudoTarget) *exec.Cmd {
+	args := []string{"login", "--relay", relayURL, "--code-file", "-"}
+	cmd := exec.Command(exe, args...)
+	cmd.Stdin = strings.NewReader(code + "\n")
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{
+			Uid: target.UID,
+			Gid: target.GID,
+		},
+	}
+	env := []string{
+		"HOME=" + target.HomeDir,
+		"USER=" + target.Username,
+		"LOGNAME=" + target.Username,
+		"PATH=" + os.Getenv("PATH"),
+	}
+	if prof := strings.TrimSpace(os.Getenv("OCLIV_PROFILE")); prof != "" {
+		env = append(env, "OCLIV_PROFILE="+prof)
+	}
+	if ca := strings.TrimSpace(os.Getenv("OCLIV_CACERT")); ca != "" {
+		env = append(env, "OCLIV_CACERT="+ca)
+	}
+	cmd.Env = env
+	return cmd
+}
+
 func setupAgentFiles() (dir, keyPath, cfgPath string, uid, gid int, err error) {
 	uid, gid = -1, -1
 	if os.Geteuid() == 0 && os.Getenv("OCLIV_CONFIG_DIR") == "" {
-		if su := strings.TrimSpace(os.Getenv("SUDO_USER")); su != "" {
-			if u, lerr := user.Lookup(su); lerr == nil && u.HomeDir != "" {
-				uid, _ = strconv.Atoi(u.Uid)
-				gid, _ = strconv.Atoi(u.Gid)
-				dir = filepath.Join(u.HomeDir, ".config", "ocliv")
-				if prof := config.ActiveProfile(); prof != "" && prof != "default" {
-					dir = filepath.Join(dir, "profiles", prof)
-				}
-				return dir, filepath.Join(dir, config.AgentKeyFile), filepath.Join(dir, config.ConfigFile), uid, gid, nil
+		if target, ok, perr := parseSudoTarget(); perr != nil {
+			return "", "", "", -1, -1, perr
+		} else if ok {
+			dir = filepath.Join(target.HomeDir, ".config", "ocliv")
+			if prof := config.ActiveProfile(); prof != "" && prof != "default" {
+				dir = filepath.Join(dir, "profiles", prof)
 			}
+			return dir, filepath.Join(dir, config.AgentKeyFile), filepath.Join(dir, config.ConfigFile), int(target.UID), int(target.GID), nil
 		}
 	}
 	dir, keyPath, cfgPath, err = agentFiles()
@@ -1028,6 +1201,35 @@ func autoEnroll(relayURL, dataDir, tenant string) (string, int) {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: cannot mint enrollment code: "+err.Error())
 		return "", apperr.ExitAuth
+	}
+	// A6: When running as root under sudo, NEVER write identity/config/journal
+	// files into SUDO_USER's home as root. Exec `ocliv login --code-file -` as
+	// the invoking UID/GID with a curated environment, then verify the result.
+	if os.Geteuid() == 0 && os.Getenv("OCLIV_CONFIG_DIR") == "" {
+		target, ok, perr := parseSudoTarget()
+		if perr != nil {
+			fmt.Fprintln(os.Stderr, "error: "+perr.Error())
+			return "", apperr.ExitAuth
+		}
+		if ok {
+			exe, eerr := os.Executable()
+			if eerr != nil {
+				fmt.Fprintln(os.Stderr, "error: resolving ocliv executable: "+eerr.Error())
+				return "", apperr.ExitInternal
+			}
+			cmd := buildUnprivilegedEnrollCmd(exe, relayURL, code, target)
+			out, cerr := cmd.CombinedOutput()
+			if cerr != nil {
+				fmt.Fprintf(os.Stderr, "error: unprivileged enrollment as %s failed: %v\n%s\n", target.Username, cerr, strings.TrimSpace(string(out)))
+				return "", apperr.ExitAuth
+			}
+			enrolledKey, lerr := identity.Load(keyPath)
+			if lerr != nil {
+				fmt.Fprintf(os.Stderr, "error: enrollment child succeeded but %s is unreadable: %v\n", keyPath, lerr)
+				return "", apperr.ExitInternal
+			}
+			return "key-" + string(enrolledKey.ID()), apperr.ExitOK
+		}
 	}
 	if uid >= 0 && os.Getenv("OCLIV_CONFIG_DIR") == "" {
 		_ = os.Setenv("OCLIV_CONFIG_DIR", dir)
@@ -1145,12 +1347,8 @@ func verifyDNSResolution(ctx context.Context, hostname string, want []string) (m
 }
 
 func recommendedEdgeMode(d setup.Detection) string {
-	switch d.Path {
-	case setup.PathDirectV6, setup.PathDirectV4, setup.PathNATV4:
-		return "single-host"
-	default:
-		return "single-host"
-	}
+	_ = d
+	return DefaultEdgeMode()
 }
 
 func printSetupReport(d setup.Detection) {
@@ -1179,7 +1377,7 @@ func printSetupNext(d setup.Detection) {
 		}
 		fmt.Printf("- Pick a free DNS name (e.g. a dynv6 hostname) and point it at this host's public %s address.\n", fam)
 		fmt.Printf("- Allow TCP 443 inbound in the host firewall; this host can serve directly (relay stays on 127.0.0.1, Caddy terminates TLS).\n")
-		fmt.Printf("- TCP 80 is needed only if you opt into `--edge tunnel` (its HTTP-01 fallback); the default `--edge single-host` binds 443 alone and pins TLS-ALPN-01 (HTTP-01 explicitly disabled), so a host where another service owns :80 can run it unmodified.\n")
+		fmt.Printf("- TCP 80 is needed for the default `--edge tunnel` (its HTTP-01 fallback); `--edge single-host` binds 443 alone and pins TLS-ALPN-01 (HTTP-01 explicitly disabled), so a host where another service owns :80 can run `--edge single-host` unmodified.\n")
 		fmt.Printf("- Re-run `ocliv setup --auto` once DNS resolves here; setup resumes from the stored non-secret setup state.\n")
 	case setup.PathNATV4:
 		fmt.Printf("- In the router admin page, forward TCP 443 to this host (%s).\n", firstOr(d.LocalV4, "its LAN address"))

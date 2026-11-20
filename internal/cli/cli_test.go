@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net"
@@ -17,8 +19,29 @@ import (
 	"ocliv/internal/agent"
 	"ocliv/internal/apperr"
 	"ocliv/internal/config"
+	"ocliv/internal/identity"
 	"ocliv/internal/server"
 )
+
+func writeDerivedEnrollResponse(w http.ResponseWriter, r *http.Request, tenant string) {
+	var req struct {
+		PublicKey string `json:"public_key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	pub, err := base64.StdEncoding.DecodeString(req.PublicKey)
+	if err != nil || len(pub) != ed25519.PublicKeySize {
+		http.Error(w, "bad public_key", http.StatusBadRequest)
+		return
+	}
+	keyID := "key-" + string(identity.KeyIDFor(ed25519.PublicKey(pub)))
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"key_id":    keyID,
+		"tenant_id": tenant,
+	})
+}
 
 // withHome redirects the agent data dir to a temp dir (unenrolled: no key).
 func withHome(t *testing.T, files map[string]string) {
@@ -153,7 +176,7 @@ func TestLoginMergesConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	enroll := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"key_id":"key-abc","tenant_id":"ten-1"}`))
+		writeDerivedEnrollResponse(w, r, "ten-1")
 	}))
 	defer enroll.Close()
 	if code := cmdLogin([]string{"--relay", enroll.URL, "--code-file", codePath}); code != apperr.ExitOK {
@@ -224,7 +247,7 @@ func TestLoginRefusesOverwriteBeforeNetwork(t *testing.T) {
 	hits := 0
 	enroll := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits++
-		w.Write([]byte(`{"key_id":"key-abc","tenant_id":"ten-1"}`))
+		writeDerivedEnrollResponse(w, r, "ten-1")
 	}))
 	defer enroll.Close()
 	if code := cmdLogin([]string{"--relay", enroll.URL, "--code-file", codePath}); code != apperr.ExitOK {

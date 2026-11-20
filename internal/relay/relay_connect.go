@@ -43,6 +43,22 @@ type challengeResp struct {
 	Capabilities []string `json:"capabilities,omitempty"`
 }
 
+// handleCapabilities serves read-only relay protocol capabilities without
+// allocating or reserving a one-time attachment challenge nonce (A4).
+func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"version": protocol.Version,
+		"capabilities": []string{
+			protocol.CapabilityPersistentNamedLeases,
+			protocol.CapabilityMgmtBodySignatureV2,
+		},
+	})
+}
+
 // maxIntentTTLSeconds bounds requested lease lifetimes (10 years).
 // Larger values cannot be represented as a time.Duration without
 // overflow, and short-lived tunnels never need more (F06).

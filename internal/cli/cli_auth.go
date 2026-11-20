@@ -40,13 +40,20 @@ const (
 )
 
 type keyRotationPendingJournal struct {
-	RelayURL      string `json:"relay_url"`
-	OldKeyID      string `json:"old_key_id"`
-	NewKeyID      string `json:"new_key_id"`
-	StagedKeyPath string `json:"staged_key_path"`
-	StartedAt     string `json:"started_at"`
-	State         string `json:"state"`
+	RelayURL          string          `json:"relay_url"`
+	OldKeyID          string          `json:"old_key_id"`
+	NewKeyID          string          `json:"new_key_id"`
+	StagedKeyPath     string          `json:"staged_key_path"`
+	StartedAt         string          `json:"started_at"`
+	State             string          `json:"state"`
+	RecoveredServices map[string]bool `json:"recovered_services,omitempty"`
 }
+
+// Fault-injection hooks for crash-consistency tests (A2).
+var (
+	keyRotateJournalWriteFn = writeRotationJournal
+	keyRotateAfterSaveHook  func() error
+)
 
 // cmdLogin performs one-time enrollment: generate a keypair, exchange the
 // operator-issued code for registration.
@@ -354,16 +361,12 @@ func performEnroll(relayURL, code, cacert string) (string, int) {
 		fmt.Fprintf(os.Stderr, "enrollment failed: bad relay response; pending enrollment journal preserved at %s\n", pendingJournalPath)
 		return "", apperr.ExitAuth
 	}
-	// P0-3: validate relay's returned key_id matches the locally generated key
-	// (when the relay returns a non-empty canonical key_id).
-	if out.KeyID != "" && out.KeyID != expectedKeyID && !strings.HasPrefix(out.KeyID, "key-abc") {
-		// Allow existing mock tests that return literal "key-abc" while
-		// rejecting any real key ID mismatch on production relays.
-		if len(out.KeyID) == len(expectedKeyID) {
-			fmt.Fprintf(os.Stderr, "enrollment failed: relay returned key_id %q, expected %q; pending journal preserved at %s\n",
-				out.KeyID, expectedKeyID, pendingJournalPath)
-			return "", apperr.ExitAuth
-		}
+	// A1: exact enrollment key identity invariant. The relay response MUST
+	// prove that the admitted key matches the locally generated keypair.
+	if out.KeyID == "" || out.KeyID != expectedKeyID {
+		fmt.Fprintf(os.Stderr, "enrollment failed: relay returned key_id %q, expected %q; pending journal preserved at %s\n",
+			out.KeyID, expectedKeyID, pendingJournalPath)
+		return "", apperr.ExitAuth
 	}
 	if err := finalizeEnrollmentFiles(pendingKeyPath, keyPath, cfgPath, relayURL, pendingJournalPath, k); err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
@@ -655,12 +658,23 @@ func runKeyRotate(argv []string, ops serviceOps) int {
 	var oldKeyID string
 	res := keyRotateResult{}
 
-	// P0-2 / P0-4: resume from persisted journal state if present.
+	// A3: check for an existing rotation journal BEFORE resolving/probing any
+	// relay so an in-progress identity transaction can never be retargeted to
+	// a different relay authority.
 	if rawJ, jerr := os.ReadFile(journalPath); jerr == nil {
-		if uerr := json.Unmarshal(rawJ, &journal); uerr != nil || journal.NewKeyID == "" {
+		if uerr := json.Unmarshal(rawJ, &journal); uerr != nil || journal.NewKeyID == "" || strings.TrimSpace(journal.RelayURL) == "" {
 			fmt.Fprintf(os.Stderr, "key rotate blocked: corrupt rotation journal at %s\n", journalPath)
 			return apperr.ExitInternal
 		}
+		journalAuth, jaErr := normalizeRelayAuthority(journal.RelayURL)
+		curAuth, caErr := normalizeRelayAuthority(relayURL)
+		if jaErr != nil || caErr != nil || journalAuth != curAuth {
+			fmt.Fprintf(os.Stderr, "ROTATION_AUTHORITY_MISMATCH: rotation journal is bound to %s, but active relay_url is %s; preserving keys and journal at %s (zero relay requests sent)\n",
+				journal.RelayURL, relayURL, journalPath)
+			return apperr.ExitAuth
+		}
+		// Authoritative relay for this transaction is always the journal's URL.
+		relayURL = journal.RelayURL
 		res.OldKeyID = journal.OldKeyID
 		res.NewKeyID = journal.NewKeyID
 		res.Recovered = true
@@ -668,17 +682,15 @@ func runKeyRotate(argv []string, ops serviceOps) int {
 		// If remote already committed (or later), NEVER retry remote RPC!
 		switch journal.State {
 		case rotStateRemoteCommitted, rotStateLocalKeyCommitted, rotStateServiceMetadataRebound, rotStatePublishersRestarted:
-			if journal.State == rotStateRemoteCommitted {
-				sk, lerr := identity.Load(journal.StagedKeyPath)
-				if lerr != nil {
-					fmt.Fprintf(os.Stderr, "key rotate recovery error: cannot load staged key %s: %v\n", journal.StagedKeyPath, lerr)
-					return apperr.ExitInternal
-				}
-				newKey = sk
-			} else {
+			if journal.State != rotStateRemoteCommitted {
 				ek, lerr := identity.Load(keyPath)
 				if lerr != nil {
 					fmt.Fprintf(os.Stderr, "key rotate recovery error: cannot load installed key %s: %v\n", keyPath, lerr)
+					return apperr.ExitInternal
+				}
+				if "key-"+string(ek.ID()) != journal.NewKeyID {
+					fmt.Fprintf(os.Stderr, "key rotate recovery error: installed key %s does not match journal %s\n",
+						"key-"+string(ek.ID()), journal.NewKeyID)
 					return apperr.ExitInternal
 				}
 				newKey = ek
@@ -691,7 +703,7 @@ func runKeyRotate(argv []string, ops serviceOps) int {
 			return emitKeyRotateResult(res, jsonOut)
 		}
 
-		// State == STAGED (ambiguous prior RPC): probe new staged key first.
+		// State == STAGED (ambiguous prior RPC): probe new staged key against journal's relay ONLY.
 		stagedKey, lerr := identity.Load(journal.StagedKeyPath)
 		if lerr != nil {
 			fmt.Fprintf(os.Stderr, "key rotate blocked: cannot load staged key %s: %v\n", journal.StagedKeyPath, lerr)
@@ -704,7 +716,7 @@ func runKeyRotate(argv []string, ops serviceOps) int {
 		}
 		if newAdmitted, newReach := probeKeyAdmitted(relayURL, stagedKey, stagedKeyID); newReach && newAdmitted {
 			journal.State = rotStateRemoteCommitted
-			if werr := writeRotationJournal(journalPath, journal); werr != nil {
+			if werr := keyRotateJournalWriteFn(journalPath, journal); werr != nil {
 				fmt.Fprintf(os.Stderr, "key rotate recovery error updating journal: %v\n", werr)
 				return apperr.ExitInternal
 			}
@@ -810,20 +822,60 @@ func runKeyRotate(argv []string, ops serviceOps) int {
 
 // advanceKeyRotation steps deterministically through every local post-remote
 // state, persisting each transition and propagating every failure so the
-// journal is NEVER deleted until every durable step succeeds (P0-4).
+// journal is NEVER deleted until every durable step and authoritative
+// post-rotation publisher verification succeed (A2, A7, P0-4).
 func advanceKeyRotation(j keyRotationPendingJournal, keyPath, journalPath string, newKey *identity.KeyPair, res *keyRotateResult, ops serviceOps) error {
 	res.State = j.State
-	// Step 1: LOCAL_KEY_COMMITTED via durable replace (fsync + rename + dir fsync).
+	// Step 1 (A2): state-derived LOCAL_KEY_COMMITTED.
+	// Inspect both installed agent.key and staged key rather than assuming the
+	// staged file still exists; durably persist LOCAL_KEY_COMMITTED BEFORE
+	// removing j.StagedKeyPath so a crash between replace and journal write
+	// recovers cleanly without losing authority.
 	if j.State == rotStateRemoteCommitted {
-		if err := newKey.SaveDurableReplace(keyPath); err != nil {
-			return fmt.Errorf("installing rotated key: %w", err)
+		installedKey, ierr := identity.Load(keyPath)
+		stagedKey, serr := identity.Load(j.StagedKeyPath)
+		installedID := ""
+		if ierr == nil {
+			installedID = "key-" + string(installedKey.ID())
 		}
-		_ = os.Remove(j.StagedKeyPath)
+		stagedID := ""
+		if serr == nil {
+			stagedID = "key-" + string(stagedKey.ID())
+		}
+		switch {
+		case ierr == nil && installedID == j.NewKeyID:
+			// Already installed (e.g., crash after SaveDurableReplace before
+			// LOCAL_KEY_COMMITTED was durably written).
+			newKey = installedKey
+		case ierr == nil && installedID == j.OldKeyID && serr == nil && stagedID == j.NewKeyID:
+			newKey = stagedKey
+			if err := newKey.SaveDurableReplace(keyPath); err != nil {
+				return fmt.Errorf("installing rotated key: %w", err)
+			}
+			if keyRotateAfterSaveHook != nil {
+				if herr := keyRotateAfterSaveHook(); herr != nil {
+					return fmt.Errorf("post-key-install fault: %w", herr)
+				}
+			}
+		default:
+			return fmt.Errorf("cannot prove local key state during REMOTE_COMMITTED recovery (installed=%q err=%v; staged=%q err=%v; want old=%q new=%q)",
+				installedID, ierr, stagedID, serr, j.OldKeyID, j.NewKeyID)
+		}
 		j.State = rotStateLocalKeyCommitted
 		res.State = j.State
-		if err := writeRotationJournal(journalPath, j); err != nil {
+		if err := keyRotateJournalWriteFn(journalPath, j); err != nil {
 			return fmt.Errorf("persisting %s state: %w", j.State, err)
 		}
+		if j.StagedKeyPath != "" {
+			_ = os.Remove(j.StagedKeyPath)
+		}
+	}
+	if newKey == nil {
+		ek, lerr := identity.Load(keyPath)
+		if lerr != nil {
+			return fmt.Errorf("loading committed key %s: %w", keyPath, lerr)
+		}
+		newKey = ek
 	}
 
 	// Step 2: SERVICE_METADATA_REBOUND (openServices/List/UpdateCAS errors are fatal).
@@ -850,29 +902,47 @@ func advanceKeyRotation(j keyRotationPendingJournal, keyPath, journalPath string
 		}
 		j.State = rotStateServiceMetadataRebound
 		res.State = j.State
-		if err := writeRotationJournal(journalPath, j); err != nil {
+		if err := keyRotateJournalWriteFn(journalPath, j); err != nil {
 			return fmt.Errorf("persisting %s state: %w", j.State, err)
 		}
 	}
 
-	// Step 3: PUBLISHERS_RESTARTED (every enabled publisher restart failure is fatal).
+	// Step 3 (A7): PUBLISHERS_RESTARTED — restart each DesiredEnabled publisher
+	// not yet verified under NewKeyID, then prove authoritative ownership and
+	// live attachment via signed relay state under NewKeyID. Persist per-service
+	// recovery progress so retries never disturb already-recovered services.
 	if j.State == rotStateServiceMetadataRebound {
+		if j.RecoveredServices == nil {
+			j.RecoveredServices = map[string]bool{}
+		}
 		var restartErrs []string
 		for _, svc := range svcs {
-			if svc.DesiredState == config.DesiredEnabled && svc.SystemdUnit != "" {
-				if outStr, rerr := ops.systemctl("restart", svc.SystemdUnit); rerr != nil {
-					restartErrs = append(restartErrs, fmt.Sprintf("%s (%s): %v %s", svc.Name, svc.SystemdUnit, rerr, strings.TrimSpace(outStr)))
-				} else {
-					res.RestartedPublishers = append(res.RestartedPublishers, svc.Name)
-				}
+			if svc.DesiredState != config.DesiredEnabled || svc.SystemdUnit == "" {
+				continue
 			}
+			if j.RecoveredServices[svc.Name] {
+				continue
+			}
+			if outStr, rerr := ops.systemctl("restart", svc.SystemdUnit); rerr != nil {
+				restartErrs = append(restartErrs, fmt.Sprintf("%s (%s): restart failed: %v %s", svc.Name, svc.SystemdUnit, rerr, strings.TrimSpace(outStr)))
+				continue
+			}
+			if verr := verifyRotatedPublisher(j.RelayURL, newKey, j.NewKeyID, svc, ops); verr != nil {
+				restartErrs = append(restartErrs, fmt.Sprintf("%s (%s): post-rotation verification failed: %v", svc.Name, svc.SystemdUnit, verr))
+				continue
+			}
+			j.RecoveredServices[svc.Name] = true
+			if werr := keyRotateJournalWriteFn(journalPath, j); werr != nil {
+				return fmt.Errorf("persisting recovered service %q: %w", svc.Name, werr)
+			}
+			res.RestartedPublishers = append(res.RestartedPublishers, svc.Name)
 		}
 		if len(restartErrs) > 0 {
-			return fmt.Errorf("restarting enabled publishers failed: %s", strings.Join(restartErrs, "; "))
+			return fmt.Errorf("restarting/verifying enabled publishers failed: %s", strings.Join(restartErrs, "; "))
 		}
 		j.State = rotStatePublishersRestarted
 		res.State = j.State
-		if err := writeRotationJournal(journalPath, j); err != nil {
+		if err := keyRotateJournalWriteFn(journalPath, j); err != nil {
 			return fmt.Errorf("persisting %s state: %w", j.State, err)
 		}
 	}
@@ -883,6 +953,102 @@ func advanceKeyRotation(j keyRotationPendingJournal, keyPath, journalPath string
 	}
 	res.State = rotStateComplete
 	return nil
+}
+
+// verifyRotatedPublisher proves from signed relay state under newKeyID that
+// the restarted publisher's lease or publication is owned by newKeyID and
+// actively attached (A7).
+func verifyRotatedPublisher(relayURL string, newKey *identity.KeyPair, newKeyID string, svc config.ServiceRecord, ops serviceOps) error {
+	callFn := ops.mgmtCall
+	if callFn == nil {
+		callFn = mgmtCall
+	}
+	const maxAttempts = 5
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(150 * time.Millisecond)
+		}
+		if svc.Type == "mcp" {
+			st, body, err := callFn(relayURL, newKey, newKeyID, http.MethodGet, "/v1/agent/mcp-routes")
+			if err != nil {
+				lastErr = fmt.Errorf("querying mcp-routes under %s: %w", newKeyID, err)
+				continue
+			}
+			if st != http.StatusOK {
+				lastErr = fmt.Errorf("mcp-routes under %s returned HTTP %d", newKeyID, st)
+				continue
+			}
+			var resp struct {
+				Routes []struct {
+					RouteID    string `json:"route_id"`
+					Name       string `json:"pub_name"`
+					LeaseID    string `json:"lease_id"`
+					RouteLive  bool   `json:"route_live"`
+					OwnerKeyID string `json:"owner_key_id"`
+				} `json:"routes"`
+			}
+			if err := json.Unmarshal(body, &resp); err != nil {
+				lastErr = fmt.Errorf("decoding mcp-routes: %w", err)
+				continue
+			}
+			for _, rt := range resp.Routes {
+				idMatch := (svc.PublicationID != "" && rt.RouteID == svc.PublicationID) || (svc.PublicationID == "" && strings.EqualFold(rt.Name, svc.Name))
+				if !idMatch {
+					continue
+				}
+				if rt.OwnerKeyID != "" && rt.OwnerKeyID != newKeyID {
+					lastErr = fmt.Errorf("publication %s owner_key_id=%s, want %s", rt.RouteID, rt.OwnerKeyID, newKeyID)
+					continue
+				}
+				if !rt.RouteLive {
+					lastErr = fmt.Errorf("publication %s not yet live under %s", rt.RouteID, newKeyID)
+					continue
+				}
+				return nil
+			}
+			if lastErr == nil {
+				lastErr = fmt.Errorf("publication for service %q not found under %s", svc.Name, newKeyID)
+			}
+			continue
+		}
+
+		// HTTP service: query signed /v1/agent/leases under newKeyID.
+		st, body, err := callFn(relayURL, newKey, newKeyID, http.MethodGet, "/v1/agent/leases")
+		if err != nil {
+			lastErr = fmt.Errorf("querying leases under %s: %w", newKeyID, err)
+			continue
+		}
+		if st != http.StatusOK {
+			lastErr = fmt.Errorf("leases under %s returned HTTP %d", newKeyID, st)
+			continue
+		}
+		var resp struct {
+			Leases []relayHTTPLeaseItem `json:"leases"`
+		}
+		if err := json.Unmarshal(body, &resp); err != nil {
+			lastErr = fmt.Errorf("decoding leases: %w", err)
+			continue
+		}
+		wantLabel := canonicalHTTPLabel(svc.Name)
+		wantPort := localPortFromURL(svc.LocalURL)
+		for _, ls := range resp.Leases {
+			if svc.LeaseID != "" && ls.LeaseID != svc.LeaseID {
+				continue
+			}
+			if svc.LeaseID == "" && (canonicalHTTPLabel(ls.Label) != wantLabel || (wantPort > 0 && ls.Port != wantPort)) {
+				continue
+			}
+			if ls.Status == "ACTIVE" && ls.RouteLive {
+				return nil
+			}
+			lastErr = fmt.Errorf("lease %s under %s status=%s route_live=%v", ls.LeaseID, newKeyID, ls.Status, ls.RouteLive)
+		}
+		if lastErr == nil {
+			lastErr = fmt.Errorf("no active live lease for service %q owned by %s", svc.Name, newKeyID)
+		}
+	}
+	return lastErr
 }
 
 func emitKeyRotateResult(res keyRotateResult, jsonOut bool) int {

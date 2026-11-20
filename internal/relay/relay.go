@@ -212,6 +212,7 @@ func New(o Options) (*Server, error) {
 		s.authz = m
 	}
 	s.mux.HandleFunc("/v1/agent/enroll", s.handleEnroll)
+	s.mux.HandleFunc("/v1/agent/capabilities", s.handleCapabilities)
 	s.mux.HandleFunc("/v1/agent/challenge", s.handleChallenge)
 	s.mux.HandleFunc("/v1/agent/connect", s.handleConnect)
 	s.mux.HandleFunc("/v1/agent/leases", s.handleAgentLeases)

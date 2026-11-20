@@ -447,6 +447,8 @@ func TestP0KeyRotateCrashRecoveryJournal(t *testing.T) {
 	var committedNewKeyID string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/agent/capabilities":
+			_, _ = w.Write([]byte(`{"capabilities":["persistent_named_leases","mgmt_body_sig_v2"]}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/agent/key/rotate":
 			var req struct {
 				NewPublicKey string `json:"new_public_key"`

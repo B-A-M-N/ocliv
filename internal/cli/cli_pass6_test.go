@@ -221,8 +221,13 @@ func TestPass6P0_4KeyRotationResumesFromMetadataReboundWithoutReCallingRotate(t 
 	t.Setenv("OCLIV_PROFILE", "")
 
 	var rotateHits atomic.Int32
+	var committedNewKeyID string
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/v1/agent/capabilities":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"capabilities": []string{protocol.CapabilityPersistentNamedLeases, protocol.CapabilityMgmtBodySignatureV2},
+			})
 		case "/v1/agent/challenge":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"nonce":        "n-rot",
@@ -234,14 +239,20 @@ func TestPass6P0_4KeyRotationResumesFromMetadataReboundWithoutReCallingRotate(t 
 			_ = json.NewDecoder(r.Body).Decode(&req)
 			pubBytes, _ := base64.StdEncoding.DecodeString(req["new_public_key"])
 			h := sha256.Sum256(pubBytes)
-			newKeyID := "key-" + hex.EncodeToString(h[:8])
+			committedNewKeyID = "key-" + hex.EncodeToString(h[:8])
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"old_key_id":           r.Header.Get("X-Ocliv-Key"),
-				"new_key_id":           newKeyID,
+				"new_key_id":           committedNewKeyID,
 				"leases_transferred":   1,
 				"sessions_evicted":     1,
 				"publications_updated": 0,
 			})
+		case "/v1/agent/leases":
+			if committedNewKeyID != "" && r.Header.Get("X-Ocliv-Key") == committedNewKeyID {
+				_, _ = w.Write([]byte(`{"leases":[{"lease_id":"lse-rot-1","label":"rotapp","port":3000,"access_mode":"protected","status":"ACTIVE","route_live":true}]}`))
+				return
+			}
+			http.Error(w, "unauthorized", http.StatusForbidden)
 		default:
 			http.NotFound(w, r)
 		}

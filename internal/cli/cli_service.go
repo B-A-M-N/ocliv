@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -198,9 +199,18 @@ func loadBackendEnvFileStrict(path string, baseEnv []string) ([]string, error) {
 	if st.Mode().Perm()&0o077 != 0 {
 		return nil, fmt.Errorf("backend env-file %s has unsafe mode %04o (want 0600)", path, st.Mode().Perm())
 	}
-	raw, err := os.ReadFile(path)
+	if sys, ok := st.Sys().(*syscall.Stat_t); ok {
+		if int(sys.Uid) != os.Geteuid() {
+			return nil, fmt.Errorf("backend env-file %s is owned by uid %d (want %d)", path, sys.Uid, os.Geteuid())
+		}
+	}
+	const maxBackendEnvBytes = 1 << 20 // 1 MiB cap
+	raw, err := io.ReadAll(io.LimitReader(f, maxBackendEnvBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("reading backend env-file %s: %w", path, err)
+	}
+	if len(raw) > maxBackendEnvBytes {
+		return nil, fmt.Errorf("backend env-file %s exceeds maximum size (%d bytes)", path, maxBackendEnvBytes)
 	}
 	if strings.ContainsRune(string(raw), '\x00') {
 		return nil, fmt.Errorf("backend env-file %s contains NUL byte", path)
@@ -631,23 +641,7 @@ func registerHostedService(req serviceAddRequest, ops serviceOps) (config.Servic
 	if err != nil {
 		return config.ServiceRecord{}, "", apperr.ExitInternal, err
 	}
-	if _, exists, err := store.Get(req.Name); err != nil {
-		return config.ServiceRecord{}, "", apperr.ExitInternal, err
-	} else if exists {
-		return config.ServiceRecord{}, "", apperr.ExitCLIValidation, fmt.Errorf("service %q already exists (use `ocliv service update %s`)", req.Name, req.Name)
-	}
 	wireLabel := canonicalHTTPLabel(req.Name)
-	if existingAll, lerr := store.List(); lerr == nil {
-		for _, other := range existingAll {
-			otherWire := canonicalHTTPLabel(other.Name)
-			if other.Identity != nil && other.Identity.WireLabel != "" {
-				otherWire = other.Identity.WireLabel
-			}
-			if otherWire == wireLabel && other.Type == req.Type {
-				return config.ServiceRecord{}, "", apperr.ExitCLIValidation, fmt.Errorf("service name %q collides on canonical wire label %q with existing service %q", req.Name, wireLabel, other.Name)
-			}
-		}
-	}
 	inst, ierr := serviceInstanceID(prof, req.Name)
 	if ierr != nil {
 		return config.ServiceRecord{}, "", apperr.ExitCLIValidation, ierr
@@ -694,7 +688,11 @@ func registerHostedService(req serviceAddRequest, ops serviceOps) (config.Servic
 		SystemdUnit:      unit,
 		BackendUnit:      backendUnit,
 	}
-	if err := store.Put(rec); err != nil {
+	rec, err = store.CreateAtomic(rec)
+	if err != nil {
+		if errors.Is(err, config.ErrServiceAlreadyExists) || errors.Is(err, config.ErrServiceLabelCollision) {
+			return config.ServiceRecord{}, "", apperr.ExitCLIValidation, err
+		}
 		return config.ServiceRecord{}, "", apperr.ExitInternal, err
 	}
 	backendStatus := "not running"

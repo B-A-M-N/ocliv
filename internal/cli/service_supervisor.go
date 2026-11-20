@@ -9,8 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
-	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -383,37 +381,20 @@ type runtimeManifest struct {
 	InstalledAt            string `json:"installed_at"`
 }
 
-func currentBuildCommitAndDirty() (commit string, dirty bool) {
-	commit = "unknown"
-	if bi, ok := debug.ReadBuildInfo(); ok && bi != nil {
-		for _, s := range bi.Settings {
-			switch s.Key {
-			case "vcs.revision":
-				if s.Value != "" {
-					commit = s.Value
-				}
-			case "vcs.modified":
-				dirty = s.Value == "true"
-			}
-		}
-	}
-	return commit, dirty
-}
-
 func buildRuntimeManifest(src, dst, sum string) runtimeManifest {
-	commit, dirty := currentBuildCommitAndDirty()
+	bi := GetBuildInfo()
 	return runtimeManifest{
 		BinaryPath:             dst,
 		SHA256:                 sum,
 		SourcePath:             src,
 		Version:                versionString(),
-		BinaryVersion:          BinaryVersion,
-		BuildCommit:            commit,
-		Dirty:                  dirty,
-		GoVersion:              runtime.Version(),
-		ProtocolVersion:        protocol.Version,
-		SupportedProtocolRange: protocol.MinVersion + "-" + protocol.MaxVersion,
-		StoreSchemaVersion:     store.SchemaVersion,
+		BinaryVersion:          bi.Version,
+		BuildCommit:            bi.BuildCommit,
+		Dirty:                  bi.Dirty,
+		GoVersion:              bi.GoVersion,
+		ProtocolVersion:        bi.ProtocolVersion,
+		SupportedProtocolRange: bi.SupportedProtocolRange,
+		StoreSchemaVersion:     bi.StoreSchemaVersion,
 		InstalledAt:            time.Now().UTC().Format(time.RFC3339Nano),
 	}
 }

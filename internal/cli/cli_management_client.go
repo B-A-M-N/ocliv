@@ -57,36 +57,58 @@ func mgmtCallBody(relayURL string, k *identity.KeyPair, keyID, method, path stri
 	return mgmtCallBodyWithNonce(relayURL, k, keyID, method, path, nonce, reqBody)
 }
 
-// probeRelayChallengeCaps queries /v1/agent/challenge to discover relay
-// capabilities before sending a body-bearing v2 management mutation (P0-1).
-// Returns (caps, respondedWithChallenge, err).
-func probeRelayChallengeCaps(relayURL, keyID string) ([]string, bool, error) {
+// probeRelayCapabilities discovers relay protocol capabilities before sending
+// a body-bearing v2 management mutation (A4, P0-1). It prefers the read-only
+// GET /v1/agent/capabilities endpoint (so no attachment challenge nonce is
+// wasted), falling back to POST /v1/agent/challenge ONLY when capabilities
+// returns 404 on an older relay. Any 404 on both, 500, malformed response, or
+// transport error fails closed — NEVER permitting an unnegotiated mutation.
+func probeRelayCapabilities(relayURL, keyID string) ([]string, error) {
 	client, err := mgmtHTTPClient(10 * time.Second)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	defer client.CloseIdleConnections()
-	body, _ := json.Marshal(map[string]string{"key_id": keyID})
-	resp, err := client.Post(strings.TrimRight(relayURL, "/")+"/v1/agent/challenge", "application/json", bytes.NewReader(body))
+	base := strings.TrimRight(relayURL, "/")
+
+	// 1) Preferred read-only capabilities endpoint (allocates zero nonces).
+	resp, err := client.Get(base + "/v1/agent/capabilities")
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
-	if resp.StatusCode == http.StatusNotFound {
-		// Minimal unit-test mock servers that do not mount /v1/agent/challenge.
-		return nil, false, nil
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		var capsResp struct {
+			Capabilities []string `json:"capabilities"`
+		}
+		if err := json.Unmarshal(raw, &capsResp); err != nil {
+			return nil, fmt.Errorf("invalid capabilities response: %w", err)
+		}
+		return capsResp.Capabilities, nil
 	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, true, fmt.Errorf("challenge returned HTTP %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusNotFound {
+		return nil, fmt.Errorf("capabilities endpoint returned HTTP %d", resp.StatusCode)
+	}
+
+	// 2) Fallback to /v1/agent/challenge for relays that predate /v1/agent/capabilities.
+	body, _ := json.Marshal(map[string]string{"key_id": keyID})
+	cResp, err := client.Post(base+"/v1/agent/challenge", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	defer cResp.Body.Close()
+	cRaw, _ := io.ReadAll(io.LimitReader(cResp.Body, 16*1024))
+	if cResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("challenge capability discovery returned HTTP %d", cResp.StatusCode)
 	}
 	var ch struct {
 		Capabilities []string `json:"capabilities"`
 	}
-	if err := json.Unmarshal(raw, &ch); err != nil {
-		return nil, true, fmt.Errorf("invalid challenge response: %w", err)
+	if err := json.Unmarshal(cRaw, &ch); err != nil {
+		return nil, fmt.Errorf("invalid challenge response: %w", err)
 	}
-	return ch.Capabilities, true, nil
+	return ch.Capabilities, nil
 }
 
 func capsContain(caps []string, want string) bool {
@@ -108,13 +130,15 @@ func mgmtCallBodyWithNonce(relayURL string, k *identity.KeyPair, keyID, method, 
 	var bodyReader io.Reader
 	useV2 := len(reqBody) > 0
 	if useV2 {
-		// P0-1: body-bearing mutations require negotiated mgmt_body_sig_v2 so
-		// we never silently fail against an older relay or downgrade to v1.
-		caps, hasChallenge, cerr := probeRelayChallengeCaps(relayURL, keyID)
+		// A4 / P0-1: body-bearing mutations strictly require negotiated
+		// mgmt_body_sig_v2. Any discovery failure (404, 500, malformed,
+		// unreachable, or missing capability) fails closed BEFORE sending the
+		// mutation request.
+		caps, cerr := probeRelayCapabilities(relayURL, keyID)
 		if cerr != nil {
 			return 0, nil, fmt.Errorf("management capability check failed: %w", cerr)
 		}
-		if hasChallenge && !capsContain(caps, protocol.CapabilityMgmtBodySignatureV2) {
+		if !capsContain(caps, protocol.CapabilityMgmtBodySignatureV2) {
 			return 0, nil, fmt.Errorf("relay must be upgraded before this operation (missing capability %q)", protocol.CapabilityMgmtBodySignatureV2)
 		}
 		bodyDigest := agent.MgmtBodySHA256(reqBody)

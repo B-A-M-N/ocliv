@@ -14,10 +14,11 @@ import (
 	"ocliv/internal/store"
 )
 
-// BuildCommit and BuildTime can be overridden at link time via -ldflags.
+// BuildCommit, BuildTime, and BuildDirty can be overridden at link time via -ldflags.
 var (
 	BuildCommit = ""
 	BuildTime   = ""
+	BuildDirty  = ""
 )
 
 // BinaryVersion is the client/relay build version reported by
@@ -25,17 +26,34 @@ var (
 // with protocol.MinVersion/MaxVersion when the wire changes.
 const BinaryVersion = "1.0.0"
 
-// versionString renders the build and wire-protocol identity from the
-// single-source constants, never hardcoded literals that can drift.
-func versionString() string {
-	return fmt.Sprintf("ocliv %s (protocol %s, supported %s-%s)",
-		BinaryVersion, protocol.Version, protocol.MinVersion, protocol.MaxVersion)
+// BuildInfo is the single authoritative build-provenance representation used
+// by `ocliv version --json`, `runtime.json`, release manifests, and diagnostics (A10).
+type BuildInfo struct {
+	Version                string `json:"version"`
+	BuildCommit            string `json:"build_commit"`
+	BuildTime              string `json:"build_time"`
+	Dirty                  bool   `json:"dirty"`
+	OS                     string `json:"os"`
+	Arch                   string `json:"arch"`
+	GoVersion              string `json:"go_version"`
+	StoreSchemaVersion     int    `json:"store_schema_version"`
+	ProtocolVersion        string `json:"protocol_version"`
+	SupportedProtocolRange string `json:"supported_protocol_range"`
 }
 
-func buildVersionInfo() map[string]any {
-	commit := BuildCommit
-	buildTime := BuildTime
-	if info, ok := debug.ReadBuildInfo(); ok {
+// GetBuildInfo returns unified build provenance. Explicit linker-provided
+// BuildCommit/BuildTime/BuildDirty always take precedence; Go debug build info
+// is fallback only (A10).
+func GetBuildInfo() BuildInfo {
+	commit := strings.TrimSpace(BuildCommit)
+	buildTime := strings.TrimSpace(BuildTime)
+	dirtySet := false
+	dirty := false
+	if d := strings.TrimSpace(strings.ToLower(BuildDirty)); d != "" {
+		dirtySet = true
+		dirty = d == "true" || d == "1" || d == "yes"
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info != nil {
 		for _, s := range info.Settings {
 			switch s.Key {
 			case "vcs.revision":
@@ -46,25 +64,59 @@ func buildVersionInfo() map[string]any {
 				if buildTime == "" {
 					buildTime = s.Value
 				}
+			case "vcs.modified":
+				if !dirtySet {
+					dirty = s.Value == "true"
+				}
 			}
 		}
 	}
+	if commit == "" {
+		commit = "unknown"
+	}
+	return BuildInfo{
+		Version:                BinaryVersion,
+		BuildCommit:            commit,
+		BuildTime:              buildTime,
+		Dirty:                  dirty,
+		OS:                     runtime.GOOS,
+		Arch:                   runtime.GOARCH,
+		GoVersion:              runtime.Version(),
+		StoreSchemaVersion:     store.SchemaVersion,
+		ProtocolVersion:        protocol.Version,
+		SupportedProtocolRange: protocol.MinVersion + "-" + protocol.MaxVersion,
+	}
+}
+
+// versionString renders the build and wire-protocol identity from the
+// single-source constants, never hardcoded literals that can drift.
+func versionString() string {
+	return fmt.Sprintf("ocliv %s (protocol %s, supported %s-%s)",
+		BinaryVersion, protocol.Version, protocol.MinVersion, protocol.MaxVersion)
+}
+
+func buildVersionInfo() map[string]any {
+	bi := GetBuildInfo()
 	return map[string]any{
-		"version":             BinaryVersion,
-		"commit":              commit,
-		"build_time":          buildTime,
-		"os":                  runtime.GOOS,
-		"arch":                runtime.GOARCH,
-		"go_version":          runtime.Version(),
-		"schema_version":      store.SchemaVersion,
-		"protocol_version":    protocol.Version,
-		"supported_protocols": protocol.MinVersion + "-" + protocol.MaxVersion,
+		"version":             bi.Version,
+		"commit":              bi.BuildCommit,
+		"build_commit":        bi.BuildCommit,
+		"build_time":          bi.BuildTime,
+		"dirty":               bi.Dirty,
+		"os":                  bi.OS,
+		"arch":                bi.Arch,
+		"go_version":          bi.GoVersion,
+		"schema_version":      bi.StoreSchemaVersion,
+		"protocol_version":    bi.ProtocolVersion,
+		"supported_protocols": bi.SupportedProtocolRange,
 		"capabilities": []string{
 			"mcp_managed_oauth",
 			"appended_as_discovery",
 			"direct_grant_v13",
 			"confidential_refresh_v14",
 			"cors_mcp_headers",
+			"persistent_named_leases",
+			"mgmt_body_sig_v2",
 		},
 	}
 }
@@ -165,7 +217,7 @@ func usage(code int) int {
 	fmt.Print(`Ocliv — secure instant HTTPS hosting.
 
 Everyday:
-  ocliv setup [--auto ...]           configure this host once (single-host edge default)
+  ocliv setup [--auto ...]           configure this host once (tunnel edge default)
   ocliv host [http|mcp] PORT [--name N]  persistently host HTTP (default) or MCP (systemd + reboot-safe)
   ocliv status [NAME] [--json]       show hosted service or tunnel health and recovery state
   ocliv restart NAME                 non-destructive restart/rebind (preserves URL & sessions)
