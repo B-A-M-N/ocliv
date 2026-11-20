@@ -183,6 +183,12 @@ func cmdTunnel(argv []string) int {
 	}
 	renderTunnelAttached(ready, a)
 	a, code = runSteadyState(ctx, ready, live, a, nil)
+	if ready.opts.cfg.Persistent {
+		// Persistent hosted services leave their relay lease in RECONNECTING
+		// on normal daemon shutdown/restart/reboot so visitor sessions survive.
+		// Explicit `ocliv stop|disable|remove` revokes the lease authoritatively.
+		return code
+	}
 	return closeTunnel(ready, a, code)
 }
 

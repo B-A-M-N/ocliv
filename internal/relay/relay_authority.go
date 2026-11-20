@@ -113,10 +113,11 @@ func isNumericPort(s string) bool {
 // authority (enrollment, challenge, connect, signed lease management).
 func isAgentPath(p string) bool {
 	switch p {
-	case "/v1/agent/enroll", "/v1/agent/challenge", "/v1/agent/connect":
+	case "/v1/agent/enroll", "/v1/agent/challenge", "/v1/agent/connect",
+		"/v1/agent/key/rotate", "/v1/agent/key/revoke":
 		return true
 	}
-	if strings.HasPrefix(p, "/v1/agent/lease/") {
+	if p == "/v1/agent/leases" || strings.HasPrefix(p, "/v1/agent/lease/") {
 		return true
 	}
 	return p == "/v1/agent/mcp-routes" || strings.HasPrefix(p, "/v1/agent/mcp-routes/")

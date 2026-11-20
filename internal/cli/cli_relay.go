@@ -36,7 +36,7 @@ func restrictFileCreation() {
 // cmdRelay handles relay-side operations.
 func cmdRelay(argv []string) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ocliv relay init|serve|doctor|issue-enroll|enroll-ssh|keys|revoke-key|tenants|backup|validate-backup|restore ...")
+		fmt.Fprintln(os.Stderr, "usage: ocliv relay init|serve|doctor|issue-enroll|enroll-ssh|keys|revoke-key|rotate-visitor-key|tenants|backup|validate-backup|restore ...")
 		return apperr.ExitCLIValidation
 	}
 	switch argv[0] {
@@ -54,6 +54,8 @@ func cmdRelay(argv []string) int {
 		return cmdRelayKeys(argv[1:])
 	case "revoke-key":
 		return cmdRelayRevokeKey(argv[1:])
+	case "rotate-visitor-key":
+		return cmdRelayRotateVisitorKey(argv[1:])
 	case "tenants":
 		return cmdRelayTenants(argv[1:])
 	case "backup":
@@ -89,6 +91,54 @@ func cmdRelayValidateBackup(argv []string) int {
 		return exitForRelayErr(err)
 	}
 	fmt.Printf("backup validated: %s\n", in)
+	return apperr.ExitOK
+}
+
+// cmdRelayRotateVisitorKey replaces <dataDir>/visitor-hmac.key with a fresh
+// 256-bit HMAC key preserving existing uid/gid ownership (P0-5, P1-5).
+// With --restart, also revokes persisted visitor_sessions rows, restarts
+// ocliv-relay, and verifies active status.
+func cmdRelayRotateVisitorKey(argv []string) int {
+	dataDir := ""
+	restart := false
+	for i := 0; i < len(argv); i++ {
+		if v, ok := mcpFlagValue(argv, &i, "data"); ok {
+			dataDir = v
+		} else if argv[i] == "--restart" {
+			restart = true
+		} else {
+			fmt.Fprintln(os.Stderr, "usage: ocliv relay rotate-visitor-key --data DIR [--restart]")
+			return apperr.ExitCLIValidation
+		}
+	}
+	if dataDir == "" {
+		fmt.Fprintln(os.Stderr, "usage: ocliv relay rotate-visitor-key --data DIR [--restart]")
+		return apperr.ExitCLIValidation
+	}
+	if _, err := relay.RotateVisitorKey(dataDir); err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
+	}
+	if restart {
+		dbPath := filepath.Join(dataDir, "ocliv.db")
+		if db, derr := store.Open(dbPath); derr == nil {
+			nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+			_, _ = db.SQL().Exec(`UPDATE visitor_sessions SET revoked_at=? WHERE revoked_at IS NULL`, nowStr)
+			db.Audit("operator", "", "", "rotate_visitor_key", "ok", "rotated visitor-hmac.key and invalidated persisted visitor sessions")
+			_ = db.Close()
+		}
+		if out, err := exec.Command("systemctl", "restart", "ocliv-relay").CombinedOutput(); err != nil {
+			fmt.Fprintf(os.Stderr, "error restarting ocliv-relay after visitor key rotation: %v (%s)\n", err, strings.TrimSpace(string(out)))
+			return apperr.ExitInternal
+		}
+		if out, err := exec.Command("systemctl", "is-active", "ocliv-relay").CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "active" {
+			fmt.Fprintf(os.Stderr, "error: ocliv-relay not active after restart (%s)\n", strings.TrimSpace(string(out)))
+			return apperr.ExitInternal
+		}
+		fmt.Printf("rotated visitor HMAC key in %s and restarted ocliv-relay (active)\n", dataDir)
+		return apperr.ExitOK
+	}
+	fmt.Printf("rotated visitor HMAC key in %s (restart ocliv-relay or pass --restart to invalidate active browser sessions)\n", dataDir)
 	return apperr.ExitOK
 }
 
@@ -407,9 +457,16 @@ func cmdRelayServe(argv []string) int {
 		return apperr.ExitInternal
 	}
 	defer db.Close()
+	visitorKey, err := relay.LoadOrCreateVisitorKey(dataDir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
+	}
 	srv, err := relay.New(relay.Options{
 		DB: db, Namespace: "t." + domain, RelayHost: relayHost,
-		MCPExternalHost: mcpHost, MCPExternalPort: mcpPort,
+		ServerKey:                visitorKey,
+		MCPExternalHost:          mcpHost,
+		MCPExternalPort:          mcpPort,
 		AutoApproveRedirectHosts: autoApproveHosts,
 		GoogleVerificationJSON:   googleVerifyJSON,
 	})

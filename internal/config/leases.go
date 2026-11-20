@@ -53,6 +53,11 @@ type LeaseRecord struct {
 	// ready. Empty path means /; status 0 means any HTTP response.
 	ProbePath   string `json:"probe_path,omitempty"`
 	ProbeStatus int    `json:"probe_status,omitempty"`
+	// Persistent binds whether the lease is a persistent hosted service
+	// (survives normal restarts/reboots/>90s outages) vs an ephemeral tunnel.
+	// Legacy records without this field default to false and never silently
+	// resume a persistent service.
+	Persistent bool `json:"persistent,omitempty"`
 }
 
 // ResumeQuery is the canonical deployment identity (P1-5, Domain A).
@@ -70,6 +75,7 @@ type ResumeQuery struct {
 	UpstreamHost    string
 	ProbePath       string
 	ProbeStatus     int
+	Persistent      bool
 }
 
 // LeaseStore persists lease records under dir/leases/.
@@ -260,7 +266,8 @@ func (s *LeaseStore) FindResume(q ResumeQuery) (LeaseRecord, bool) {
 		if rec.RelayURL == q.RelayURL && rec.KeyID == q.KeyID && rec.Port == q.Port &&
 			rec.AccessMode == q.AccessMode && rec.Name == q.Name && rec.Public == q.Public &&
 			rec.IPv6 == q.IPv6 && rec.TTLSeconds == q.TTLSeconds && rec.UpstreamHost == q.UpstreamHost &&
-			rec.ProbePath == q.ProbePath && rec.ProbeStatus == q.ProbeStatus {
+			rec.ProbePath == q.ProbePath && rec.ProbeStatus == q.ProbeStatus &&
+			rec.Persistent == q.Persistent {
 			return rec, true
 		}
 	}

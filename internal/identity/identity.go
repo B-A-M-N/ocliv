@@ -9,9 +9,13 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"ocliv/internal/apperr"
@@ -56,33 +60,144 @@ func (k *KeyPair) Public() ed25519.PublicKey {
 
 // ID derives the stable key identifier.
 func (k *KeyPair) ID() KeyID {
-	sum := sha256.Sum256(k.Public())
+	return KeyIDFor(k.Public())
+}
+
+// KeyIDFor derives the stable key identifier from a raw Ed25519 public key.
+func KeyIDFor(pub ed25519.PublicKey) KeyID {
+	sum := sha256.Sum256(pub)
 	return KeyID(hex.EncodeToString(sum[:KeyIDBytes]))
 }
 
-// Save writes the seed with owner-only permissions (B08). Refuses to
-// overwrite an existing key and refuses unsafe file modes.
+// Save durably writes the seed with owner-only permissions using
+// O_CREATE|O_EXCL|O_NOFOLLOW, fsyncs the file, and fsyncs the parent directory
+// (P0-2, B08). Refuses to overwrite an existing file or follow a symlink.
 func (k *KeyPair) Save(path string) error {
-	if _, err := os.Stat(path); err == nil {
-		return apperr.E(apperr.CodeInternal, "agent key exists; refusing to overwrite (use logout first)", nil)
+	if k == nil || len(k.Seed) != ed25519.SeedSize {
+		return apperr.E(apperr.CodeInternal, "cannot save invalid agent key", nil)
 	}
-	if err := os.WriteFile(path, []byte(base64.StdEncoding.EncodeToString(k.Seed)), 0o600); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return apperr.E(apperr.CodeInternal, "creating agent key directory", err)
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return apperr.E(apperr.CodeInternal, "agent key exists; refusing to overwrite (use logout first)", err)
+		}
+		return apperr.E(apperr.CodeInternal, "creating agent key", err)
+	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(path)
+		}
+	}()
+	st, err := f.Stat()
+	if err != nil || !st.Mode().IsRegular() {
+		_ = f.Close()
+		return apperr.E(apperr.CodeInternal, "agent key target is not a regular file", err)
+	}
+	encoded := base64.StdEncoding.EncodeToString(k.Seed)
+	if _, err := io.WriteString(f, encoded); err != nil {
+		_ = f.Close()
 		return apperr.E(apperr.CodeInternal, "writing agent key", err)
+	}
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return apperr.E(apperr.CodeInternal, "setting agent key permissions", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return apperr.E(apperr.CodeInternal, "syncing agent key", err)
+	}
+	if err := f.Close(); err != nil {
+		return apperr.E(apperr.CodeInternal, "closing agent key", err)
+	}
+	if err := syncParentDir(dir); err != nil {
+		return apperr.E(apperr.CodeInternal, "syncing agent key directory", err)
+	}
+	cleanup = false
+	return nil
+}
+
+// SaveDurableReplace atomically and durably replaces path with k using a
+// staged 0600 file + fsync + rename + parent-dir fsync (P0-2). Used for
+// crash-safe key rotation after remote commit.
+func (k *KeyPair) SaveDurableReplace(path string) error {
+	if k == nil || len(k.Seed) != ed25519.SeedSize {
+		return apperr.E(apperr.CodeInternal, "cannot save invalid agent key", nil)
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return apperr.E(apperr.CodeInternal, "creating agent key directory", err)
+	}
+	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return apperr.E(apperr.CodeInternal, "refusing to replace symlinked agent key", nil)
+	}
+	tmp, err := os.CreateTemp(dir, ".agent-key-replace-*")
+	if err != nil {
+		return apperr.E(apperr.CodeInternal, "staging replacement agent key", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return apperr.E(apperr.CodeInternal, "chmod replacement agent key", err)
+	}
+	if _, err := io.WriteString(tmp, base64.StdEncoding.EncodeToString(k.Seed)); err != nil {
+		_ = tmp.Close()
+		return apperr.E(apperr.CodeInternal, "writing replacement agent key", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return apperr.E(apperr.CodeInternal, "syncing replacement agent key", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return apperr.E(apperr.CodeInternal, "closing replacement agent key", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return apperr.E(apperr.CodeInternal, "renaming replacement agent key", err)
+	}
+	if err := syncParentDir(dir); err != nil {
+		return apperr.E(apperr.CodeInternal, "syncing agent key directory after rename", err)
 	}
 	return nil
 }
 
-// Load reads a key file, failing closed on unreadable or unsafe files (B08).
+func syncParentDir(dir string) error {
+	dfd, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	serr := dfd.Sync()
+	cerr := dfd.Close()
+	if serr != nil {
+		return serr
+	}
+	return cerr
+}
+
+// Load reads a key file via a single O_NOFOLLOW file descriptor, verifying
+// regular-file type and owner-only 0600 permissions before reading (P0-2, B08).
 func Load(path string) (*KeyPair, error) {
-	fi, err := os.Stat(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, apperr.E(apperr.CodeEnrollAuth, "no agent enrollment found; run `ocliv login` first", err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, apperr.E(apperr.CodeEnrollAuth, "stat agent key", err)
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, apperr.E(apperr.CodeEnrollAuth, "agent key is not a regular file", nil)
 	}
 	if fi.Mode().Perm()&0o077 != 0 {
 		return nil, apperr.E(apperr.CodeEnrollAuth,
 			fmt.Sprintf("agent key %s has unsafe permissions %o; want 0600", path, fi.Mode().Perm()), nil)
 	}
-	raw, err := os.ReadFile(path)
+	raw, err := io.ReadAll(io.LimitReader(f, 256))
 	if err != nil {
 		return nil, apperr.E(apperr.CodeEnrollAuth, "reading agent key", err)
 	}

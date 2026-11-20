@@ -97,6 +97,28 @@ func (s *Server) currentLeaseExpiry(t *routeTarget) (time.Time, bool) {
 	return expiry, expiry.After(time.Now().UTC())
 }
 
+// handleEdgeHealthz serves a protocol-neutral public-edge verification endpoint
+// on the hosted hostname (`HEAD|GET /_ocliv/healthz`). It returns 200 OK only
+// after exact Host routing matches an admitted live route, never forwarding to
+// the upstream application and never leaking secrets.
+func (s *Server) handleEdgeHealthz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodHead && r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	t, _, code := s.route(r.Host)
+	if t == nil {
+		http.Error(w, http.StatusText(code), code)
+		return
+	}
+	w.Header().Set("X-Ocliv-Edge", "ok")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodGet {
+		_, _ = w.Write([]byte("ok\n"))
+	}
+}
+
 // route maps an exact Host to exactly one live lease generation. Anything
 // else maps to no destination (D01, D03): malformed -> 400/421, unknown or
 // offline -> 404/503 with no cross-tenant hint.

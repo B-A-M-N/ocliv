@@ -33,6 +33,10 @@ func (s *Server) allocateOrResume(tenantID, keyID string, intent LeaseIntent) (*
 	if _, _, status, err := s.lookupKey(keyID); err != nil || !s.identityAdmitted(tenantID, status) {
 		return nil, attachedMsg{}, apperr.E(apperr.CodeEnrollAuth, "unknown, revoked, or suspended agent key", err)
 	}
+	if intent.Persistent && strings.TrimSpace(intent.Name) == "" {
+		return nil, attachedMsg{}, apperr.E(apperr.CodeCLIValidation,
+			"persistent lease requires an explicit named hostname", nil)
+	}
 	now := time.Now().UTC()
 	if intent.LeaseID != "" {
 		ls, err := s.resumeLease(tenantID, keyID, intent)
@@ -117,12 +121,13 @@ func wantMode(intent LeaseIntent) (string, error) {
 func (s *Server) resumeLease(tenantID, keyID string, intent LeaseIntent) (*lease.Lease, error) {
 	var ls lease.Lease
 	var state string
+	var persistentInt int
 	var expiresAt, reconnectUntil sql.NullString
 	err := s.db.SQL().QueryRow(
-		`SELECT id, tenant_id, agent_key_id, hostname, port, access_mode, generation, token_generation, status, expires_at, reconnect_until
+		`SELECT id, tenant_id, agent_key_id, hostname, port, access_mode, generation, token_generation, status, expires_at, reconnect_until, COALESCE(persistent, 0)
 		 FROM leases WHERE id=?`, intent.LeaseID,
 	).Scan(&ls.ID, &ls.TenantID, &ls.AgentKeyID, &ls.Hostname, &ls.Port, &ls.AccessMode,
-		&ls.Generation, new(int), &state, &expiresAt, &reconnectUntil)
+		&ls.Generation, new(int), &state, &expiresAt, &reconnectUntil, &persistentInt)
 	if err != nil {
 		// Unknown id is the only resume path that may mint a new lease;
 		// any other read failure fails closed (B09, F12).
@@ -182,7 +187,11 @@ func (s *Server) resumeLease(tenantID, keyID string, intent LeaseIntent) (*lease
 			return nil, apperr.E(apperr.CodeExpired, "reconnect grace elapsed", nil)
 		}
 	}
-	if ls.Port != intent.Port {
+	if (persistentInt != 0) != intent.Persistent {
+		s.db.Audit("agent", tenantID, ls.ID, "resume", "denied", "persistent mode mismatch")
+		return nil, apperr.E(apperr.CodeConflict, "resume persistent mode mismatch", nil)
+	}
+	if ls.Port != intent.Port && persistentInt == 0 {
 		return nil, apperr.E(apperr.CodeConflict, "resume with different port requires a new lease", nil)
 	}
 	// Access mode is part of the lease identity: a changed mode must never
@@ -214,12 +223,16 @@ func (s *Server) resumeLease(tenantID, keyID string, intent LeaseIntent) (*lease
 	// Terminal states stay terminal; only a fenced generation wins.
 	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
 	newGen := ls.Generation + 1
+	newPort := ls.Port
+	if persistentInt != 0 && intent.Port > 0 {
+		newPort = intent.Port
+	}
 	res, err := s.db.SQL().Exec(
-		`UPDATE leases SET generation=?, status=?, reconnect_until=NULL
+		`UPDATE leases SET generation=?, port=?, status=?, reconnect_until=NULL
 		 WHERE id=? AND generation=? AND status IN (?,?)
 		 AND tenant_id=? AND agent_key_id=?
 		 AND (expires_at IS NULL OR expires_at > ?)`,
-		newGen, lease.StateActive, ls.ID, ls.Generation,
+		newGen, newPort, lease.StateActive, ls.ID, ls.Generation,
 		string(lease.StateActive), string(lease.StateReconnecting),
 		tenantID, keyID, nowStr)
 	if err != nil {
@@ -242,6 +255,7 @@ func (s *Server) resumeLease(tenantID, keyID string, intent LeaseIntent) (*lease
 	// (3) register only the fenced generation (see registerSession).
 	s.evictIfOlder(ls.ID, newGen)
 	ls.Generation = newGen
+	ls.Port = newPort
 	ls.UpdatedAt = time.Now()
 	ls.State = lease.StateActive
 	metrics.Global.SessionReconnects.Add(1)
@@ -295,7 +309,15 @@ func (s *Server) allocateEphemeral(tenantID, keyID string, intent LeaseIntent, n
 // reclaim is reserved for the SAME key that owns the hostname (the
 // publisher-restart case); a cross-key takeover requires an explicit,
 // audited ownership-transfer operation, which does not exist yet.
+const (
+	maxPersistentLeasesPerKey    = 32
+	maxPersistentLeasesPerTenant = 128
+)
+
 func (s *Server) allocateNamed(tenantID, keyID string, intent LeaseIntent, now time.Time) (*lease.Lease, attachedMsg, error) {
+	if !s.throttle.Allow("reg:" + tenantID) {
+		return nil, attachedMsg{}, apperr.E(apperr.CodeQuotaLease, "registration rate limited", nil)
+	}
 	label := strings.ToLower(intent.Name)
 	if err := lease.ValidateLabel(label); err != nil {
 		return nil, attachedMsg{}, err
@@ -330,44 +352,72 @@ func (s *Server) insertLease(tenantID, keyID, label string, intent LeaseIntent, 
 	}
 	var retiredID string
 	var reclaimDenied bool
+	var reboundPersistent bool
+	var reboundGen uint64
+	persistentVal := 0
+	if intent.Persistent && named != nil {
+		persistentVal = 1
+	}
 	err = withTx(s.db.SQL(), func(tx *sql.Tx) error {
 		if named != nil {
-			var owner, ownerKey, st, oldID string
-			err := tx.QueryRow(`SELECT tenant_id, agent_key_id, status, id FROM leases WHERE hostname=?`, hostname).Scan(&owner, &ownerKey, &st, &oldID)
+			var owner, ownerKey, st, oldID, oldMode string
+			var oldGen uint64
+			var oldPersistent int
+			var oldExpires sql.NullString
+			err := tx.QueryRow(`SELECT tenant_id, agent_key_id, status, id, access_mode, generation, COALESCE(persistent, 0), expires_at FROM leases WHERE hostname=?`, hostname).
+				Scan(&owner, &ownerKey, &st, &oldID, &oldMode, &oldGen, &oldPersistent, &oldExpires)
 			if err == nil {
 				if owner != tenantID {
 					return apperr.E(apperr.CodeOwnershipConflict, "named host owned by another tenant", nil)
 				}
-				// Same tenant is not enough (P0-2): the reclaim rebinds
-				// the retired lease's publications — and for managed
-				// routes their operator approval state — to the new
-				// lease. Automatic reclaim is reserved for the SAME key
-				// that owns the hostname (the publisher-restart case).
-				// A different key must use an explicit ownership
-				// transfer, which does not exist, so it is refused here.
 				if ownerKey != keyID {
 					reclaimDenied = true
 					return apperr.E(apperr.CodeOwnershipConflict, "named host is held by another agent key in this tenant", nil)
 				}
-				// Same owner: reclaim the name; old generations are fenced.
-				// The old lease id is captured so its live session and
-				// budget are retired after commit (P1-04). The deletes and
-				// the replacement insert commit atomically: no window exists
-				// where durable evidence is gone but the replacement is not.
+				// Persistent named rebind: ONLY explicitly resumable states
+				// (ACTIVE, RECONNECTING) with an unexpired deadline qualify for
+				// in-place transport rebind (P0-5). Past or malformed expires_at
+				// MUST fall through to terminal replacement so old visitor
+				// tokens and browser sessions are never revived.
+				resumableState := st == string(lease.StateActive) || st == string(lease.StateReconnecting)
+				unexpired := !oldExpires.Valid || strings.TrimSpace(oldExpires.String) == ""
+				if oldExpires.Valid && strings.TrimSpace(oldExpires.String) != "" {
+					if parsedExp, perr := time.Parse(time.RFC3339Nano, oldExpires.String); perr == nil && parsedExp.After(now) {
+						unexpired = true
+					}
+				}
+				if oldPersistent != 0 && intent.Persistent && oldMode == mode && resumableState && unexpired {
+					var expires any
+					if intent.TTLSeconds > 0 {
+						expires = now.Add(time.Duration(intent.TTLSeconds) * time.Second).Format(time.RFC3339Nano)
+					}
+					nextGen := oldGen + 1
+					nowStr := now.Format(time.RFC3339Nano)
+					res, err := tx.Exec(
+						`UPDATE leases SET port=?, generation=?, status=?, reconnect_until=NULL, expires_at=?
+						 WHERE id=? AND tenant_id=? AND agent_key_id=? AND status IN (?,?)
+						   AND (expires_at IS NULL OR expires_at = '' OR expires_at > ?)`,
+						intent.Port, nextGen, lease.StateActive, expires, oldID, tenantID, keyID,
+						string(lease.StateActive), string(lease.StateReconnecting), nowStr)
+					if err != nil {
+						return err
+					}
+					if n, _ := res.RowsAffected(); n == 1 {
+						id = oldID
+						reboundPersistent = true
+						reboundGen = nextGen
+						sharePrepared = false
+						return nil
+					}
+				}
+				// Ephemeral reclaim or post-revoke/close replacement: old
+				// credentials and sessions are explicitly wiped.
 				if _, err := tx.Exec(`DELETE FROM access_tokens WHERE lease_id IN (SELECT id FROM leases WHERE hostname=?)`, hostname); err != nil {
 					return err
 				}
 				if _, err := tx.Exec(`DELETE FROM visitor_sessions WHERE lease_id IN (SELECT id FROM leases WHERE hostname=?)`, hostname); err != nil {
 					return err
 				}
-				// Publications are NOT deleted on reclaim (P1-A): the
-				// stable route rebinds to the replacement lease below,
-				// so the public URL survives ordinary restarts.
-				// Revoked tombstones stay revoked and never rebind; their
-				// lease_id is detached first so the deferred FK on the
-				// retired lease cannot fail the reclaim commit (P0-B).
-				// The tombstone keeps its route identity, ownership, and
-				// revoked state with a NULL active binding.
 				if _, err := tx.Exec(
 					`UPDATE mcp_publications SET lease_id=NULL, updated_at=? WHERE lease_id=? AND revoked_at IS NOT NULL`,
 					now.Format(time.RFC3339Nano), oldID); err != nil {
@@ -379,14 +429,35 @@ func (s *Server) insertLease(tenantID, keyID, label string, intent LeaseIntent, 
 				retiredID = oldID
 			}
 		}
+		if persistentVal != 0 {
+			var keyCount, tenantCount int
+			if err := tx.QueryRow(
+				`SELECT COUNT(*) FROM leases WHERE agent_key_id=? AND COALESCE(persistent, 0)!=0 AND status IN (?,?)`,
+				keyID, string(lease.StateActive), string(lease.StateReconnecting),
+			).Scan(&keyCount); err != nil {
+				return err
+			}
+			if keyCount >= maxPersistentLeasesPerKey {
+				return apperr.E(apperr.CodeQuotaLease, "persistent lease quota exceeded for agent key", nil)
+			}
+			if err := tx.QueryRow(
+				`SELECT COUNT(*) FROM leases WHERE tenant_id=? AND COALESCE(persistent, 0)!=0 AND status IN (?,?)`,
+				tenantID, string(lease.StateActive), string(lease.StateReconnecting),
+			).Scan(&tenantCount); err != nil {
+				return err
+			}
+			if tenantCount >= maxPersistentLeasesPerTenant {
+				return apperr.E(apperr.CodeQuotaLease, "persistent lease quota exceeded for tenant", nil)
+			}
+		}
 		var expires any
 		if intent.TTLSeconds > 0 {
 			expires = now.Add(time.Duration(intent.TTLSeconds) * time.Second).Format(time.RFC3339Nano)
 		}
 		if _, err := tx.Exec(
-			`INSERT INTO leases(id, tenant_id, agent_key_id, hostname, label, port, access_mode, generation, status, expires_at, created_at)
-			 VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-			id, tenantID, keyID, hostname, label, intent.Port, mode, 1, lease.StateActive, expires, now.Format(time.RFC3339Nano)); err != nil {
+			`INSERT INTO leases(id, tenant_id, agent_key_id, hostname, label, port, access_mode, generation, status, expires_at, persistent, created_at)
+			 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+			id, tenantID, keyID, hostname, label, intent.Port, mode, 1, lease.StateActive, expires, persistentVal, now.Format(time.RFC3339Nano)); err != nil {
 			return err
 		}
 		if retiredID != "" {
@@ -434,7 +505,10 @@ func (s *Server) insertLease(tenantID, keyID, label string, intent LeaseIntent, 
 		}
 		return nil, attachedMsg{}, apperr.E(apperr.CodeStoreFault, "allocating lease", err)
 	}
-	if retiredID != "" && retiredID != id {
+	if reboundPersistent {
+		s.evictIfOlder(id, reboundGen)
+		s.db.Audit("agent", tenantID, id, "lease_rebind", "ok", "persistent lease rebound; visitor sessions preserved")
+	} else if retiredID != "" && retiredID != id {
 		// The reclaimed lease loses forwarding authority immediately:
 		// kill its live session and drop its budget (P1-04).
 		s.evictLease(retiredID)
@@ -444,8 +518,12 @@ func (s *Server) insertLease(tenantID, keyID, label string, intent LeaseIntent, 
 	if intent.TTLSeconds > 0 {
 		expiresAt = now.Add(time.Duration(intent.TTLSeconds) * time.Second)
 	}
+	gen := uint64(1)
+	if reboundPersistent {
+		gen = reboundGen
+	}
 	ls := &lease.Lease{ID: id, TenantID: tenantID, AgentKeyID: keyID, Hostname: hostname,
-		Port: intent.Port, AccessMode: mode, State: lease.StateActive, Generation: 1, ExpiresAt: expiresAt}
+		Port: intent.Port, AccessMode: mode, State: lease.StateActive, Generation: gen, ExpiresAt: expiresAt}
 	// Every protected lease gets one initial single-redeem share token; the
 	// raw secret goes to the agent over the authenticated session only.
 	// The verifier committed inside the allocation transaction above, so
@@ -488,10 +566,14 @@ func (s *Server) reconcileBoot() error {
 		now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano)); err != nil {
 		return apperr.E(apperr.CodeStoreFault, "reconciling reconnecting leases", err)
 	}
-	// Surviving ACTIVE rows: no live session exists, so RECONNECTING with a
-	// fresh owner-resume window (F04).
+	// Surviving ACTIVE rows: ephemeral leases enter RECONNECTING with a
+	// bounded grace window; persistent hosted leases enter RECONNECTING with
+	// reconnect_until=NULL so they survive arbitrarily long restarts/outages.
 	if _, err := s.db.SQL().Exec(
-		`UPDATE leases SET status=?, reconnect_until=? WHERE status=?`,
+		`UPDATE leases
+		 SET status=?,
+		     reconnect_until=CASE WHEN COALESCE(persistent, 0) != 0 THEN NULL ELSE ? END
+		 WHERE status=?`,
 		lease.StateReconnecting, now.Add(lease.ReconnectGrace).Format(time.RFC3339Nano), lease.StateActive); err != nil {
 		return apperr.E(apperr.CodeStoreFault, "reconciling active leases", err)
 	}
@@ -515,9 +597,9 @@ func (s *Server) reconcileBoot() error {
 			return apperr.E(apperr.CodeStoreFault, "pruning authorization state", err)
 		}
 	}
-	// Re-arm in-memory expiry for every row still waiting on a resume.
+	// Re-arm in-memory expiry for ephemeral rows still waiting on a resume.
 	rows, err := s.db.SQL().Query(
-		`SELECT id, reconnect_until FROM leases WHERE status=?`, lease.StateReconnecting)
+		`SELECT id, reconnect_until FROM leases WHERE status=? AND COALESCE(persistent, 0)=0`, lease.StateReconnecting)
 	if err != nil {
 		return apperr.E(apperr.CodeStoreFault, "reconciling expiry timers", err)
 	}

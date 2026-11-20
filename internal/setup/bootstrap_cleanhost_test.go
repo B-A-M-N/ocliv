@@ -97,6 +97,17 @@ func TestInstallDynv6RefreshKeepsTokenOutOfUnitsAndJournalsToken(t *testing.T) {
 	if err := InstallDynv6RefreshTo("Lab.Dynv6.net.", "secret-token", dataDir, envPath, servicePath, timerPath); err != nil {
 		t.Fatal(err)
 	}
+	// Also verify DuckDNS persistent refresh timer installation (same contract).
+	duckDir := t.TempDir()
+	duckEnv := filepath.Join(duckDir, "etc", "ocliv", "dns-refresh.env")
+	duckSvc := filepath.Join(duckDir, "systemd", "ocliv-dns-refresh.service")
+	duckTmr := filepath.Join(duckDir, "systemd", "ocliv-dns-refresh.timer")
+	if err := InstallDNSRefreshTo("Demo.DuckDNS.org.", "duck-secret", filepath.Join(duckDir, "data"), duckEnv, duckSvc, duckTmr); err != nil {
+		t.Fatalf("InstallDNSRefreshTo(duckdns): %v", err)
+	}
+	if b, err := os.ReadFile(duckEnv); err != nil || !strings.Contains(string(b), "OCLIV_DNS_HOST=demo.duckdns.org") || !strings.Contains(string(b), "duckdns.token") {
+		t.Fatalf("unexpected duckdns env: %q err=%v", string(b), err)
+	}
 	tokenPath := filepath.Join(dataDir, "dynv6.token")
 	info, err := os.Stat(tokenPath)
 	if err != nil {

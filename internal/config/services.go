@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -18,9 +20,36 @@ var validServiceNameRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,47}$`)
 // Service desired states stored durably in services.json.
 const (
 	DesiredConfigured = "configured"
+	DesiredStarting   = "starting"
 	DesiredEnabled    = "enabled"
 	DesiredDisabled   = "disabled"
 )
+
+// CurrentIdentitySchemaVersion is incremented whenever HostedServiceIdentity
+// semantics or migration invariants change.
+const CurrentIdentitySchemaVersion = 1
+
+// NewServiceID mints a 128-bit durable opaque identifier for a hosted service
+// using cryptographic randomness. It fails explicitly if the random source fails.
+func NewServiceID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("failed to generate cryptographic service ID: %w", err)
+	}
+	return "svc-" + hex.EncodeToString(raw[:]), nil
+}
+
+// HostedServiceIdentity binds a hosted service's permanent public identity
+// independently of mutable local target configuration (port/host/exec).
+type HostedServiceIdentity struct {
+	SchemaVersion int    `json:"schema_version,omitempty"`
+	ServiceID     string `json:"service_id"`
+	Name          string `json:"name"`
+	WireLabel     string `json:"wire_label,omitempty"`
+	OwnerKeyID    string `json:"owner_key_id,omitempty"`
+	RelayID       string `json:"relay_id,omitempty"`
+	PublicationID string `json:"publication_id,omitempty"`
+}
 
 // Backend ownership modes.
 const (
@@ -45,14 +74,18 @@ type VerificationEvidence struct {
 // ReconcileStatus tracks durable recovery attempts, bounded backoff, and
 // terminal revocation/auth fences for a managed service.
 type ReconcileStatus struct {
-	ObservedGeneration int64  `json:"observed_generation,omitempty"`
-	Attempt            uint32 `json:"attempt,omitempty"`
-	NextRetryAt        string `json:"next_retry_at,omitempty"`
-	LastTransitionAt   string `json:"last_transition_at,omitempty"`
-	LastErrorCode      string `json:"last_error_code,omitempty"`
-	LastErrorDetail    string `json:"last_error_detail,omitempty"`
-	LastConfirmedStage string `json:"last_confirmed_stage,omitempty"`
-	Terminal           bool   `json:"terminal,omitempty"`
+	ObservedGeneration    int64  `json:"observed_generation,omitempty"`
+	LastGoodGeneration    int64  `json:"last_good_generation,omitempty"`
+	Attempt               uint32 `json:"attempt,omitempty"`
+	NextRetryAt           string `json:"next_retry_at,omitempty"`
+	LastTransitionAt      string `json:"last_transition_at,omitempty"`
+	FailureLayer          string `json:"failure_layer,omitempty"`        // backend | agent | lease | publication | authorization | edge | client
+	ErrorClassification   string `json:"error_classification,omitempty"` // retryable | terminal
+	LastErrorCode         string `json:"last_error_code,omitempty"`
+	LastErrorDetail       string `json:"last_error_detail,omitempty"`
+	LastConfirmedStage    string `json:"last_confirmed_stage,omitempty"`
+	LastVerifiedPublicURL string `json:"last_verified_public_url,omitempty"`
+	Terminal              bool   `json:"terminal,omitempty"`
 }
 
 // GoogleCutoverRecord tracks crash-recoverable two-identity client replacement.
@@ -91,34 +124,41 @@ type ProviderBinding struct {
 // Publication identity is bound to Name (never derived from a local TCP port)
 // and Profile/RelayURL (never silently switched by active-profile changes).
 type ServiceRecord struct {
-	Name                 string                     `json:"name"`
-	Type                 string                     `json:"type"`                   // "mcp" | "http"
-	BackendMode          string                     `json:"backend_mode,omitempty"` // "attached" | "managed"
-	BackendExec          string                     `json:"backend_exec,omitempty"`
-	BackendArgs          []string                   `json:"backend_args,omitempty"`
-	LocalURL             string                     `json:"local_url,omitempty"`
-	StdioCmd             []string                   `json:"stdio_cmd,omitempty"`
-	StdioDir             string                     `json:"stdio_dir,omitempty"`
-	StdioEnv             []string                   `json:"stdio_env,omitempty"`
-	Auth                 string                     `json:"auth"`
-	RelayURL             string                     `json:"relay_url,omitempty"`
-	Profile              string                     `json:"profile,omitempty"`
-	DesiredState         string                     `json:"desired_state"`
-	Revision             int64                      `json:"revision"`
-	StateGeneration      int64                      `json:"state_generation,omitempty"`
-	PublicationID        string                     `json:"publication_id,omitempty"`
-	PublicURL            string                     `json:"public_url,omitempty"`
-	PublicVerified       bool                       `json:"public_verified,omitempty"`
-	VerificationEvidence *VerificationEvidence      `json:"verification_evidence,omitempty"`
-	Reconcile            *ReconcileStatus           `json:"reconcile,omitempty"`
-	ProviderBindings     map[string]ProviderBinding `json:"provider_bindings,omitempty"`
-	SystemdUnit          string                     `json:"systemd_unit,omitempty"`
-	BackendUnit          string                     `json:"backend_unit,omitempty"`
-	LastVerifiedAt       string                     `json:"last_verified_at,omitempty"`
-	LastFailure          string                     `json:"last_failure,omitempty"`
-	LastRecoveryAction   string                     `json:"last_recovery_action,omitempty"`
-	CreatedAt            string                     `json:"created_at"`
-	UpdatedAt            string                     `json:"updated_at"`
+	Name                    string                     `json:"name"`
+	Type                    string                     `json:"type"`                   // "mcp" | "http"
+	BackendMode             string                     `json:"backend_mode,omitempty"` // "attached" | "managed"
+	BackendExec             string                     `json:"backend_exec,omitempty"`
+	BackendArgs             []string                   `json:"backend_args,omitempty"`
+	BackendWorkDir          string                     `json:"backend_workdir,omitempty"`
+	BackendEnvFile          string                     `json:"backend_env_file,omitempty"`
+	LocalURL                string                     `json:"local_url,omitempty"`
+	StdioCmd                []string                   `json:"stdio_cmd,omitempty"`
+	StdioDir                string                     `json:"stdio_dir,omitempty"`
+	StdioEnv                []string                   `json:"stdio_env,omitempty"`
+	Auth                    string                     `json:"auth"`
+	RelayURL                string                     `json:"relay_url,omitempty"`
+	Profile                 string                     `json:"profile,omitempty"`
+	DesiredState            string                     `json:"desired_state"`
+	Revision                int64                      `json:"revision"`
+	StartupGeneration       int64                      `json:"startup_generation,omitempty"`
+	ConfigGeneration        int64                      `json:"config_generation,omitempty"`
+	AppliedConfigGeneration int64                      `json:"applied_config_generation,omitempty"`
+	StateGeneration         int64                      `json:"state_generation,omitempty"`
+	Identity                *HostedServiceIdentity     `json:"identity,omitempty"`
+	PublicationID           string                     `json:"publication_id,omitempty"`
+	LeaseID                 string                     `json:"lease_id,omitempty"`
+	PublicURL               string                     `json:"public_url,omitempty"`
+	PublicVerified          bool                       `json:"public_verified,omitempty"`
+	VerificationEvidence    *VerificationEvidence      `json:"verification_evidence,omitempty"`
+	Reconcile               *ReconcileStatus           `json:"reconcile,omitempty"`
+	ProviderBindings        map[string]ProviderBinding `json:"provider_bindings,omitempty"`
+	SystemdUnit             string                     `json:"systemd_unit,omitempty"`
+	BackendUnit             string                     `json:"backend_unit,omitempty"`
+	LastVerifiedAt          string                     `json:"last_verified_at,omitempty"`
+	LastFailure             string                     `json:"last_failure,omitempty"`
+	LastRecoveryAction      string                     `json:"last_recovery_action,omitempty"`
+	CreatedAt               string                     `json:"created_at"`
+	UpdatedAt               string                     `json:"updated_at"`
 }
 
 // ValidateServiceName enforces a safe, explicit service identifier.

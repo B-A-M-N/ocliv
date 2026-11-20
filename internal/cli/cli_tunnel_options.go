@@ -118,6 +118,8 @@ func parseTunnelOptions(argv []string) (tunnelOptions, int) {
 			probePath = argv[i]
 		case strings.HasPrefix(a, "--probe-path="):
 			probePath = strings.TrimPrefix(a, "--probe-path=")
+		case a == "--persistent":
+			cfg.Persistent = true
 		case a == "--probe-status" && i+1 < len(argv):
 			i++
 			probeStatusStr = argv[i]
@@ -132,6 +134,10 @@ func parseTunnelOptions(argv []string) (tunnelOptions, int) {
 			fmt.Fprintln(os.Stderr, "unexpected argument "+a)
 			return tunnelOptions{}, apperr.ExitCLIValidation
 		}
+	}
+	if cfg.Persistent && strings.TrimSpace(cfg.Name) == "" {
+		fmt.Fprintln(os.Stderr, "error: --persistent requires an explicit --name")
+		return tunnelOptions{}, apperr.ExitCLIValidation
 	}
 	port, err := config.ValidatePort(portStr)
 	if err != nil {

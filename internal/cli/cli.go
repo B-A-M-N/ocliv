@@ -102,6 +102,10 @@ func Run(argv []string) int {
 		return cmdLogin(argv[1:])
 	case "logout":
 		return cmdLogout(argv[1:])
+	case "key":
+		return cmdKey(argv[1:])
+	case "runtime":
+		return cmdRuntime(argv[1:])
 	case "status":
 		return cmdStatus(argv[1:])
 	case "doctor":
@@ -126,6 +130,28 @@ func Run(argv []string) int {
 		return cmdConnect(argv[1:])
 	case "host":
 		return cmdHost(argv[1:])
+	case "restart":
+		if err := requireUserContext("restart", false); err != nil {
+			fmt.Fprintln(os.Stderr, "error: "+err.Error())
+			return apperr.ExitCLIValidation
+		}
+		return cmdServiceRestart(argv[1:], defaultServiceOps())
+	case "stop":
+		if err := requireUserContext("stop", false); err != nil {
+			fmt.Fprintln(os.Stderr, "error: "+err.Error())
+			return apperr.ExitCLIValidation
+		}
+		return cmdServiceStop(argv[1:], defaultServiceOps())
+	case "remove":
+		if err := requireUserContext("remove", false); err != nil {
+			fmt.Fprintln(os.Stderr, "error: "+err.Error())
+			return apperr.ExitCLIValidation
+		}
+		return cmdServiceRemove(argv[1:], defaultServiceOps())
+	case "logs":
+		return cmdServiceLogs(argv[1:])
+	case "share":
+		return cmdShare(argv[1:])
 	default:
 		if strings.HasPrefix(argv[0], "-") {
 			fmt.Fprintf(os.Stderr, "unknown flag %q; see `ocliv help`\n", argv[0])
@@ -139,10 +165,13 @@ func usage(code int) int {
 	fmt.Print(`Ocliv — secure instant HTTPS hosting.
 
 Everyday:
-  ocliv host PORT [--name N]  persistently host a local MCP server (systemd + reboot-safe)
-  ocliv PORT                  share localhost:PORT over protected HTTPS
-  ocliv mcp PORT [--name N]   publish the MCP server on localhost:PORT (OAuth enforced)
-  ocliv status [--json]       tunnel state with the next action when unhealthy
+  ocliv setup [--auto ...]           configure this host once (single-host edge default)
+  ocliv host [http|mcp] PORT [--name N]  persistently host HTTP (default) or MCP (systemd + reboot-safe)
+  ocliv status [NAME] [--json]       show hosted service or tunnel health and recovery state
+  ocliv restart NAME                 non-destructive restart/rebind (preserves URL & sessions)
+  ocliv stop NAME [--json]           immediately disable public access, retain identity
+  ocliv remove NAME --confirm NAME   permanently retire a hosted publication
+  ocliv PORT                  share localhost:PORT over protected HTTPS (ephemeral)
   ocliv doctor                diagnose key, relay, local service, and DNS/TLS
   ocliv login --relay URL --code-file PATH   enroll this machine once
   ocliv profile create NAME | use NAME|default | list   separate enrollments

@@ -30,11 +30,17 @@ type challengeReq struct {
 	KeyID string `json:"key_id"`
 }
 
+// CapabilityPersistentNamedLeases is advertised in /v1/agent/challenge so
+// agents requesting persistent hosted leases fail closed against older relays
+// that would silently drop the `persistent` field.
+const CapabilityPersistentNamedLeases = protocol.CapabilityPersistentNamedLeases
+
 type challengeResp struct {
-	Nonce   string `json:"nonce"`
-	Origin  string `json:"origin"`
-	Version string `json:"version"`
-	Expires string `json:"expires_at"`
+	Nonce        string   `json:"nonce"`
+	Origin       string   `json:"origin"`
+	Version      string   `json:"version"`
+	Expires      string   `json:"expires_at"`
+	Capabilities []string `json:"capabilities,omitempty"`
 }
 
 // maxIntentTTLSeconds bounds requested lease lifetimes (10 years).
@@ -53,6 +59,7 @@ type LeaseIntent struct {
 	Ready      bool   `json:"ready"`
 	LeaseID    string `json:"lease_id,omitempty"`    // resume attempt
 	TTLSeconds int64  `json:"ttl_seconds,omitempty"` // requested lease lifetime; 0 = until close
+	Persistent bool   `json:"persistent,omitempty"`  // persistent hosted service (survives restart/reboot/>90s outage)
 	Version    string `json:"version"`               // handshake protocol version, must match
 }
 
@@ -91,6 +98,10 @@ func (s *Server) handleChallenge(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, challengeResp{
 		Nonce: nonceB64, Origin: "https://" + s.relayHost,
 		Version: protocol.Version, Expires: ch.ExpiresAt.UTC().Format(time.RFC3339Nano),
+		Capabilities: []string{
+			protocol.CapabilityPersistentNamedLeases,
+			protocol.CapabilityMgmtBodySignatureV2,
+		},
 	})
 }
 

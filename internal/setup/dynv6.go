@@ -124,7 +124,13 @@ func UpdateDynv6(ctx context.Context, baseURL, zone, token, ipv4, ipv6 string) e
 	if err != nil {
 		return err
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		// Never follow redirects when sending a credential-bearing URL.
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		// Transport errors (*url.Error) embed the credential-bearing

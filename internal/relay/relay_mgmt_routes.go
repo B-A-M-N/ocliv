@@ -14,7 +14,6 @@
 package relay
 
 import (
-	"crypto/ed25519"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -73,8 +72,7 @@ func (s *Server) agentKeyAuth(r *http.Request) (tenantID, keyID string, auth boo
 			return "", "", false
 		}
 	}
-	msg := []byte(fmt.Sprintf("ocliv-mgmt-v1\n%s\n%s\n%s\n%d\n%s", key, r.Method, r.URL.Path, ts.Unix(), nonce))
-	if !ed25519.Verify(pub, msg, sig) {
+	if !verifySignedMgmtBodyAndSig(r, pub, key, nonce, ts, sig) {
 		return "", "", false
 	}
 	if r.Method != http.MethodGet && !s.consumeMgmtNonce(tenant, "", nonce) {

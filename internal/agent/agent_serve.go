@@ -42,6 +42,7 @@ func (rn *Runner) resumeLeaseID() string {
 		AccessMode: rn.Cfg.AccessMode, Name: rn.Cfg.Name, Public: rn.Cfg.Public,
 		IPv6: rn.Cfg.IPv6, TTLSeconds: rn.Cfg.TTLSeconds, UpstreamHost: rn.Cfg.UpstreamHost,
 		ProbePath: rn.ProbePath, ProbeStatus: rn.ProbeStatus,
+		Persistent: rn.Cfg.Persistent,
 	})
 	if !ok {
 		return ""
@@ -73,6 +74,7 @@ func (rn *Runner) saveLease(att Attached) error {
 		Generation: att.Generation, IPv6: rn.Cfg.IPv6,
 		TTLSeconds: rn.Cfg.TTLSeconds, UpstreamHost: rn.Cfg.UpstreamHost,
 		ProbePath: rn.ProbePath, ProbeStatus: rn.ProbeStatus,
+		Persistent: rn.Cfg.Persistent,
 	})
 }
 

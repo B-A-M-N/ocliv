@@ -214,18 +214,25 @@ func New(o Options) (*Server, error) {
 	s.mux.HandleFunc("/v1/agent/enroll", s.handleEnroll)
 	s.mux.HandleFunc("/v1/agent/challenge", s.handleChallenge)
 	s.mux.HandleFunc("/v1/agent/connect", s.handleConnect)
+	s.mux.HandleFunc("/v1/agent/leases", s.handleAgentLeases)
 	s.mux.HandleFunc("/v1/agent/lease/", s.handleAgentLease) // signed agent management
+	s.mux.HandleFunc("/v1/agent/key/rotate", s.handleAgentKeyRotate)
+	s.mux.HandleFunc("/v1/agent/key/revoke", s.handleAgentKeyRevoke)
 	s.mux.HandleFunc("/v1/agent/mcp-routes", s.handleAgentPublications)
 	s.mux.HandleFunc("/v1/agent/mcp-routes/", s.handleAgentPublications)
 	s.mux.HandleFunc(askPath, s.handleAsk)
 	s.mux.HandleFunc(access.UnlockPath, s.handleUnlockPage)
 	s.mux.HandleFunc(access.RedeemPath, s.handleRedeem)
+	s.mux.HandleFunc("/_ocliv/healthz", s.handleEdgeHealthz)
 	s.mux.HandleFunc("/", s.handlePublic)
 	// Crash recovery: reconcile durable rows before serving traffic (F11).
 	// Reconciliation failures refuse startup: serving on unknown durable
 	// state is worse than not serving (P1-05).
 	if err := s.reconcileBoot(); err != nil {
 		return nil, err
+	}
+	if len(o.ServerKey) == 32 && s.db != nil {
+		s.db.Audit("relay", "", "", "visitor_hmac_fingerprint", "ok", VisitorKeyFingerprint(o.ServerKey))
 	}
 	return s, nil
 }

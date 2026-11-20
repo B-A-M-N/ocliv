@@ -95,14 +95,20 @@ func (s *Server) supervise(sess *Session, leaseID string) {
 			// Revalidate the lease each tick so idle streams die
 			// within one interval of terminal revocation instead
 			// of forwarding until the next visitor request.
-			var st string
-			if err := s.db.SQL().QueryRow(`SELECT status FROM leases WHERE id=?`, leaseID).Scan(&st); err != nil {
+			var st, ownerKeyID string
+			if err := s.db.SQL().QueryRow(`SELECT status, agent_key_id FROM leases WHERE id=?`, leaseID).Scan(&st, &ownerKeyID); err != nil {
 				s.detach(sess, leaseID)
 				s.evictLease(leaseID)
 				return
 			}
 			if st == lease.StateRevoked || st == lease.StateClosed || st == lease.StateExpired {
 				s.db.Audit("agent", "", leaseID, "supervise", "evicted", "lease terminal ("+st+") under live session")
+				s.detach(sess, leaseID)
+				s.evictLease(leaseID)
+				return
+			}
+			if sess.KeyID != "" && ownerKeyID != sess.KeyID {
+				s.db.Audit("agent", "", leaseID, "supervise", "evicted", "lease owner changed ("+sess.KeyID+" -> "+ownerKeyID+") under live session")
 				s.detach(sess, leaseID)
 				s.evictLease(leaseID)
 				return
@@ -243,7 +249,10 @@ func (s *Server) armExpiry(leaseID string, at time.Time) {
 // reported as a successful reconnect-state change.
 func (s *Server) markReconnecting(leaseID string, generation uint64) (bool, error) {
 	res, err := s.db.SQL().Exec(
-		`UPDATE leases SET status=?, reconnect_until=? WHERE id=? AND generation=? AND status=?`,
+		`UPDATE leases
+		 SET status=?,
+		     reconnect_until=CASE WHEN COALESCE(persistent, 0) != 0 THEN NULL ELSE ? END
+		 WHERE id=? AND generation=? AND status=?`,
 		lease.StateReconnecting,
 		time.Now().UTC().Add(lease.ReconnectGrace).Format(time.RFC3339Nano),
 		leaseID, generation, lease.StateActive)

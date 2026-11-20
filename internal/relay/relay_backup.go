@@ -783,6 +783,31 @@ func RestoreState(dataDir, backupPath string, resetAuthority, relayStopped bool)
 		return apperr.E(apperr.CodeStoreFault, "reopening restored database", err)
 	}
 	defer db.Close()
+	// Fail-closed visitor session continuity on restore (P1-6, P2): compare
+	// the non-secret SHA-256 fingerprint of <dataDir>/visitor-hmac.key against
+	// the latest fingerprint recorded in the restored database. If the key is
+	// absent, unreadable, or does not match the restored DB's fingerprint,
+	// explicitly invalidate all restored visitor_sessions and audit why.
+	reason := ""
+	keyBytes, kerr := readVisitorKeyStrict(filepath.Join(dataDir, visitorKeyFileName))
+	if kerr != nil {
+		reason = "visitor-hmac.key absent or unreadable"
+	} else {
+		var recordedFP string
+		_ = db.SQL().QueryRow(`SELECT detail FROM audit_events WHERE category='visitor_hmac_fingerprint' AND result='ok' ORDER BY id DESC LIMIT 1`).Scan(&recordedFP)
+		if recordedFP == "" {
+			reason = "restored DB has no visitor HMAC fingerprint"
+		} else if recordedFP != VisitorKeyFingerprint(keyBytes) {
+			reason = "visitor-hmac.key fingerprint mismatch"
+		}
+	}
+	if reason != "" {
+		nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+		if _, err := db.SQL().Exec(`UPDATE visitor_sessions SET revoked_at=? WHERE revoked_at IS NULL`, nowStr); err != nil {
+			return apperr.E(apperr.CodeStoreFault, "invalidating restored visitor sessions", err)
+		}
+		db.Audit("operator", "", "", "restore_visitor_sessions", "invalidated", reason+"; restored visitor sessions invalidated")
+	}
 	mode := "restore"
 	if resetAuthority {
 		mode = "restore+reset-authority"

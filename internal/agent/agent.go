@@ -365,15 +365,24 @@ func (rn *Runner) once(ctx context.Context) error {
 				resp.StatusCode, strings.TrimSpace(string(body))))
 		}
 		var ch struct {
-			Nonce   string `json:"nonce"`
-			Origin  string `json:"origin"`
-			Version string `json:"version"`
+			Nonce        string   `json:"nonce"`
+			Origin       string   `json:"origin"`
+			Version      string   `json:"version"`
+			Capabilities []string `json:"capabilities"`
 		}
 		if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&ch); err != nil {
 			resp.Body.Close()
 			return fmt.Errorf("bad challenge: %w", err)
 		}
 		resp.Body.Close()
+		if rn.Cfg.Persistent {
+			if strings.TrimSpace(rn.Cfg.Name) == "" {
+				return Permanent(fmt.Errorf("persistent lease requires an explicit --name"))
+			}
+			if !hasCapability(ch.Capabilities, protocol.CapabilityPersistentNamedLeases) {
+				return Permanent(fmt.Errorf("relay does not advertise required capability %q; upgrade relay before using persistent hosting", protocol.CapabilityPersistentNamedLeases))
+			}
+		}
 		nonce, err := base64.StdEncoding.DecodeString(ch.Nonce)
 		if err != nil {
 			return fmt.Errorf("bad challenge nonce: %w", err)
@@ -386,7 +395,7 @@ func (rn *Runner) once(ctx context.Context) error {
 			"port": rn.Cfg.Port, "name": rn.Cfg.Name, "public": rn.Cfg.Public,
 			"access_mode": rn.Cfg.AccessMode,
 			"ready":       rn.leaseIntentReady(), "lease_id": intentLease,
-			"ttl_seconds": rn.Cfg.TTLSeconds, "version": protocol.Version,
+			"ttl_seconds": rn.Cfg.TTLSeconds, "persistent": rn.Cfg.Persistent, "version": protocol.Version,
 		})
 		ts := time.Now().UTC()
 		sig := rn.Key.Sign(nonce, ch.Origin, ch.Version, ts, string(intentRaw))

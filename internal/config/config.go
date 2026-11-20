@@ -43,6 +43,7 @@ type Agent struct {
 	JSONOut       bool
 	NoShareLink   bool
 	ShareLinkFile string // optional 0600 file receiving the share URL
+	Persistent    bool   // persistent hosted service (survives restart/reboot/>90s outage)
 	KeyPath       string
 	DataDir       string
 	InsecureTest  bool // test-only: trust a named test CA; never set in prod builds

@@ -18,6 +18,30 @@ import (
 	"ocliv/internal/lease"
 )
 
+// revokeVisitorCredentials revokes all visitor access tokens and browser
+// sessions for leaseID and bumps token_generation in one transaction, WITHOUT
+// revoking the lease itself or tombstoning publications (P0-6). Verifies
+// RowsAffected == 1 on the lease update (P2).
+func (s *Server) revokeVisitorCredentials(leaseID string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	return withTx(s.db.SQL(), func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`UPDATE access_tokens SET revoked_at=? WHERE lease_id=? AND revoked_at IS NULL`, now, leaseID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE visitor_sessions SET revoked_at=? WHERE lease_id=? AND revoked_at IS NULL`, now, leaseID); err != nil {
+			return err
+		}
+		res, err := tx.Exec(`UPDATE leases SET token_generation = token_generation + 1 WHERE id=?`, leaseID)
+		if err != nil {
+			return err
+		}
+		if n, rerr := res.RowsAffected(); rerr != nil || n != 1 {
+			return apperr.E(apperr.CodeUnknownHost, "lease no longer exists during visitor credential revoke", rerr)
+		}
+		return nil
+	})
+}
+
 // revokeLease applies the full terminal revocation transition atomically:
 // visitor credentials revoked, token generation bumped, lease marked
 // REVOKED so no later resume can re-activate it and the router denies new
@@ -90,6 +114,14 @@ func revokeAgentKeyTx(tx *sql.Tx, keyID, now string) ([]string, error) {
 			return nil, err
 		}
 	}
+	// P1-3: tombstone ALL publications owned by this key (including those on
+	// already-closed/detached leases) so revoking an identity retires all
+	// durable authority owned by it.
+	if _, err := tx.Exec(
+		`UPDATE mcp_publications SET revoked_at=?, updated_at=? WHERE owner_key_id=? AND revoked_at IS NULL`,
+		now, now, keyID); err != nil {
+		return nil, err
+	}
 	res, err := tx.Exec(`UPDATE agent_keys SET status='revoked', revoked_at=? WHERE id=?`, now, keyID)
 	if err != nil {
 		return nil, err
@@ -100,13 +132,15 @@ func revokeAgentKeyTx(tx *sql.Tx, keyID, now string) ([]string, error) {
 	return ids, nil
 }
 
-// RevokeAgentKey is the operator key-revocation primitive (P0-A): one
-// coordinated transactional state change — the key is marked revoked,
-// all its live leases and visitor credentials are terminally revoked,
-// affected publications are tombstoned, and after commit every affected
-// live session is evicted so in-flight forwarding dies too. Blocking
-// future handshakes alone would leave existing tunnels forwarding.
+// RevokeAgentKey is the operator key-revocation primitive (P0-A).
 func (s *Server) RevokeAgentKey(keyID, reason string) ([]string, error) {
+	return s.RevokeAgentKeyAs(keyID, "operator", reason)
+}
+
+// RevokeAgentKeyAs executes the full transactional key-revocation primitive
+// and audits with the caller's actual actor identity ("operator" or "agent",
+// P1-2) so self-logout never fabricates an operator audit entry.
+func (s *Server) RevokeAgentKeyAs(keyID, actor, reason string) ([]string, error) {
 	affected, err := RevokeAgentKeyDB(s.db, keyID)
 	if err != nil {
 		return nil, err
@@ -114,7 +148,7 @@ func (s *Server) RevokeAgentKey(keyID, reason string) ([]string, error) {
 	for _, id := range affected {
 		s.evictLease(id)
 	}
-	s.db.Audit("operator", "", keyID, "agent_key_revoke", "ok", reason)
+	s.db.Audit(actor, "", keyID, "agent_key_revoke", "ok", reason)
 	return affected, nil
 }
 

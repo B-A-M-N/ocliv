@@ -13,8 +13,12 @@ config so `ocliv 3000` and `ocliv mcp publish` just work afterwards.
    `printf '%s' "$TOKEN" > ~/.dynv6-token && chmod 600 ~/.dynv6-token`.
    Never pass it as a CLI argument (it would land in shell history).
 3. If detection reports `nat-ipv4-needs-forward`: forward TCP 443 (and
-   80 if you keep the default tunnel edge) in the router admin page to
-   this host's LAN address. See *Ports* below.
+   TCP 80 only if you opt into `--edge tunnel`) in the router admin page
+   to this host's LAN address. See *Ports* below. If detection reports
+   `cgnat-no-direct-ipv4`, direct inbound IPv4 hosting is physically
+   blocked by your ISP; Ocliv cannot bypass CGNAT on its own — serve
+   over direct IPv6 or run your relay on an externally reachable host
+   (for example via `ocliv setup --auto --provider oracle`).
 4. An ACME contact email for certificates: `--acme-email you@addr`.
 5. Root for the install steps (Caddy/systemd). Without root, setup
    prints the exact manual commands instead.
@@ -34,19 +38,25 @@ printf '%s' "$TOKEN" > ~/.dynv6-token && chmod 600 ~/.dynv6-token
 #    Preview the DNS update (token redacted, nothing sent).
 ocliv setup --auto --hostname lab.dynv6.net --token-file ~/.dynv6-token --dry-run
 
-# 3. Full bootstrap: DNS sync, edge render (see --edge below), DNS
-#    verify, relay_url persist, Caddy install, systemd enable,
-#    auto-enroll.
+# 3. Full bootstrap (default edge: single-host — one hostname, TCP 443 only,
+#    no wildcard DNS record): DNS sync, edge render, DNS verify, relay_url
+#    persist, Caddy install, systemd enable, auto-enroll.
 sudo ocliv setup --auto --hostname lab.dynv6.net \
   --acme-email you@addr --token-file ~/.dynv6-token
 
-#    Hosting MCP servers on ONE public hostname instead? Pick the
-#    single-host edge (needs no wildcard record, and only TCP 443):
+#    Need generic per-tunnel *.t.<domain> hostnames instead? Opt into the
+#    tunnel edge (requires wildcard DNS and TCP 80 + 443):
 sudo ocliv setup --auto --hostname lab.dynv6.net \
-  --acme-email you@addr --token-file ~/.dynv6-token --edge single-host
+  --acme-email you@addr --token-file ~/.dynv6-token --edge tunnel
 
 # 4. From another network (no -k): expect relay 4xx, not TLS errors.
 curl -v https://lab.dynv6.net/v1/agent/challenge
+
+# 5. Host a persistent service (retains its public URL across restarts/reboots):
+ocliv host 8765 --name personal-tools
+ocliv status personal-tools
+ocliv stop personal-tools
+ocliv remove personal-tools --confirm personal-tools
 ```
 
 The token travels only via `--token-file` (0600, owned by root for
@@ -58,20 +68,14 @@ invoked command (e.g. in a shell profile), never as an inline
 
 Three edges, three issuance models. Pick with `--edge`, one per relay:
 
-- **Tunnel edge (`Caddyfile.tunnel`, `--edge tunnel`, setup's default).**
-  On-demand per-hostname certificates: each new `*.t.<domain>` tunnel
-  hostname gets its own cert after the relay's ask guard approves the
-  request. Ask guard is tested; issuance itself is unverified against
-  public ACME (see the qualification table below). This is the
-  production shape for generic `ocliv 3000` tunnels.
-- **Single-host edge (`Caddyfile.single-host`, `--edge single-host`).**
+- **Single-host edge (`Caddyfile.single-host`, `--edge single-host`, setup's default).**
   ONE public apex hostname carries agent control, unlock pages, and the
   path-based MCP routes `/r/<route-id>/mcp`. ACME issuance PINNED to
   TLS-ALPN-01 on 443 (the template's issuer carries
   `disable_http_challenge`, so the edge never needs port 80 and a host
   where another service owns :80 — Pi-hole — can run it unmodified), and
-  no wildcard DNS record or DNS plugin. This is the edge for MCP
-  hosting; `docs/MCP-HOSTING.md` documents it. Proven by adapting the
+  no wildcard DNS record or DNS plugin. This is the default edge for
+  persistent hosting; `docs/MCP-HOSTING.md` documents it. Proven by adapting the
   file with a real `caddy adapt`: one server listening on `:443`, no
   `http_port`, and `challenges.http.disabled: true` on the ACME issuer.
   The pin is deliberate: Caddy enables HTTP-01 and TLS-ALPN-01 by
@@ -85,6 +89,12 @@ Three edges, three issuance models. Pick with `--edge`, one per relay:
   `scripts/verify-single-host-loopback.sh` — internal CA, strict-TLS
   control chain, enrollment and attach PASS at loopback; public trust
   and external reachability are NOT part of that run.)
+- **Tunnel edge (`Caddyfile.tunnel`, `--edge tunnel`).**
+  On-demand per-hostname certificates: each new `*.t.<domain>` tunnel
+  hostname gets its own cert after the relay's ask guard approves the
+  request. Ask guard is tested; issuance itself is unverified against
+  public ACME (see the qualification table below). Opt into this edge
+  when you specifically need per-tunnel `*.t.<domain>` hostnames.
 - **Wildcard edge (`Caddyfile`, `--edge wildcard`).** One DNS-01
   wildcard certificate covering all tunnel hostnames. Needs a Caddy
   DNS-provider plugin and credentials (`--dns-provider/--dns-env`);
@@ -96,7 +106,7 @@ limits, single-host by the one apex certificate you already need,
 wildcard by DNS-plugin availability. Choose one edge per relay.
 
 **Ports.** Forward TCP 443 always. Forward TCP 80 as well only if you
-keep the default tunnel edge (it can fall back to HTTP-01); the
+opt into `--edge tunnel` (it can fall back to HTTP-01); the default
 single-host edge disables HTTP-01 explicitly and issues via TLS-ALPN-01
 on 443, so it does not need port 80 and a host where another service
 owns :80 (Pi-hole, for example) can run it unmodified. Do not "solve" a
@@ -133,12 +143,12 @@ service account is never deleted). An existing destination WITHOUT the
 
 | Symptom | Cause | Recovery |
 |---|---|---|
-| `cgnat-no-direct-ipv4` | Carrier-grade NAT | Serve over IPv6 if direct, else `setup --auto --provider oracle` (own OCI account, confirm-gated) |
-| `nat-ipv4-needs-forward` persists | Forward missing/wrong | Forward TCP 80+443 to the LAN address in the report; re-run |
+| `cgnat-no-direct-ipv4` | Carrier-grade NAT (Ocliv cannot bypass CGNAT on its own) | Serve over IPv6 if direct, else host the relay on an externally reachable machine (e.g. `setup --auto --provider oracle`, own OCI account, confirm-gated) |
+| `nat-ipv4-needs-forward` persists | Forward missing/wrong | Forward TCP 443 (plus TCP 80 only if using `--edge tunnel`) to the LAN address in the report; re-run |
 | `dns ... not resolving here yet` | Propagation | Wait, then re-run the same command; nothing half-written persists |
 | `dns ... not to observed egress` | Stale record / wrong zone | Check the zone answers for this host (dig from another network); fix and re-run |
 | `enrollment failed: relay unreachable` | Caddy/relay not serving | `systemctl status ocliv-relay`, `caddy validate`, `ocliv relay doctor` |
-| ACME issuance fails | Port blocked or DNS wrong | Verify inbound with the off-network curl probe. For the single-host edge, 443 alone suffices (HTTP-01 explicitly disabled, TLS-ALPN-01 on 443); for the default tunnel edge, also allow 80 (HTTP-01 fallback) |
+| ACME issuance fails | Port blocked or DNS wrong | Verify inbound with the off-network curl probe. For the default single-host edge, 443 alone suffices (HTTP-01 explicitly disabled, TLS-ALPN-01 on 443); for `--edge tunnel`, also allow 80 (HTTP-01 fallback) |
 | Caddy config replaced badly | Failed validate | Setup restores `/etc/caddy/Caddyfile.ocliv-bak` automatically |
 | IP address changed (dynv6) | DHCP/PPPoE renewal | `ocliv setup --refresh-dns --hostname ZONE` (DNS-only, no re-provisioning), or enable the refresh timer below |
 | Relay down after reboot | Service not enabled | `systemctl enable --now ocliv-relay`; certificates renew automatically via Caddy |

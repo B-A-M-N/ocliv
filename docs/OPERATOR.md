@@ -50,22 +50,54 @@ failed renewal retries only until the known expiry deadline; the agent then
 reconnects through the ordinary authenticated resume path. Revoked keys and
 closed leases never gain a renewal exception.
 
-## Restart semantics (P1 — fail-closed session invalidation)
+## Restart, visitor-key, and backup/restore semantics
 
-The visitor-session HMAC key is random per relay instance unless
-explicitly configured, so a relay restart intentionally invalidates
-persisted browser session cookies: stored verifiers stop matching and
-visitors reauthenticate (redeem a fresh share link). This is fail-closed
-by design, not a rotation service.
+The visitor-session HMAC key is persisted at `<dataDir>/visitor-hmac.key`
+(owner-only `0600`, loaded with `O_NOFOLLOW`, created race-freely via
+`O_CREATE|O_EXCL`). Real relay restarts and host reboots preserve existing
+protected browser session cookies for persistent leases without requiring
+visitors to re-authenticate.
+
+To explicitly invalidate all active browser cookies across the relay, run:
+
+```sh
+ocliv relay rotate-visitor-key --data /var/lib/ocliv
+sudo systemctl restart ocliv-relay
+```
+
+When restoring a SQLite backup onto a host without the matching
+`<dataDir>/visitor-hmac.key`, `ocliv relay restore` fails closed by
+explicitly invalidating all restored `visitor_sessions` rows and auditing
+the invalidation so no unverifiable active sessions remain.
 
 Lease rows are durable: restart runs `reconcileBoot`, which moves
-`ACTIVE` leases to `RECONNECTING` (bounded by the reconnect grace) and
-expires lapsed TTLs. The agent reconnects, receives a new generation, then
-resumes renewal against the relay's persisted expiry. Nothing
-resurrects `CLOSED`/`REVOKED`/`EXPIRED` rows. Revocations, token
-generation bumps, and audit history all survive restarts — restore from
-an older backup can still resurrect revoked identities (H06), so treat
-backups as point-in-time copies, never as revocation truth.
+`ACTIVE` ephemeral leases to `RECONNECTING` (bounded by the reconnect
+grace), moves `ACTIVE` persistent named leases (`leases.persistent=1`) to
+`RECONNECTING` with no grace expiry so they survive arbitrarily long
+outages/reboots, and expires lapsed TTLs. Nothing resurrects
+`CLOSED`/`REVOKED`/`EXPIRED` rows or past-TTL leases.
+
+## Agent key lifecycle, runtime upgrades, and dynamic DNS
+
+- **Key rotation**: `ocliv key rotate` performs a crash-safe, body-bound
+  (`ocliv-mgmt-v2`) rotation with replacement-key proof of possession
+  (`new_key_proof`), atomically transferring leases and MCP publications on
+  the relay, immediately evicting sessions authenticated under the old key,
+  and restarting enabled local publishers. A pending journal
+  (`key-rotation-pending.json`) enables safe retry on transport drop.
+- **Logout**: `ocliv logout` revokes the agent key AND all its live leases,
+  visitor credentials, publications, and sessions on the exact persisted
+  relay authority first, stops local hosted units bound to that key, and
+  removes local identity files while preserving preferences (`agent.conf`).
+  Use `--force-local` only when the relay is permanently gone.
+- **Managed user runtime**: User-level hosted services always execute the
+  pinned binary at `~/.local/share/ocliv/bin/ocliv` tracked by
+  `runtime.json`. Ordinary `ocliv service start` never overwrites an
+  existing pinned runtime; use `ocliv runtime upgrade [--restart]` to
+  upgrade explicitly (downgrades require `--allow-downgrade`).
+- **Dynamic DNS refresh**: `ocliv setup` installs the recurring
+  `ocliv-dns-refresh.timer` for both `.dynv6.net` and `.duckdns.org`
+  hostnames, storing the provider token in `<dataDir>` with mode `0600`.
 
 ## Publication management (P0-D — durable identities)
 

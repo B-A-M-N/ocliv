@@ -41,20 +41,27 @@ func (rn *Runner) fetchChallenge(httpClient *http.Client, relayURL string) (nonc
 			resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var ch struct {
-		Nonce   string `json:"nonce"`
-		Origin  string `json:"origin"`
-		Version string `json:"version"`
+		Nonce        string   `json:"nonce"`
+		Origin       string   `json:"origin"`
+		Version      string   `json:"version"`
+		Capabilities []string `json:"capabilities"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&ch); err != nil {
 		resp.Body.Close()
 		return nil, "", "", "", fmt.Errorf("bad challenge: %w", err)
 	}
 	resp.Body.Close()
-	// Version compatibility is enforced before signing: an intent signed
-	// under an unknown protocol version could attach to a relay that
-	// cannot honor it. Outside the supported range the relay cannot help,
-	// so the failure is permanent, never retried.
-	if ch.Version < protocol.MinVersion || ch.Version > protocol.MaxVersion {
+	if rn.Cfg.Persistent {
+		if strings.TrimSpace(rn.Cfg.Name) == "" {
+			return nil, "", "", "", Permanent(fmt.Errorf("persistent lease requires an explicit --name"))
+		}
+		if !hasCapability(ch.Capabilities, protocol.CapabilityPersistentNamedLeases) {
+			return nil, "", "", "", Permanent(fmt.Errorf("relay does not advertise required capability %q; upgrade relay before using persistent hosting", protocol.CapabilityPersistentNamedLeases))
+		}
+	}
+	// Version compatibility is enforced before signing using numeric revision
+	// parsing (never lexical string ordering).
+	if !protocol.VersionInRange(ch.Version, protocol.MinVersion, protocol.MaxVersion) {
 		return nil, "", "", "", Permanent(fmt.Errorf("relay protocol %q outside supported range %s-%s: upgrade ocliv",
 			ch.Version, protocol.MinVersion, protocol.MaxVersion))
 	}
@@ -65,7 +72,15 @@ func (rn *Runner) fetchChallenge(httpClient *http.Client, relayURL string) (nonc
 	return nonce, ch.Nonce, ch.Origin, ch.Version, nil
 }
 
-// buildHandshake performs phase 2: sign the canonical intent. Local
+func hasCapability(caps []string, want string) bool {
+	for _, c := range caps {
+		if c == want {
+			return true
+		}
+	}
+	return false
+}
+
 // readiness is re-probed at every (re)connect: the CLI probes only before
 // the first run, and a hardcoded true would let a resume claim a
 // reverified local service it never checked (P1-09).
@@ -73,7 +88,7 @@ func (rn *Runner) buildHandshake(nonce []byte, origin, version string) (intentRa
 	intentRaw, _ = json.Marshal(map[string]any{
 		"port": rn.Cfg.Port, "name": rn.Cfg.Name, "public": rn.Cfg.Public,
 		"ready": rn.leaseIntentReady(), "lease_id": rn.resumeLeaseID(),
-		"ttl_seconds": rn.Cfg.TTLSeconds, "version": protocol.Version,
+		"ttl_seconds": rn.Cfg.TTLSeconds, "persistent": rn.Cfg.Persistent, "version": protocol.Version,
 	})
 	ts = time.Now().UTC()
 	sig = rn.Key.Sign(nonce, origin, version, ts, string(intentRaw))

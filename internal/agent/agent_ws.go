@@ -6,7 +6,9 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -151,11 +153,29 @@ func MgmtNonce() (string, error) {
 	return base64.StdEncoding.EncodeToString(b[:]), nil
 }
 
-// MgmtMessage builds the canonical signed bytes for an agent management
-// request (method + path + timestamp + nonce). The relay verifies the same
-// bytes; the nonce binds each signature to a single use.
+// MgmtMessage builds the canonical v1 signed bytes for bodyless agent
+// management requests.
 func MgmtMessage(keyID, method, path string, ts time.Time, nonce string) []byte {
 	return []byte(fmt.Sprintf("ocliv-mgmt-v1\n%s\n%s\n%s\n%d\n%s", keyID, method, path, ts.Unix(), nonce))
+}
+
+// MgmtBodySHA256 returns the lowercase hex SHA-256 digest of a management
+// request body (empty body hashes to the standard SHA-256 of "").
+func MgmtBodySHA256(body []byte) string {
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:])
+}
+
+// MgmtMessageV2 builds the canonical v2 signed bytes binding the request
+// body's SHA-256 digest into the Ed25519 management signature (P0-4).
+func MgmtMessageV2(keyID, method, path string, ts time.Time, nonce, bodySHA256Hex string) []byte {
+	return []byte(fmt.Sprintf("ocliv-mgmt-v2\n%s\n%s\n%s\n%d\n%s\n%s", keyID, method, path, ts.Unix(), nonce, bodySHA256Hex))
+}
+
+// KeyRotationProofMessage builds the canonical proof-of-possession message
+// signed by the replacement private key during key rotation (P0-4).
+func KeyRotationProofMessage(oldKeyID, newKeyID, nonce string) []byte {
+	return []byte(fmt.Sprintf("ocliv-key-rotation-v1\n%s\n%s\n%s", oldKeyID, newKeyID, nonce))
 }
 
 // SignMgmt signs an agent management request with a caller-provided nonce.

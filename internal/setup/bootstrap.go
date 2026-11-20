@@ -268,49 +268,68 @@ func PlanBootstrap(env BootstrapEnv) (steps []Step, blockReason string) {
 		mk("enroll this machine",
 			fmt.Sprintf("ocliv relay issue-enroll --data %s --tenant home && ocliv login --relay https://%s --code-file -", dataDir, env.Hostname)),
 	}
-	if strings.HasSuffix(strings.ToLower(strings.TrimSuffix(env.Hostname, ".")), ".dynv6.net") {
-		steps = append(steps, mk("install and enable dynv6 refresh timer",
-			"install the Ocliv DNS refresh service and timer, store the dynv6 token in the ocliv data directory with mode 0600, then run systemctl enable --now ocliv-dns-refresh.timer"))
+	lowerHost := strings.ToLower(strings.TrimSuffix(env.Hostname, "."))
+	if strings.HasSuffix(lowerHost, ".dynv6.net") || IsDuckDNSZone(lowerHost) {
+		provider := "dynv6"
+		if IsDuckDNSZone(lowerHost) {
+			provider = "duckdns"
+		}
+		steps = append(steps, mk("install and enable "+provider+" refresh timer",
+			"install the Ocliv DNS refresh service and timer, store the "+provider+" token in the ocliv data directory with mode 0600, then run systemctl enable --now ocliv-dns-refresh.timer"))
 	}
 	return steps, ""
 }
 
-// InstallDynv6Refresh installs the DNS-only refresh units and their
-// non-secret host/token-path environment. The token is stored separately
-// under the relay data directory, owned by the ocliv service account, and
-// never appears in a unit or environment file. An existing token is kept
-// only when it exactly matches the token used for this setup run.
-func InstallDynv6Refresh(hostname, token, dataDir string) error {
-	return InstallDynv6RefreshTo(hostname, token, dataDir,
+// InstallDNSRefresh installs the DNS-only refresh units for supported dynamic
+// DNS providers (dynv6.net and duckdns.org).
+func InstallDNSRefresh(hostname, token, dataDir string) error {
+	return InstallDNSRefreshTo(hostname, token, dataDir,
 		"/etc/ocliv/dns-refresh.env",
 		"/etc/systemd/system/ocliv-dns-refresh.service",
 		"/etc/systemd/system/ocliv-dns-refresh.timer")
 }
 
-// InstallDynv6RefreshTo installs the refresh config at explicit paths. The
-// explicit destinations keep the filesystem transaction testable without
-// touching host system directories.
+// InstallDynv6Refresh is a backwards-compatible wrapper around InstallDNSRefresh.
+func InstallDynv6Refresh(hostname, token, dataDir string) error {
+	return InstallDNSRefresh(hostname, token, dataDir)
+}
+
+// InstallDynv6RefreshTo is a backwards-compatible wrapper around InstallDNSRefreshTo.
 func InstallDynv6RefreshTo(hostname, token, dataDir, envPath, servicePath, timerPath string) error {
+	return InstallDNSRefreshTo(hostname, token, dataDir, envPath, servicePath, timerPath)
+}
+
+// InstallDNSRefreshTo installs the refresh config at explicit paths for both
+// .dynv6.net and .duckdns.org hostnames.
+func InstallDNSRefreshTo(hostname, token, dataDir, envPath, servicePath, timerPath string) error {
 	hostname = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(hostname), "."))
-	if !validDynv6Zone(hostname) {
-		return fmt.Errorf("dynv6 refresh requires a <label>.dynv6.net hostname")
+	isDuck := IsDuckDNSZone(hostname)
+	if !validDynv6Zone(hostname) && !isDuck {
+		return fmt.Errorf("DNS refresh requires a <label>.dynv6.net or <label>.duckdns.org hostname")
+	}
+	provider := "dynv6"
+	tokenFileName := "dynv6.token"
+	if isDuck {
+		provider = "duckdns"
+		tokenFileName = "duckdns.token"
 	}
 	if strings.TrimSpace(token) == "" {
-		return fmt.Errorf("dynv6 refresh token is empty")
+		return fmt.Errorf("%s refresh token is empty", provider)
 	}
 	if dataDir == "" || strings.ContainsAny(dataDir, "\r\n\t ") {
-		return fmt.Errorf("dynv6 refresh requires an absolute data directory without whitespace")
+		return fmt.Errorf("%s refresh requires an absolute data directory without whitespace", provider)
 	}
 	if !filepath.IsAbs(dataDir) {
-		return fmt.Errorf("dynv6 refresh data directory must be absolute")
+		return fmt.Errorf("%s refresh data directory must be absolute", provider)
 	}
-	if err := installDynv6Token(filepath.Join(dataDir, "dynv6.token"), token); err != nil {
+	tokenPath := filepath.Join(dataDir, tokenFileName)
+	if err := installDynv6Token(tokenPath, token); err != nil {
 		return err
 	}
 
-	env := ManagedMarker + " (dynv6 refresh configuration)\n" +
+	env := ManagedMarker + " (" + provider + " refresh configuration)\n" +
 		"OCLIV_DNS_HOST=" + hostname + "\n" +
-		"OCLIV_DNS_TOKEN_FILE=" + filepath.Join(dataDir, "dynv6.token") + "\n"
+		"OCLIV_DNS_TOKEN_FILE=" + tokenPath + "\n"
 	if err := os.MkdirAll(filepath.Dir(envPath), 0o700); err != nil {
 		return fmt.Errorf("create DNS refresh config directory: %w", err)
 	}
@@ -424,9 +443,28 @@ func EnableDynv6RefreshTimer() error {
 	return runCmd("systemctl", "enable", "--now", "ocliv-dns-refresh.timer")
 }
 
-// RollbackDynv6Token removes only a token created by this setup run.
-func RollbackDynv6Token(dataDir string) error {
-	path := filepath.Join(dataDir, "dynv6.token")
+// DNSRefreshTokenPath returns the provider-specific token path in dataDir for
+// supported dynamic DNS providers (.dynv6.net or .duckdns.org, P1-6).
+func DNSRefreshTokenPath(hostname, dataDir string) (string, error) {
+	h := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(hostname), "."))
+	switch {
+	case IsDuckDNSZone(h):
+		return filepath.Join(dataDir, "duckdns.token"), nil
+	case validDynv6Zone(h):
+		return filepath.Join(dataDir, "dynv6.token"), nil
+	default:
+		return "", fmt.Errorf("unsupported dynamic DNS hostname %q", hostname)
+	}
+}
+
+// RollbackDNSRefreshToken removes only a provider token created by this setup
+// run (journaled by <token>.ocliv-new) for either dynv6 or DuckDNS (P1-6).
+func RollbackDNSRefreshToken(hostname, dataDir string) error {
+	path, err := DNSRefreshTokenPath(hostname, dataDir)
+	if err != nil {
+		// Non-DDNS hostname has no DDNS token to roll back.
+		return nil
+	}
 	if _, err := os.Stat(path + ".ocliv-new"); err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -439,9 +477,27 @@ func RollbackDynv6Token(dataDir string) error {
 	return os.Remove(path + ".ocliv-new")
 }
 
-// CleanDynv6TokenJournal removes the creation journal after successful setup.
+// CleanDNSRefreshTokenJournal removes the creation journal after successful
+// setup for either dynv6 or DuckDNS (P1-6).
+func CleanDNSRefreshTokenJournal(hostname, dataDir string) error {
+	path, err := DNSRefreshTokenPath(hostname, dataDir)
+	if err != nil {
+		return nil
+	}
+	if rerr := os.Remove(path + ".ocliv-new"); rerr != nil && !os.IsNotExist(rerr) {
+		return rerr
+	}
+	return nil
+}
+
+// RollbackDynv6Token is a backwards-compatible wrapper around RollbackDNSRefreshToken.
+func RollbackDynv6Token(dataDir string) error {
+	return RollbackDNSRefreshToken("compat.dynv6.net", dataDir)
+}
+
+// CleanDynv6TokenJournal is a backwards-compatible wrapper around CleanDNSRefreshTokenJournal.
 func CleanDynv6TokenJournal(dataDir string) {
-	_ = os.Remove(filepath.Join(dataDir, "dynv6.token.ocliv-new"))
+	_ = CleanDNSRefreshTokenJournal("compat.dynv6.net", dataDir)
 }
 
 // runCmd executes a system command for the live executors below.

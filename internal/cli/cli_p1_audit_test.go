@@ -426,7 +426,7 @@ func TestEmergencyDisableSucceedsRemotelyWhenSupervisorBroken(t *testing.T) {
 		t.Fatalf("emergency disable exit=%d, want 0 when remote disable confirmed despite broken local supervisor", code)
 	}
 
-	// HTTP service disable must report NOT_APPLICABLE (never RemoteDisabled=true).
+	// HTTP service that was enabled with missing local LeaseID and unreachable relay must report REMOTE_DISABLE_UNCONFIRMED (never RemoteDisabled=true).
 	_ = st.Put(config.ServiceRecord{
 		Name: "emerg-http", Type: "http", LocalURL: "http://127.0.0.1:3000",
 		Profile: "default", RelayURL: "https://relay.example",
@@ -442,8 +442,8 @@ func TestEmergencyDisableSucceedsRemotelyWhenSupervisorBroken(t *testing.T) {
 			return "inactive", nil
 		},
 	})
-	if resHTTP.RemoteDisableStatus != "NOT_APPLICABLE" || resHTTP.RemoteDisabled {
-		t.Fatalf("expected NOT_APPLICABLE / RemoteDisabled=false for HTTP service, got %+v", resHTTP)
+	if resHTTP.RemoteDisableStatus != "REMOTE_DISABLE_UNCONFIRMED" || resHTTP.RemoteDisabled {
+		t.Fatalf("expected REMOTE_DISABLE_UNCONFIRMED / RemoteDisabled=false for HTTP service with missing LeaseID and no relay, got %+v", resHTTP)
 	}
 }
 

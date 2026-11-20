@@ -52,7 +52,7 @@ func TestSetupDryRunSendsNothing(t *testing.T) {
 		_, _ = w.Write([]byte("203.0.113.9\n"))
 	}))
 	defer echo.Close()
-	t.Setenv("OCLIV_DYNV6_ENDPOINT", upd.URL)
+	setTestDynv6Endpoint(t, upd.URL)
 	t.Setenv("DYNV6_TOKEN", "TESTTOKEN")
 	var code int
 	out := captureStdout(t, func() {
@@ -86,7 +86,7 @@ func TestSetupLiveUpdateAgainstFixture(t *testing.T) {
 		_, _ = w.Write([]byte("203.0.113.9\n"))
 	}))
 	defer echo.Close()
-	t.Setenv("OCLIV_DYNV6_ENDPOINT", upd.URL)
+	setTestDynv6Endpoint(t, upd.URL)
 	t.Setenv("DYNV6_TOKEN", "TESTTOKEN")
 	var code int
 	_ = captureStdout(t, func() {
@@ -127,7 +127,7 @@ func TestSetupFreshInstallDoesNotPersistBeforeProvisioning(t *testing.T) {
 		_, _ = w.Write([]byte("203.0.113.9\n"))
 	}))
 	defer echo.Close()
-	t.Setenv("OCLIV_DYNV6_ENDPOINT", upd.URL)
+	setTestDynv6Endpoint(t, upd.URL)
 	t.Setenv("DYNV6_TOKEN", "TESTTOKEN")
 	out := t.TempDir()
 	var code int
@@ -201,7 +201,7 @@ func TestSetupWildcardDNSBlocksWithoutRecord(t *testing.T) {
 		_, _ = w.Write([]byte("203.0.113.9\n"))
 	}))
 	defer echo.Close()
-	t.Setenv("OCLIV_DYNV6_ENDPOINT", upd.URL)
+	setTestDynv6Endpoint(t, upd.URL)
 	t.Setenv("DYNV6_TOKEN", "TESTTOKEN")
 	out := t.TempDir()
 	var code int
@@ -251,7 +251,7 @@ func TestSetupKeepsWorkingRelayURLWhenBlocked(t *testing.T) {
 		_, _ = w.Write([]byte("203.0.113.9\n"))
 	}))
 	defer echo.Close()
-	t.Setenv("OCLIV_DYNV6_ENDPOINT", upd.URL)
+	setTestDynv6Endpoint(t, upd.URL)
 	t.Setenv("DYNV6_TOKEN", "TESTTOKEN")
 	out := t.TempDir()
 	var code int
@@ -290,7 +290,7 @@ func TestSetupRenderRefusesOnDNSMismatch(t *testing.T) {
 		_, _ = w.Write([]byte("203.0.113.9\n"))
 	}))
 	defer echo.Close()
-	t.Setenv("OCLIV_DYNV6_ENDPOINT", upd.URL)
+	setTestDynv6Endpoint(t, upd.URL)
 	t.Setenv("DYNV6_TOKEN", "TESTTOKEN")
 	out := t.TempDir()
 	var code int
@@ -406,7 +406,7 @@ func TestSetupRefreshDNSChanged(t *testing.T) {
 		w.Write([]byte("addresses updated"))
 	}))
 	defer upd.Close()
-	t.Setenv("OCLIV_DYNV6_ENDPOINT", upd.URL)
+	setTestDynv6Endpoint(t, upd.URL)
 	t.Setenv("DYNV6_TOKEN", "refresh-token")
 	oldLookup := setup.LookupHost
 	setup.LookupHost = func(ctx context.Context, host string) ([]string, error) {
@@ -439,7 +439,7 @@ func TestSetupRefreshDNSNoChange(t *testing.T) {
 		w.Write([]byte("addresses updated"))
 	}))
 	defer upd.Close()
-	t.Setenv("OCLIV_DYNV6_ENDPOINT", upd.URL)
+	setTestDynv6Endpoint(t, upd.URL)
 	t.Setenv("DYNV6_TOKEN", "refresh-token")
 	oldLookup := setup.LookupHost
 	setup.LookupHost = func(ctx context.Context, host string) ([]string, error) {
@@ -556,7 +556,7 @@ func TestSetupSingleHostEdgeNeedsNoWildcardRecord(t *testing.T) {
 		_, _ = w.Write([]byte("203.0.113.9\n"))
 	}))
 	defer echo.Close()
-	t.Setenv("OCLIV_DYNV6_ENDPOINT", upd.URL)
+	setTestDynv6Endpoint(t, upd.URL)
 	t.Setenv("DYNV6_TOKEN", "TESTTOKEN")
 	out := t.TempDir()
 	var code int
@@ -606,7 +606,7 @@ func TestSetupTunnelEdgeStillRequiresWildcard(t *testing.T) {
 		_, _ = w.Write([]byte("203.0.113.9\n"))
 	}))
 	defer echo.Close()
-	t.Setenv("OCLIV_DYNV6_ENDPOINT", upd.URL)
+	setTestDynv6Endpoint(t, upd.URL)
 	t.Setenv("DYNV6_TOKEN", "TESTTOKEN")
 	out := t.TempDir()
 	var code int
@@ -726,4 +726,11 @@ func TestAutoEnrollKeyWithoutRelayConfigBlocked(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(home, ".config", "ocliv", "agent.key")); err != nil {
 		t.Fatalf("key disturbed: %v", err)
 	}
+}
+
+func setTestDynv6Endpoint(t *testing.T, url string) {
+	t.Helper()
+	old := dynv6EndpointTestOverride
+	dynv6EndpointTestOverride = url
+	t.Cleanup(func() { dynv6EndpointTestOverride = old })
 }

@@ -164,6 +164,10 @@ func resolveDoctorProbe(recPath string, recStatus int, flagPath, flagStatusStr s
 // local lease selects the record; the signed relay status is
 // authoritative whenever reachable.
 func cmdStatus(argv []string) int {
+	// `ocliv status NAME [--json] [--strict-health]` inspects a hosted service directly.
+	if len(argv) > 0 && !strings.HasPrefix(argv[0], "-") {
+		return cmdServiceStatus(argv, defaultServiceOps())
+	}
 	showJSON := len(argv) > 0 && argv[0] == "--json"
 	dir, _, cfgPath, err := agentFiles()
 	if err != nil {
@@ -171,12 +175,21 @@ func cmdStatus(argv []string) int {
 		return apperr.ExitInternal
 	}
 	store, err := config.OpenLeaseStore(dir)
-	if err != nil {
-		fmt.Println("no active tunnel")
-		return apperr.ExitOK
+	var recs []config.LeaseRecord
+	if err == nil {
+		recs = store.List()
 	}
-	recs := store.List()
 	if len(recs) == 0 {
+		if svcStore, serr := openServices(); serr == nil {
+			if svcs, lerr := svcStore.List(); lerr == nil && len(svcs) > 0 {
+				if showJSON {
+					b, _ := json.MarshalIndent(map[string]any{"services": svcs}, "", "  ")
+					fmt.Println(string(b))
+					return apperr.ExitOK
+				}
+				return cmdServiceList(nil, defaultServiceOps())
+			}
+		}
 		fmt.Println("no active tunnel")
 		return apperr.ExitOK
 	}
@@ -224,30 +237,40 @@ func cmdStatus(argv []string) int {
 		for _, other := range recs[1:] {
 			fmt.Printf("Other tunnel: %s (port %d, lease %s)\n", other.Hostname, other.Port, other.LeaseID)
 		}
+		if svcStore, serr := openServices(); serr == nil {
+			if svcs, lerr := svcStore.List(); lerr == nil && len(svcs) > 0 {
+				fmt.Println("\nHosted services:")
+				_ = cmdServiceList(nil, defaultServiceOps())
+			}
+		}
 	}
 	return code
 }
 
-// cmdDoctor runs agent-side diagnostics.
+// cmdDoctor runs agent-side diagnostics, or hosted-service diagnostics when
+// given a service NAME or --all (P2-23).
 func cmdDoctor(argv []string) int {
-	_ = argv
-	dir, keyPath, cfgPath, _ := agentFiles()
-	cfgVals, _ := config.LoadAgentFile(cfgPath)
-	relayURL := cfgVals["relay_url"]
-	if v := config.EnvRelay(); v != "" {
-		relayURL = v
-	}
-	if relayURL == "" {
-		relayURL = config.DefaultRelayURL
-	}
+	return runDoctor(argv, defaultServiceOps())
+}
+
+func runDoctor(argv []string, ops serviceOps) int {
+	// P1-5: parse all CLI flags FIRST (including --profile) before resolving
+	// any profile-dependent paths or relay configuration.
 	var cacert string
-	var flagPath, flagStatusStr string
+	var flagPath, flagStatusStr, profileFlag string
+	var serviceTarget string
+	var checkAll, jsonOut bool
 	for i := 0; i < len(argv); i++ {
 		if strings.HasPrefix(argv[i], "--cacert=") {
 			cacert = strings.TrimPrefix(argv[i], "--cacert=")
 		} else if argv[i] == "--cacert" && i+1 < len(argv) {
 			i++
 			cacert = argv[i]
+		} else if strings.HasPrefix(argv[i], "--profile=") {
+			profileFlag = strings.TrimPrefix(argv[i], "--profile=")
+		} else if argv[i] == "--profile" && i+1 < len(argv) {
+			i++
+			profileFlag = argv[i]
 		} else if strings.HasPrefix(argv[i], "--probe-path=") {
 			flagPath = strings.TrimPrefix(argv[i], "--probe-path=")
 		} else if argv[i] == "--probe-path" && i+1 < len(argv) {
@@ -258,7 +281,36 @@ func cmdDoctor(argv []string) int {
 		} else if argv[i] == "--probe-status" && i+1 < len(argv) {
 			i++
 			flagStatusStr = argv[i]
+		} else if argv[i] == "--all" {
+			checkAll = true
+		} else if argv[i] == "--json" {
+			jsonOut = true
+		} else if !strings.HasPrefix(argv[i], "-") && serviceTarget == "" {
+			serviceTarget = argv[i]
+		} else {
+			fmt.Fprintf(os.Stderr, "unknown doctor flag %q\n", argv[i])
+			return apperr.ExitCLIValidation
 		}
+	}
+	if serviceTarget != "" && checkAll {
+		fmt.Fprintln(os.Stderr, "cannot combine service NAME with --all")
+		return apperr.ExitCLIValidation
+	}
+	if serviceTarget != "" || checkAll {
+		return runDoctorServices(serviceTarget, checkAll, jsonOut, profileFlag, ops)
+	}
+	dir, keyPath, cfgPath, perr := agentFilesForProfile(profileFlag)
+	if perr != nil {
+		fmt.Fprintln(os.Stderr, "error: "+perr.Error())
+		return apperr.ExitCLIValidation
+	}
+	cfgVals, _ := config.LoadAgentFile(cfgPath)
+	relayURL := cfgVals["relay_url"]
+	if v := config.EnvRelay(); v != "" {
+		relayURL = v
+	}
+	if relayURL == "" {
+		relayURL = config.DefaultRelayURL
 	}
 	if cacert == "" {
 		cacert = os.Getenv("OCLIV_CACERT")
@@ -293,6 +345,137 @@ func cmdDoctor(argv []string) int {
 	})
 	fmt.Print(res.Report())
 	if res.OK {
+		return apperr.ExitOK
+	}
+	return apperr.ExitRelayTLS
+}
+
+func runDoctorServices(name string, all, jsonOut bool, profile string, ops serviceOps) int {
+	var svcStore *config.ServiceStore
+	var err error
+	if strings.TrimSpace(profile) != "" {
+		svcStore, err = openServicesForProfile(profile)
+	} else {
+		svcStore, err = openServices()
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
+	}
+	var targets []config.ServiceRecord
+	if all {
+		svcs, lerr := svcStore.List()
+		if lerr != nil {
+			fmt.Fprintln(os.Stderr, "error: "+lerr.Error())
+			return apperr.ExitInternal
+		}
+		targets = svcs
+	} else {
+		rec, ok, gerr := svcStore.Get(name)
+		if gerr != nil {
+			fmt.Fprintln(os.Stderr, "error: "+gerr.Error())
+			return apperr.ExitInternal
+		}
+		if !ok {
+			fmt.Fprintf(os.Stderr, "unknown hosted service %q\n", name)
+			return apperr.ExitCLIValidation
+		}
+		targets = []config.ServiceRecord{rec}
+	}
+	type serviceDiag struct {
+		Name        string                  `json:"name"`
+		Type        string                  `json:"type"`
+		OK          bool                    `json:"ok"`
+		Status      ServiceStatusReport     `json:"status"`
+		Persistence PersistenceVerification `json:"persistence"`
+	}
+	diags := make([]serviceDiag, 0, len(targets))
+	allOK := true
+	for _, rec := range targets {
+		pv := verifyRebootPersistence(rec, ops)
+		k, keyID, kerr := loadKeyForProfile(rec.Profile)
+		var rep ServiceStatusReport
+		if kerr != nil && rec.DesiredState != config.DesiredDisabled {
+			// P1-4: missing/unreadable agent key must NEVER panic inside
+			// inspectServiceStatus -> mgmtCall -> k.Private().
+			serviceID := ""
+			if rec.Identity != nil {
+				serviceID = rec.Identity.ServiceID
+			}
+			rep = ServiceStatusReport{
+				Name:          rec.Name,
+				ServiceID:     serviceID,
+				Type:          rec.Type,
+				Profile:       rec.Profile,
+				BackendMode:   rec.BackendMode,
+				DesiredState:  rec.DesiredState,
+				Revision:      rec.Revision,
+				State:         ServiceStateUnknown,
+				Health:        HealthBlocked,
+				IngressDetail: "agent credentials missing (" + kerr.Error() + "); run `ocliv login` to re-enroll",
+				Layers: ServiceLayers{
+					Process:       "unknown",
+					Backend:       "unknown",
+					Agent:         "disconnected",
+					Lease:         "unknown",
+					Publication:   "unknown",
+					Authorization: "missing_key",
+					Edge:          "unknown",
+					Client:        "unverified",
+				},
+			}
+		} else {
+			rep = inspectServiceStatus(rec, k, keyID, ops)
+		}
+		// For desired-enabled hosted services, a clean doctor verdict requires
+		// BOTH runtime/transport health AND verified reboot persistence.
+		ok := rep.State == ServiceStateServing &&
+			(rep.Health == HealthReady || rep.Health == "HEALTHY") &&
+			pv.PersistenceConfigured
+		if rec.DesiredState == config.DesiredDisabled && rep.State == ServiceStateDisabled {
+			ok = true
+		}
+		if !ok {
+			allOK = false
+		}
+		diags = append(diags, serviceDiag{
+			Name:        rec.Name,
+			Type:        rec.Type,
+			OK:          ok,
+			Status:      rep,
+			Persistence: pv,
+		})
+	}
+	if jsonOut {
+		b, _ := json.MarshalIndent(map[string]any{
+			"ok":       allOK,
+			"services": diags,
+		}, "", "  ")
+		fmt.Println(string(b))
+	} else {
+		if len(diags) == 0 {
+			fmt.Println("No hosted services configured.")
+			return apperr.ExitOK
+		}
+		for _, d := range diags {
+			mark := "✓"
+			if !d.OK {
+				mark = "✗"
+			}
+			fmt.Printf("%s %s (%s) state=%s health=%s level=%s persistence=%v\n",
+				mark, d.Name, d.Type, d.Status.State, d.Status.Health, d.Status.VerificationLevel, d.Persistence.PersistenceConfigured)
+			fmt.Printf("  layers: process=%s backend=%s agent=%s lease=%s pub=%s auth=%s edge=%s\n",
+				d.Status.Layers.Process, d.Status.Layers.Backend, d.Status.Layers.Agent,
+				d.Status.Layers.Lease, d.Status.Layers.Publication, d.Status.Layers.Authorization, d.Status.Layers.Edge)
+			if d.Status.IngressDetail != "" {
+				fmt.Printf("  detail: %s\n", d.Status.IngressDetail)
+			}
+			if !d.Persistence.PersistenceConfigured && d.Persistence.FailureReason != "" {
+				fmt.Printf("  persistence: %s\n", d.Persistence.FailureReason)
+			}
+		}
+	}
+	if allOK {
 		return apperr.ExitOK
 	}
 	return apperr.ExitRelayTLS

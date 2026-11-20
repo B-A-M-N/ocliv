@@ -12,6 +12,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
+	"strings"
 
 	"ocliv/internal/apperr"
 )
@@ -24,7 +26,49 @@ const (
 	MetaCap      = 32 * 1024
 	DataCap      = 64 * 1024
 	MaxBodyBytes = 64 << 20 // 64 MiB fixed build-time cap, enforced as a running total
+
+	// CapabilityPersistentNamedLeases is advertised in /v1/agent/challenge
+	// when the relay supports Schema V18 persistent named HTTP leases.
+	CapabilityPersistentNamedLeases = "persistent_named_leases_v1"
+
+	// CapabilityMgmtBodySignatureV2 is advertised in /v1/agent/challenge when
+	// the relay verifies body-bound ocliv-mgmt-v2 management signatures (P0-1).
+	CapabilityMgmtBodySignatureV2 = "mgmt_body_sig_v2"
 )
+
+// ParseRevision parses a protocol string of the form "ocliv/<N>" into its
+// positive numeric revision N, avoiding lexical comparison bugs (e.g. ocliv/10 < ocliv/2).
+func ParseRevision(v string) (int, error) {
+	if !strings.HasPrefix(v, "ocliv/") {
+		return 0, fmt.Errorf("invalid protocol version %q", v)
+	}
+	raw := strings.TrimPrefix(v, "ocliv/")
+	if raw == "" || strings.HasPrefix(raw, "0") {
+		return 0, fmt.Errorf("invalid protocol revision in %q", v)
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("invalid protocol revision in %q", v)
+	}
+	return n, nil
+}
+
+// VersionInRange checks numerically whether v falls within [minV, maxV].
+func VersionInRange(v, minV, maxV string) bool {
+	nv, err := ParseRevision(v)
+	if err != nil {
+		return false
+	}
+	nmin, err := ParseRevision(minV)
+	if err != nil {
+		return false
+	}
+	nmax, err := ParseRevision(maxV)
+	if err != nil {
+		return false
+	}
+	return nv >= nmin && nv <= nmax
+}
 
 // Frame types.
 const (
