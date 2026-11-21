@@ -450,6 +450,86 @@ func cmdRelayServe(argv []string) int {
 		}
 		googleVerifyJSON = b
 	}
+
+	// Release manifest and artifact directory for publisher self-update.
+	rawManifestFile := os.Getenv("OCLIV_RELEASE_MANIFEST")
+	if v, seen := explicitRelayFlag(argv, "--release-manifest"); seen {
+		rawManifestFile = v
+	}
+	var releaseManifestJSON []byte
+	if rawManifestFile != "" {
+		b, rerr := os.ReadFile(rawManifestFile)
+		if rerr != nil {
+			fmt.Fprintf(os.Stderr, "error: reading --release-manifest %q: %v\n", rawManifestFile, rerr)
+			return apperr.ExitCLIValidation
+		}
+		if !json.Valid(b) {
+			fmt.Fprintf(os.Stderr, "error: --release-manifest %q is not valid JSON\n", rawManifestFile)
+			return apperr.ExitCLIValidation
+		}
+		releaseManifestJSON = b
+	}
+	rawArtifactDir := os.Getenv("OCLIV_RELEASE_ARTIFACT_DIR")
+	if v, seen := explicitRelayFlag(argv, "--release-artifacts"); seen {
+		rawArtifactDir = v
+	}
+	if rawArtifactDir != "" {
+		fi, serr := os.Stat(rawArtifactDir)
+		if serr != nil || !fi.IsDir() {
+			fmt.Fprintf(os.Stderr, "error: --release-artifacts %q is not a directory\n", rawArtifactDir)
+			return apperr.ExitCLIValidation
+		}
+	}
+
+	// Edge mode (tunnel/wildcard/single-host) for capability advertisement.
+	edgeMode := os.Getenv("OCLIV_EDGE_MODE")
+	if v, seen := explicitRelayFlag(argv, "--edge-mode"); seen {
+		edgeMode = v
+	}
+	if edgeMode != "" && edgeMode != "tunnel" && edgeMode != "wildcard" && edgeMode != "single-host" {
+		fmt.Fprintln(os.Stderr, "error: --edge-mode must be tunnel, wildcard, or single-host")
+		return apperr.ExitCLIValidation
+	}
+
+	// Global session capacity limits.
+	maxHTTPStreams, maxWSStreams, maxSessions := int64(0), int64(0), int64(0)
+	if v, seen := explicitRelayFlag(argv, "--max-http-streams"); seen || os.Getenv("OCLIV_MAX_HTTP_STREAMS") != "" {
+		raw := v
+		if raw == "" {
+			raw = os.Getenv("OCLIV_MAX_HTTP_STREAMS")
+		}
+		n, perr := strconv.ParseInt(raw, 10, 64)
+		if perr != nil || n < 1 {
+			fmt.Fprintln(os.Stderr, "error: --max-http-streams must be a positive integer")
+			return apperr.ExitCLIValidation
+		}
+		maxHTTPStreams = n
+	}
+	if v, seen := explicitRelayFlag(argv, "--max-ws-streams"); seen || os.Getenv("OCLIV_MAX_WS_STREAMS") != "" {
+		raw := v
+		if raw == "" {
+			raw = os.Getenv("OCLIV_MAX_WS_STREAMS")
+		}
+		n, perr := strconv.ParseInt(raw, 10, 64)
+		if perr != nil || n < 1 {
+			fmt.Fprintln(os.Stderr, "error: --max-ws-streams must be a positive integer")
+			return apperr.ExitCLIValidation
+		}
+		maxWSStreams = n
+	}
+	if v, seen := explicitRelayFlag(argv, "--max-publisher-sessions"); seen || os.Getenv("OCLIV_MAX_PUBLISHER_SESSIONS") != "" {
+		raw := v
+		if raw == "" {
+			raw = os.Getenv("OCLIV_MAX_PUBLISHER_SESSIONS")
+		}
+		n, perr := strconv.ParseInt(raw, 10, 64)
+		if perr != nil || n < 1 {
+			fmt.Fprintln(os.Stderr, "error: --max-publisher-sessions must be a positive integer")
+			return apperr.ExitCLIValidation
+		}
+		maxSessions = n
+	}
+
 	restrictFileCreation()
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
@@ -473,6 +553,12 @@ func cmdRelayServe(argv []string) int {
 		MCPExternalPort:          mcpPort,
 		AutoApproveRedirectHosts: autoApproveHosts,
 		GoogleVerificationJSON:   googleVerifyJSON,
+		ReleaseManifestJSON:      releaseManifestJSON,
+		ReleaseArtifactDir:       rawArtifactDir,
+		EdgeMode:                 edgeMode,
+		GlobalMaxHTTPStreams:      maxHTTPStreams,
+		GlobalMaxWSStreams:        maxWSStreams,
+		GlobalMaxSessions:        maxSessions,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())

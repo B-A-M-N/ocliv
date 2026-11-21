@@ -7,7 +7,11 @@ package relay
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
+	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -52,6 +56,15 @@ type Options struct {
 	// GET /.well-known/ocliv-release-manifest.json. If nil the endpoint
 	// returns 404 — no manifest configured by the operator.
 	ReleaseManifestJSON []byte
+	// ReleaseArtifactDir is the filesystem directory serving release artifacts at
+	// GET /.well-known/ocliv-artifacts/{name}. If empty the artifact endpoint
+	// returns 404. Every artifact must be declared in ReleaseManifestJSON before
+	// it can be served; undeclared files are never accessible.
+	ReleaseArtifactDir string
+	// EdgeMode explicitly sets the ingress topology for capability advertisement
+	// and configuration validation. Valid values: "tunnel", "wildcard",
+	// "single-host". Empty means unknown — capabilities advertised conservatively.
+	EdgeMode string
 }
 
 // Logger is a minimal structured logger to avoid import cycles.
@@ -146,6 +159,8 @@ type Server struct {
 	autoApproveRedirectHosts []string
 	googleVerificationJSON   []byte
 	releaseManifestJSON      []byte
+	releaseArtifactDir       string
+	edgeMode                 string
 	visitors                 visitorAccess // HMAC key + verifier for visitor sessions
 	log                      Logger
 
@@ -206,6 +221,8 @@ func New(o Options) (*Server, error) {
 		autoApproveRedirectHosts: autoApprove,
 		googleVerificationJSON:   append([]byte(nil), o.GoogleVerificationJSON...),
 		releaseManifestJSON:      append([]byte(nil), o.ReleaseManifestJSON...),
+		releaseArtifactDir:       o.ReleaseArtifactDir,
+		edgeMode:                 strings.ToLower(strings.TrimSpace(o.EdgeMode)),
 		visitors:                 newVisitorAccess(o.ServerKey),
 		log:                      o.Logger,
 		registry:                 newSessionRegistry(),
@@ -232,6 +249,15 @@ func New(o Options) (*Server, error) {
 		s.authz = m
 	}
 	s.mux.HandleFunc("/.well-known/ocliv-release-manifest.json", s.handleReleaseManifest)
+	if o.ReleaseArtifactDir != "" {
+		// Validate that all manifest-declared artifacts exist before serving.
+		if len(o.ReleaseManifestJSON) > 0 {
+			if err := validateArtifactDir(o.ReleaseManifestJSON, o.ReleaseArtifactDir); err != nil {
+				return nil, fmt.Errorf("release artifacts validation: %w", err)
+			}
+		}
+		s.mux.HandleFunc("/.well-known/ocliv-artifacts/", s.handleReleaseArtifact)
+	}
 	s.mux.HandleFunc("/v1/agent/enroll", s.handleEnroll)
 	s.mux.HandleFunc("/v1/agent/pair-request", s.handlePairRequest)
 	s.mux.HandleFunc("/v1/agent/pair-status", s.handlePairStatus)
@@ -255,6 +281,11 @@ func New(o Options) (*Server, error) {
 	if err := s.reconcileBoot(); err != nil {
 		return nil, err
 	}
+	// Best-effort startup prune: mark expired pending pairing requests and
+	// remove old resolved ones. Never blocks startup on error.
+	if s.db != nil {
+		_, _, _ = s.db.PrunePairingRequests(time.Now(), 24*time.Hour)
+	}
 	if len(o.ServerKey) == 32 && s.db != nil {
 		s.db.Audit("relay", "", "", "visitor_hmac_fingerprint", "ok", VisitorKeyFingerprint(o.ServerKey))
 	}
@@ -273,6 +304,34 @@ func defaultOrI64(val, def int64) int64 {
 		return val
 	}
 	return def
+}
+
+// validateArtifactDir checks that every artifact declared in the manifest
+// exists in dir as a regular file (not a symlink). Called at startup to
+// prevent advertising artifacts that cannot actually be served.
+func validateArtifactDir(manifestJSON []byte, dir string) error {
+	var m struct {
+		Artifacts map[string]struct {
+			SHA256 string `json:"sha256"`
+		} `json:"artifacts"`
+	}
+	if err := json.Unmarshal(manifestJSON, &m); err != nil {
+		return fmt.Errorf("manifest parse: %w", err)
+	}
+	for name := range m.Artifacts {
+		if !isValidArtifactName(name) {
+			return fmt.Errorf("invalid artifact name in manifest: %q", name)
+		}
+		p := filepath.Join(dir, name)
+		fi, err := os.Lstat(p)
+		if err != nil {
+			return fmt.Errorf("artifact %q not found in dir: %w", name, err)
+		}
+		if !fi.Mode().IsRegular() {
+			return fmt.Errorf("artifact %q is not a regular file", name)
+		}
+	}
+	return nil
 }
 
 // Handler serves both agent control and public ingress. In production Caddy
