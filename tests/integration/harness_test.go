@@ -528,6 +528,13 @@ func newHarnessNS(t *testing.T, namespace, relayHost string, mcpHost ...string) 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("enroll status %d", resp.StatusCode)
 	}
+	// Integration tests exercise the full agent-relay handshake, public-mode
+	// visitor routing, and operator takedown — not tenant policy enforcement
+	// (which has its own suite in internal/relay/relay_policy_test.go).
+	// Allow public leases for the test tenant so tests that use Public:true work.
+	if err := db.SetTenantPolicy("tenant-test", store.TenantPolicy{AllowPublic: true}); err != nil {
+		t.Fatal(err)
+	}
 	return h
 }
 
