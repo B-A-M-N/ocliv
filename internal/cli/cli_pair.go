@@ -13,10 +13,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"ocliv/internal/apperr"
-	"ocliv/internal/config"
 	"ocliv/internal/control"
 	"ocliv/internal/identity"
 )
@@ -83,9 +83,6 @@ func cmdPair(argv []string) int {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return apperr.ExitCLIValidation
 	}
-	if cacert == "" {
-		cacert = config.CACertPath()
-	}
 
 	// Generate or load a keypair for this profile.
 	_, keyPath, cfgPath, err := agentFiles()
@@ -112,7 +109,10 @@ func cmdPair(argv []string) int {
 		fmt.Fprintln(os.Stderr, "generated new key "+("key-"+string(k.ID())))
 	}
 
-	client, err := control.HTTPClient(15 * time.Second)
+	client, err := control.NewHTTPClient(control.HTTPClientOptions{
+		Timeout:    15 * time.Second,
+		CACertPath: cacert,
+	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error building HTTP client: "+err.Error())
 		return apperr.ExitRelayTLS
@@ -157,10 +157,13 @@ func cmdPair(argv []string) int {
 	fmt.Printf("Pairing code: %s (expires %s)\n", pairResp.PairingCode, expiry.Round(time.Second))
 	fmt.Printf("Ask the relay operator to run:\n  ocliv relay approve %s --tenant TENANT\n", pairResp.PairingCode)
 
+	// Always persist poll credentials before proceeding so Ctrl-C + ocliv pair resume works.
+	if err := savePairPending(relayURL, pairResp.PollID, pairResp.PollSecret, pairResp.ExpiresInSeconds, cacert); err != nil {
+		fmt.Fprintln(os.Stderr, "error: could not save pairing state (required for resume): "+err.Error())
+		return apperr.ExitInternal
+	}
+
 	if !doWait {
-		if err := savePairPending(relayURL, pairResp.PollID, pairResp.PollSecret, pairResp.ExpiresInSeconds); err != nil {
-			fmt.Fprintln(os.Stderr, "warning: could not save pairing state: "+err.Error())
-		}
 		fmt.Println("\nRun `ocliv pair resume` to complete enrollment when the operator approves.")
 		return apperr.ExitOK
 	}
@@ -201,8 +204,6 @@ func cmdPairResume(argv []string) int {
 			return apperr.ExitCLIValidation
 		}
 	}
-	_ = cacert
-
 	st, err := loadPairPending()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
@@ -215,13 +216,22 @@ func cmdPairResume(argv []string) int {
 		return apperr.ExitAuth
 	}
 
+	// Use explicit --cacert flag; fall back to the path saved with the pending state.
+	caCertPath := cacert
+	if caCertPath == "" {
+		caCertPath = st.CACertPath
+	}
+
 	_, _, cfgPath, err := agentFiles()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return apperr.ExitInternal
 	}
 
-	client, err := control.HTTPClient(15 * time.Second)
+	client, err := control.NewHTTPClient(control.HTTPClientOptions{
+		Timeout:    15 * time.Second,
+		CACertPath: caCertPath,
+	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error building HTTP client: "+err.Error())
 		return apperr.ExitRelayTLS
@@ -326,6 +336,7 @@ type pairPendingState struct {
 	PollID     string `json:"poll_id"`
 	PollSecret string `json:"poll_secret"`
 	ExpiresAt  string `json:"expires_at"`
+	CACertPath string `json:"cacert_path,omitempty"`
 }
 
 func pairPendingPath() (string, error) {
@@ -336,7 +347,7 @@ func pairPendingPath() (string, error) {
 	return filepath.Join(dir, "pair-pending.json"), nil
 }
 
-func savePairPending(relayURL, pollID, pollSecret string, expiresInSeconds int) error {
+func savePairPending(relayURL, pollID, pollSecret string, expiresInSeconds int, caCertPath string) error {
 	p, err := pairPendingPath()
 	if err != nil {
 		return err
@@ -347,11 +358,12 @@ func savePairPending(relayURL, pollID, pollSecret string, expiresInSeconds int) 
 		PollID:     pollID,
 		PollSecret: pollSecret,
 		ExpiresAt:  exp,
+		CACertPath: caCertPath,
 	})
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(p, b, 0600)
+	return writePrivateFileAtomic(p, b)
 }
 
 func loadPairPending() (pairPendingState, error) {
@@ -359,13 +371,93 @@ func loadPairPending() (pairPendingState, error) {
 	if err != nil {
 		return pairPendingState{}, err
 	}
-	b, err := os.ReadFile(p)
+	b, err := readPrivateBytesStrict(p, 4096)
 	if err != nil {
-		return pairPendingState{}, fmt.Errorf("no pending pairing request found (run `ocliv pair RELAY_URL` first): %w", err)
+		if os.IsNotExist(err) {
+			return pairPendingState{}, fmt.Errorf("no pending pairing request found (run `ocliv pair RELAY_URL` first)")
+		}
+		return pairPendingState{}, fmt.Errorf("reading pairing state: %w", err)
 	}
 	var st pairPendingState
 	if err := json.Unmarshal(b, &st); err != nil {
 		return pairPendingState{}, fmt.Errorf("corrupt pending pairing state: %w", err)
 	}
 	return st, nil
+}
+
+// writePrivateFileAtomic writes data to path atomically via a sibling temp file
+// in the same directory (same filesystem as dest). The temp file is created with
+// mode 0600, fsynced, then renamed atomically; the parent directory is fsynced.
+func writePrivateFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("creating directory: %w", err)
+	}
+	f, err := os.CreateTemp(dir, ".tmp-"+filepath.Base(path))
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	tmp := f.Name()
+	if err := os.Chmod(tmp, 0600); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("chmod temp: %w", err)
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("writing: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("fsync: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("close: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("rename: %w", err)
+	}
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		d.Close()
+	}
+	return nil
+}
+
+// readPrivateBytesStrict reads up to maxSize bytes from a private state file,
+// verifying it is a regular file (not a symlink) owned by the current user with
+// mode 0600.
+func readPrivateBytesStrict(path string, maxSize int64) ([]byte, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		if err == syscall.ENOENT {
+			return nil, os.ErrNotExist
+		}
+		return nil, err
+	}
+	f := os.NewFile(uintptr(fd), path)
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%q is not a regular file", path)
+	}
+	if fi.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("%q has mode %o (want 0600)", path, fi.Mode().Perm())
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		if int(st.Uid) != os.Getuid() {
+			return nil, fmt.Errorf("%q is owned by uid %d (want %d)", path, st.Uid, os.Getuid())
+		}
+	}
+	if fi.Size() > maxSize {
+		return nil, fmt.Errorf("%q is too large (%d > %d)", path, fi.Size(), maxSize)
+	}
+	return io.ReadAll(io.LimitReader(f, maxSize+1))
 }

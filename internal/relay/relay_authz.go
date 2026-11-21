@@ -159,6 +159,10 @@ func (s *Server) RunAuthzMaintenance(ctx context.Context) {
 				s.db.Audit("system", "", "", "authz-prune", "error",
 					"reclaiming abandoned registrations failed: "+errShort(err))
 			}
+			if _, _, err := s.db.PrunePairingRequests(now, 24*time.Hour); err != nil {
+				s.db.Audit("system", "", "", "authz-prune", "error",
+					"pruning pairing requests failed: "+errShort(err))
+			}
 		}
 	}
 }

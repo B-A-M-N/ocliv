@@ -766,15 +766,31 @@ func scanPairingRequest(row pairingScanner) (PairingRequest, error) {
 	return pr, nil
 }
 
-// CountPendingPairingRequests returns the total number of pending pairing
-// requests relay-wide for global cap enforcement.
+// CountPendingPairingRequests returns the number of non-expired pending pairing
+// requests relay-wide for global cap enforcement. Expired-but-not-yet-pruned
+// rows are excluded so they cannot block new requests.
 func (d *DB) CountPendingPairingRequests() (int, error) {
 	var n int
 	if err := d.sql.QueryRow(
-		`SELECT COUNT(*) FROM pairing_requests WHERE status='pending'`).Scan(&n); err != nil {
+		`SELECT COUNT(*) FROM pairing_requests WHERE status='pending' AND expires_at > ?`,
+		time.Now().UTC().Format(time.RFC3339Nano)).Scan(&n); err != nil {
 		return 0, apperr.E(apperr.CodeStoreFault, "counting pending pairing requests", err)
 	}
 	return n, nil
+}
+
+// SupersedePendingPairingRequest marks any existing pending pairing request
+// from keyID as expired, so a publisher never holds two valid display codes
+// simultaneously. Called before creating a new request.
+func (d *DB) SupersedePendingPairingRequest(keyID string, now time.Time) error {
+	_, err := d.sql.Exec(
+		`UPDATE pairing_requests SET status='expired', resolved_at=?
+		 WHERE key_id=? AND status='pending'`,
+		now.UTC().Format(time.RFC3339Nano), keyID)
+	if err != nil {
+		return apperr.E(apperr.CodeStoreFault, "superseding prior pairing request", err)
+	}
+	return nil
 }
 
 // PrunePairingRequests durably expires pending requests past their TTL and

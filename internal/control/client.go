@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -54,30 +56,57 @@ var noFollow = func(_ *http.Request, _ []*http.Request) error {
 	return http.ErrUseLastResponse
 }
 
+// HTTPClientOptions configures the HTTP client returned by NewHTTPClient.
+type HTTPClientOptions struct {
+	Timeout    time.Duration
+	CACertPath string // explicit PEM CA bundle path; overrides OCLIV_CACERT env when non-empty
+}
+
+// NewHTTPClient builds a TLS-aware no-redirect HTTP client. When opts.CACertPath
+// is non-empty it is loaded directly; otherwise the OCLIV_CACERT env variable is
+// honoured. TLS verification is never disabled and all HTTP redirects are refused.
+func NewHTTPClient(opts HTTPClientOptions) (*http.Client, error) {
+	if opts.Timeout <= 0 {
+		opts.Timeout = 15 * time.Second
+	}
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	if opts.CACertPath != "" {
+		pem, err := os.ReadFile(opts.CACertPath)
+		if err != nil {
+			return nil, fmt.Errorf("loading CA certificate %q: %w", opts.CACertPath, err)
+		}
+		pool, serr := x509.SystemCertPool()
+		if serr != nil || pool == nil {
+			pool = x509.NewCertPool()
+		}
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("no certificates parsed from %q", opts.CACertPath)
+		}
+		tlsCfg.RootCAs = pool
+	} else {
+		p, err := config.CertPool()
+		if err != nil {
+			return nil, err
+		}
+		if p != nil {
+			tlsCfg.RootCAs = p
+		}
+	}
+	return &http.Client{
+		Timeout:       opts.Timeout,
+		CheckRedirect: noFollow,
+		Transport: &http.Transport{
+			TLSClientConfig: tlsCfg,
+			Proxy:           func(*http.Request) (*url.URL, error) { return nil, nil },
+		},
+	}, nil
+}
+
 // HTTPClient builds an HTTP client honoring OCLIV_CACERT without ever
 // disabling TLS verification. It refuses all HTTP redirects and disables
 // ambient HTTP proxy to prevent credential leakage on the control plane.
 func HTTPClient(timeout time.Duration) (*http.Client, error) {
-	if timeout <= 0 {
-		timeout = 15 * time.Second
-	}
-	pool, err := config.CertPool()
-	if err != nil {
-		return nil, err
-	}
-	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
-	if pool != nil {
-		tlsCfg.RootCAs = pool
-	}
-	return &http.Client{
-		Timeout:       timeout,
-		CheckRedirect: noFollow,
-		Transport: &http.Transport{
-			TLSClientConfig: tlsCfg,
-			// No ambient HTTP proxy on the authenticated control plane.
-			Proxy: func(*http.Request) (*url.URL, error) { return nil, nil },
-		},
-	}, nil
+	return NewHTTPClient(HTTPClientOptions{Timeout: timeout})
 }
 
 // ValidateRelayURL checks that raw is a valid relay base URL:
