@@ -59,4 +59,8 @@ done < <(git ls-files | grep -E '_test\.go$' | grep -iE '(pass[0-9]|rereview|rem
 if [ "$FAIL" -ne 0 ]; then
   exit 1
 fi
+if command -v python3 >/dev/null 2>&1 && [ -f scripts/release/render-shell-trust.py ]; then
+  python3 scripts/release/render-shell-trust.py --check
+fi
+
 echo "OK: repository hygiene checks passed"

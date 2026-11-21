@@ -104,26 +104,27 @@ if [ -x "$OUT/ocliv-linux-${HOST_ARCH}" ]; then
   "$OUT/ocliv-linux-${HOST_ARCH}" version --json >"$OUT/ocliv-version.json"
 fi
 
+GO_VER="$(go version | awk '{print $3}')"
 SBOM_FILE=""
 SBOM_TOOL="none"
+SBOM_TOOL_VERSION=""
+# Canonical pinned CycloneDX generator: cyclonedx-gomod.
+# --production mode requires cyclonedx-gomod explicitly (no silent tool substitution).
 if command -v cyclonedx-gomod >/dev/null 2>&1; then
   echo "==> Generating CycloneDX SBOM via cyclonedx-gomod"
   SBOM_FILE="sbom.cdx.json"
   SBOM_TOOL="cyclonedx-gomod"
+  SBOM_TOOL_VERSION="$(cyclonedx-gomod version 2>/dev/null | head -1 || echo unknown)"
   cyclonedx-gomod app -json -output "$OUT/$SBOM_FILE" -main ./cmd/ocliv .
-elif command -v syft >/dev/null 2>&1; then
-  echo "==> Generating CycloneDX SBOM via syft"
-  SBOM_FILE="sbom.cdx.json"
-  SBOM_TOOL="syft"
-  syft dir:. -o cyclonedx-json="$OUT/$SBOM_FILE"
 else
-  if [ "$ALLOW_MISSING_TOOLS" -eq 0 ]; then
-    echo "error: neither cyclonedx-gomod nor syft is installed for SBOM generation" >&2
+  if [ "$PRODUCTION_MODE" -eq 1 ] || [ "$ALLOW_MISSING_TOOLS" -eq 0 ]; then
+    echo "error: canonical SBOM generator cyclonedx-gomod is not installed (install: go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest)" >&2
     exit 1
   fi
-  echo "warning: SBOM tool not installed; generating fallback go-module-inventory.json" >&2
+  echo "warning: cyclonedx-gomod not installed; generating non-production fallback go-module-inventory.json" >&2
   SBOM_FILE="go-module-inventory.json"
   SBOM_TOOL="go-list-fallback"
+  SBOM_TOOL_VERSION="$GO_VER"
   go list -m -json all >"$OUT/$SBOM_FILE"
 fi
 
@@ -169,16 +170,18 @@ else
   fi
 fi
 
-python3 - "$OUT/release-manifest.json" "$SHA" "$BUILD_TIME" "$SOURCE_DATE_EPOCH" "$GO_VER" "$AMD64_SHA" "$ARM64_SHA" "$SBOM_FILE" "$SBOM_SHA" "$SBOM_TOOL" "$GOVULN_STATUS" "$BUILD_CMD" "$OUT/ocliv-version.json" "$SIGNING_KEY_ID" "$NON_PRODUCTION" <<'PY'
+python3 - "$OUT/release-manifest.json" "$SHA" "$BUILD_TIME" "$SOURCE_DATE_EPOCH" "$GO_VER" "$AMD64_SHA" "$ARM64_SHA" "$SBOM_FILE" "$SBOM_SHA" "$SBOM_TOOL" "$SBOM_TOOL_VERSION" "$GOVULN_STATUS" "$BUILD_CMD" "$OUT/ocliv-version.json" "$SIGNING_KEY_ID" "$NON_PRODUCTION" <<'PY'
 import json, pathlib, sys
 (manifest_path, sha, build_time, epoch, go_ver, amd64_sha, arm64_sha,
- sbom_file, sbom_sha, sbom_tool, govuln, build_cmd, ver_json_path,
+ sbom_file, sbom_sha, sbom_tool, sbom_tool_ver, govuln, build_cmd, ver_json_path,
  signing_key_id, non_prod) = sys.argv[1:]
 ver_info = {}
 p = pathlib.Path(ver_json_path)
 if p.exists():
     ver_info = json.loads(p.read_text())
 manifest = {
+    "manifest_version": 1,
+    "release_sequence": int(epoch),
     "commit": sha,
     "dirty": False,
     "non_production": non_prod == "1",
@@ -200,6 +203,7 @@ manifest = {
             "format": "cyclonedx-json" if sbom_file.endswith(".cdx.json") else "go-list-json",
             "file": sbom_file,
             "generator": sbom_tool,
+            "generator_version": sbom_tool_ver,
             "sha256": sbom_sha,
         }
     },

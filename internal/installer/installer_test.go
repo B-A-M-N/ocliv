@@ -7,10 +7,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -357,6 +361,189 @@ func TestTrustRootParityWithInstallClientScript(t *testing.T) {
 		if !containsString(content, want) {
 			t.Errorf("install-client.sh missing canonical trust entry %q from release-trust.json", want)
 		}
+	}
+}
+
+func TestReleaseSequenceAntiRollback(t *testing.T) {
+	seqPath := filepath.Join(t.TempDir(), ".ocliv-release-seq")
+	if err := CheckReleaseSequence(seqPath, 100, false); err != nil {
+		t.Fatalf("initial sequence should pass: %v", err)
+	}
+	if err := RecordReleaseSequence(seqPath, 100); err != nil {
+		t.Fatalf("record sequence: %v", err)
+	}
+	// Equal or higher sequence allowed.
+	if err := CheckReleaseSequence(seqPath, 100, false); err != nil {
+		t.Fatalf("equal sequence should pass: %v", err)
+	}
+	if err := CheckReleaseSequence(seqPath, 200, false); err != nil {
+		t.Fatalf("higher sequence should pass: %v", err)
+	}
+	// Lower sequence MUST be rejected without override.
+	if err := CheckReleaseSequence(seqPath, 99, false); err == nil {
+		t.Fatal("lower release_sequence must be refused without allowDowngrade")
+	}
+	// Explicit override allows downgrade.
+	if err := CheckReleaseSequence(seqPath, 99, true); err != nil {
+		t.Fatalf("explicit allowDowngrade should pass: %v", err)
+	}
+}
+
+func TestInstallClientScriptMultiKeyRotationAndPinning(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("install-client.sh test runs on Linux only")
+	}
+	shell := "/bin/sh"
+	if dashPath, err := exec.LookPath("dash"); err == nil {
+		shell = dashPath
+	}
+	if _, err := exec.LookPath("openssl"); err != nil {
+		t.Skip("openssl not installed")
+	}
+	if _, err := exec.LookPath("curl"); err != nil {
+		if _, err2 := exec.LookPath("wget"); err2 != nil {
+			t.Skip("neither curl nor wget installed")
+		}
+	}
+
+	// Generate 3 distinct Ed25519 keys whose IDs intentionally contain 'n'
+	// (regression test for the old broken POSIX IFS='\n' splitting bug).
+	pubActive, privActive, _ := ed25519.GenerateKey(rand.Reader)
+	pubRetiring, privRetiring, _ := ed25519.GenerateKey(rand.Reader)
+	pubRevoked, privRevoked, _ := ed25519.GenerateKey(rand.Reader)
+
+	origScript, err := os.ReadFile(filepath.Join("..", "..", "packaging", "install", "install-client.sh"))
+	if err != nil {
+		t.Fatalf("read install-client.sh: %v", err)
+	}
+	const beginMarker = "# BEGIN GENERATED TRUST ROOT (from internal/installer/release-trust.json)"
+	const endMarker = "# END GENERATED TRUST ROOT"
+	s := string(origScript)
+	bi := strings.Index(s, beginMarker)
+	ei := strings.Index(s, endMarker)
+	if bi < 0 || ei < 0 || ei <= bi {
+		t.Fatal("install-client.sh missing generated trust root markers")
+	}
+	trustBlock := fmt.Sprintf(
+		"%s\nTRUSTED_RELEASE_KEYS='active-n-key|active|%s\nretiring-n-key|retiring|%s\nrevoked-n-key|revoked|%s'\n%s",
+		beginMarker,
+		hex.EncodeToString(pubActive),
+		hex.EncodeToString(pubRetiring),
+		hex.EncodeToString(pubRevoked),
+		endMarker,
+	)
+	patched := s[:bi] + trustBlock + s[ei+len(endMarker):]
+	tmpDir := t.TempDir()
+	scriptCopy := filepath.Join(tmpDir, "install-client.sh")
+	if err := os.WriteFile(scriptCopy, []byte(patched), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Build a fake ocliv executable that responds to `version --json` with the commit.
+	const commitSHA = "deadbeef1234567890"
+	fakeBin := []byte(fmt.Sprintf("#!/bin/sh\necho '{\"version\":\"0.0.0-test\",\"build_commit\":\"%s\",\"schema_version\":22}'\n", commitSHA))
+	binSum := sha256.Sum256(fakeBin)
+	binHex := hex.EncodeToString(binSum[:])
+	artifact := ArtifactName(runtime.GOOS, runtime.GOARCH)
+
+	var curManifest []byte
+	var curSig string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/.well-known/ocliv-release-manifest.json":
+			_, _ = w.Write(curManifest)
+		case "/.well-known/ocliv-release-manifest.json.sig":
+			_, _ = w.Write([]byte(curSig))
+		case "/.well-known/ocliv-artifacts/" + artifact:
+			_, _ = w.Write(fakeBin)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	makeSigned := func(signingKeyID string, seq int64, signer ed25519.PrivateKey) ([]byte, string) {
+		m := map[string]any{
+			"manifest_version": 1,
+			"release_sequence": seq,
+			"commit":           commitSHA,
+			"dirty":            false,
+			"govulncheck":      "pass",
+			"artifacts": map[string]any{
+				artifact: map[string]any{"sha256": binHex},
+			},
+		}
+		if signingKeyID != "" {
+			m["signing_key_id"] = signingKeyID
+		}
+		raw, _ := json.MarshalIndent(m, "", "  ")
+		raw = append(raw, '\n')
+		sig := hex.EncodeToString(ed25519.Sign(signer, raw))
+		return raw, sig
+	}
+
+	runInstall := func(instDir string, extraEnv ...string) (int, string) {
+		cmd := exec.Command(shell, scriptCopy, srv.URL)
+		cmd.Env = append(os.Environ(), "OCLIV_INSTALL_DIR="+instDir)
+		cmd.Env = append(cmd.Env, extraEnv...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			if ee, ok := err.(*exec.ExitError); ok {
+				return ee.ExitCode(), string(out)
+			}
+			return -1, string(out) + err.Error()
+		}
+		return 0, string(out)
+	}
+
+	instDir := filepath.Join(tmpDir, "inst")
+
+	// 1. Missing signing_key_id must be rejected.
+	curManifest, curSig = makeSigned("", 10, privActive)
+	if rc, out := runInstall(instDir); rc == 0 {
+		t.Fatalf("missing signing_key_id should fail, got rc=0: %s", out)
+	}
+
+	// 2. Unknown signing_key_id must be rejected.
+	curManifest, curSig = makeSigned("unknown-n-key", 10, privActive)
+	if rc, out := runInstall(instDir); rc == 0 {
+		t.Fatalf("unknown signing_key_id should fail, got rc=0: %s", out)
+	}
+
+	// 3. Revoked key must be rejected.
+	curManifest, curSig = makeSigned("revoked-n-key", 10, privRevoked)
+	if rc, out := runInstall(instDir); rc == 0 {
+		t.Fatalf("revoked signing_key_id should fail, got rc=0: %s", out)
+	}
+
+	// 4. Wrong signing_key_id (declared active, signed by retiring) must be rejected.
+	curManifest, curSig = makeSigned("active-n-key", 10, privRetiring)
+	if rc, out := runInstall(instDir); rc == 0 {
+		t.Fatalf("mismatched signing_key_id/signature should fail, got rc=0: %s", out)
+	}
+
+	// 5. Valid retiring key must succeed.
+	curManifest, curSig = makeSigned("retiring-n-key", 10, privRetiring)
+	if rc, out := runInstall(instDir); rc != 0 {
+		t.Fatalf("retiring-n-key install failed (rc=%d): %s", rc, out)
+	}
+
+	// 6. Valid active key with higher release_sequence must succeed.
+	curManifest, curSig = makeSigned("active-n-key", 20, privActive)
+	if rc, out := runInstall(instDir); rc != 0 {
+		t.Fatalf("active-n-key install failed (rc=%d): %s", rc, out)
+	}
+
+	// 7. Release sequence downgrade (20 -> 15) must be refused without OCLIV_ALLOW_DOWNGRADE=1.
+	curManifest, curSig = makeSigned("active-n-key", 15, privActive)
+	if rc, out := runInstall(instDir); rc == 0 {
+		t.Fatalf("release_sequence downgrade should fail, got rc=0: %s", out)
+	}
+
+	// 8. Test trust override without OCLIV_ALLOW_TEST_TRUST=1 must be refused.
+	curManifest, curSig = makeSigned("active-n-key", 20, privActive)
+	if rc, out := runInstall(instDir, "OCLIV_TEST_SIGNING_PUBLIC_KEY_PEM=dummy"); rc == 0 {
+		t.Fatalf("test trust override without OCLIV_ALLOW_TEST_TRUST=1 should fail, got rc=0: %s", out)
 	}
 }
 

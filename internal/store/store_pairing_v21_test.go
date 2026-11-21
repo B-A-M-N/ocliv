@@ -126,3 +126,117 @@ func TestPruneTerminalLeaseEphemeraPreservesTombstones(t *testing.T) {
 		t.Fatalf("terminal lease tombstone must never be deleted: count=%d err=%v", leaseCount, err)
 	}
 }
+
+func TestV21DuplicatePendingDeduplicatedOnV22Migration(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "v21dup.db")
+	sqldb, err := sql.Open("sqlite", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		schemaV1, schemaV2, schemaV3, schemaV4, schemaV5, schemaV6, schemaV7,
+		schemaV8, schemaV9, schemaV10, schemaV11, schemaV12, schemaV13, schemaV14,
+		schemaV15, schemaV16, schemaV17, schemaV18, schemaV19, schemaV20, schemaV21,
+	} {
+		if _, err := sqldb.Exec(stmt); err != nil {
+			sqldb.Close()
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	exp := time.Now().UTC().Add(10 * time.Minute).Format(time.RFC3339Nano)
+	if _, err := sqldb.Exec(`INSERT OR REPLACE INTO schema_version(v, applied_at) VALUES(21, ?)`, now); err != nil {
+		sqldb.Close()
+		t.Fatal(err)
+	}
+	// Plant 2 live pending rows for the SAME key_id in V21 (legal in V21, illegal in V22).
+	for i, code := range []string{"aaaa-1111-2222", "bbbb-3333-4444"} {
+		if _, err := sqldb.Exec(
+			`INSERT INTO pairing_requests(id, display_code, poll_id, poll_verifier, public_key, key_id, source_ip, status, created_at, expires_at)
+			 VALUES(?,?,?,X'0102',X'00','key-dup','127.0.0.1','pending',?,?)`,
+			"dup-"+string(rune('1'+i)), code, "poll-"+string(rune('1'+i)), now, exp); err != nil {
+			sqldb.Close()
+			t.Fatal(err)
+		}
+	}
+	sqldb.Close()
+
+	// Migrating V21 -> V22 must expire the older duplicate BEFORE creating the partial unique index.
+	db, err := Open(p)
+	if err != nil {
+		t.Fatalf("V21->V22 migration failed on duplicate pending rows: %v", err)
+	}
+	defer db.Close()
+
+	var pend int
+	if err := db.SQL().QueryRow(`SELECT COUNT(*) FROM pairing_requests WHERE key_id='key-dup' AND status='pending'`).Scan(&pend); err != nil || pend != 1 {
+		t.Fatalf("expected 1 surviving pending row after V22 migration, got %d (err=%v)", pend, err)
+	}
+	// Re-opening an already-V22 DB must be a clean no-op.
+	db.Close()
+	db2, err := Open(p)
+	if err != nil {
+		t.Fatalf("already-V22 reopen failed: %v", err)
+	}
+	db2.Close()
+}
+
+func TestV20ToV22MigrationWithDuplicatePending(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "v20dup.db")
+	sqldb, err := sql.Open("sqlite", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		schemaV1, schemaV2, schemaV3, schemaV4, schemaV5, schemaV6, schemaV7,
+		schemaV8, schemaV9, schemaV10, schemaV11, schemaV12, schemaV13, schemaV14,
+		schemaV15, schemaV16, schemaV17, schemaV18, schemaV19, schemaV20,
+	} {
+		if _, err := sqldb.Exec(stmt); err != nil {
+			sqldb.Close()
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	exp := time.Now().UTC().Add(10 * time.Minute).Format(time.RFC3339Nano)
+	if _, err := sqldb.Exec(`INSERT OR REPLACE INTO schema_version(v, applied_at) VALUES(20, ?)`, now); err != nil {
+		sqldb.Close()
+		t.Fatal(err)
+	}
+	// Duplicate pending rows for the same key_id + an approved legacy row in V20.
+	for i, code := range []string{"cccc-1111-2222", "dddd-3333-4444"} {
+		if _, err := sqldb.Exec(
+			`INSERT INTO pairing_requests(id, display_code, poll_id, poll_verifier, public_key, key_id, source_ip, status, created_at, expires_at)
+			 VALUES(?,?,?,X'0102',X'00','key-v20-dup','127.0.0.1','pending',?,?)`,
+			"v20-dup-"+string(rune('1'+i)), code, "v20-poll-"+string(rune('1'+i)), now, exp); err != nil {
+			sqldb.Close()
+			t.Fatal(err)
+		}
+	}
+	if _, err := sqldb.Exec(
+		`INSERT INTO pairing_requests(id, display_code, poll_id, poll_verifier, public_key, key_id, source_ip, status, created_at, expires_at, resolved_at, enrollment_code_id)
+		 VALUES('v20-app','eeee-5555-6666','v20-poll-app',X'0102',X'00','key-v20-app','127.0.0.1','approved',?,?,?,'tenant-v20')`,
+		now, exp, now); err != nil {
+		sqldb.Close()
+		t.Fatal(err)
+	}
+	sqldb.Close()
+
+	db, err := Open(p)
+	if err != nil {
+		t.Fatalf("V20->V22 migration failed: %v", err)
+	}
+	defer db.Close()
+
+	var pend int
+	if err := db.SQL().QueryRow(`SELECT COUNT(*) FROM pairing_requests WHERE key_id='key-v20-dup' AND status='pending'`).Scan(&pend); err != nil || pend != 1 {
+		t.Fatalf("expected 1 surviving pending row after V20->V22 migration, got %d (err=%v)", pend, err)
+	}
+	prApp, err := db.GetPairingRequest("eeee-5555-6666")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prApp.ResolvedTenantID != "tenant-v20" {
+		t.Fatalf("V20->V22 resolved_tenant_id=%q, want tenant-v20", prApp.ResolvedTenantID)
+	}
+}

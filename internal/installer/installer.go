@@ -32,6 +32,8 @@ var AllowUnqualifiedRelease bool
 // artifact endpoint (ocliv-{os}-{arch} naming). Sbom is optional provenance
 // metadata that is NOT served by the artifact endpoint.
 type ReleaseManifest struct {
+	ManifestVersion int                      `json:"manifest_version,omitempty"`
+	ReleaseSequence int64                    `json:"release_sequence,omitempty"`
 	Commit          string                   `json:"commit"`
 	Dirty           bool                     `json:"dirty"`
 	NonProduction   bool                     `json:"non_production,omitempty"`
@@ -400,13 +402,84 @@ func DownloadAndVerify(ctx context.Context, client *http.Client, artifactURL, ex
 	return nil
 }
 
+// CheckReleaseSequence enforces monotonic release anti-rollback against
+// seqPath. If seqPath holds a higher sequence than seq and allowDowngrade is
+// false, an error is returned before activation.
+func CheckReleaseSequence(seqPath string, seq int64, allowDowngrade bool) error {
+	if seq <= 0 {
+		return nil
+	}
+	raw, err := os.ReadFile(seqPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("reading release sequence %s: %w", seqPath, err)
+	}
+	var prev int64
+	if _, serr := fmt.Sscanf(strings.TrimSpace(string(raw)), "%d", &prev); serr != nil {
+		return fmt.Errorf("corrupt release sequence file %s", seqPath)
+	}
+	if seq < prev && !allowDowngrade {
+		return fmt.Errorf("refusing release downgrade: manifest release_sequence=%d < installed=%d", seq, prev)
+	}
+	return nil
+}
+
+// RecordReleaseSequence atomically persists seq to seqPath (mode 0644) and
+// fsyncs the parent directory.
+func RecordReleaseSequence(seqPath string, seq int64) error {
+	if seq <= 0 {
+		return nil
+	}
+	dir := filepath.Dir(seqPath)
+	tmp, err := os.CreateTemp(dir, ".ocliv-seq-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := fmt.Fprintf(tmp, "%d\n", seq); err != nil {
+		tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, seqPath); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	syncDir(dir)
+	return nil
+}
+
 // DownloadValidateAndInstall downloads artifactURL into dst's directory,
-// verifies SHA256, runs pre-swap candidate validation (`version --json` +
-// manifest commit/protocol/schema check), safely preserves dst+".prev",
-// atomically activates dst, and runs post-swap validation with automatic
-// rollback on failure.
+// verifies SHA256, checks monotonic release_sequence anti-rollback, runs
+// pre-swap candidate validation (`version --json` + manifest commit/protocol/
+// schema check), safely preserves dst+".prev", atomically activates dst, runs
+// post-swap validation with automatic rollback on failure, and records the
+// accepted release_sequence.
 func DownloadValidateAndInstall(ctx context.Context, client *http.Client, artifactURL, expected, dst string, manifest *ReleaseManifest) error {
 	dir := filepath.Dir(dst)
+	seqPath := filepath.Join(dir, ".ocliv-release-seq")
+	allowDowngrade := strings.TrimSpace(os.Getenv("OCLIV_ALLOW_DOWNGRADE")) == "1"
+	if manifest != nil && manifest.ReleaseSequence > 0 {
+		if err := CheckReleaseSequence(seqPath, manifest.ReleaseSequence, allowDowngrade); err != nil {
+			return err
+		}
+	}
 	tmpName, err := DownloadToTemp(ctx, client, artifactURL, expected, dir)
 	if err != nil {
 		return err
@@ -420,6 +493,9 @@ func DownloadValidateAndInstall(ctx context.Context, client *http.Client, artifa
 	}); err != nil {
 		_ = os.Remove(tmpName)
 		return err
+	}
+	if manifest != nil && manifest.ReleaseSequence > 0 {
+		_ = RecordReleaseSequence(seqPath, manifest.ReleaseSequence)
 	}
 	return nil
 }

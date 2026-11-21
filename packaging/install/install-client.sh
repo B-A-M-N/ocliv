@@ -15,12 +15,12 @@ RELAY_URL="${1:-${OCLIV_RELAY_URL:-}}"
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 info() { printf 'info: %s\n' "$*"; }
 
-# Canonical trusted Ed25519 key set synced from internal/installer/release-trust.json.
-# Format: one "<key_id>|<status>|<64-hex-ed25519-pub>" entry per line.
-# Statuses: active, retiring (accepted during rotation), revoked (always rejected).
-# OCLIV_SIGNING_PUBLIC_KEY_PEM may override for isolated test harnesses.
+# BEGIN GENERATED TRUST ROOT (from internal/installer/release-trust.json)
 TRUSTED_RELEASE_KEYS='release-2026-v1-placeholder|active|0000000000000000000000000000000000000000000000000000000000000000'
-SIGNING_PUBLIC_KEY_PEM="${OCLIV_SIGNING_PUBLIC_KEY_PEM:-}"
+# END GENERATED TRUST ROOT
+# Test-only trust override (ONLY honored when OCLIV_ALLOW_TEST_TRUST=1 AND
+# OCLIV_ENV=development AND RELAY_URL is loopback).
+TEST_SIGNING_PUBLIC_KEY_PEM="${OCLIV_TEST_SIGNING_PUBLIC_KEY_PEM:-${OCLIV_SIGNING_PUBLIC_KEY_PEM:-}}"
 
 # Validate RELAY_URL: require HTTPS for non-loopback hosts; HTTP permitted only
 # for explicit loopback development (127.*, localhost, [::1]).
@@ -105,9 +105,10 @@ _hex_to_bin() {
             v = hex[substr($0, i, 1)] * 16 + hex[substr($0, i+1, 1)]
             printf "\\%03o", v
         }
-    }' | {
-        IFS= read -r _oct
-        printf "$_oct"
+    }
+    END { printf "\n" }' | {
+        IFS= read -r _oct || [ -n "$_oct" ]
+        printf '%b' "$_oct"
     }
 }
 
@@ -173,40 +174,66 @@ _json_bool() {
 
 DECLARED_KEY_ID="$(_json_str signing_key_id || true)"
 AUTHENTICATED_KEY_ID=""
-if [ -n "$SIGNING_PUBLIC_KEY_PEM" ]; then
-    printf '%s\n' "$SIGNING_PUBLIC_KEY_PEM" > "$PUBKEYFILE"
+
+_is_loopback_url() {
+    case "$1" in
+        http://127.*|https://127.*|http://localhost|http://localhost:*|https://localhost|https://localhost:*|http://\[::1\]|http://\[::1\]:*|https://\[::1\]|https://\[::1\]:*)
+            return 0 ;;
+        *)
+            return 1 ;;
+    esac
+}
+
+if [ -n "$TEST_SIGNING_PUBLIC_KEY_PEM" ]; then
+    # Refuse test trust override unless all three development guards hold.
+    if [ "${OCLIV_ALLOW_TEST_TRUST:-}" != "1" ] || [ "${OCLIV_ENV:-}" != "development" ] || ! _is_loopback_url "$RELAY_URL"; then
+        die "test trust override refused (requires OCLIV_ALLOW_TEST_TRUST=1, OCLIV_ENV=development, and loopback RELAY_URL)"
+    fi
+    printf '%s\n' "$TEST_SIGNING_PUBLIC_KEY_PEM" > "$PUBKEYFILE"
     if openssl pkeyutl -verify -pubin -inkey "$PUBKEYFILE" -rawin -in "$MANIFEST_TMPFILE" -sigfile "$SIGFILE" >/dev/null 2>&1; then
-        AUTHENTICATED_KEY_ID="${DECLARED_KEY_ID:-override-pem}"
+        AUTHENTICATED_KEY_ID="${DECLARED_KEY_ID:-test-dev-override}"
     fi
 else
-    _old_ifs="$IFS"
-    IFS='
-'
-    for _entry in $TRUSTED_RELEASE_KEYS; do
-        [ -n "$_entry" ] || continue
-        _kid="$(printf '%s' "$_entry" | cut -d'|' -f1)"
-        _kst="$(printf '%s' "$_entry" | cut -d'|' -f2)"
-        _khex="$(printf '%s' "$_entry" | cut -d'|' -f3)"
-        if [ -n "$DECLARED_KEY_ID" ] && [ "$_kid" != "$DECLARED_KEY_ID" ]; then
+    [ -n "$DECLARED_KEY_ID" ] || die "manifest missing required 'signing_key_id' field"
+    _found_key=0
+    while IFS='|' read -r _kid _kst _khex; do
+        [ -n "$_kid" ] || continue
+        if [ "$_kid" != "$DECLARED_KEY_ID" ]; then
             continue
         fi
+        _found_key=1
         if [ "$_kst" = "revoked" ]; then
-            [ -n "$DECLARED_KEY_ID" ] && die "manifest signing key '$_kid' has been revoked"
-            continue
+            die "manifest signing_key_id '$_kid' has been revoked"
         fi
         if [ "$_kst" != "active" ] && [ "$_kst" != "retiring" ]; then
-            continue
+            die "manifest signing_key_id '$_kid' has unsupported status '$_kst'"
         fi
         _hex_to_ed25519_pem "$_khex" > "$PUBKEYFILE"
         if openssl pkeyutl -verify -pubin -inkey "$PUBKEYFILE" -rawin -in "$MANIFEST_TMPFILE" -sigfile "$SIGFILE" >/dev/null 2>&1; then
             AUTHENTICATED_KEY_ID="$_kid"
-            break
         fi
-    done
-    IFS="$_old_ifs"
+        break
+    done <<EOF
+$TRUSTED_RELEASE_KEYS
+EOF
+    [ "$_found_key" = "1" ] || die "manifest signing_key_id '$DECLARED_KEY_ID' is not in the trusted key set"
 fi
 [ -n "$AUTHENTICATED_KEY_ID" ] || die "manifest signature verification FAILED — refusing to install (manifest may have been tampered with)"
 info "manifest signature verified (signing_key_id=$AUTHENTICATED_KEY_ID)"
+
+# Anti-rollback: verify monotonic release_sequence if present in manifest.
+SEQ_FILE="${INSTALL_DIR}/.ocliv-release-seq"
+RELEASE_SEQ="$(printf '%s\n' "$MANIFEST" | tr ',' '\n' | grep '"release_sequence"' \
+    | sed 's/.*"release_sequence"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/' | head -1 || true)"
+if [ -n "$RELEASE_SEQ" ] && [ -f "$SEQ_FILE" ]; then
+    PREV_SEQ="$(tr -d ' \r\n' < "$SEQ_FILE" || true)"
+    case "$PREV_SEQ" in
+        ''|*[!0-9]*) die "corrupt release sequence file $SEQ_FILE" ;;
+    esac
+    if [ "$RELEASE_SEQ" -lt "$PREV_SEQ" ] && [ "${OCLIV_ALLOW_DOWNGRADE:-}" != "1" ]; then
+        die "refusing release downgrade: manifest release_sequence=$RELEASE_SEQ < installed=$PREV_SEQ (set OCLIV_ALLOW_DOWNGRADE=1 to override)"
+    fi
+fi
 
 NON_PROD="$(_json_bool non_production || true)"
 if [ "$NON_PROD" = "true" ]; then
@@ -304,24 +331,38 @@ if [ -f "$DEST" ]; then
     HAD_PREV=1
 fi
 
+# Dependency-free directory durability sync (works under minimal POSIX PATH without python3).
+_sync_dir() {
+    if command -v sync >/dev/null 2>&1; then
+        sync "$1" 2>/dev/null || sync 2>/dev/null || true
+    fi
+}
+
 mv "$TMPFILE" "$DEST"
 TMPFILE=""
-
-# Best-effort directory fsync for crash durability.
-if command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import os,sys; fd=os.open(sys.argv[1],os.O_RDONLY); os.fsync(fd); os.close(fd)' "$INSTALL_DIR" 2>/dev/null || true
-fi
+_sync_dir "$INSTALL_DIR"
 
 # Post-swap verification: must succeed and match EXPECTED_COMMIT, or rollback.
 if ! _verify_binary "$DEST"; then
     printf 'error: post-install verification failed: installed binary did not execute or commit mismatch\n' >&2
     if [ "$HAD_PREV" = "1" ] && [ -f "${DEST}.prev" ]; then
         mv "${DEST}.prev" "$DEST"
+        _sync_dir "$INSTALL_DIR"
         printf 'rolled back to previous version\n' >&2
     else
         rm -f "$DEST"
+        _sync_dir "$INSTALL_DIR"
     fi
     exit 1
+fi
+
+# Persist accepted release_sequence atomically for anti-rollback protection.
+if [ -n "$RELEASE_SEQ" ]; then
+    _seq_tmp="$(mktemp "${INSTALL_DIR}/.ocliv-seq.XXXXXX")"
+    printf '%s\n' "$RELEASE_SEQ" > "$_seq_tmp"
+    chmod 644 "$_seq_tmp"
+    mv "$_seq_tmp" "$SEQ_FILE"
+    _sync_dir "$INSTALL_DIR"
 fi
 
 VERSION="$("$DEST" version --json 2>/dev/null \

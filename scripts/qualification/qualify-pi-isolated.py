@@ -6,17 +6,21 @@ reads or mutates production state. It checks owner, executable, and stage-specif
 argv before signaling any process.
 
 Usage:
-  qualify-pi-isolated.py [--smoke] [--release-dir DIR]
+  qualify-pi-isolated.py --release-dir DIR        # strict release mode (default)
+  qualify-pi-isolated.py --smoke [--release-dir]  # non-release isolated staging smoke
+  qualify-pi-isolated.py [--keep-workdir]         # retain ephemeral secret workdir for debugging
 
-In default (release) mode, ANY skipped gate is treated as a failure.
+In default (release) mode, --release-dir with a production-signed bundle is REQUIRED
+and ANY skipped gate is treated as a failure.
 """
 import argparse, atexit, base64, hashlib, http.server, json, os, re, shutil, signal
 import socket, stat, subprocess, sys, tempfile, threading, time
 import urllib.request, urllib.error, urllib.parse
 
 parser = argparse.ArgumentParser(description="Ocliv isolated loopback release qualification")
-parser.add_argument("--smoke", action="store_true", help="non-release smoke mode (allows SKIP without failing)")
-parser.add_argument("--release-dir", default="", help="optional directory containing signed release-manifest.json, .sig, and binary artifacts")
+parser.add_argument("--smoke", action="store_true", help="non-release isolated staging smoke mode (allows ephemeral dev signing and SKIP)")
+parser.add_argument("--release-dir", default="", help="directory containing signed release-manifest.json, .sig, and binary artifacts (REQUIRED in default strict mode)")
+parser.add_argument("--keep-workdir", action="store_true", help="debug-only: keep ephemeral secret workdir on exit (prints warning)")
 ARGS = parser.parse_args()
 
 S = os.path.dirname(os.path.realpath(__file__))
@@ -36,6 +40,8 @@ PASS = []
 FAIL = []
 SKIP = []
 CHILDREN = []
+WORK_DIR = tempfile.mkdtemp(prefix="ocliv-qual-work-")
+os.chmod(WORK_DIR, 0o700)
 os.umask(0o077)
 
 
@@ -91,6 +97,10 @@ def cleanup():
                 proc.wait(timeout=3)
         except Exception as exc:
             errors.append(str(exc))
+    if ARGS.keep_workdir:
+        print(f"WARNING: --keep-workdir enabled; ephemeral secret workdir retained at {WORK_DIR}", file=sys.stderr, flush=True)
+    else:
+        shutil.rmtree(WORK_DIR, ignore_errors=True)
     if errors:
         print("CLEANUP ERROR: " + "; ".join(errors), file=sys.stderr, flush=True)
         os._exit(1)
@@ -190,48 +200,77 @@ EXPECTED_SCHEMA = str(BIN_VER_INFO.get("schema_version") or "")
 if not EXPECTED_SCHEMA:
     raise RuntimeError("binary `version --json` missing schema_version")
 
-if RELEASE_DIR and os.path.isdir(RELEASE_DIR):
+if not ARGS.smoke:
+    print("== MODE: STRICT RELEASE QUALIFICATION ==", flush=True)
+    if not RELEASE_DIR or not os.path.isdir(RELEASE_DIR):
+        raise RuntimeError("strict release mode requires --release-dir DIR pointing to a production-signed release bundle (pass --smoke for non-release staging smoke)")
     REL_MANIFEST_PATH = os.path.join(RELEASE_DIR, "release-manifest.json")
     REL_SIG_PATH = os.path.join(RELEASE_DIR, "release-manifest.json.sig")
+    if not os.path.isfile(REL_MANIFEST_PATH) or not os.path.isfile(REL_SIG_PATH):
+        raise RuntimeError("strict release mode requires both release-manifest.json and release-manifest.json.sig in --release-dir")
+    with open(REL_MANIFEST_PATH, encoding="utf-8") as _mf:
+        _strict_m = json.load(_mf)
+    if _strict_m.get("non_production"):
+        raise RuntimeError("strict release mode refuses non_production=true manifest")
+    if _strict_m.get("dirty") is not False:
+        raise RuntimeError("strict release mode refuses dirty manifest")
+    if not _strict_m.get("signing_key_id"):
+        raise RuntimeError("strict release mode requires non-empty signing_key_id in manifest")
+    if not ((_strict_m.get("provenance") or {}).get("sbom")):
+        raise RuntimeError("strict release mode requires provenance.sbom in manifest")
+    REL_USE_DEV_UNSIGNED = False
 else:
-    RELEASE_DIR = os.path.join(S, "release-bundle-stage")
-    os.makedirs(RELEASE_DIR, mode=0o700, exist_ok=True)
-    import platform
-    _arch = "arm64" if platform.machine() in ("aarch64", "arm64") else "amd64"
-    _aname = f"ocliv-linux-{_arch}"
-    _adst = os.path.join(RELEASE_DIR, _aname)
-    shutil.copy2(BIN, _adst)
-    with open(_adst, "rb") as _af:
-        _asha = hashlib.sha256(_af.read()).hexdigest()
-    REL_MANIFEST_PATH = os.path.join(RELEASE_DIR, "release-manifest.json")
-    _mobj = {
-        "commit": BIN_COMMIT,
-        "dirty": False,
-        "build_time": BIN_VER_INFO.get("build_time") or "2026-11-21T00:00:00Z",
-        "protocol_version": BIN_VER_INFO.get("protocol_version") or "",
-        "schema_version": int(EXPECTED_SCHEMA),
-        "govulncheck": "pass",
-        "artifacts": {_aname: {"sha256": _asha}},
-    }
-    with open(REL_MANIFEST_PATH, "w", encoding="utf-8") as _mf:
-        _mf.write(json.dumps(_mobj, indent=2) + "\n")
-    # Sign with ephemeral Ed25519 key for install-client.sh bootstrap & tamper verification.
-    _priv_pem = os.path.join(RELEASE_DIR, "test-signing-priv.pem")
-    _pub_pem = os.path.join(RELEASE_DIR, "test-signing-pub.pem")
-    _sig_raw = os.path.join(RELEASE_DIR, "release-manifest.json.sig.raw")
-    REL_SIG_PATH = os.path.join(RELEASE_DIR, "release-manifest.json.sig")
-    subprocess.run(["openssl", "genpkey", "-algorithm", "ed25519", "-out", _priv_pem], check=True, capture_output=True)
-    subprocess.run(["openssl", "pkey", "-in", _priv_pem, "-pubout", "-out", _pub_pem], check=True, capture_output=True)
-    subprocess.run(["openssl", "pkeyutl", "-sign", "-inkey", _priv_pem, "-rawin", "-in", REL_MANIFEST_PATH, "-out", _sig_raw], check=True, capture_output=True)
-    with open(_sig_raw, "rb") as _sf, open(REL_SIG_PATH, "w", encoding="ascii") as _hf:
-        _hf.write(_sf.read().hex())
-    os.remove(_sig_raw)
-    with open(_pub_pem, "r", encoding="ascii") as _pf:
-        REL_SIGN_PUB_PEM = _pf.read().strip()
-    # The relay's embedded key is the production placeholder, so for the self-generated
-    # ephemeral test bundle we start the relay with --allow-unsigned-dev-release while
-    # testing real Ed25519 signature verification directly in Phase G5 via install-client.sh.
-    REL_USE_DEV_UNSIGNED = True
+    print("== MODE: ISOLATED STAGING SMOKE (non-release) ==", flush=True)
+    if RELEASE_DIR and os.path.isdir(RELEASE_DIR):
+        REL_MANIFEST_PATH = os.path.join(RELEASE_DIR, "release-manifest.json")
+        REL_SIG_PATH = os.path.join(RELEASE_DIR, "release-manifest.json.sig")
+        REL_USE_DEV_UNSIGNED = True
+    else:
+        RELEASE_DIR = os.path.join(S, "release-bundle-stage")
+        os.makedirs(RELEASE_DIR, mode=0o700, exist_ok=True)
+        import platform
+        _arch = "arm64" if platform.machine() in ("aarch64", "arm64") else "amd64"
+        _aname = f"ocliv-linux-{_arch}"
+        _adst = os.path.join(RELEASE_DIR, _aname)
+        shutil.copy2(BIN, _adst)
+        with open(_adst, "rb") as _af:
+            _asha = hashlib.sha256(_af.read()).hexdigest()
+        REL_MANIFEST_PATH = os.path.join(RELEASE_DIR, "release-manifest.json")
+        _mobj = {
+            "manifest_version": 1,
+            "release_sequence": int(time.time()),
+            "signing_key_id": "stage-smoke-ephemeral",
+            "commit": BIN_COMMIT,
+            "dirty": False,
+            "build_time": BIN_VER_INFO.get("build_time") or "2026-11-21T00:00:00Z",
+            "protocol_version": BIN_VER_INFO.get("protocol_version") or "",
+            "schema_version": int(EXPECTED_SCHEMA),
+            "govulncheck": "pass",
+            "artifacts": {_aname: {"sha256": _asha}},
+        }
+        with open(REL_MANIFEST_PATH, "w", encoding="utf-8") as _mf:
+            _mf.write(json.dumps(_mobj, indent=2) + "\n")
+        # Sign with an ephemeral Ed25519 key stored ONLY in WORK_DIR and unlinked immediately.
+        _priv_pem = os.path.join(WORK_DIR, "stage-smoke-priv.pem")
+        _pub_pem = os.path.join(WORK_DIR, "stage-smoke-pub.pem")
+        _sig_raw = os.path.join(WORK_DIR, "release-manifest.json.sig.raw")
+        REL_SIG_PATH = os.path.join(RELEASE_DIR, "release-manifest.json.sig")
+        try:
+            subprocess.run(["openssl", "genpkey", "-algorithm", "ed25519", "-out", _priv_pem], check=True, capture_output=True)
+            os.chmod(_priv_pem, 0o600)
+            subprocess.run(["openssl", "pkey", "-in", _priv_pem, "-pubout", "-out", _pub_pem], check=True, capture_output=True)
+            subprocess.run(["openssl", "pkeyutl", "-sign", "-inkey", _priv_pem, "-rawin", "-in", REL_MANIFEST_PATH, "-out", _sig_raw], check=True, capture_output=True)
+            with open(_sig_raw, "rb") as _sf, open(REL_SIG_PATH, "w", encoding="ascii") as _hf:
+                _hf.write(_sf.read().hex())
+            with open(_pub_pem, "r", encoding="ascii") as _pf:
+                REL_SIGN_PUB_PEM = _pf.read().strip()
+        finally:
+            for _secret_f in (_priv_pem, _pub_pem, _sig_raw):
+                try:
+                    os.remove(_secret_f)
+                except FileNotFoundError:
+                    pass
+        REL_USE_DEV_UNSIGNED = True
 
 relay_args = [
     BIN, "relay", "serve",
@@ -292,12 +331,18 @@ if not ra:
     codes = [x for x in issue.stdout.split() if x.startswith("ocliv-enroll-")]
     if len(codes) != 1:
         raise RuntimeError("expected one staging enrollment code")
-    code_path = os.path.join(S, "qc.txt")
+    code_path = os.path.join(WORK_DIR, "qc.txt")
     fd = os.open(code_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(codes[0] + "\n")
     sh([BIN, "logout"], ENV)
-    login = sh([BIN, "login", "--relay", BASE, "--code-file", code_path], ENV)
+    try:
+        login = sh([BIN, "login", "--relay", BASE, "--code-file", code_path], ENV)
+    finally:
+        try:
+            os.remove(code_path)
+        except FileNotFoundError:
+            pass
     if login.returncode:
         raise RuntimeError("staging login failed: " + login.stderr[:200])
     start_child([BIN, "mcp", "publish", "--local", "http://127.0.0.1:28099/mcp", "--auth", "ocliv-managed", "--name", "qa", "--ttl", "30m", "--relay", BASE], os.path.join(S, "pub-qa.log"), env=ENV, required=["mcp", "publish", "--name", "qa"])
@@ -554,7 +599,7 @@ else:
 _install_script = os.path.normpath(os.path.join(S, "..", "..", "packaging", "install", "install-client.sh"))
 if not os.path.exists(_install_script):
     _install_script = os.path.join(S, "install-client.sh")
-if os.path.exists(_install_script) and REL_SIGN_PUB_PEM and os.path.exists(REL_SIG_PATH):
+if os.path.exists(_install_script) and os.path.exists(REL_SIG_PATH) and (not ARGS.smoke or REL_SIGN_PUB_PEM):
     _tamper_mode = {"mode": "none"}
 
     class _SignedBundleHandler(http.server.BaseHTTPRequestHandler):
@@ -602,11 +647,11 @@ if os.path.exists(_install_script) and REL_SIGN_PUB_PEM and os.path.exists(REL_S
     _min_bin = tempfile.mkdtemp(prefix="ocliv-minpath-")
     try:
         # Build a sanitized minimal PATH with ONLY documented bootstrap prerequisites
-        # (no go, git, caddy, docker, jq, python3, or pre-existing ocliv).
+        # (explicitly excluding go, git, caddy, docker, jq, xxd, python3, and pre-existing ocliv).
         _allowed_tools = [
             "sh", "curl", "wget", "openssl", "sha256sum", "uname", "mktemp",
             "cp", "mv", "rm", "chmod", "cat", "tr", "grep", "sed", "head",
-            "awk", "wc", "cut", "id", "mkdir", "xxd", "printf", "test", "[",
+            "awk", "wc", "cut", "id", "mkdir", "sync", "printf", "test", "[",
         ]
         for _tool in _allowed_tools:
             _tpath = shutil.which(_tool)
@@ -619,11 +664,14 @@ if os.path.exists(_install_script) and REL_SIGN_PUB_PEM and os.path.exists(REL_S
             "HOME": _inst_dir,
             "PATH": _min_bin,
             "OCLIV_INSTALL_DIR": _inst_dir,
-            "OCLIV_SIGNING_PUBLIC_KEY_PEM": REL_SIGN_PUB_PEM,
         }
-        # Assert excluded dev tools are absent from minimal PATH.
-        _excluded_found = [t for t in ("go", "git", "caddy", "docker", "jq", "ocliv") if shutil.which(t, path=_min_bin)]
-        check("G5_env: minimal publisher PATH excludes go/git/caddy/docker/jq/ocliv", len(_excluded_found) == 0, f"found={_excluded_found}")
+        if REL_SIGN_PUB_PEM:
+            _ienv["OCLIV_ALLOW_TEST_TRUST"] = "1"
+            _ienv["OCLIV_ENV"] = "development"
+            _ienv["OCLIV_TEST_SIGNING_PUBLIC_KEY_PEM"] = REL_SIGN_PUB_PEM
+        # Assert excluded dev tools AND xxd/python3 are absent from minimal PATH.
+        _excluded_found = [t for t in ("go", "git", "caddy", "docker", "jq", "ocliv", "xxd", "python3") if shutil.which(t, path=_min_bin)]
+        check("G5_env: minimal publisher PATH excludes go/git/caddy/docker/jq/ocliv/xxd/python3", len(_excluded_found) == 0, f"found={_excluded_found}")
         # Happy path: valid signed bundle installs cleanly in minimal PATH.
         _r_ok = subprocess.run([os.path.join(_min_bin, "sh"), _install_script, _burl], capture_output=True, text=True, timeout=30, env=_ienv)
         _inst_bin = os.path.join(_inst_dir, "ocliv")
@@ -640,6 +688,13 @@ if os.path.exists(_install_script) and REL_SIGN_PUB_PEM and os.path.exists(REL_S
         _tamper_mode["mode"] = "artifact"
         _r_ta = subprocess.run([os.path.join(_min_bin, "sh"), _install_script, _burl], capture_output=True, text=True, timeout=20, env=_ienv)
         check("G5d: tampered artifact rejected", _r_ta.returncode != 0, "rc=" + str(_r_ta.returncode))
+        # Test trust override without OCLIV_ALLOW_TEST_TRUST=1 must be rejected.
+        _tamper_mode["mode"] = "none"
+        _ienv_no_allow = dict(_ienv)
+        _ienv_no_allow.pop("OCLIV_ALLOW_TEST_TRUST", None)
+        _ienv_no_allow["OCLIV_TEST_SIGNING_PUBLIC_KEY_PEM"] = REL_SIGN_PUB_PEM or "dummy"
+        _r_tref = subprocess.run([os.path.join(_min_bin, "sh"), _install_script, _burl], capture_output=True, text=True, timeout=20, env=_ienv_no_allow)
+        check("G5e: test trust override refused without OCLIV_ALLOW_TEST_TRUST=1", _r_tref.returncode != 0, "rc=" + str(_r_tref.returncode))
     finally:
         _bsrv.shutdown()
         shutil.rmtree(_inst_dir, ignore_errors=True)
@@ -734,6 +789,211 @@ try:
             break
         time.sleep(0.5)
     check("H3: slot released on disconnect and 3rd publisher admitted without leakage", _re_admitted, f"active={_st4.get('active_sessions')}")
+
+    # Stop p2 and p3 so we have a clean session slot for the blocking HTTP + WS upstream publisher.
+    for _p, _req in ((p2, ["mcp", "publish", "--name", "cap2"]), (p3, ["mcp", "publish"])):
+        if _p.poll() is None:
+            try:
+                stop_pid(_p.pid, BIN, _req)
+                _p.wait(timeout=8)
+            except Exception:
+                pass
+
+    # H4 & H5: real blocking HTTP stream cap=2 & WebSocket stream cap=2 saturation.
+    _http_release = threading.Event()
+    _ws_stop = threading.Event()
+    _hold_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _hold_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    _hold_srv.bind(("127.0.0.1", 0))
+    _hold_port = _hold_srv.getsockname()[1]
+    _hold_srv.listen(16)
+    _hold_srv.settimeout(0.5)
+
+    def _handle_hold_conn(conn):
+        try:
+            conn.settimeout(15)
+            raw = b""
+            while b"\r\n\r\n" not in raw and len(raw) < 8192:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                raw += chunk
+            head = raw.split(b"\r\n\r\n", 1)[0].decode("latin1", errors="replace")
+            first = head.splitlines()[0] if head else ""
+            if "/hold-ws" in first:
+                ws_key = ""
+                for line in head.splitlines()[1:]:
+                    if line.lower().startswith("sec-websocket-key:"):
+                        ws_key = line.split(":", 1)[1].strip()
+                accept = base64.b64encode(hashlib.sha1((ws_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+                resp = (
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                ).encode("ascii")
+                conn.sendall(resp)
+                conn.settimeout(0.5)
+                while not _ws_stop.is_set():
+                    try:
+                        data = conn.recv(1024)
+                        if not data:
+                            break
+                    except socket.timeout:
+                        continue
+            else:
+                if "/hold-http" in first:
+                    _http_release.wait(timeout=15)
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _accept_loop():
+        while not _ws_stop.is_set():
+            try:
+                c, _ = _hold_srv.accept()
+                threading.Thread(target=_handle_hold_conn, args=(c,), daemon=True).start()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+    _accept_thr = threading.Thread(target=_accept_loop, daemon=True)
+    _accept_thr.start()
+
+    _pub_stream = start_child(
+        [BIN, str(_hold_port), "--public", "--name", "capstream", "--ttl", "10m", "--relay", _cap_base],
+        os.path.join(S, "cap-stream.log"), env=e1, required=[str(_hold_port), "--public", "--name", "capstream"]
+    )
+    _stream_host = ""
+    for _ in range(40):
+        _sh_out = sh(["python3", "-c", "import sqlite3;c=sqlite3.connect('" + _cap_db + "/ocliv.db');r=c.execute(\"SELECT hostname FROM leases WHERE label='capstream' AND status='ACTIVE' ORDER BY created_at DESC LIMIT 1\").fetchone();print(r[0] if r else '')"]).stdout.strip()
+        if _sh_out:
+            _stream_host = _sh_out
+            break
+        time.sleep(0.5)
+
+    if _stream_host:
+        # H4: Hold 2 HTTP streams open -> 3rd gets 503 while /health/ready == 200 -> release -> recovers to 0.
+        _h_results = []
+        def _do_hold_http():
+            st, _, _ = http_req("GET", "/hold-http", host=_stream_host, base=_cap_base)
+            _h_results.append(st)
+
+        _ht1 = threading.Thread(target=_do_hold_http, daemon=True)
+        _ht2 = threading.Thread(target=_do_hold_http, daemon=True)
+        _ht1.start()
+        _ht2.start()
+        _h_sat = False
+        for _ in range(40):
+            _hs = json.loads(urllib.request.urlopen("http://127.0.0.1:28086/health/status", timeout=2).read().decode())
+            if _hs.get("active_http_streams") == 2:
+                _h_sat = True
+                break
+            time.sleep(0.1)
+        _h3_st, _, _ = http_req("GET", "/hold-http", host=_stream_host, base=_cap_base)
+        _h_ready = urllib.request.urlopen("http://127.0.0.1:28086/health/ready", timeout=2).status
+        _http_release.set()
+        _ht1.join(timeout=10)
+        _ht2.join(timeout=10)
+        _h4_st, _, _ = http_req("GET", "/fast", host=_stream_host, base=_cap_base)
+        _h_zero = False
+        for _ in range(30):
+            _hs2 = json.loads(urllib.request.urlopen("http://127.0.0.1:28086/health/status", timeout=2).read().decode())
+            if _hs2.get("active_http_streams") == 0:
+                _h_zero = True
+                break
+            time.sleep(0.1)
+        check(
+            "H4: --max-http-streams=2 rejects 3rd (503), /health/ready=200, recovers to 0",
+            _h_sat and _h3_st == 503 and _h_ready == 200 and _h4_st == 200 and _h_zero and _h_results == [200, 200],
+            f"sat={_h_sat} 3rd={_h3_st} ready={_h_ready} next={_h4_st} zero={_h_zero} held={_h_results}",
+        )
+
+        # H5: Hold 2 WebSocket upgrades open -> 3rd gets 503 while /health/ready == 200 -> close 1 -> 4th gets 101 -> close all -> 0.
+        def _open_ws():
+            sk = socket.create_connection(("127.0.0.1", 28082), timeout=5)
+            key = base64.b64encode(os.urandom(16)).decode()
+            req = (
+                f"GET /hold-ws HTTP/1.1\r\n"
+                f"Host: {_stream_host}\r\n"
+                f"Origin: http://{_stream_host}\r\n"
+                f"Upgrade: websocket\r\n"
+                f"Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                f"Sec-WebSocket-Version: 13\r\n\r\n"
+            ).encode("ascii")
+            sk.sendall(req)
+            buf = b""
+            sk.settimeout(5)
+            while b"\r\n\r\n" not in buf and len(buf) < 4096:
+                ch = sk.recv(1024)
+                if not ch:
+                    break
+                buf += ch
+            line = buf.split(b"\r\n", 1)[0].decode("latin1", errors="replace")
+            return sk, line
+
+        _ws_socks = []
+        try:
+            _s1, _l1 = _open_ws()
+            _ws_socks.append(_s1)
+            _s2, _l2 = _open_ws()
+            _ws_socks.append(_s2)
+            _w_sat = False
+            for _ in range(40):
+                _ws_st = json.loads(urllib.request.urlopen("http://127.0.0.1:28086/health/status", timeout=2).read().decode())
+                if _ws_st.get("active_ws_streams") == 2:
+                    _w_sat = True
+                    break
+                time.sleep(0.1)
+            _s3, _l3 = _open_ws()
+            _s3.close()
+            _w_ready = urllib.request.urlopen("http://127.0.0.1:28086/health/ready", timeout=2).status
+            _s1.close()
+            _ws_socks.remove(_s1)
+            for _ in range(30):
+                _ws_st2 = json.loads(urllib.request.urlopen("http://127.0.0.1:28086/health/status", timeout=2).read().decode())
+                if _ws_st2.get("active_ws_streams") == 1:
+                    break
+                time.sleep(0.1)
+            _s4, _l4 = _open_ws()
+            _ws_socks.append(_s4)
+            for _sk in list(_ws_socks):
+                _sk.close()
+            _ws_socks.clear()
+            _w_zero = False
+            for _ in range(40):
+                _ws_st3 = json.loads(urllib.request.urlopen("http://127.0.0.1:28086/health/status", timeout=2).read().decode())
+                if _ws_st3.get("active_ws_streams") == 0:
+                    _w_zero = True
+                    break
+                time.sleep(0.1)
+            check(
+                "H5: --max-ws-streams=2 rejects 3rd (503), /health/ready=200, recovers to 0",
+                ("101" in _l1) and ("101" in _l2) and _w_sat and ("503" in _l3) and _w_ready == 200 and ("101" in _l4) and _w_zero,
+                f"l1={_l1[:15]} l2={_l2[:15]} sat={_w_sat} l3={_l3[:15]} ready={_w_ready} l4={_l4[:15]} zero={_w_zero}",
+            )
+        finally:
+            for _sk in _ws_socks:
+                try:
+                    _sk.close()
+                except Exception:
+                    pass
+    else:
+        check("H4: --max-http-streams=2 saturation", False, "capstream public lease did not activate")
+        check("H5: --max-ws-streams=2 saturation", False, "capstream public lease did not activate")
+
+    _ws_stop.set()
+    _hold_srv.close()
+    if _pub_stream.poll() is None:
+        stop_pid(_pub_stream.pid, BIN, [str(_hold_port), "--public", "--name", "capstream"])
+        _pub_stream.wait(timeout=8)
 finally:
     for _ch in _cap_homes:
         shutil.rmtree(_ch, ignore_errors=True)
@@ -788,6 +1048,14 @@ if os.path.exists(_ilog):
     _ihex = re.findall(r'\b[0-9a-f]{64}\b', _idata)
     _ikey_leak = len(set(_ihex)) > 3
 check("I5: relay log heuristic: no raw private key hex strings", not _ikey_leak, "unique_64hex=" + str(len(set(_ihex))))
+
+# I6: zero retained secret files (enrollment codes, private signing keys) in stage dir S.
+_retained_secrets = []
+for _rroot, _, _rfiles in os.walk(S):
+    for _rf in _rfiles:
+        if _rf == "qc.txt" or _rf.endswith(".pem") or _rf.endswith(".key"):
+            _retained_secrets.append(os.path.relpath(os.path.join(_rroot, _rf), S))
+check("I6: zero secret files (*.pem, *.key, qc.txt) retained in stage dir", len(_retained_secrets) == 0, f"found={_retained_secrets}")
 
 print("\n== SUMMARY ==")
 print("PASS", len(PASS))
