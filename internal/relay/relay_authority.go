@@ -109,12 +109,19 @@ func isNumericPort(s string) bool {
 	return true
 }
 
-// isAgentPath reports the agent control-plane paths bound to the relay
-// authority (enrollment, challenge, connect, signed lease management).
+// isAgentPath reports the agent control-plane and relay-hosted distribution
+// paths bound to the relay authority (enrollment, pairing, challenge, connect,
+// signed lease management, and well-known release manifest/artifacts).
 func isAgentPath(p string) bool {
 	switch p {
-	case "/v1/agent/enroll", "/v1/agent/capabilities", "/v1/agent/challenge", "/v1/agent/connect",
-		"/v1/agent/key/rotate", "/v1/agent/key/revoke":
+	case "/v1/agent/enroll", "/v1/agent/pair-request", "/v1/agent/pair-status",
+		"/v1/agent/capabilities", "/v1/agent/challenge", "/v1/agent/connect",
+		"/v1/agent/key/rotate", "/v1/agent/key/revoke",
+		"/.well-known/ocliv-release-manifest.json",
+		"/.well-known/ocliv-release-manifest.json.sig":
+		return true
+	}
+	if strings.HasPrefix(p, "/.well-known/ocliv-artifacts/") {
 		return true
 	}
 	if p == "/v1/agent/leases" || strings.HasPrefix(p, "/v1/agent/lease/") {

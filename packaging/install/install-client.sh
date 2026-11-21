@@ -93,21 +93,32 @@ case "$OPENSSL_VER" in
         ;;
 esac
 
+# Pure POSIX hex-to-binary converter (works under dash/ash/bash without xxd or python3).
+_hex_to_bin() {
+    awk 'BEGIN {
+        for (i = 0; i < 16; i++) hex[substr("0123456789abcdef", i+1, 1)] = i
+        for (i = 0; i < 16; i++) hex[substr("0123456789ABCDEF", i+1, 1)] = i
+    }
+    {
+        gsub(/[^0-9a-fA-F]/, "", $0)
+        for (i = 1; i <= length($0); i += 2) {
+            v = hex[substr($0, i, 1)] * 16 + hex[substr($0, i+1, 1)]
+            printf "\\%03o", v
+        }
+    }' | {
+        IFS= read -r _oct
+        printf "$_oct"
+    }
+}
+
 # Convert a 64-hex raw Ed25519 public key into SubjectPublicKeyInfo PEM
 # using ASN.1 prefix 302a300506032b6570032100 + 32-byte key.
 _hex_to_ed25519_pem() {
     _hex="$1"
     _spki="302a300506032b6570032100${_hex}"
     printf '%s\n' '-----BEGIN PUBLIC KEY-----'
-    if command -v xxd >/dev/null 2>&1; then
-        printf '%s' "$_spki" | xxd -r -p | openssl base64 -A
-        printf '\n'
-    else
-        # Pure POSIX octal conversion for minimal environments without xxd/python.
-        _oct="$(printf '%s' "$_spki" | sed 's/../\\x&/g')"
-        printf "$_oct" | openssl base64 -A
-        printf '\n'
-    fi
+    printf '%s\n' "$_spki" | _hex_to_bin | openssl base64 -A
+    printf '\n'
     printf '%s\n' '-----END PUBLIC KEY-----'
 }
 
@@ -136,16 +147,7 @@ _fetch_to_file "$SIG_URL" "$SIGFILE" || die "failed to fetch manifest signature 
 SIGLEN="$(wc -c < "$SIGFILE" | tr -d ' \n')"
 if [ "$SIGLEN" = "128" ] || [ "$SIGLEN" = "129" ]; then
     RAWSIGFILE="$(mktemp)"
-    if command -v xxd >/dev/null 2>&1; then
-        xxd -r -p "$SIGFILE" > "$RAWSIGFILE" || die "hex-decode of signature file failed"
-    elif command -v python3 >/dev/null 2>&1; then
-        python3 -c 'import sys; open(sys.argv[2],"wb").write(bytes.fromhex(open(sys.argv[1]).read().strip()))' "$SIGFILE" "$RAWSIGFILE" \
-            || die "hex-decode of signature file failed"
-    else
-        _shex="$(tr -d ' \r\n' < "$SIGFILE")"
-        _soct="$(printf '%s' "$_shex" | sed 's/../\\x&/g')"
-        printf "$_soct" > "$RAWSIGFILE" || die "hex-decode of signature file failed"
-    fi
+    _hex_to_bin < "$SIGFILE" > "$RAWSIGFILE" || die "hex-decode of signature file failed"
     mv "$RAWSIGFILE" "$SIGFILE"
     RAWSIGFILE=""
 elif [ "$SIGLEN" != "64" ]; then

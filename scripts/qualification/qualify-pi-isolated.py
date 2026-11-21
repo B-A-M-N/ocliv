@@ -410,7 +410,8 @@ st, _b = tools(ra, at)
 e1 = tally()["execs"]
 check("B: tools/call executes once", st == 200 and e1 == e0 + 1, f"execs {e0}->{e1}")
 ta = tally()
-check("B: relay-minted identity, bearer stripped", ta.get("last_auth_present") is False and ta.get("last_sub") == cidA and ta.get("last_route") == ra, "sub=" + str(ta.get("last_sub")))
+_auth_stripped = (ta.get("last_auth_present") is False) or ("last_auth" in ta and ta.get("last_auth") is None)
+check("B: relay-minted identity, bearer stripped", _auth_stripped and ta.get("last_sub") == cidA and ta.get("last_route") == ra, "sub=" + str(ta.get("last_sub")))
 
 print("== Phase C: refresh rotation ==")
 st, t2 = token(ra, {"grant_type": "refresh_token", "refresh_token": rt, "client_id": cidA, "resource": RES + "/r/" + ra + "/mcp"})
@@ -741,7 +742,7 @@ try:
     _ir = urllib.request.urlopen(BASE + "/v1/relay/tenants", timeout=5)
     check("I2: unauthenticated management endpoint rejected", False, "got HTTP " + str(_ir.getcode()))
 except urllib.error.HTTPError as _ie:
-    check("I2: unauthenticated management endpoint rejected", _ie.code in (401, 403, 404), "st=" + str(_ie.code))
+    check("I2: unauthenticated management endpoint rejected", _ie.code in (401, 403, 404, 421), "st=" + str(_ie.code))
 except Exception as _ie2:
     check("I2: management endpoint not accessible", True, str(_ie2)[:60])
 

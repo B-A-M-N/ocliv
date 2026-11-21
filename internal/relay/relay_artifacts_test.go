@@ -417,4 +417,19 @@ func TestAllowUnsignedDevReleaseRefusedOnPublicRelayHost(t *testing.T) {
 	if st := s.StatusSnapshot(); st.ReleaseTrustMode != "UNSIGNED_DEVELOPMENT" {
 		t.Fatalf("ReleaseTrustMode=%q, want UNSIGNED_DEVELOPMENT", st.ReleaseTrustMode)
 	}
+	// Verify release manifest and artifacts are authorized through s.Handler() on relayHost (not 421).
+	req := httptest.NewRequest(http.MethodGet, "https://127.0.0.1/.well-known/ocliv-release-manifest.json", nil)
+	req.Host = "127.0.0.1"
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET manifest via Handler() on relayHost: got %d, want 200", rec.Code)
+	}
+	req2 := httptest.NewRequest(http.MethodGet, "https://127.0.0.1/.well-known/ocliv-artifacts/ocliv-linux-amd64", nil)
+	req2.Host = "127.0.0.1"
+	rec2 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("GET artifact via Handler() on relayHost: got %d, want 200", rec2.Code)
+	}
 }
