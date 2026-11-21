@@ -51,6 +51,11 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
+# File descriptor budget: each publisher session needs at least 3 FDs (yamux,
+# socket, TLS). 512 sessions × ~8 streams + ~4 k HTTP proxy streams + DB/config
+# files stays well inside 65536. Qualify against actual workload before raising
+# the publisher-session cap above 512 without also verifying headroom here.
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target

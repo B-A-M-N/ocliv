@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -164,10 +165,10 @@ func IssueEnrollmentCode(db *store.DB, tenantID string, ttl time.Duration, issue
 	// Suspended tenants cannot enroll new publishers (P0-A): suspension
 	// is terminal for the tenant's authority until explicitly unsuspended.
 	// Unknown tenants (first enrollment, tenantID=="default") are unaffected.
+	// DB errors are hard failures — not "tenant not found" (see validateEnrollmentTenantState).
 	if tenantID != "default" {
-		var tst string
-		if err := db.SQL().QueryRow(`SELECT status FROM tenants WHERE id=?`, tenantID).Scan(&tst); err == nil && tst == "suspended" {
-			return "", apperr.E(apperr.CodeEnrollAuth, "tenant suspended", nil)
+		if err := validateEnrollmentTenantState(db, tenantID); err != nil {
+			return "", err
 		}
 	}
 	code, verifier, err := identity.MintEnrollmentCode()
@@ -184,4 +185,24 @@ func IssueEnrollmentCode(db *store.DB, tenantID string, ttl time.Duration, issue
 	}
 	db.Audit(issuedBy, tenantID, "", "enrollment_issue", "ok", "code issued")
 	return code, nil
+}
+
+// validateEnrollmentTenantState returns an error if tenantID is suspended or
+// the database query fails. sql.ErrNoRows means the tenant doesn't exist yet
+// (allowed for bootstrap enrollment). A database error is never silently
+// treated as "not found" — both are distinct failure modes.
+func validateEnrollmentTenantState(db *store.DB, tenantID string) error {
+	var status string
+	err := db.SQL().QueryRow(`SELECT status FROM tenants WHERE id=?`, tenantID).Scan(&status)
+	switch {
+	case err == nil:
+		if status == "suspended" {
+			return apperr.E(apperr.CodeEnrollAuth, "tenant suspended", nil)
+		}
+		return nil
+	case errors.Is(err, sql.ErrNoRows):
+		return nil
+	default:
+		return apperr.E(apperr.CodeStoreFault, "checking tenant state", err)
+	}
 }

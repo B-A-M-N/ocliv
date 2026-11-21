@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"ocliv/internal/apperr"
@@ -96,25 +97,50 @@ func (s *Server) handlePairRequest(w http.ResponseWriter, r *http.Request) {
 	sum := sha256.Sum256(rawPub)
 	keyID := "key-" + hex.EncodeToString(sum[:identity.KeyIDBytes])
 
-	displayCode, err := mintPairingCode()
-	if err != nil {
-		s.log.Error("pair-request: mint code failed", "err", errShort(err))
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
-	pollID, pollSecret, pollVerifier, err := mintPollCredentials()
-	if err != nil {
-		s.log.Error("pair-request: mint poll credentials failed", "err", errShort(err))
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
 	now := time.Now().UTC()
 	id := fmt.Sprintf("pair-%d", now.UnixNano())
 
-	if err := s.db.CreatePairingRequest(id, displayCode, pollID, pollVerifier, rawPub, keyID, sourceIP, now.Add(pairingTTL)); err != nil {
-		s.log.Error("pair-request: store failed", "err", errShort(err))
+	// Supersede any existing pending request from the same key so the publisher
+	// never holds two simultaneously valid display codes.
+	if err := s.db.SupersedePendingPairingRequest(keyID, now); err != nil {
+		s.log.Warn("pair-request: supersede failed", "err", errShort(err))
+		// non-fatal: continue with new request
+	}
+
+	// Retry on UNIQUE constraint collision (display_code and poll_id must be unique).
+	var (
+		displayCode  string
+		pollID       string
+		pollSecret   string
+		pollVerifier []byte
+		insertErr    error
+	)
+	for attempt := 0; attempt < 4; attempt++ {
+		var err error
+		displayCode, err = mintPairingCode()
+		if err != nil {
+			s.log.Error("pair-request: mint code failed", "err", errShort(err))
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		pollID, pollSecret, pollVerifier, err = mintPollCredentials()
+		if err != nil {
+			s.log.Error("pair-request: mint poll credentials failed", "err", errShort(err))
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		insertErr = s.db.CreatePairingRequest(id, displayCode, pollID, pollVerifier, rawPub, keyID, sourceIP, now.Add(pairingTTL))
+		if insertErr == nil {
+			break
+		}
+		if isPairingUniqueConstraintError(insertErr) {
+			s.log.Warn("pair-request: code collision, retrying", "attempt", attempt+1)
+			continue
+		}
+		break // non-collision error; fall through to failure
+	}
+	if insertErr != nil {
+		s.log.Error("pair-request: store failed", "err", errShort(insertErr))
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -199,10 +225,10 @@ func ApprovePairingRequest(db *store.DB, displayCode, tenantID string) (keyID st
 	}
 
 	// Suspended tenants cannot receive new publishers (same gate as enrollment).
+	// DB errors are hard failures — not silently treated as "tenant not found".
 	if tenantID != "" {
-		var tst string
-		if err := db.SQL().QueryRow(`SELECT status FROM tenants WHERE id=?`, tenantID).Scan(&tst); err == nil && tst == "suspended" {
-			return "", apperr.E(apperr.CodeEnrollAuth, "tenant suspended", nil)
+		if err := validateEnrollmentTenantState(db, tenantID); err != nil {
+			return "", err
 		}
 	}
 
@@ -230,6 +256,17 @@ func ApprovePairingRequest(db *store.DB, displayCode, tenantID string) (keyID st
 	}
 	db.Audit("operator", tenantID, "", "pair-approve", "ok", "key enrolled key="+pr.KeyID)
 	return pr.KeyID, nil
+}
+
+// isPairingUniqueConstraintError returns true when err is a SQLite UNIQUE
+// constraint violation, indicating a display_code or poll_id collision.
+func isPairingUniqueConstraintError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "UNIQUE constraint failed") ||
+		strings.Contains(msg, "unique constraint failed")
 }
 
 // mintPairingCode generates a 12-hex-char display code in XXXX-XXXX-XXXX format

@@ -358,6 +358,7 @@ func buildInitFiles(cfg initConfig) map[string]string {
 	if cfg.autoApproveRedirectHosts != "" {
 		fmt.Fprintf(&env, "OCLIV_AUTO_APPROVE_REDIRECT_HOSTS=%s\n", cfg.autoApproveRedirectHosts)
 	}
+	fmt.Fprintf(&env, "OCLIV_EDGE_MODE=%s\n", cfg.edge)
 	files["relay.env"] = env.String()
 	caddy := edgecaddy.SingleHost()
 	if cfg.edge == "wildcard" {

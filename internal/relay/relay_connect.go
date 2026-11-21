@@ -265,15 +265,16 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	// Acquire a global session slot before the WebSocket upgrade so that
 	// a capacity-denied agent gets a plain HTTP 503 and no lease state is
-	// mutated (P1 audit item 13). The slot is released on every exit path.
+	// mutated (P1 audit item 13). defer ensures every exit path releases
+	// the slot, preventing future leaked slots from new error paths.
 	if !s.globalBudget.AdmitSession() {
 		s.db.Audit("agent", tenant, "", "attach", "denied", "global session capacity exceeded")
 		http.Error(w, "relay at capacity", http.StatusServiceUnavailable)
 		return
 	}
+	defer s.globalBudget.ReleaseSession()
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
 	if err != nil {
-		s.globalBudget.ReleaseSession()
 		return
 	}
 	ctx := r.Context()
@@ -293,12 +294,10 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		}
 		conn.Close(websocket.StatusCode(closeCode), "lease denied")
 		s.db.Audit("agent", tenant, "", "attach", "denied", denyCode)
-		s.globalBudget.ReleaseSession()
 		return
 	}
 	raw, _ := json.Marshal(attached)
 	if err := transport.WriteControl(ctx, conn, raw); err != nil {
-		s.globalBudget.ReleaseSession()
 		if _, merr := s.markReconnecting(ls.ID, ls.Generation); merr != nil {
 			s.db.Audit("system", "", ls.ID, "attach", "error", "reconnect transition failed: "+errShort(merr))
 		}
@@ -307,7 +306,6 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	// registerSession blocks until the publisher connection ends.
 	s.registerSession(ctx, conn, ls, tenant, keyID, attached.AccessMode)
-	s.globalBudget.ReleaseSession()
 }
 
 // shortKeyID derives the identity key id from the stored key row id.

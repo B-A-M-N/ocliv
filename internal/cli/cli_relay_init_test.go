@@ -57,6 +57,7 @@ func TestRelayInitGeneratesSingleHost(t *testing.T) {
 		"OCLIV_DOMAIN=hosting.test",
 		"OCLIV_MCP_HOST=relay.hosting.test",
 		"OCLIV_RELAY_HOST=relay.hosting.test",
+		"OCLIV_EDGE_MODE=single-host",
 	} {
 		if !strings.Contains(string(env), want) {
 			t.Fatalf("relay.env missing %q:\n%s", want, env)
@@ -96,6 +97,45 @@ func TestRelayInitGeneratesSingleHost(t *testing.T) {
 	}
 	if code := cmdRelayInit(argv2); code == apperr.ExitOK {
 		t.Fatal("conflicting re-run overwrote deployment files")
+	}
+}
+
+func TestRelayInitEdgeModeInEnvFile(t *testing.T) {
+	for _, tc := range []struct {
+		edge    string
+		extra   []string
+		wantEnv string
+	}{
+		{
+			edge:    "tunnel",
+			extra:   []string{"--mcp-host", "relay.hosting.test", "--acme-email", "ops@hosting.test"},
+			wantEnv: "OCLIV_EDGE_MODE=tunnel",
+		},
+		{
+			edge:    "wildcard",
+			extra:   []string{"--dns-provider", "cloudflare", "--dns-env", "CF_API_TOKEN", "--acme-email", "ops@hosting.test"},
+			wantEnv: "OCLIV_EDGE_MODE=wildcard",
+		},
+	} {
+		t.Run(tc.edge, func(t *testing.T) {
+			out := t.TempDir()
+			argv := append([]string{
+				"--domain", "hosting.test",
+				"--edge", tc.edge,
+				"--data", "/var/lib/ocliv",
+				"--out", out,
+			}, tc.extra...)
+			if code := cmdRelayInit(argv); code != apperr.ExitOK {
+				t.Fatalf("exit=%d", code)
+			}
+			env, err := os.ReadFile(filepath.Join(out, "relay.env"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(env), tc.wantEnv) {
+				t.Fatalf("relay.env missing %q:\n%s", tc.wantEnv, env)
+			}
+		})
 	}
 }
 

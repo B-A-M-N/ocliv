@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -332,6 +333,20 @@ func CheckRelay(in RelayInput) Result {
 	}
 	add(false, false, "public internet", "not applicable to private staging; NOT VERIFIED for production")
 	add(true, false, "health endpoints", "/health/live, /health/ready, /metrics expected on loopback only (binding not verified by doctor)")
+	// OS file-descriptor budget: each publisher session consumes at least 3 FDs.
+	// A relay running under the default soft limit (1024) will hit EMFILE under load.
+	var rLimit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
+		add(false, false, "fd limit", "could not read RLIMIT_NOFILE: "+shortErr(err))
+	} else {
+		const minFDs = 4096
+		detail := fmt.Sprintf("RLIMIT_NOFILE soft=%d hard=%d", rLimit.Cur, rLimit.Max)
+		if rLimit.Cur < minFDs {
+			add(false, true, "fd limit", detail+" — below recommended minimum "+fmt.Sprintf("%d", minFDs)+"; set LimitNOFILE=65536 in the systemd unit or run ulimit -n 65536")
+		} else {
+			add(true, true, "fd limit", detail)
+		}
+	}
 	return res
 }
 
