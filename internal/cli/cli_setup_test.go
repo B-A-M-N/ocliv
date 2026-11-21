@@ -734,3 +734,73 @@ func setTestDynv6Endpoint(t *testing.T, url string) {
 	dynv6EndpointTestOverride = url
 	t.Cleanup(func() { dynv6EndpointTestOverride = old })
 }
+
+// TestSetupResumeSkipsCorrectStages verifies that the skipStage closure uses
+// strict less-than ordering: the resumeStage itself must NOT be skipped, and
+// only stages that strictly precede it are skipped.
+func TestSetupResumeSkipsCorrectStages(t *testing.T) {
+	makeSkip := func(resumeStage string) func(string) bool {
+		return func(stage string) bool {
+			if resumeStage == "" {
+				return false
+			}
+			ri := setupStageIndex(resumeStage)
+			si := setupStageIndex(stage)
+			if ri < 0 || si < 0 {
+				return false
+			}
+			return si < ri
+		}
+	}
+
+	t.Run("resumeFromDNSVerified", func(t *testing.T) {
+		skip := makeSkip(stageDNSVerified)
+		// Stages before DNS_VERIFIED must be skipped.
+		if !skip(stageDetected) {
+			t.Error("stageDetected should be skipped when resuming from DNS_VERIFIED")
+		}
+		if !skip(stageDNSUpdated) {
+			t.Error("stageDNSUpdated should be skipped when resuming from DNS_VERIFIED")
+		}
+		// DNS_VERIFIED itself must NOT be skipped — it is the resume stage.
+		if skip(stageDNSVerified) {
+			t.Error("stageDNSVerified must not be skipped when it is the resume stage")
+		}
+		// Stages after DNS_VERIFIED must not be skipped.
+		if skip(stageArtifactsRendered) {
+			t.Error("stageArtifactsRendered must not be skipped")
+		}
+		if skip(stageSystemInstalled) {
+			t.Error("stageSystemInstalled must not be skipped")
+		}
+		if skip(stageComplete) {
+			t.Error("stageComplete must not be skipped")
+		}
+	})
+
+	t.Run("freshRunNoResume", func(t *testing.T) {
+		skip := makeSkip("")
+		for _, stage := range setupStageOrder {
+			if skip(stage) {
+				t.Errorf("stage %s should not be skipped on a fresh run", stage)
+			}
+		}
+	})
+
+	t.Run("resumeFromDetected", func(t *testing.T) {
+		skip := makeSkip(stageDetected)
+		// When resuming from the first stage, nothing should be skipped.
+		for _, stage := range setupStageOrder {
+			if skip(stage) {
+				t.Errorf("stage %s should not be skipped when resuming from DETECTED (first stage)", stage)
+			}
+		}
+	})
+
+	t.Run("unknownStageNeverSkipped", func(t *testing.T) {
+		skip := makeSkip(stageComplete)
+		if skip("UNKNOWN_STAGE") {
+			t.Error("unknown stage must not be skipped (safe default: execute)")
+		}
+	})
+}

@@ -109,6 +109,7 @@ type setupState struct {
 	Hostname       string            `json:"hostname,omitempty"`
 	EdgeMode       string            `json:"edge_mode,omitempty"`
 	ACMEEmail      string            `json:"acme_email,omitempty"`
+	DataDir        string            `json:"data_dir,omitempty"`
 	CompletedStage string            `json:"completed_stage,omitempty"`
 	StageEvidence  map[string]string `json:"stage_evidence,omitempty"`
 	Blocker        string            `json:"blocker,omitempty"`
@@ -250,10 +251,10 @@ func checkpointSetup(st *setupState, stage string, evidence map[string]string) e
 	return saveSetupState(*st)
 }
 
-// revalidateStage returns a per-stage validator that checks recorded evidence
-// rather than merely testing if the key is non-empty. Future iterations can
-// add live re-verification (DNS lookup, file hash check, health probe) here
-// without changing the planSetupResume contract.
+// revalidateStage returns a per-stage validator with live system checks where
+// possible. DNS_VERIFIED performs an actual hostname lookup; installed/ready
+// stages inspect systemd service state; artifact stages check that rendered
+// files still exist on disk.
 func revalidateStage(st setupState) func(string) bool {
 	return func(stage string) bool {
 		switch stage {
@@ -262,16 +263,36 @@ func revalidateStage(st setupState) func(string) bool {
 		case stageDNSUpdated:
 			return st.StageEvidence[stageDNSUpdated] != ""
 		case stageDNSVerified:
-			// Hostname must be known and DNS verification evidence recorded.
-			return st.Hostname != "" && st.StageEvidence[stageDNSVerified] != ""
+			if st.Hostname == "" || st.StageEvidence[stageDNSVerified] == "" {
+				return false
+			}
+			// Live DNS check: verify the hostname still resolves from here.
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			addrs, err := setupLookupHost(ctx, st.Hostname)
+			return err == nil && len(addrs) > 0
 		case stageArtifactsRendered:
-			return st.StageEvidence[stageArtifactsRendered] != ""
+			if st.StageEvidence[stageArtifactsRendered] == "" || st.DataDir == "" {
+				return false
+			}
+			// Rendered Caddyfile is the key deployment artifact; its absence means re-render.
+			_, err := os.Stat(filepath.Join(st.DataDir, "Caddyfile"))
+			return err == nil
 		case stageSystemInstalled:
-			return st.StageEvidence[stageSystemInstalled] != ""
+			if st.StageEvidence[stageSystemInstalled] == "" {
+				return false
+			}
+			return exec.Command("systemctl", "is-enabled", "ocliv-relay").Run() == nil
 		case stageRelayReady:
-			return st.StageEvidence[stageRelayReady] != ""
+			if st.StageEvidence[stageRelayReady] == "" {
+				return false
+			}
+			return exec.Command("systemctl", "is-active", "ocliv-relay").Run() == nil
 		case stageRefreshTimerReady:
-			return st.StageEvidence[stageRefreshTimerReady] != ""
+			if st.StageEvidence[stageRefreshTimerReady] == "" {
+				return false
+			}
+			return exec.Command("systemctl", "is-active", "ocliv-dns-refresh.timer").Run() == nil
 		case stageComplete:
 			return st.CompletedStage == stageComplete
 		default:
@@ -446,10 +467,19 @@ func cmdSetup(argv []string) int {
 				resumeStage, strings.Join(revalidated, ", "))
 		}
 	}
-	// skipStage returns true when resuming past a stage that is already complete,
-	// allowing the setup flow to skip re-executing and re-checkpointing it.
+	// skipStage returns true when a stage was already proven in a prior run and
+	// does not need to be re-executed. The resumeStage itself is the FIRST stage
+	// that must run — only stages strictly before it are skipped.
 	skipStage := func(stage string) bool {
-		return resumeStage != "" && stageAtOrBefore(stage, resumeStage)
+		if resumeStage == "" {
+			return false // fresh run: execute all stages
+		}
+		ri := setupStageIndex(resumeStage)
+		si := setupStageIndex(stage)
+		if ri < 0 || si < 0 {
+			return false // unknown stage: safe default is execute
+		}
+		return si < ri
 	}
 	if dryRun && hostname == "" {
 		fmt.Fprintln(os.Stderr, "--dry-run needs --hostname ZONE.dynv6.net (or ZONE.duckdns.org)")
@@ -458,13 +488,15 @@ func cmdSetup(argv []string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	d := setup.Gather(ctx, echoV4, echoV6)
-	// state accumulates setup progress; evidence merges incrementally via checkpointSetup.
-	state := setupState{
-		DetectedPath: d.Path.String(),
-		Hostname:     hostname,
-		EdgeMode:     edge,
-		ACMEEmail:    acmeEmail,
-	}
+	// When resuming, preserve all previously accumulated evidence so that
+	// checkpoints merge into the existing record rather than overwriting it.
+	// Overwrite only current run's configuration inputs.
+	state := prevState
+	state.DetectedPath = d.Path.String()
+	state.Hostname = hostname
+	state.EdgeMode = edge
+	state.ACMEEmail = acmeEmail
+	state.DataDir = dataDir
 	if !check && !dryRun && !refreshDNS && echoV4 == defaultEchoV4 && echoV6 == defaultEchoV6 && !skipStage(stageDetected) {
 		blocker := ""
 		if hostname == "" {
@@ -561,6 +593,12 @@ func cmdSetup(argv []string) int {
 		printSetupNext(d)
 		return apperr.ExitOK
 	}
+	// If a prior run completed all stages and they all revalidated, there is
+	// nothing to re-provision. Report existing deployment as complete.
+	if !dryRun && resumeStage == stageComplete {
+		fmt.Printf("setup already complete for %s; all prior stages revalidated — nothing to re-run\n", hostname)
+		return emitSetupJSON("setup_dns", stageComplete, "already complete; all stages revalidated", apperr.ExitOK)
+	}
 	var rc int
 	var detail string
 	if jsonOut {
@@ -575,7 +613,7 @@ func cmdSetup(argv []string) int {
 		if dryRun {
 			stage = "dry_run_ok"
 		} else {
-			stage = "provisioned"
+			stage = stageComplete // canonical stage name so planSetupResume can index it
 		}
 	}
 	if !dryRun {
@@ -584,7 +622,12 @@ func cmdSetup(argv []string) int {
 			blocker = ""
 		}
 		state.Blocker = blocker
-		if serr := checkpointSetup(&state, stage, map[string]string{"hostname": hostname, "edge": edge}); serr != nil {
+		state.DataDir = dataDir
+		if serr := checkpointSetup(&state, stage, map[string]string{
+			"hostname":    hostname,
+			"edge":        edge,
+			stageComplete: time.Now().UTC().Format(time.RFC3339),
+		}); serr != nil {
 			fmt.Fprintln(os.Stderr, "error: cannot persist setup state: "+serr.Error())
 			if rc == apperr.ExitOK {
 				rc = apperr.ExitInternal
