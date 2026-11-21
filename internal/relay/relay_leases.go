@@ -323,12 +323,20 @@ func (s *Server) allocateNamed(tenantID, keyID string, intent LeaseIntent, now t
 		return nil, attachedMsg{}, err
 	}
 	// Enforce per-tenant persistent lease quota before the expensive insert.
-	if policy := s.db.GetTenantPolicy(tenantID); policy.MaxPersistentLeases > 0 {
+	// Quota reads must fail closed: a SQLite error or corrupt policy JSON
+	// must never be treated as "unlimited" (P1 audit item 12).
+	namedPolicy, err := s.db.GetTenantPolicy(tenantID)
+	if err != nil {
+		return nil, attachedMsg{}, apperr.E(apperr.CodeStoreFault, "reading tenant policy", err)
+	}
+	if namedPolicy.MaxPersistentLeases > 0 {
 		var persistent int
-		_ = s.db.SQL().QueryRow(
+		if err := s.db.SQL().QueryRow(
 			`SELECT COUNT(*) FROM leases WHERE tenant_id=? AND COALESCE(persistent,0)=1 AND status NOT IN ('REVOKED','CLOSED','EXPIRED')`,
-			tenantID).Scan(&persistent)
-		if persistent >= policy.MaxPersistentLeases {
+			tenantID).Scan(&persistent); err != nil {
+			return nil, attachedMsg{}, apperr.E(apperr.CodeStoreFault, "counting persistent leases", err)
+		}
+		if persistent >= namedPolicy.MaxPersistentLeases {
 			return nil, attachedMsg{}, apperr.E(apperr.CodeQuotaLease, "tenant persistent lease limit reached", nil)
 		}
 	}
@@ -346,16 +354,21 @@ func (s *Server) insertLease(tenantID, keyID, label string, intent LeaseIntent, 
 	}
 	// Enforce tenant policy before the expensive DB transaction.
 	// The relay is authoritative: a publisher cannot bypass this by
-	// constructing a modified client.
-	policy := s.db.GetTenantPolicy(tenantID)
+	// constructing a modified client. Quota reads must fail closed (P1 item 12).
+	policy, err := s.db.GetTenantPolicy(tenantID)
+	if err != nil {
+		return nil, attachedMsg{}, apperr.E(apperr.CodeStoreFault, "reading tenant policy", err)
+	}
 	if mode == "public" && !policy.AllowPublic {
 		return nil, attachedMsg{}, apperr.E(apperr.CodeCLIValidation, "relay tenant policy denies public exposure; operator must enable allow_public for this tenant", nil)
 	}
 	if policy.MaxActiveLeases > 0 {
 		var active int
-		_ = s.db.SQL().QueryRow(
+		if err := s.db.SQL().QueryRow(
 			`SELECT COUNT(*) FROM leases WHERE tenant_id=? AND status IN ('ACTIVE','RECONNECTING','PENDING')`,
-			tenantID).Scan(&active)
+			tenantID).Scan(&active); err != nil {
+			return nil, attachedMsg{}, apperr.E(apperr.CodeStoreFault, "counting active leases", err)
+		}
 		if active >= policy.MaxActiveLeases {
 			return nil, attachedMsg{}, apperr.E(apperr.CodeQuotaLease, "tenant active lease limit reached", nil)
 		}

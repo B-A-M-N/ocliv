@@ -112,18 +112,59 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, enrollResp{KeyID: "key-" + keyID, TenantID: tenantID})
 }
 
-// IssueEnrollment mints a one-time operator enrollment grant (B05).
-// Operator-authenticated endpoint in production; here guarded by the fact
-// that only the internal/admin listener exposes it (H01).
+// resolveEnrollmentTenant returns the tenant ID to use for a new enrollment code.
+// Rules:
+//   - requested != "": validate+return it (suspension check is done later).
+//   - 0 active tenants: return "default" (bootstrap / first enrollment).
+//   - 1 active tenant: return that tenant (convenience; avoids forcing --tenant on small single-tenant relays).
+//   - >1 active tenants: fail — explicit --tenant is required to prevent arbitrary selection.
+func resolveEnrollmentTenant(db *store.DB, requested string) (string, error) {
+	if requested != "" {
+		return requested, nil
+	}
+	rows, err := db.SQL().Query(`SELECT id FROM tenants WHERE status='active' ORDER BY created_at`)
+	if err != nil {
+		return "", apperr.E(apperr.CodeStoreFault, "querying active tenants", err)
+	}
+	defer rows.Close()
+	var tenants []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return "", apperr.E(apperr.CodeStoreFault, "scanning tenant", err)
+		}
+		tenants = append(tenants, id)
+	}
+	if err := rows.Err(); err != nil {
+		return "", apperr.E(apperr.CodeStoreFault, "iterating tenants", err)
+	}
+	switch len(tenants) {
+	case 0:
+		return "default", nil
+	case 1:
+		return tenants[0], nil
+	default:
+		return "", apperr.E(apperr.CodeEnrollAuth,
+			"multiple active tenants exist; --tenant is required", nil)
+	}
+}
+
 // IssueEnrollmentCode mints a one-time operator enrollment grant (B05).
 // It is a narrow store operation, NOT a relay instance method: building a
 // *Server runs reconcileBoot, which mutates unrelated live lease rows.
 // The operator enroll path must never construct a Server (P0-01).
 func IssueEnrollmentCode(db *store.DB, tenantID string, ttl time.Duration, issuedBy string) (string, error) {
+	// Resolve the tenant before the suspension check so that multi-tenant
+	// ambiguity is caught immediately, not silently resolved to the oldest.
+	var err error
+	tenantID, err = resolveEnrollmentTenant(db, tenantID)
+	if err != nil {
+		return "", err
+	}
 	// Suspended tenants cannot enroll new publishers (P0-A): suspension
 	// is terminal for the tenant's authority until explicitly unsuspended.
-	// Unknown tenants (first enrollment) are unaffected.
-	if tenantID != "" {
+	// Unknown tenants (first enrollment, tenantID=="default") are unaffected.
+	if tenantID != "default" {
 		var tst string
 		if err := db.SQL().QueryRow(`SELECT status FROM tenants WHERE id=?`, tenantID).Scan(&tst); err == nil && tst == "suspended" {
 			return "", apperr.E(apperr.CodeEnrollAuth, "tenant suspended", nil)
@@ -135,14 +176,6 @@ func IssueEnrollmentCode(db *store.DB, tenantID string, ttl time.Duration, issue
 	}
 	now := time.Now().UTC()
 	id := fmt.Sprintf("enr-%d", now.UnixNano())
-	if tenantID == "" {
-		var existing string
-		if err := db.SQL().QueryRow(`SELECT id FROM tenants WHERE status='active' ORDER BY created_at LIMIT 1`).Scan(&existing); err == nil && existing != "" {
-			tenantID = existing
-		} else {
-			tenantID = "default"
-		}
-	}
 	_, err = db.SQL().Exec(
 		`INSERT INTO enrollment_codes(id, verifier, tenant_id, expires_at, issued_by) VALUES(?,?,?,?,?)`,
 		id, verifier, tenantID, now.Add(ttl).Format(time.RFC3339Nano), issuedBy)

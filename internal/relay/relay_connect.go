@@ -60,13 +60,19 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 // Base capabilities are always present; optional capabilities reflect
 // actual runtime configuration so publishers can determine available
 // features without reading local relay state.
+// HTTP subdomain ingress requires explicit wildcard or tunnel edge topology,
+// not merely a non-empty relay host — a relay host alone does not prove
+// that Caddy is configured for wildcard/subdomain ingress (P1 item 11).
 func (s *Server) relayCapabilities() []string {
 	caps := []string{
 		protocol.CapabilityPersistentNamedLeases,
 		protocol.CapabilityMgmtBodySignatureV2,
 	}
-	if s.relayHost != "" {
-		caps = append(caps, protocol.CapabilityHTTPSubdomainIngress)
+	switch s.edgeMode {
+	case "wildcard", "tunnel":
+		if s.relayHost != "" {
+			caps = append(caps, protocol.CapabilityHTTPSubdomainIngress)
+		}
 	}
 	if s.mcpHost != "" {
 		caps = append(caps, protocol.CapabilityMCPPathIngress)
@@ -257,8 +263,17 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "handshake signature invalid", http.StatusUnauthorized)
 		return
 	}
+	// Acquire a global session slot before the WebSocket upgrade so that
+	// a capacity-denied agent gets a plain HTTP 503 and no lease state is
+	// mutated (P1 audit item 13). The slot is released on every exit path.
+	if !s.globalBudget.AdmitSession() {
+		s.db.Audit("agent", tenant, "", "attach", "denied", "global session capacity exceeded")
+		http.Error(w, "relay at capacity", http.StatusServiceUnavailable)
+		return
+	}
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
 	if err != nil {
+		s.globalBudget.ReleaseSession()
 		return
 	}
 	ctx := r.Context()
@@ -278,11 +293,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		}
 		conn.Close(websocket.StatusCode(closeCode), "lease denied")
 		s.db.Audit("agent", tenant, "", "attach", "denied", denyCode)
-		return
-	}
-	if !s.globalBudget.AdmitSession() {
-		conn.Close(websocket.StatusCode(1013), "relay at capacity")
-		s.db.Audit("agent", tenant, ls.ID, "attach", "denied", "global session capacity exceeded")
+		s.globalBudget.ReleaseSession()
 		return
 	}
 	raw, _ := json.Marshal(attached)
