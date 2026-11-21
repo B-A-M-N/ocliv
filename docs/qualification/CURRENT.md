@@ -18,9 +18,25 @@ across schema migrations or security-boundary changes.
 | `950440e` | V19 | PASS | PASS (29/0 loopback) | NOT VERIFIED | Historical baseline (`history/PI-ISOLATED-RESULT-2026-11-21.md`); superseded |
 | `8cce9af` | V20 | PASS | NOT VERIFIED | NOT VERIFIED | Superseded by Round 2 & Round 3 remediation |
 | `2f635e470183ed464150bdaceb2c1e674313cc27` | V21 | PASS (full suite + race matrix) | **PASS 60/0/0** (0 SKIP, 0 FAIL, strict release mode) | NOT VERIFIED | Clean detached-worktree ARM64 artifact (`3b59bfddd623b133cd6112b17b2e35186adc4ea38e0f9db35e217f608fb853d3`); Phases A–I all PASS on `10.9.66.170`; production `ocliv-relay` (PID 1577) and `caddy` (PID 1574) untouched |
-| `11dead068fa06f4dc152b5950aad5f6e233fdd94` | V22 | PASS (unit + hygiene + vet) | **PASS 61/0/0** + **V19→V22 migration 10/0** + **soak harness smoke PASS** | NOT VERIFIED | Clean detached-worktree ARM64 artifact (`3b9ba712670d2769929b93152b0fe5af46cccfe7f04b14c6cc255d5c06b0bb67`); adds V22 one-pending-per-key index, strict `OCLIV_ENV=development AND loopback` gate, `non_production` refusal, provenance SBOM startup verification, and Phase H 3-limit + `/health/ready` checks; production `ocliv-relay` (PID 1577) and `caddy` (PID 1574) untouched |
+| `11dead068fa06f4dc152b5950aad5f6e233fdd94` | V22 | PASS (unit + hygiene + vet) | **PASS 61/0/0** + **V19→V22 migration 10/0** + **soak harness smoke PASS** | NOT VERIFIED | Clean detached-worktree ARM64 artifact (`3b9ba712670d2769929b93152b0fe5af46cccfe7f04b14c6cc255d5c06b0bb67`); superseded by `071d7ff` |
+| `071d7ff16638a55684d21f02b3a0cf22d652bda2` | V22 | PASS (installer/store/relay/cli/setup/doctor/systemd + `dash` multi-key test + hygiene + vet) | **PASS 65/0/0** (`--smoke`) + **V19→V22 online-snapshot migration 12/0** + **20s live-workload soak PASS** | NOT VERIFIED | Clean detached-worktree ARM64 artifact (`4e35a4016298dc7c2c0825025cdd5afc63d8b138f24d2d825bf44a927e8732a1`); adds real HTTP cap=2 & WS cap=2 saturation, SQLite online backup API + semantic column digests + restored-DB live readiness, live-publisher soak with mid-soak reconnect, single-source trust-root parity, mandatory `signing_key_id`, `release_sequence` anti-rollback, no-`xxd`/`python3` minimal PATH, and zero retained ephemeral secrets; production `ocliv-relay` (PID 1577) and `caddy` (PID 1574) untouched |
 
-## Latest Isolated Pi Qualification Receipt (`11dead0`)
+## Latest Isolated Pi Staging Receipt (`071d7ff` — non-production staging smoke)
+
+- **Date:** 2026-11-21
+- **Candidate Commit SHA:** `071d7ff16638a55684d21f02b3a0cf22d652bda2` (`dirty=false`, `govulncheck=pass`, `non_production=true` pending permanent signing key & `cyclonedx-gomod`, schema `V22`)
+- **ARM64 Binary SHA-256 (verified post-transfer on Pi):** `4e35a4016298dc7c2c0825025cdd5afc63d8b138f24d2d825bf44a927e8732a1`
+- **Signing Key ID:** `stage-ephemeral-071d7ff` (ephemeral external `0600` Ed25519 staging key, unlinked immediately after signing)
+- **Pi Stage Directory:** `/home/bamn/ocliv-stage/stage-071d7ff-2026-11-21`
+- **Isolated Staging Qualification (`qualify-pi-isolated.py --smoke`):** **PASS 65 / SKIP 0 / FAIL 0**
+  - Phase G5 (`install-client.sh` in sanitized minimal PATH): explicitly excludes `go`, `git`, `caddy`, `docker`, `jq`, `ocliv`, `xxd`, and `python3`; valid signed install PASS, tampered manifest/sig/artifact rejected, and test-trust override without `OCLIV_ALLOW_TEST_TRUST=1` refused.
+  - Phase H: real `--max-publisher-sessions=2`, `--max-http-streams=2` (2 held open, 3rd rejected 503 while `/health/ready=200`, release, recovers to 0), and `--max-ws-streams=2` (2 held 101, 3rd rejected 503 while `/health/ready=200`, close 1, 4th admitted 101, recovers to 0).
+  - Phase I6: zero ephemeral secret files (`*.pem`, `qc.txt`) retained in stage directory.
+- **V19→V22 Online-Snapshot Migration Rehearsal (`rehearse-prod-migration.py` against transactionally consistent read-only online snapshot of `stage-950440e` WAL DB):** **PASS 12 / FAIL 0** (`src_journal_mode=wal`, `src_schema=V19`, snapshot SHA-256 `70bad61c79ee9ff247979189cbf1034030a59a8b69d0862b0ad97a190114b104`; canonical sorted semantic SHA-256 digests identical across `tenants`, `agent_keys`, `leases`, `terminal_leases`, `mcp_publications`, `authz_clients`, `authz_grants`, `authz_revocations`; restored DB integrity/FK/schema/reset-authority verified + candidate relay `/health/ready == 200` on restored DB).
+- **Live-Workload Soak Smoke (`soak-isolated.py --duration 20 --sample-interval 5 --receipt-out ./soak-receipt.json`):** **PASS** (`samples=5`, `reconnects_completed=1`, `route_expected_401=5`, `pair_ok=5`, `unexpected_fail=0`, FDs `13->13`, RSS `15632KB->16156KB`, `active_sessions=1`).
+- **Production Isolation Proof:** `ocliv-relay` MainPID `1577` → `1577`, `caddy` MainPID `1574` → `1574` (untouched).
+
+## Prior Isolated Pi Qualification Receipt (`11dead0` — preserved)
 
 - **Date:** 2026-11-21
 - **Candidate Commit SHA:** `11dead068fa06f4dc152b5950aad5f6e233fdd94` (`dirty=false`, `govulncheck=pass`, schema `V22`)

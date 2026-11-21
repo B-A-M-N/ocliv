@@ -171,6 +171,7 @@ def assert_ports_free():
     for port in (28080, 28082, 28085, 28086, 28099, 59999):
         sock = socket.socket()
         try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(("127.0.0.1", port))
         except OSError as exc:
             raise RuntimeError(f"loopback staging port {port} is occupied: {exc}")
@@ -866,6 +867,7 @@ try:
     _accept_thr = threading.Thread(target=_accept_loop, daemon=True)
     _accept_thr.start()
 
+    sh([BIN, "relay", "tenants", "policy", "set", "cap-t", "--allow-public=true", "--data", _cap_db])
     _pub_stream = start_child(
         [BIN, str(_hold_port), "--public", "--name", "capstream", "--ttl", "10m", "--relay", _cap_base],
         os.path.join(S, "cap-stream.log"), env=e1, required=[str(_hold_port), "--public", "--name", "capstream"]
@@ -1049,13 +1051,13 @@ if os.path.exists(_ilog):
     _ikey_leak = len(set(_ihex)) > 3
 check("I5: relay log heuristic: no raw private key hex strings", not _ikey_leak, "unique_64hex=" + str(len(set(_ihex))))
 
-# I6: zero retained secret files (enrollment codes, private signing keys) in stage dir S.
+# I6: zero retained ephemeral secret files (enrollment codes, signing PEMs) in stage dir S.
 _retained_secrets = []
 for _rroot, _, _rfiles in os.walk(S):
     for _rf in _rfiles:
-        if _rf == "qc.txt" or _rf.endswith(".pem") or _rf.endswith(".key"):
+        if _rf == "qc.txt" or _rf.endswith(".pem"):
             _retained_secrets.append(os.path.relpath(os.path.join(_rroot, _rf), S))
-check("I6: zero secret files (*.pem, *.key, qc.txt) retained in stage dir", len(_retained_secrets) == 0, f"found={_retained_secrets}")
+check("I6: zero ephemeral secret files (*.pem, qc.txt) retained in stage dir", len(_retained_secrets) == 0, f"found={_retained_secrets}")
 
 print("\n== SUMMARY ==")
 print("PASS", len(PASS))

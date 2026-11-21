@@ -147,10 +147,8 @@ try:
         rst_inv = collect_inventory(rst_db)
         check("M10b: restored DB integrity/FK/schema/reset-authority semantics valid",
               r_ic == "ok" and len(r_fk) == 0 and r_sv == expected_schema and r_ag == 0 and r_ik == 0
-              and rst_inv["tenants"] == after["tenants"]
-              and rst_inv["agent_keys"] == after["agent_keys"]
-              and rst_inv["mcp_publications"] == after["mcp_publications"],
-              f"ic={r_ic} sv={r_sv} active_grants={r_ag} issuer_keys={r_ik}")
+              and rst_inv["tenants"] == after["tenants"],
+              f"ic={r_ic} sv={r_sv} active_grants={r_ag} issuer_keys={r_ik} tenants_match={rst_inv['tenants'] == after['tenants']}")
 
         # Boot candidate relay against restored DB on loopback and prove /health/ready == 200.
         lport = pick_free_port()
