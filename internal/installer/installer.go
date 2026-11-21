@@ -6,6 +6,7 @@ package installer
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -18,6 +19,16 @@ import (
 )
 
 const maxDownloadBytes = 100 * 1024 * 1024 // 100 MB
+
+// ReleasePublicKey is the Ed25519 public key used to sign release manifests.
+// In production embed a 32-byte key here at build time via ldflags or a
+// separate keymaterial package. The zero value skips signature verification
+// (development / self-hosted mode).
+var ReleasePublicKey []byte
+
+// AllowUnqualifiedRelease disables the govulncheck=pass requirement.
+// Set to true only for testing or emergency override scenarios.
+var AllowUnqualifiedRelease bool
 
 // ReleaseManifest matches the dist/*/release-manifest.json format.
 type ReleaseManifest struct {
@@ -52,9 +63,33 @@ func ArtifactURL(baseURL, artifactName string) string {
 	return strings.TrimRight(baseURL, "/") + "/.well-known/ocliv-artifacts/" + artifactName
 }
 
+// VerifyManifest verifies rawManifest was signed by the pinned release key.
+// If ReleasePublicKey is nil/empty, verification is skipped (development mode).
+// sigHex is a lowercase hex-encoded Ed25519 signature over the exact manifest bytes.
+func VerifyManifest(rawManifest []byte, sigHex string) error {
+	if len(ReleasePublicKey) == 0 {
+		return nil // no pinned key configured
+	}
+	if sigHex == "" {
+		return fmt.Errorf("manifest signature missing; refusing unverified manifest")
+	}
+	sig, err := hex.DecodeString(sigHex)
+	if err != nil {
+		return fmt.Errorf("manifest signature malformed: %w", err)
+	}
+	if len(ReleasePublicKey) != ed25519.PublicKeySize {
+		return fmt.Errorf("pinned release key has wrong length %d (want %d)", len(ReleasePublicKey), ed25519.PublicKeySize)
+	}
+	if !ed25519.Verify(ed25519.PublicKey(ReleasePublicKey), rawManifest, sig) {
+		return fmt.Errorf("manifest signature invalid: not signed by pinned release key")
+	}
+	return nil
+}
+
 // FetchManifest downloads and parses the manifest from manifestURL.
-// It returns an error if the manifest is missing, malformed, or the build
-// is dirty (a dirty binary has non-reproducible provenance).
+// It fails if the manifest is missing, malformed, dirty, or govulncheck != "pass"
+// (unless AllowUnqualifiedRelease is true). No signature verification is
+// performed — use FetchManifestSigned when ReleasePublicKey is configured.
 func FetchManifest(ctx context.Context, client *http.Client, manifestURL string) (*ReleaseManifest, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
 	if err != nil {
@@ -81,14 +116,81 @@ func FetchManifest(ctx context.Context, client *http.Client, manifestURL string)
 	if len(m.Artifacts) == 0 {
 		return nil, fmt.Errorf("manifest contains no artifacts")
 	}
+	if !AllowUnqualifiedRelease && m.Govulncheck != "pass" {
+		return nil, fmt.Errorf("refusing release: govulncheck=%q (expected \"pass\")", m.Govulncheck)
+	}
+	return &m, nil
+}
+
+// FetchManifestSigned downloads the manifest and its detached Ed25519 signature,
+// verifies the signature against the pinned ReleasePublicKey, then parses and
+// validates the manifest. If ReleasePublicKey is nil, signature verification is
+// skipped (development / self-hosted mode — no key pinned).
+func FetchManifestSigned(ctx context.Context, client *http.Client, manifestURL string) (*ReleaseManifest, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("manifest request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("manifest fetch: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("relay does not publish a release manifest")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("manifest fetch: HTTP %d", resp.StatusCode)
+	}
+	rawManifest, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("manifest read: %w", err)
+	}
+
+	if len(ReleasePublicKey) > 0 {
+		sigURL := manifestURL + ".sig"
+		sigReq, err := http.NewRequestWithContext(ctx, http.MethodGet, sigURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("signature request: %w", err)
+		}
+		sigResp, err := client.Do(sigReq)
+		if err != nil {
+			return nil, fmt.Errorf("signature fetch: %w", err)
+		}
+		defer sigResp.Body.Close()
+		if sigResp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("signature fetch: HTTP %d", sigResp.StatusCode)
+		}
+		sigHexBytes, err := io.ReadAll(io.LimitReader(sigResp.Body, 256))
+		if err != nil {
+			return nil, fmt.Errorf("signature read: %w", err)
+		}
+		if err := VerifyManifest(rawManifest, strings.TrimSpace(string(sigHexBytes))); err != nil {
+			return nil, err
+		}
+	}
+
+	var m ReleaseManifest
+	if err := json.Unmarshal(rawManifest, &m); err != nil {
+		return nil, fmt.Errorf("manifest parse: %w", err)
+	}
+	if m.Dirty {
+		return nil, fmt.Errorf("refusing dirty build: manifest reports dirty=true")
+	}
+	if len(m.Artifacts) == 0 {
+		return nil, fmt.Errorf("manifest contains no artifacts")
+	}
+	if !AllowUnqualifiedRelease && m.Govulncheck != "pass" {
+		return nil, fmt.Errorf("refusing release: govulncheck=%q (expected \"pass\")", m.Govulncheck)
+	}
 	return &m, nil
 }
 
 // DownloadAndVerify downloads the binary at artifactURL, verifies its SHA256
 // against expected (hex string), and installs it at dst with mode 0755.
-// The write is atomic: a temp file in the same directory receives the download,
-// the digest is verified, then it is renamed into place — dst is never touched
-// unless the digest matches.
+// The write is atomic: a temp file receives the download, the digest is
+// verified, then it is renamed into place. The previous binary is preserved
+// as dst+".prev" for rollback. The parent directory is fsynced after install.
 func DownloadAndVerify(ctx context.Context, client *http.Client, artifactURL, expected, dst string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, artifactURL, nil)
 	if err != nil {
@@ -137,8 +239,45 @@ func DownloadAndVerify(ctx context.Context, client *http.Client, artifactURL, ex
 	if err := os.Chmod(tmpName, 0o755); err != nil {
 		return fmt.Errorf("chmod temp file: %w", err)
 	}
+
+	// Preserve the existing binary as .prev before replacing (best-effort rollback).
+	prevPath := dst + ".prev"
+	if _, serr := os.Stat(dst); serr == nil {
+		if cerr := copyFile(dst, prevPath); cerr != nil {
+			return fmt.Errorf("preserving previous binary: %w", cerr)
+		}
+	}
+
 	if err := os.Rename(tmpName, dst); err != nil {
 		return fmt.Errorf("installing binary: %w", err)
 	}
+
+	// Fsync the parent directory to make the rename durable across a crash.
+	if dh, err := os.Open(dir); err == nil {
+		_ = dh.Sync()
+		dh.Close()
+	}
 	return nil
+}
+
+// copyFile copies src to dst (mode 0755), syncing before close.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o755)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
