@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -18,7 +19,7 @@ import (
 
 func cmdInstall(argv []string) int {
 	var relayURL, manifestURL, artifactURL, dir string
-	yes, dryRun := false, false
+	yes, dryRun, allowUnsignedDev := false, false, false
 
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
@@ -27,12 +28,13 @@ func cmdInstall(argv []string) int {
 			fmt.Fprintln(os.Stderr, "usage: ocliv install --relay URL [--dir DIR] [--yes] [--dry-run]")
 			fmt.Fprintln(os.Stderr, "       ocliv install --manifest-url URL [--artifact-url URL] [--dir DIR] [--yes] [--dry-run]")
 			fmt.Fprintln(os.Stderr, "")
-			fmt.Fprintln(os.Stderr, "  --relay URL         fetch manifest from relay's well-known endpoint")
-			fmt.Fprintln(os.Stderr, "  --manifest-url URL  fetch manifest from explicit URL")
-			fmt.Fprintln(os.Stderr, "  --artifact-url URL  download artifact from explicit URL (skips auto-detection)")
-			fmt.Fprintln(os.Stderr, "  --dir DIR           install directory (default: directory of current binary)")
-			fmt.Fprintln(os.Stderr, "  --yes               skip confirmation prompt")
-			fmt.Fprintln(os.Stderr, "  --dry-run           download and verify digest but do not install")
+			fmt.Fprintln(os.Stderr, "  --relay URL                      fetch manifest from relay's well-known endpoint")
+			fmt.Fprintln(os.Stderr, "  --manifest-url URL               fetch manifest from explicit URL")
+			fmt.Fprintln(os.Stderr, "  --artifact-url URL               download artifact from explicit URL (skips auto-detection)")
+			fmt.Fprintln(os.Stderr, "  --dir DIR                        install directory (default: directory of current binary)")
+			fmt.Fprintln(os.Stderr, "  --yes                            skip confirmation prompt")
+			fmt.Fprintln(os.Stderr, "  --dry-run                        download and verify digest but do not install")
+			fmt.Fprintln(os.Stderr, "  --allow-unsigned-dev-release     skip manifest signature check (loopback manifest URLs only)")
 			return apperr.ExitOK
 		case a == "--relay" || strings.HasPrefix(a, "--relay="):
 			v, ok := mcpFlagValue(argv, &i, "relay")
@@ -62,6 +64,8 @@ func cmdInstall(argv []string) int {
 			yes = true
 		case a == "--dry-run":
 			dryRun = true
+		case a == "--allow-unsigned-dev-release":
+			allowUnsignedDev = true
 		default:
 			fmt.Fprintf(os.Stderr, "error: unknown flag %q\n", a)
 			return apperr.ExitCLIValidation
@@ -98,15 +102,26 @@ func cmdInstall(argv []string) int {
 	defer cancel()
 
 	fmt.Fprintf(os.Stderr, "fetching manifest from %s...\n", manifestURL)
-	m, err := installer.FetchManifest(ctx, client, manifestURL)
+	var m *installer.ReleaseManifest
+	if allowUnsignedDev {
+		if !isLoopbackURL(manifestURL) {
+			fmt.Fprintln(os.Stderr, "error: --allow-unsigned-dev-release is only permitted for loopback manifest URLs (127.x, localhost, ::1)")
+			return apperr.ExitCLIValidation
+		}
+		fmt.Fprintln(os.Stderr, "warning: manifest signature check bypassed via --allow-unsigned-dev-release")
+		m, err = installer.FetchManifest(ctx, client, manifestURL)
+	} else {
+		pubKey := installer.ProductionPublicKey()
+		m, err = installer.FetchManifestSigned(ctx, client, manifestURL, pubKey)
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		if strings.Contains(err.Error(), "manifest signature") || strings.Contains(err.Error(), "unsigned manifest") {
+			fmt.Fprintln(os.Stderr, "hint: use --allow-unsigned-dev-release for local development relays that don't publish a .sig file")
+		}
 		return apperr.ExitRelayTLS
 	}
 	fmt.Printf("manifest: commit=%s build_time=%s govulncheck=%s\n", m.Commit, m.BuildTime, m.Govulncheck)
-	if m.Govulncheck != "pass" {
-		fmt.Fprintf(os.Stderr, "warning: govulncheck=%q (not 'pass')\n", m.Govulncheck)
-	}
 
 	entry, ok := m.Artifacts[artifactName]
 	if !ok {
@@ -165,4 +180,15 @@ func cmdInstall(argv []string) int {
 	}
 	fmt.Printf("installed: %s (commit %s)\n", dst, m.Commit)
 	return apperr.ExitOK
+}
+
+// isLoopbackURL returns true if rawURL resolves to a loopback address.
+func isLoopbackURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	return host == "localhost" || host == "127.0.0.1" || host == "::1" ||
+		strings.HasPrefix(host, "127.")
 }

@@ -113,7 +113,7 @@ func TestRelayInitEdgeModeInEnvFile(t *testing.T) {
 		},
 		{
 			edge:    "wildcard",
-			extra:   []string{"--dns-provider", "cloudflare", "--dns-env", "CF_API_TOKEN", "--acme-email", "ops@hosting.test"},
+			extra:   []string{"--dns-provider", "cloudflare", "--dns-env", "CF_API_TOKEN", "--acme-email", "ops@hosting.test", "--allow-reserved-domain"},
 			wantEnv: "OCLIV_EDGE_MODE=wildcard",
 		},
 	} {

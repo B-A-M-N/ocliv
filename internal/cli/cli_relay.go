@@ -2,7 +2,9 @@
 package cli
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -481,6 +483,35 @@ func cmdRelayServe(argv []string) int {
 		}
 	}
 
+	// Optional Ed25519 signature for the release manifest.
+	rawManifestSigFile := os.Getenv("OCLIV_RELEASE_MANIFEST_SIG")
+	if v, seen := explicitRelayFlag(argv, "--release-manifest-sig"); seen {
+		rawManifestSigFile = v
+	}
+	var releaseManifestSig []byte
+	if rawManifestSigFile != "" {
+		b, rerr := os.ReadFile(rawManifestSigFile)
+		if rerr != nil {
+			fmt.Fprintf(os.Stderr, "error: reading --release-manifest-sig %q: %v\n", rawManifestSigFile, rerr)
+			return apperr.ExitCLIValidation
+		}
+		b = bytes.TrimSpace(b)
+		switch len(b) {
+		case 64:
+			releaseManifestSig = b
+		case 128:
+			decoded, herr := hex.DecodeString(string(b))
+			if herr != nil {
+				fmt.Fprintf(os.Stderr, "error: --release-manifest-sig %q must be 64-byte raw or 128 hex chars\n", rawManifestSigFile)
+				return apperr.ExitCLIValidation
+			}
+			releaseManifestSig = decoded
+		default:
+			fmt.Fprintf(os.Stderr, "error: --release-manifest-sig %q: unexpected size %d (want 64 raw bytes or 128 hex chars)\n", rawManifestSigFile, len(b))
+			return apperr.ExitCLIValidation
+		}
+	}
+
 	// Edge mode (tunnel/wildcard/single-host) for capability advertisement.
 	edgeMode := os.Getenv("OCLIV_EDGE_MODE")
 	if v, seen := explicitRelayFlag(argv, "--edge-mode"); seen {
@@ -554,6 +585,7 @@ func cmdRelayServe(argv []string) int {
 		AutoApproveRedirectHosts: autoApproveHosts,
 		GoogleVerificationJSON:   googleVerifyJSON,
 		ReleaseManifestJSON:      releaseManifestJSON,
+		ReleaseManifestSig:       releaseManifestSig,
 		ReleaseArtifactDir:       rawArtifactDir,
 		EdgeMode:                 edgeMode,
 		GlobalMaxHTTPStreams:     maxHTTPStreams,
