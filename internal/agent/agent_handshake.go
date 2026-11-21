@@ -37,8 +37,8 @@ func (rn *Runner) fetchChallenge(httpClient *http.Client, relayURL string) (nonc
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
-		return nil, "", "", "", fmt.Errorf("enrollment revoked or unknown, stopping (status %d: %s)",
-			resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, "", "", "", Permanent(fmt.Errorf("enrollment revoked or unknown, stopping (status %d: %s)",
+			resp.StatusCode, strings.TrimSpace(string(body))))
 	}
 	var ch struct {
 		Nonce        string   `json:"nonce"`
@@ -122,9 +122,6 @@ func (rn *Runner) dialAttach(ctx context.Context, httpClient *http.Client, wsBas
 	raw, err := transport.ReadControl(ctx, conn)
 	if err != nil {
 		conn.Close(websocket.StatusProtocolError, "no attach")
-		if closeCode(err) == 4401 {
-			return nil, att, fmt.Errorf("agent lease permanently denied by relay")
-		}
 		return nil, att, fmt.Errorf("no session attach: %w", err)
 	}
 	if err := json.Unmarshal(raw, &att); err != nil || att.Type != "attached" {

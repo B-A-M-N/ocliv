@@ -104,6 +104,11 @@ func TestValidateRelayURL(t *testing.T) {
 		{"https://relay.example.net?foo=bar", true},
 		// Empty host
 		{"https://", true},
+		// Non-root path
+		{"https://relay.example.net/v1", true},
+		{"https://relay.example.net/api/path", true},
+		// Trailing slash is valid (treated as root)
+		{"https://relay.example.net/", false},
 	}
 	for _, tc := range cases {
 		err := ValidateRelayURL(tc.raw)
@@ -117,7 +122,10 @@ func TestValidateRelayURL(t *testing.T) {
 }
 
 func TestClientNilKeyAndFailClosedNegotiation(t *testing.T) {
-	c := NewClient("https://127.0.0.1:1", nil, "key-none")
+	c, err := NewClient("https://127.0.0.1:1", nil, "key-none")
+	if err != nil {
+		t.Fatalf("unexpected NewClient error: %v", err)
+	}
 	if _, _, err := c.Call(http.MethodGet, "/v1/agent/leases"); err == nil {
 		t.Fatalf("expected error on nil key")
 	}
@@ -140,11 +148,40 @@ func TestClientNilKeyAndFailClosedNegotiation(t *testing.T) {
 	}
 	t.Setenv("OCLIV_CACERT", caPath)
 
-	c2 := NewClient(srv.URL, kp, "key-"+string(kp.ID()))
+	c2, err := NewClient(srv.URL, kp, "key-"+string(kp.ID()))
+	if err != nil {
+		t.Fatalf("unexpected NewClient error: %v", err)
+	}
 	if _, _, err := c2.CallBody(http.MethodPost, "/v1/agent/key/rotate", []byte(`{"x":1}`)); err == nil {
 		t.Fatalf("expected fail-closed error when capabilities & challenge both 404")
 	}
 	if mutationHits.Load() != 0 {
 		t.Fatalf("expected 0 mutation hits, got %d", mutationHits.Load())
+	}
+}
+
+// TestNewClientRejectsPath verifies that NewClient fails when the URL contains
+// a non-root path component, preventing misconfigured clients from silently
+// routing to wrong endpoints.
+func TestNewClientRejectsPath(t *testing.T) {
+	cases := []struct {
+		url     string
+		wantErr bool
+	}{
+		{"https://relay.example.net", false},
+		{"https://relay.example.net/", false},
+		{"https://relay.example.net/v1", true},
+		{"https://relay.example.net/api/path", true},
+		{"http://not-loopback.example.net", true},
+		{"", true},
+	}
+	for _, tc := range cases {
+		_, err := NewClient(tc.url, nil, "key-test")
+		if tc.wantErr && err == nil {
+			t.Errorf("NewClient(%q): expected error, got nil", tc.url)
+		}
+		if !tc.wantErr && err != nil {
+			t.Errorf("NewClient(%q): unexpected error: %v", tc.url, err)
+		}
 	}
 }

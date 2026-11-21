@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -666,5 +667,48 @@ func TestOnceStampsAttachmentClock(t *testing.T) {
 	}
 	if rn2.sessionHealthy() {
 		t.Fatal("failed handshake reported healthy")
+	}
+}
+
+// TestHandshakeClientRefusesRedirects verifies that the agent handshake HTTP
+// client never follows redirects from the relay, so that signed
+// X-Ocliv-* headers are never forwarded to a redirect target controlled by
+// an adversary (P0 item 7).
+func TestHandshakeClientRefusesRedirects(t *testing.T) {
+	for _, code := range []int{301, 302, 303, 307, 308} {
+		code := code
+		t.Run(fmt.Sprintf("%d", code), func(t *testing.T) {
+			var targetHits atomic.Int32
+
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				targetHits.Add(1)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer target.Close()
+
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, target.URL+r.URL.Path, code)
+			}))
+			defer origin.Close()
+
+			key, err := identity.Generate()
+			if err != nil {
+				t.Fatal(err)
+			}
+			rn := &Runner{
+				Key:   key,
+				KeyID: "key-test",
+				Cfg:   config.Agent{RelayURL: origin.URL, DataDir: t.TempDir(), Port: 8080},
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			// once() will fail (redirect not followed → 3xx challenge response),
+			// but the redirect target must not receive any request.
+			_ = rn.once(ctx)
+
+			if targetHits.Load() != 0 {
+				t.Errorf("redirect code %d: redirect target received %d request(s); expected 0 (credential leak)", code, targetHits.Load())
+			}
+		})
 	}
 }

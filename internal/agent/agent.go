@@ -7,11 +7,8 @@ package agent
 import (
 	"context"
 	"crypto/tls"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -23,8 +20,6 @@ import (
 
 	"ocliv/internal/config"
 	"ocliv/internal/identity"
-	"ocliv/internal/protocol"
-	"ocliv/internal/transport"
 )
 
 // Attached is the relay's session confirmation.
@@ -325,127 +320,61 @@ func (rn *Runner) once(ctx context.Context) error {
 	} else if pool != nil {
 		tlsCfg.RootCAs = pool
 	}
-	httpClient := &http.Client{Timeout: 15 * time.Second}
+	httpClient := &http.Client{
+		Timeout: 15 * time.Second,
+		// Reject redirects: a relay that redirects the challenge or WS upgrade
+		// would forward signed auth headers to an attacker-controlled host.
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	if strings.HasPrefix(relayURL, "https") {
 		httpClient.Transport = &http.Transport{TLSClientConfig: tlsCfg}
 	}
 	if rn.HandshakeTransport != nil {
 		httpClient.Transport = rn.HandshakeTransport
 	}
-	// 1-3. Fetch one-time challenge, sign, attach. The loop runs at most
-	// twice: an expired-lease denial (4410) with a stale local record
-	// drops that record once and retries with an empty lease id so the
-	// relay mints a replacement. The retry re-fetches a fresh challenge
-	// because nonces are single-use and must never be replayed (B07).
+	// 1-3. Fetch one-time challenge, sign, attach via canonical helpers.
+	// The loop runs at most twice: an expired-lease denial (4410) with a
+	// stale local record drops that record once and retries — the retry
+	// re-fetches a fresh challenge because nonces are single-use (B07).
 	// Revoked/closed identities stay terminal (4401). The replacement
 	// preserves the deployment identity (same name/mode/port), so a
 	// stable named route rebinds instead of stranding the publisher.
-	intentLease := rn.resumeLeaseID()
 	replaced := false
 	var conn *websocket.Conn
-	var raw []byte
+	var att Attached
 	for {
-		chReq, _ := json.Marshal(map[string]string{"key_id": rn.KeyID})
-		resp, err := httpClient.Post(relayURL+"/v1/agent/challenge", "application/json", strings.NewReader(string(chReq)))
+		nonce, nonceB64, origin, version, err := rn.fetchChallenge(httpClient, relayURL)
 		if err != nil {
-			return fmt.Errorf("relay unreachable: %w", err)
+			return err
 		}
-		// A denied challenge is classified before decode: 4xx (except 429)
-		// means the credential itself is bad and retrying cannot help (F09:
-		// stop on permanent credential failure, same as the WS 4401 path).
-		// 429/5xx stay retryable with backoff.
-		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-			resp.Body.Close()
-			return fmt.Errorf("challenge temporarily unavailable (status %d)", resp.StatusCode)
-		}
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-			resp.Body.Close()
-			return Permanent(fmt.Errorf("enrollment revoked or unknown, stopping (status %d: %s)",
-				resp.StatusCode, strings.TrimSpace(string(body))))
-		}
-		var ch struct {
-			Nonce        string   `json:"nonce"`
-			Origin       string   `json:"origin"`
-			Version      string   `json:"version"`
-			Capabilities []string `json:"capabilities"`
-		}
-		if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&ch); err != nil {
-			resp.Body.Close()
-			return fmt.Errorf("bad challenge: %w", err)
-		}
-		resp.Body.Close()
-		if rn.Cfg.Persistent {
-			if strings.TrimSpace(rn.Cfg.Name) == "" {
-				return Permanent(fmt.Errorf("persistent lease requires an explicit --name"))
-			}
-			if !hasCapability(ch.Capabilities, protocol.CapabilityPersistentNamedLeases) {
-				return Permanent(fmt.Errorf("relay does not advertise required capability %q; upgrade relay before using persistent hosting", protocol.CapabilityPersistentNamedLeases))
-			}
-		}
-		nonce, err := base64.StdEncoding.DecodeString(ch.Nonce)
-		if err != nil {
-			return fmt.Errorf("bad challenge nonce: %w", err)
-		}
-		// 2. Sign the canonical intent.
-		// Re-probe local readiness at every (re)connect: the CLI probes
-		// only before the first run, and a hardcoded true would let a
-		// resume claim a reverified local service it never checked (P1-09).
-		intentRaw, _ := json.Marshal(map[string]any{
-			"port": rn.Cfg.Port, "name": rn.Cfg.Name, "public": rn.Cfg.Public,
-			"access_mode": rn.Cfg.AccessMode,
-			"ready":       rn.leaseIntentReady(), "lease_id": intentLease,
-			"ttl_seconds": rn.Cfg.TTLSeconds, "persistent": rn.Cfg.Persistent, "version": protocol.Version,
-		})
-		ts := time.Now().UTC()
-		sig := rn.Key.Sign(nonce, ch.Origin, ch.Version, ts, string(intentRaw))
-		// 3. Open WSS with handshake headers.
-		wsURL := wsBase + "/v1/agent/connect"
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, wsURL, nil)
-		req.Header.Set("X-Ocliv-Key", rn.KeyID)
-		req.Header.Set("X-Ocliv-Nonce", ch.Nonce)
-		req.Header.Set("X-Ocliv-TS", ts.Format(time.RFC3339Nano))
-		req.Header.Set("X-Ocliv-Intent", base64.StdEncoding.EncodeToString(intentRaw))
-		req.Header.Set("X-Ocliv-Sig", base64.StdEncoding.EncodeToString(sig))
-		dialOpts := &websocket.DialOptions{
-			HTTPClient:      httpClient,
-			HTTPHeader:      req.Header,
-			CompressionMode: websocket.CompressionDisabled,
-		}
-		conn, _, err = websocket.Dial(ctx, wsURL, dialOpts)
-		if err != nil {
-			return fmt.Errorf("agent session rejected: %w", err)
-		}
-		// 4. Read the attached message, then bridge to yamux server.
-		raw, err = transport.ReadControl(ctx, conn)
-		if err != nil {
-			conn.Close(websocket.StatusProtocolError, "no attach")
+		intentRaw, ts, sig := rn.buildHandshake(nonce, origin, version)
+		var aerr error
+		conn, att, aerr = rn.dialAttach(ctx, httpClient, wsBase, nonceB64, intentRaw, ts, sig)
+		if aerr != nil {
 			// The relay closes denied attaches with distinct codes
 			// (F09): 4401 is terminal, 4409 is a retryable
 			// allocation race, 4410 permits one replacement for an
 			// expired lease under the same valid identity, and 4413
 			// is an OWNERSHIP conflict — the name belongs to another
 			// key or tenant, which no retry can win.
-			code := closeCode(err)
-			if classifyAttachDenial(code) == attachDenialReplaceOnce && intentLease != "" && !replaced {
-				rn.dropStaleLease(intentLease)
-				intentLease = ""
-				replaced = true
-				continue
+			code := closeCode(aerr)
+			if classifyAttachDenial(code) == attachDenialReplaceOnce && !replaced {
+				if staleLease := rn.resumeLeaseID(); staleLease != "" {
+					rn.dropStaleLease(staleLease)
+					replaced = true
+					continue
+				}
 			}
 			if classifyAttachDenial(code) == attachDenialPermanent {
 				return attachDenialError(code)
 			}
-			return fmt.Errorf("no session attach: %w", err)
+			return aerr
 		}
 		break
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "done")
-	var att Attached
-	if err := json.Unmarshal(raw, &att); err != nil || att.Type != "attached" {
-		conn.Close(websocket.StatusProtocolError, "bad attach")
-		return fmt.Errorf("bad session attach")
-	}
 	// The relay confirmed the attachment here; the health window
 	// starts now, excluding everything the handshake just cost.
 	rn.attachedAt = time.Now()

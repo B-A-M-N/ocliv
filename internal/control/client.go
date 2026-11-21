@@ -31,13 +31,20 @@ type Client struct {
 }
 
 // NewClient constructs a signed relay-management client bound to relayURL and key.
-func NewClient(relayURL string, key *identity.KeyPair, keyID string) *Client {
+// Returns an error if relayURL fails ValidateRelayURL, making an invalid client
+// impossible to construct rather than merely something the caller is expected to
+// pre-check.
+func NewClient(relayURL string, key *identity.KeyPair, keyID string) (*Client, error) {
+	trimmed := strings.TrimRight(strings.TrimSpace(relayURL), "/")
+	if err := ValidateRelayURL(trimmed); err != nil {
+		return nil, err
+	}
 	return &Client{
-		RelayURL: strings.TrimRight(strings.TrimSpace(relayURL), "/"),
+		RelayURL: trimmed,
 		Key:      key,
 		KeyID:    keyID,
 		Timeout:  15 * time.Second,
-	}
+	}, nil
 }
 
 // noFollow refuses all HTTP redirects. Signed management requests carry
@@ -108,6 +115,11 @@ func ValidateRelayURL(raw string) error {
 	}
 	if u.RawQuery != "" {
 		return fmt.Errorf("relay URL must not contain query parameters")
+	}
+	// Reject non-root base paths: https://relay.example.net/foo would change
+	// signature semantics and request routing in unpredictable ways.
+	if u.Path != "" && u.Path != "/" {
+		return fmt.Errorf("relay URL must not contain a path component (got %q); use the root URL", u.Path)
 	}
 	return nil
 }
