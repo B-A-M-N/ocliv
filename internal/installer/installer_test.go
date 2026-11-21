@@ -88,10 +88,12 @@ func TestFetchManifestSignedRejectsUnsigned(t *testing.T) {
 func TestFetchManifestSignedVerifies(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	m := ReleaseManifest{
-		Commit:      "abc123",
-		Dirty:       false,
-		Govulncheck: "pass",
-		Artifacts:   map[string]ArtifactEntry{"ocliv-linux-amd64": {SHA256: "deadbeef"}},
+		ManifestVersion: 1,
+		ReleaseSequence: 1,
+		Commit:          "abc123",
+		Dirty:           false,
+		Govulncheck:     "pass",
+		Artifacts:       map[string]ArtifactEntry{"ocliv-linux-amd64": {SHA256: "deadbeef"}},
 	}
 	manifestBytes, _ := json.Marshal(m)
 	manifestBytes = append(manifestBytes, '\n')
@@ -387,6 +389,52 @@ func TestReleaseSequenceAntiRollback(t *testing.T) {
 	if err := CheckReleaseSequence(seqPath, 99, true); err != nil {
 		t.Fatalf("explicit allowDowngrade should pass: %v", err)
 	}
+	// Symlink sequence file must be refused.
+	symDir := t.TempDir()
+	victim := filepath.Join(symDir, "victim")
+	_ = os.WriteFile(victim, []byte("1\n"), 0o600)
+	symSeq := filepath.Join(symDir, ".ocliv-release-seq")
+	_ = os.Symlink(victim, symSeq)
+	if err := CheckReleaseSequence(symSeq, 100, false); err == nil {
+		t.Fatal("symlink release sequence file must be refused")
+	}
+	// Non-positive sequence must be refused.
+	if err := CheckReleaseSequence(seqPath, 0, false); err == nil {
+		t.Fatal("non-positive release_sequence must be refused")
+	}
+}
+
+func TestFetchManifestSignedRejectsMissingVersionOrSequence(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	for _, tc := range []struct {
+		name string
+		m    ReleaseManifest
+	}{
+		{
+			name: "missing manifest_version",
+			m:    ReleaseManifest{ReleaseSequence: 10, Commit: "abc", Govulncheck: "pass", Artifacts: map[string]ArtifactEntry{"ocliv-linux-amd64": {SHA256: "deadbeef"}}},
+		},
+		{
+			name: "missing release_sequence",
+			m:    ReleaseManifest{ManifestVersion: 1, Commit: "abc", Govulncheck: "pass", Artifacts: map[string]ArtifactEntry{"ocliv-linux-amd64": {SHA256: "deadbeef"}}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, _ := json.Marshal(tc.m)
+			sigHex := hex.EncodeToString(ed25519.Sign(priv, raw))
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/manifest.json.sig" {
+					_, _ = w.Write([]byte(sigHex))
+					return
+				}
+				_, _ = w.Write(raw)
+			}))
+			defer srv.Close()
+			if _, err := FetchManifestSigned(context.Background(), srv.Client(), srv.URL+"/manifest.json", pub); err == nil {
+				t.Fatalf("%s: expected error, got nil", tc.name)
+			}
+		})
+	}
 }
 
 func TestInstallClientScriptMultiKeyRotationAndPinning(t *testing.T) {
@@ -544,6 +592,21 @@ func TestInstallClientScriptMultiKeyRotationAndPinning(t *testing.T) {
 	curManifest, curSig = makeSigned("active-n-key", 20, privActive)
 	if rc, out := runInstall(instDir, "OCLIV_TEST_SIGNING_PUBLIC_KEY_PEM=dummy"); rc == 0 {
 		t.Fatalf("test trust override without OCLIV_ALLOW_TEST_TRUST=1 should fail, got rc=0: %s", out)
+	}
+
+	// 9. Missing release_sequence (0) must be refused.
+	curManifest, curSig = makeSigned("active-n-key", 0, privActive)
+	if rc, out := runInstall(instDir); rc == 0 {
+		t.Fatalf("release_sequence=0 should fail, got rc=0: %s", out)
+	}
+
+	// 10. Symlink .ocliv-release-seq must be refused.
+	symDir := filepath.Join(tmpDir, "sym-inst")
+	_ = os.MkdirAll(symDir, 0o755)
+	_ = os.Symlink("/etc/hosts", filepath.Join(symDir, ".ocliv-release-seq"))
+	curManifest, curSig = makeSigned("active-n-key", 20, privActive)
+	if rc, out := runInstall(symDir); rc == 0 {
+		t.Fatalf("symlink .ocliv-release-seq should fail, got rc=0: %s", out)
 	}
 }
 

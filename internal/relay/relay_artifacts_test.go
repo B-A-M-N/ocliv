@@ -54,10 +54,12 @@ func artifactManifest(t *testing.T, artifacts map[string][]byte) ([]byte, string
 		}
 	}
 	m := map[string]interface{}{
-		"commit":      "abc",
-		"dirty":       false,
-		"govulncheck": "pass",
-		"artifacts":   entries,
+		"manifest_version": 1,
+		"release_sequence": 1,
+		"commit":           "abc",
+		"dirty":            false,
+		"govulncheck":      "pass",
+		"artifacts":        entries,
 	}
 	b, _ := json.Marshal(m)
 	return b, dir
@@ -483,6 +485,29 @@ func TestNonProductionManifestRejectedEvenWithValidSignature(t *testing.T) {
 		ReleaseVerifyKeys:   []ed25519.PublicKey{pub},
 	}); err == nil {
 		t.Fatal("non_production=true manifest must be rejected even with a valid signature from a trusted key")
+	}
+
+	// Missing manifest_version or release_sequence must also be rejected in production mode.
+	for _, tc := range []struct {
+		name string
+		m    map[string]any
+	}{
+		{"missing manifest_version", map[string]any{"release_sequence": 1, "commit": "abc", "dirty": false, "govulncheck": "pass", "artifacts": map[string]any{"ocliv-linux-amd64": map[string]string{"sha256": hex.EncodeToString(h[:])}}}},
+		{"missing release_sequence", map[string]any{"manifest_version": 1, "commit": "abc", "dirty": false, "govulncheck": "pass", "artifacts": map[string]any{"ocliv-linux-amd64": map[string]string{"sha256": hex.EncodeToString(h[:])}}}},
+	} {
+		raw, _ := json.Marshal(tc.m)
+		msig := ed25519.Sign(priv, raw)
+		if _, err := New(Options{
+			DB:                  db,
+			Namespace:           "t.example.test",
+			RelayHost:           "relay.example.test",
+			ReleaseManifestJSON: raw,
+			ReleaseManifestSig:  msig,
+			ReleaseArtifactDir:  dir,
+			ReleaseVerifyKeys:   []ed25519.PublicKey{pub},
+		}); err == nil {
+			t.Fatalf("%s must be rejected in production mode", tc.name)
+		}
 	}
 }
 

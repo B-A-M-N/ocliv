@@ -221,14 +221,35 @@ fi
 [ -n "$AUTHENTICATED_KEY_ID" ] || die "manifest signature verification FAILED — refusing to install (manifest may have been tampered with)"
 info "manifest signature verified (signing_key_id=$AUTHENTICATED_KEY_ID)"
 
-# Anti-rollback: verify monotonic release_sequence if present in manifest.
+# Mandatory manifest contract: manifest_version == 1 and positive integer release_sequence.
+_json_int() {
+    printf '%s\n' "$MANIFEST" | tr ',' '\n' | grep "\"$1\"" \
+        | sed 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/' | head -1
+}
+
+MANIFEST_VER="$(_json_int manifest_version || true)"
+if [ "$MANIFEST_VER" != "1" ]; then
+    die "refusing installation: manifest 'manifest_version' must be 1 (got '${MANIFEST_VER:-missing}')"
+fi
+
+RELEASE_SEQ="$(_json_int release_sequence || true)"
+case "$RELEASE_SEQ" in
+    ''|0|*[!0-9]*)
+        die "refusing installation: manifest 'release_sequence' must be a positive integer (got '${RELEASE_SEQ:-missing}')" ;;
+esac
+
+# Anti-rollback: reject symlink/non-regular sequence file and enforce monotonic release_sequence.
 SEQ_FILE="${INSTALL_DIR}/.ocliv-release-seq"
-RELEASE_SEQ="$(printf '%s\n' "$MANIFEST" | tr ',' '\n' | grep '"release_sequence"' \
-    | sed 's/.*"release_sequence"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/' | head -1 || true)"
-if [ -n "$RELEASE_SEQ" ] && [ -f "$SEQ_FILE" ]; then
+if [ -L "$SEQ_FILE" ]; then
+    die "refusing symlink release sequence file $SEQ_FILE"
+fi
+if [ -e "$SEQ_FILE" ] && [ ! -f "$SEQ_FILE" ]; then
+    die "refusing non-regular release sequence file $SEQ_FILE"
+fi
+if [ -f "$SEQ_FILE" ]; then
     PREV_SEQ="$(tr -d ' \r\n' < "$SEQ_FILE" || true)"
     case "$PREV_SEQ" in
-        ''|*[!0-9]*) die "corrupt release sequence file $SEQ_FILE" ;;
+        ''|0|*[!0-9]*) die "corrupt release sequence file $SEQ_FILE" ;;
     esac
     if [ "$RELEASE_SEQ" -lt "$PREV_SEQ" ] && [ "${OCLIV_ALLOW_DOWNGRADE:-}" != "1" ]; then
         die "refusing release downgrade: manifest release_sequence=$RELEASE_SEQ < installed=$PREV_SEQ (set OCLIV_ALLOW_DOWNGRADE=1 to override)"
@@ -255,6 +276,8 @@ fi
 
 EXPECTED_COMMIT="$(_json_str commit)"
 [ -n "$EXPECTED_COMMIT" ] || die "refusing installation: manifest 'commit' field missing"
+EXPECTED_SCHEMA="$(_json_int schema_version || true)"
+EXPECTED_PROTOCOL="$(_json_str protocol_version || true)"
 
 # Extract SHA256 for the target artifact from the artifacts block (handles both
 # compact and multi-line pretty-printed JSON).
@@ -297,24 +320,46 @@ info "SHA256 verified"
 
 chmod 755 "$TMPFILE"
 
-# Pre-swap candidate validation: verify the staged binary runs and reports the
-# exact commit from the authenticated manifest BEFORE replacing any live binary.
+# Comprehensive candidate validator: verifies version --json succeeds, version is
+# non-empty, dirty=false, commit matches EXPECTED_COMMIT, and schema/protocol
+# match the authenticated manifest when declared. Sets VERIFIED_VERSION.
+VERIFIED_VERSION=""
 _verify_binary() {
     _bin="$1"
     _vjson="$("$_bin" version --json 2>/dev/null)" || return 1
+    _bver="$(printf '%s\n' "$_vjson" | tr ',' '\n' | grep '"version"' \
+        | sed 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1)"
+    [ -n "$_bver" ] || return 1
+    _bdirty="$(printf '%s\n' "$_vjson" | tr ',' '\n' | grep '"dirty"' \
+        | sed 's/.*"dirty"[[:space:]]*:[[:space:]]*\([a-z]*\).*/\1/' | head -1 || true)"
+    if [ "$_bdirty" = "true" ]; then
+        return 1
+    fi
     _bcommit="$(printf '%s\n' "$_vjson" | tr ',' '\n' | grep '"build_commit"' \
         | sed 's/.*"build_commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1)"
     if [ -z "$_bcommit" ]; then
         _bcommit="$(printf '%s\n' "$_vjson" | tr ',' '\n' | grep '"commit"' \
             | sed 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1)"
     fi
-    [ -n "$_bcommit" ] && [ "$_bcommit" = "$EXPECTED_COMMIT" ]
+    [ -n "$_bcommit" ] && [ "$_bcommit" = "$EXPECTED_COMMIT" ] || return 1
+    if [ -n "$EXPECTED_SCHEMA" ]; then
+        _bschema="$(printf '%s\n' "$_vjson" | tr ',' '\n' | grep '"schema_version"' \
+            | sed 's/.*"schema_version"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/' | head -1 || true)"
+        [ "$_bschema" = "$EXPECTED_SCHEMA" ] || return 1
+    fi
+    if [ -n "$EXPECTED_PROTOCOL" ]; then
+        _bproto="$(printf '%s\n' "$_vjson" | tr ',' '\n' | grep '"protocol_version"' \
+            | sed 's/.*"protocol_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1 || true)"
+        [ "$_bproto" = "$EXPECTED_PROTOCOL" ] || return 1
+    fi
+    VERIFIED_VERSION="$_bver"
+    return 0
 }
 
 if ! _verify_binary "$TMPFILE"; then
-    die "staged binary failed pre-swap verification (version --json failed or commit != $EXPECTED_COMMIT)"
+    die "staged binary failed pre-swap verification (version/dirty/commit/schema/protocol mismatch against manifest)"
 fi
-info "staged binary pre-swap verification passed (commit $EXPECTED_COMMIT)"
+info "staged binary pre-swap verification passed (version $VERIFIED_VERSION, commit $EXPECTED_COMMIT)"
 
 # ---------------------------------------------------------------------------
 # Install atomically with safe .prev preservation and post-swap rollback.
@@ -338,13 +383,7 @@ _sync_dir() {
     fi
 }
 
-mv "$TMPFILE" "$DEST"
-TMPFILE=""
-_sync_dir "$INSTALL_DIR"
-
-# Post-swap verification: must succeed and match EXPECTED_COMMIT, or rollback.
-if ! _verify_binary "$DEST"; then
-    printf 'error: post-install verification failed: installed binary did not execute or commit mismatch\n' >&2
+_rollback_dest() {
     if [ "$HAD_PREV" = "1" ] && [ -f "${DEST}.prev" ]; then
         mv "${DEST}.prev" "$DEST"
         _sync_dir "$INSTALL_DIR"
@@ -353,25 +392,30 @@ if ! _verify_binary "$DEST"; then
         rm -f "$DEST"
         _sync_dir "$INSTALL_DIR"
     fi
+}
+
+mv "$TMPFILE" "$DEST"
+TMPFILE=""
+_sync_dir "$INSTALL_DIR"
+
+# Post-swap comprehensive verification BEFORE advancing rollback state.
+if ! _verify_binary "$DEST"; then
+    printf 'error: post-install verification failed: installed binary failed comprehensive validation\n' >&2
+    _rollback_dest
     exit 1
 fi
 
-# Persist accepted release_sequence atomically for anti-rollback protection.
-if [ -n "$RELEASE_SEQ" ]; then
-    _seq_tmp="$(mktemp "${INSTALL_DIR}/.ocliv-seq.XXXXXX")"
-    printf '%s\n' "$RELEASE_SEQ" > "$_seq_tmp"
-    chmod 644 "$_seq_tmp"
-    mv "$_seq_tmp" "$SEQ_FILE"
-    _sync_dir "$INSTALL_DIR"
+# Persist accepted release_sequence atomically ONLY after all post-swap checks pass.
+_seq_tmp="$(mktemp "${INSTALL_DIR}/.ocliv-seq.XXXXXX")"
+if ! ( printf '%s\n' "$RELEASE_SEQ" > "$_seq_tmp" && chmod 644 "$_seq_tmp" && mv "$_seq_tmp" "$SEQ_FILE" ); then
+    rm -f "$_seq_tmp" 2>/dev/null || true
+    printf 'error: failed to persist release_sequence %s; rolling back\n' "$RELEASE_SEQ" >&2
+    _rollback_dest
+    exit 1
 fi
+_sync_dir "$INSTALL_DIR"
 
-VERSION="$("$DEST" version --json 2>/dev/null \
-    | tr ',' '\n' \
-    | grep '"version"' \
-    | sed 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' \
-    | head -1)"
-[ -n "$VERSION" ] || die "post-install version check returned empty version"
-info "installed: $DEST (version $VERSION, commit $EXPECTED_COMMIT)"
+info "installed: $DEST (version $VERIFIED_VERSION, commit $EXPECTED_COMMIT, seq $RELEASE_SEQ)"
 
 # ---------------------------------------------------------------------------
 # Post-install hints.

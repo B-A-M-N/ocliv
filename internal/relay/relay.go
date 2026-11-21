@@ -350,12 +350,22 @@ func New(o Options) (*Server, error) {
 		}
 		if hasSig {
 			var meta struct {
-				SigningKeyID  string `json:"signing_key_id"`
-				NonProduction bool   `json:"non_production"`
+				ManifestVersion int    `json:"manifest_version"`
+				ReleaseSequence int64  `json:"release_sequence"`
+				SigningKeyID    string `json:"signing_key_id"`
+				NonProduction   bool   `json:"non_production"`
 			}
 			_ = json.Unmarshal(o.ReleaseManifestJSON, &meta)
-			if meta.NonProduction && !o.AllowUnsignedRelease {
-				return nil, fmt.Errorf("relay startup: refusing non_production=true release manifest in production mode")
+			if !o.AllowUnsignedRelease {
+				if meta.NonProduction {
+					return nil, fmt.Errorf("relay startup: refusing non_production=true release manifest in production mode")
+				}
+				if meta.ManifestVersion != 1 {
+					return nil, fmt.Errorf("relay startup: refusing release manifest with manifest_version=%d (want 1)", meta.ManifestVersion)
+				}
+				if meta.ReleaseSequence <= 0 {
+					return nil, fmt.Errorf("relay startup: refusing release manifest with missing/non-positive release_sequence=%d", meta.ReleaseSequence)
+				}
 			}
 			sigHex := hex.EncodeToString(o.ReleaseManifestSig)
 			if len(o.ReleaseVerifyKeys) > 0 {

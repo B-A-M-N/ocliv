@@ -13,13 +13,14 @@ Usage:
 In default (release) mode, --release-dir with a production-signed bundle is REQUIRED
 and ANY skipped gate is treated as a failure.
 """
-import argparse, atexit, base64, hashlib, http.server, json, os, re, shutil, signal
+import argparse, atexit, base64, datetime, hashlib, http.server, json, os, platform, re, shutil, signal
 import socket, stat, subprocess, sys, tempfile, threading, time
 import urllib.request, urllib.error, urllib.parse
 
 parser = argparse.ArgumentParser(description="Ocliv isolated loopback release qualification")
 parser.add_argument("--smoke", action="store_true", help="non-release isolated staging smoke mode (allows ephemeral dev signing and SKIP)")
 parser.add_argument("--release-dir", default="", help="directory containing signed release-manifest.json, .sig, and binary artifacts (REQUIRED in default strict mode)")
+parser.add_argument("--receipt-out", default="", help="optional path to write provenance-bound JSON qualification receipt")
 parser.add_argument("--keep-workdir", action="store_true", help="debug-only: keep ephemeral secret workdir on exit (prints warning)")
 ARGS = parser.parse_args()
 
@@ -201,6 +202,19 @@ EXPECTED_SCHEMA = str(BIN_VER_INFO.get("schema_version") or "")
 if not EXPECTED_SCHEMA:
     raise RuntimeError("binary `version --json` missing schema_version")
 
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+_ARCH = "arm64" if platform.machine() in ("aarch64", "arm64") else "amd64"
+ARTIFACT_NAME = f"ocliv-linux-{_ARCH}"
+BIN_SHA256 = sha256_file(BIN)
+ACTIVE_MANIFEST = {}
+
 if not ARGS.smoke:
     print("== MODE: STRICT RELEASE QUALIFICATION ==", flush=True)
     if not RELEASE_DIR or not os.path.isdir(RELEASE_DIR):
@@ -215,27 +229,47 @@ if not ARGS.smoke:
         raise RuntimeError("strict release mode refuses non_production=true manifest")
     if _strict_m.get("dirty") is not False:
         raise RuntimeError("strict release mode refuses dirty manifest")
+    if _strict_m.get("manifest_version") != 1:
+        raise RuntimeError(f"strict release mode requires manifest_version == 1 (got {_strict_m.get('manifest_version')!r})")
+    _rseq = _strict_m.get("release_sequence")
+    if not isinstance(_rseq, int) or isinstance(_rseq, bool) or _rseq <= 0:
+        raise RuntimeError(f"strict release mode requires positive integer release_sequence (got {_rseq!r})")
     if not _strict_m.get("signing_key_id"):
         raise RuntimeError("strict release mode requires non-empty signing_key_id in manifest")
     if not ((_strict_m.get("provenance") or {}).get("sbom")):
         raise RuntimeError("strict release mode requires provenance.sbom in manifest")
+    # Cryptographic/byte-for-byte binding: tested binary == signed bundle artifact == manifest identity.
+    if _strict_m.get("commit") != BIN_COMMIT:
+        raise RuntimeError(f"release bundle commit ({_strict_m.get('commit')}) != qualification binary commit ({BIN_COMMIT})")
+    if int(_strict_m.get("schema_version") or 0) != int(EXPECTED_SCHEMA):
+        raise RuntimeError(f"release bundle schema_version ({_strict_m.get('schema_version')}) != qualification binary schema ({EXPECTED_SCHEMA})")
+    _bin_proto = BIN_VER_INFO.get("protocol_version") or ""
+    if _strict_m.get("protocol_version") and _bin_proto and _strict_m.get("protocol_version") != _bin_proto:
+        raise RuntimeError(f"release bundle protocol_version ({_strict_m.get('protocol_version')}) != qualification binary ({_bin_proto})")
+    _bundle_bin = os.path.join(RELEASE_DIR, ARTIFACT_NAME)
+    if not os.path.isfile(_bundle_bin):
+        raise RuntimeError(f"release bundle missing platform artifact {_bundle_bin}")
+    _bundle_sha = sha256_file(_bundle_bin)
+    _declared_sha = ((_strict_m.get("artifacts") or {}).get(ARTIFACT_NAME) or {}).get("sha256", "")
+    if len({BIN_SHA256, _bundle_sha, _declared_sha}) != 1:
+        raise RuntimeError(f"qualification binary != signed release artifact (bin={BIN_SHA256} bundle={_bundle_sha} manifest={_declared_sha})")
+    ACTIVE_MANIFEST = _strict_m
     REL_USE_DEV_UNSIGNED = False
 else:
     print("== MODE: ISOLATED STAGING SMOKE (non-release) ==", flush=True)
     if RELEASE_DIR and os.path.isdir(RELEASE_DIR):
         REL_MANIFEST_PATH = os.path.join(RELEASE_DIR, "release-manifest.json")
         REL_SIG_PATH = os.path.join(RELEASE_DIR, "release-manifest.json.sig")
+        if os.path.isfile(REL_MANIFEST_PATH):
+            with open(REL_MANIFEST_PATH, encoding="utf-8") as _mf:
+                ACTIVE_MANIFEST = json.load(_mf)
         REL_USE_DEV_UNSIGNED = True
     else:
         RELEASE_DIR = os.path.join(S, "release-bundle-stage")
         os.makedirs(RELEASE_DIR, mode=0o700, exist_ok=True)
-        import platform
-        _arch = "arm64" if platform.machine() in ("aarch64", "arm64") else "amd64"
-        _aname = f"ocliv-linux-{_arch}"
-        _adst = os.path.join(RELEASE_DIR, _aname)
+        _adst = os.path.join(RELEASE_DIR, ARTIFACT_NAME)
         shutil.copy2(BIN, _adst)
-        with open(_adst, "rb") as _af:
-            _asha = hashlib.sha256(_af.read()).hexdigest()
+        _asha = sha256_file(_adst)
         REL_MANIFEST_PATH = os.path.join(RELEASE_DIR, "release-manifest.json")
         _mobj = {
             "manifest_version": 1,
@@ -247,8 +281,9 @@ else:
             "protocol_version": BIN_VER_INFO.get("protocol_version") or "",
             "schema_version": int(EXPECTED_SCHEMA),
             "govulncheck": "pass",
-            "artifacts": {_aname: {"sha256": _asha}},
+            "artifacts": {ARTIFACT_NAME: {"sha256": _asha}},
         }
+        ACTIVE_MANIFEST = _mobj
         with open(REL_MANIFEST_PATH, "w", encoding="utf-8") as _mf:
             _mf.write(json.dumps(_mobj, indent=2) + "\n")
         # Sign with an ephemeral Ed25519 key stored ONLY in WORK_DIR and unlinked immediately.
@@ -1059,9 +1094,40 @@ for _rroot, _, _rfiles in os.walk(S):
             _retained_secrets.append(os.path.relpath(os.path.join(_rroot, _rf), S))
 check("I6: zero ephemeral secret files (*.pem, qc.txt) retained in stage dir", len(_retained_secrets) == 0, f"found={_retained_secrets}")
 
+_bundle_art_path = os.path.join(RELEASE_DIR, ARTIFACT_NAME) if RELEASE_DIR else ""
+_receipt = {
+    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "mode": "isolated-staging-smoke" if ARGS.smoke else "strict-production",
+    "candidate_commit": BIN_COMMIT,
+    "qual_binary_sha256": BIN_SHA256,
+    "signed_artifact_name": ARTIFACT_NAME,
+    "signed_artifact_sha256": sha256_file(_bundle_art_path) if _bundle_art_path and os.path.isfile(_bundle_art_path) else "",
+    "manifest_sha256": sha256_file(REL_MANIFEST_PATH) if REL_MANIFEST_PATH and os.path.isfile(REL_MANIFEST_PATH) else "",
+    "manifest_version": ACTIVE_MANIFEST.get("manifest_version"),
+    "release_sequence": ACTIVE_MANIFEST.get("release_sequence"),
+    "schema_version": int(EXPECTED_SCHEMA),
+    "protocol_version": BIN_VER_INFO.get("protocol_version") or "",
+    "signing_key_id": ACTIVE_MANIFEST.get("signing_key_id") or "",
+    "sbom": (ACTIVE_MANIFEST.get("provenance") or {}).get("sbom") or {},
+    "stage_dir": S,
+    "pass_count": len(PASS),
+    "skip_count": len(SKIP),
+    "fail_count": len(FAIL),
+    "skipped": SKIP,
+    "failed": FAIL,
+    "ok": not FAIL and (not SKIP or ARGS.smoke),
+}
+_default_receipt = os.path.join(S, "qual-receipt.json")
+with open(_default_receipt, "w", encoding="utf-8") as _rf:
+    json.dump(_receipt, _rf, indent=2)
+if ARGS.receipt_out and os.path.realpath(ARGS.receipt_out) != os.path.realpath(_default_receipt):
+    with open(ARGS.receipt_out, "w", encoding="utf-8") as _rf:
+        json.dump(_receipt, _rf, indent=2)
+
 print("\n== SUMMARY ==")
 print("PASS", len(PASS))
 print("SKIP", len(SKIP), SKIP)
 print("FAIL", len(FAIL), FAIL)
+print("RECEIPT", _default_receipt)
 if FAIL or (SKIP and not ARGS.smoke):
     sys.exit(1)

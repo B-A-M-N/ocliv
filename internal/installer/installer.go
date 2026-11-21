@@ -223,6 +223,12 @@ func FetchManifestSignedAny(ctx context.Context, client *http.Client, manifestUR
 	if m.NonProduction {
 		return nil, fmt.Errorf("refusing non-production release manifest (non_production=true)")
 	}
+	if m.ManifestVersion != 1 {
+		return nil, fmt.Errorf("refusing release manifest: unsupported or missing manifest_version=%d (want 1)", m.ManifestVersion)
+	}
+	if m.ReleaseSequence <= 0 {
+		return nil, fmt.Errorf("refusing release manifest: missing or non-positive release_sequence=%d", m.ReleaseSequence)
+	}
 	if m.Dirty {
 		return nil, fmt.Errorf("refusing dirty build: manifest reports dirty=true")
 	}
@@ -309,6 +315,7 @@ func ValidateBinaryCandidate(ctx context.Context, binPath string, manifest *Rele
 		Version         string `json:"version"`
 		Commit          string `json:"commit"`
 		BuildCommit     string `json:"build_commit"`
+		Dirty           bool   `json:"dirty"`
 		ProtocolVersion string `json:"protocol_version"`
 		SchemaVersion   int    `json:"schema_version"`
 	}
@@ -317,6 +324,9 @@ func ValidateBinaryCandidate(ctx context.Context, binPath string, manifest *Rele
 	}
 	if info.Version == "" {
 		return fmt.Errorf("candidate binary reported empty version")
+	}
+	if info.Dirty && !AllowUnqualifiedRelease {
+		return fmt.Errorf("candidate binary reports dirty=true")
 	}
 	if manifest != nil {
 		gotCommit := info.BuildCommit
@@ -407,7 +417,14 @@ func DownloadAndVerify(ctx context.Context, client *http.Client, artifactURL, ex
 // false, an error is returned before activation.
 func CheckReleaseSequence(seqPath string, seq int64, allowDowngrade bool) error {
 	if seq <= 0 {
-		return nil
+		return fmt.Errorf("refusing non-positive release_sequence=%d", seq)
+	}
+	if fi, err := os.Lstat(seqPath); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular() {
+			return fmt.Errorf("refusing non-regular or symlink release sequence file %s", seqPath)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat release sequence %s: %w", seqPath, err)
 	}
 	raw, err := os.ReadFile(seqPath)
 	if err != nil {
