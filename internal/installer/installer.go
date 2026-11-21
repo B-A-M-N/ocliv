@@ -20,17 +20,14 @@ import (
 
 const maxDownloadBytes = 100 * 1024 * 1024 // 100 MB
 
-// ReleasePublicKey is the Ed25519 public key used to sign release manifests.
-// In production embed a 32-byte key here at build time via ldflags or a
-// separate keymaterial package. The zero value skips signature verification
-// (development / self-hosted mode).
-var ReleasePublicKey []byte
-
 // AllowUnqualifiedRelease disables the govulncheck=pass requirement.
 // Set to true only for testing or emergency override scenarios.
 var AllowUnqualifiedRelease bool
 
 // ReleaseManifest matches the dist/*/release-manifest.json format.
+// Artifacts contains only binary distribution artifacts served by the relay
+// artifact endpoint (ocliv-{os}-{arch} naming). Sbom is optional provenance
+// metadata that is NOT served by the artifact endpoint.
 type ReleaseManifest struct {
 	Commit          string                   `json:"commit"`
 	Dirty           bool                     `json:"dirty"`
@@ -39,11 +36,15 @@ type ReleaseManifest struct {
 	SchemaVersion   int                      `json:"schema_version"`
 	Govulncheck     string                   `json:"govulncheck"`
 	Artifacts       map[string]ArtifactEntry `json:"artifacts"`
+	// Sbom is the optional SBOM provenance entry. Not served by the artifact endpoint.
+	Sbom *ArtifactEntry `json:"sbom,omitempty"`
 }
 
-// ArtifactEntry holds provenance data for one platform binary.
+// ArtifactEntry holds provenance data for one artifact.
 type ArtifactEntry struct {
-	SHA256 string `json:"sha256"`
+	SHA256   string `json:"sha256"`
+	Size     int64  `json:"size,omitempty"`
+	Platform string `json:"platform,omitempty"`
 }
 
 // ArtifactName returns the canonical artifact name for a given platform, e.g.
@@ -63,25 +64,22 @@ func ArtifactURL(baseURL, artifactName string) string {
 	return strings.TrimRight(baseURL, "/") + "/.well-known/ocliv-artifacts/" + artifactName
 }
 
-// VerifyManifest verifies rawManifest was signed by the pinned release key.
-// If ReleasePublicKey is nil/empty, verification is skipped (development mode).
-// sigHex is a lowercase hex-encoded Ed25519 signature over the exact manifest bytes.
-func VerifyManifest(rawManifest []byte, sigHex string) error {
-	if len(ReleasePublicKey) == 0 {
-		return nil // no pinned key configured
+// VerifyManifest verifies that rawManifest was signed by pubKey.
+// sigHex must be a hex-encoded Ed25519 signature over the exact manifest bytes.
+// Never silently succeeds — the caller decides whether to skip verification.
+func VerifyManifest(rawManifest []byte, sigHex string, pubKey ed25519.PublicKey) error {
+	if len(pubKey) != ed25519.PublicKeySize {
+		return fmt.Errorf("invalid public key length %d (want %d)", len(pubKey), ed25519.PublicKeySize)
 	}
 	if sigHex == "" {
-		return fmt.Errorf("manifest signature missing; refusing unverified manifest")
+		return fmt.Errorf("manifest signature missing")
 	}
-	sig, err := hex.DecodeString(sigHex)
-	if err != nil {
-		return fmt.Errorf("manifest signature malformed: %w", err)
+	sig, err := hex.DecodeString(strings.TrimSpace(sigHex))
+	if err != nil || len(sig) != ed25519.SignatureSize {
+		return fmt.Errorf("manifest signature malformed")
 	}
-	if len(ReleasePublicKey) != ed25519.PublicKeySize {
-		return fmt.Errorf("pinned release key has wrong length %d (want %d)", len(ReleasePublicKey), ed25519.PublicKeySize)
-	}
-	if !ed25519.Verify(ed25519.PublicKey(ReleasePublicKey), rawManifest, sig) {
-		return fmt.Errorf("manifest signature invalid: not signed by pinned release key")
+	if !ed25519.Verify(pubKey, rawManifest, sig) {
+		return fmt.Errorf("manifest signature invalid")
 	}
 	return nil
 }
@@ -122,11 +120,10 @@ func FetchManifest(ctx context.Context, client *http.Client, manifestURL string)
 	return &m, nil
 }
 
-// FetchManifestSigned downloads the manifest and its detached Ed25519 signature,
-// verifies the signature against the pinned ReleasePublicKey, then parses and
-// validates the manifest. If ReleasePublicKey is nil, signature verification is
-// skipped (development / self-hosted mode — no key pinned).
-func FetchManifestSigned(ctx context.Context, client *http.Client, manifestURL string) (*ReleaseManifest, error) {
+// FetchManifestSigned downloads the manifest, fetches its detached .sig signature,
+// verifies the signature using pubKey, then parses and validates the manifest.
+// Never skips verification — if you have no signing key, call FetchManifest instead.
+func FetchManifestSigned(ctx context.Context, client *http.Client, manifestURL string, pubKey ed25519.PublicKey) (*ReleaseManifest, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("manifest request: %w", err)
@@ -147,27 +144,28 @@ func FetchManifestSigned(ctx context.Context, client *http.Client, manifestURL s
 		return nil, fmt.Errorf("manifest read: %w", err)
 	}
 
-	if len(ReleasePublicKey) > 0 {
-		sigURL := manifestURL + ".sig"
-		sigReq, err := http.NewRequestWithContext(ctx, http.MethodGet, sigURL, nil)
-		if err != nil {
-			return nil, fmt.Errorf("signature request: %w", err)
-		}
-		sigResp, err := client.Do(sigReq)
-		if err != nil {
-			return nil, fmt.Errorf("signature fetch: %w", err)
-		}
-		defer sigResp.Body.Close()
-		if sigResp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("signature fetch: HTTP %d", sigResp.StatusCode)
-		}
-		sigHexBytes, err := io.ReadAll(io.LimitReader(sigResp.Body, 256))
-		if err != nil {
-			return nil, fmt.Errorf("signature read: %w", err)
-		}
-		if err := VerifyManifest(rawManifest, strings.TrimSpace(string(sigHexBytes))); err != nil {
-			return nil, err
-		}
+	sigURL := manifestURL + ".sig"
+	sigReq, err := http.NewRequestWithContext(ctx, http.MethodGet, sigURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("signature request: %w", err)
+	}
+	sigResp, err := client.Do(sigReq)
+	if err != nil {
+		return nil, fmt.Errorf("signature fetch: %w", err)
+	}
+	defer sigResp.Body.Close()
+	if sigResp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("relay does not publish a manifest signature; unsigned manifests are not accepted by this client")
+	}
+	if sigResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("signature fetch: HTTP %d", sigResp.StatusCode)
+	}
+	sigHexBytes, err := io.ReadAll(io.LimitReader(sigResp.Body, 256))
+	if err != nil {
+		return nil, fmt.Errorf("signature read: %w", err)
+	}
+	if err := VerifyManifest(rawManifest, strings.TrimSpace(string(sigHexBytes)), pubKey); err != nil {
+		return nil, err
 	}
 
 	var m ReleaseManifest

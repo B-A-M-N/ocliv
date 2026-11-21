@@ -149,12 +149,35 @@ manifest = {
     "artifacts": {
         "ocliv-linux-amd64": {"sha256": amd64_sha},
         "ocliv-linux-arm64": {"sha256": arm64_sha},
-        sbom_file: {"sha256": sbom_sha},
     },
+    "sbom": {"sha256": sbom_sha, "name": sbom_file},
     "build_command": build_cmd,
 }
 pathlib.Path(manifest_path).write_text(json.dumps(manifest, indent=2) + "\n")
 PY
+
+SIGNING_KEY_FILE="${OCLIV_RELEASE_SIGNING_KEY_FILE:-}"
+if [ -z "$SIGNING_KEY_FILE" ] && [ "${OCLIV_UNSIGNED_DEV:-}" != "true" ]; then
+  echo "error: OCLIV_RELEASE_SIGNING_KEY_FILE is not set" >&2
+  echo "       Set it to an Ed25519 signing key (openssl genpkey -algorithm ed25519 -out key.pem)" >&2
+  echo "       To skip signing for local development builds: OCLIV_UNSIGNED_DEV=true" >&2
+  exit 1
+fi
+
+if [ -n "$SIGNING_KEY_FILE" ]; then
+  if [ ! -f "$SIGNING_KEY_FILE" ]; then
+    echo "error: signing key file not found: $SIGNING_KEY_FILE" >&2
+    exit 1
+  fi
+  echo "==> Signing release manifest"
+  RAWSIG="$OUT/release-manifest.json.sig.raw"
+  openssl dgst -sign "$SIGNING_KEY_FILE" -out "$RAWSIG" "$OUT/release-manifest.json"
+  xxd -p -cols 64 "$RAWSIG" | tr -d '\n' > "$OUT/release-manifest.json.sig"
+  rm -f "$RAWSIG"
+  echo "Manifest signed: $OUT/release-manifest.json.sig"
+else
+  echo "==> WARNING: Unsigned development build (OCLIV_UNSIGNED_DEV=true)"
+fi
 
 echo "==> Release bundle written to $OUT"
 cat "$OUT/release-manifest.json"

@@ -7,10 +7,12 @@ package relay
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -20,6 +22,7 @@ import (
 
 	"ocliv/internal/access"
 	"ocliv/internal/apperr"
+	"ocliv/internal/installer"
 	"ocliv/internal/limits"
 	"ocliv/internal/store"
 )
@@ -56,6 +59,11 @@ type Options struct {
 	// GET /.well-known/ocliv-release-manifest.json. If nil the endpoint
 	// returns 404 — no manifest configured by the operator.
 	ReleaseManifestJSON []byte
+	// ReleaseManifestSig is the raw 64-byte Ed25519 signature of ReleaseManifestJSON,
+	// served at GET /.well-known/ocliv-release-manifest.json.sig. When both fields
+	// are set the relay verifies the signature against the production key at startup
+	// and refuses to start if the signature is invalid.
+	ReleaseManifestSig []byte
 	// ReleaseArtifactDir is the filesystem directory serving release artifacts at
 	// GET /.well-known/ocliv-artifacts/{name}. If empty the artifact endpoint
 	// returns 404. Every artifact must be declared in ReleaseManifestJSON before
@@ -159,6 +167,7 @@ type Server struct {
 	autoApproveRedirectHosts []string
 	googleVerificationJSON   []byte
 	releaseManifestJSON      []byte
+	releaseManifestSig       []byte
 	releaseArtifactDir       string
 	edgeMode                 string
 	visitors                 visitorAccess // HMAC key + verifier for visitor sessions
@@ -221,6 +230,7 @@ func New(o Options) (*Server, error) {
 		autoApproveRedirectHosts: autoApprove,
 		googleVerificationJSON:   append([]byte(nil), o.GoogleVerificationJSON...),
 		releaseManifestJSON:      append([]byte(nil), o.ReleaseManifestJSON...),
+		releaseManifestSig:       append([]byte(nil), o.ReleaseManifestSig...),
 		releaseArtifactDir:       o.ReleaseArtifactDir,
 		edgeMode:                 strings.ToLower(strings.TrimSpace(o.EdgeMode)),
 		visitors:                 newVisitorAccess(o.ServerKey),
@@ -249,6 +259,13 @@ func New(o Options) (*Server, error) {
 		s.authz = m
 	}
 	s.mux.HandleFunc("/.well-known/ocliv-release-manifest.json", s.handleReleaseManifest)
+	s.mux.HandleFunc("/.well-known/ocliv-release-manifest.json.sig", s.handleReleaseManifestSig)
+	if len(o.ReleaseManifestJSON) > 0 && len(o.ReleaseManifestSig) > 0 {
+		sigHex := hex.EncodeToString(o.ReleaseManifestSig)
+		if err := installer.VerifyManifest(o.ReleaseManifestJSON, sigHex, installer.ProductionPublicKey()); err != nil {
+			return nil, fmt.Errorf("relay startup: release manifest signature invalid: %w", err)
+		}
+	}
 	if o.ReleaseArtifactDir != "" {
 		// Validate that all manifest-declared artifacts exist before serving.
 		if len(o.ReleaseManifestJSON) > 0 {
@@ -306,9 +323,9 @@ func defaultOrI64(val, def int64) int64 {
 	return def
 }
 
-// validateArtifactDir checks that every artifact declared in the manifest
-// exists in dir as a regular file (not a symlink). Called at startup to
-// prevent advertising artifacts that cannot actually be served.
+// validateArtifactDir checks that every artifact declared in manifest.artifacts
+// exists in dir as a regular file (no symlinks) and matches its declared SHA256.
+// Only the "artifacts" map is validated; provenance fields like "sbom" are ignored.
 func validateArtifactDir(manifestJSON []byte, dir string) error {
 	var m struct {
 		Artifacts map[string]struct {
@@ -318,17 +335,30 @@ func validateArtifactDir(manifestJSON []byte, dir string) error {
 	if err := json.Unmarshal(manifestJSON, &m); err != nil {
 		return fmt.Errorf("manifest parse: %w", err)
 	}
-	for name := range m.Artifacts {
+	for name, entry := range m.Artifacts {
 		if !isValidArtifactName(name) {
-			return fmt.Errorf("invalid artifact name in manifest: %q", name)
+			return fmt.Errorf("invalid artifact name in manifest: %q (must match ocliv-{os}-{arch})", name)
+		}
+		if entry.SHA256 == "" {
+			return fmt.Errorf("artifact %q has no sha256 in manifest", name)
 		}
 		p := filepath.Join(dir, name)
-		fi, err := os.Lstat(p)
-		if err != nil {
-			return fmt.Errorf("artifact %q not found in dir: %w", name, err)
+		if !strings.HasPrefix(filepath.Clean(p), filepath.Clean(dir)+string(filepath.Separator)) {
+			return fmt.Errorf("artifact name %q escapes artifact directory", name)
 		}
-		if !fi.Mode().IsRegular() {
-			return fmt.Errorf("artifact %q is not a regular file", name)
+		f, _, err := openArtifactSafe(p)
+		if err != nil {
+			return fmt.Errorf("artifact validation: %w", err)
+		}
+		h := sha256.New()
+		if _, err := io.Copy(h, f); err != nil {
+			f.Close()
+			return fmt.Errorf("hashing artifact %q: %w", name, err)
+		}
+		f.Close()
+		got := hex.EncodeToString(h.Sum(nil))
+		if !strings.EqualFold(got, entry.SHA256) {
+			return fmt.Errorf("artifact %q SHA256 mismatch: manifest=%s actual=%s", name, entry.SHA256, got)
 		}
 	}
 	return nil

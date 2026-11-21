@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // handleReleaseArtifact serves release artifacts declared in the release manifest.
@@ -58,15 +59,9 @@ func (s *Server) handleReleaseArtifact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fi, err := os.Lstat(cleanPath)
-	if err != nil || !fi.Mode().IsRegular() {
-		http.NotFound(w, r)
-		return
-	}
-
-	f, err := os.Open(cleanPath)
+	f, fi, err := openArtifactSafe(cleanPath)
 	if err != nil {
-		http.Error(w, "artifact unavailable", http.StatusInternalServerError)
+		http.NotFound(w, r)
 		return
 	}
 	defer f.Close()
@@ -77,6 +72,30 @@ func (s *Server) handleReleaseArtifact(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", fi.Size()))
 
 	http.ServeContent(w, r, name, fi.ModTime(), f)
+}
+
+// openArtifactSafe opens path without following symlinks (O_NOFOLLOW).
+// The returned FileInfo comes from fstat on the open FD, so it matches
+// the file at the same inode — no TOCTOU window between stat and serve.
+func openArtifactSafe(path string) (*os.File, os.FileInfo, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		if err == syscall.ELOOP || err == syscall.ENOTDIR {
+			return nil, nil, fmt.Errorf("artifact %q is a symlink or non-directory", filepath.Base(path))
+		}
+		return nil, nil, fmt.Errorf("opening artifact %q: %w", filepath.Base(path), err)
+	}
+	f := os.NewFile(uintptr(fd), path)
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, nil, fmt.Errorf("stat artifact %q: %w", filepath.Base(path), err)
+	}
+	if !fi.Mode().IsRegular() {
+		f.Close()
+		return nil, nil, fmt.Errorf("artifact %q is not a regular file", filepath.Base(path))
+	}
+	return f, fi, nil
 }
 
 // isValidArtifactName reports whether name is a safe artifact identifier.
