@@ -153,6 +153,57 @@ func ValidateRelayURL(raw string) error {
 	return nil
 }
 
+// ValidateDownloadURL checks that raw is a safe artifact/manifest download URL:
+//   - scheme is https (or http only for explicit loopback development hosts);
+//   - non-empty host;
+//   - no userinfo (credentials) or fragment;
+//   - no path traversal segments ("..") or backslashes.
+//
+// Unlike ValidateRelayURL, non-root paths (such as /.well-known/...) are
+// permitted because explicit --manifest-url and --artifact-url point to files.
+func ValidateDownloadURL(raw string) error {
+	if strings.TrimSpace(raw) == "" {
+		return fmt.Errorf("download URL is empty")
+	}
+	for _, r := range raw {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("download URL contains control characters")
+		}
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("download URL is not parseable: %w", err)
+	}
+	switch u.Scheme {
+	case "https":
+		// always allowed
+	case "http":
+		if !isLoopbackHost(u.Hostname()) {
+			return fmt.Errorf("download URL scheme %q requires HTTPS for non-loopback hosts; use https://", u.Scheme)
+		}
+	default:
+		return fmt.Errorf("download URL scheme %q is not supported; use https://", u.Scheme)
+	}
+	if u.Host == "" || u.Hostname() == "" {
+		return fmt.Errorf("download URL has no host")
+	}
+	if u.User != nil {
+		return fmt.Errorf("download URL must not contain credentials (userinfo)")
+	}
+	if u.Fragment != "" || u.RawFragment != "" {
+		return fmt.Errorf("download URL must not contain a fragment")
+	}
+	if strings.Contains(u.Path, "\\") || strings.Contains(u.RawPath, "\\") {
+		return fmt.Errorf("download URL path must not contain backslashes")
+	}
+	for _, seg := range strings.Split(u.Path, "/") {
+		if seg == ".." {
+			return fmt.Errorf("download URL path must not contain traversal segments")
+		}
+	}
+	return nil
+}
+
 // isLoopbackHost returns true for loopback IP addresses (127.0.0.0/8, ::1)
 // and the hostname "localhost".
 func isLoopbackHost(host string) bool {

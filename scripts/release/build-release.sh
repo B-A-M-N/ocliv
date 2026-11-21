@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 # Clean detached-worktree release builder for Ocliv.
 # Usage: ./scripts/release/build-release.sh [--skip-tests] [--allow-missing-tools] [COMMIT_SHA]
@@ -127,10 +128,43 @@ AMD64_SHA="$(sha256sum "$OUT/ocliv-linux-amd64" | awk '{print $1}')"
 ARM64_SHA="$(sha256sum "$OUT/ocliv-linux-arm64" | awk '{print $1}')"
 SBOM_SHA="$(sha256sum "$OUT/$SBOM_FILE" | awk '{print $1}')"
 
-python3 - "$OUT/release-manifest.json" "$SHA" "$BUILD_TIME" "$SOURCE_DATE_EPOCH" "$GO_VER" "$AMD64_SHA" "$ARM64_SHA" "$SBOM_FILE" "$SBOM_SHA" "$SBOM_TOOL" "$GOVULN_STATUS" "$BUILD_CMD" "$OUT/ocliv-version.json" <<'PY'
+SIGNING_KEY_FILE="${OCLIV_RELEASE_SIGNING_KEY_FILE:-}"
+SIGNING_KEY_ID="${OCLIV_RELEASE_SIGNING_KEY_ID:-}"
+NON_PRODUCTION=0
+if [ "$ALLOW_MISSING_TOOLS" -eq 1 ] || [ "$SKIP_TESTS" -eq 1 ]; then
+  NON_PRODUCTION=1
+fi
+if [ -z "$SIGNING_KEY_FILE" ]; then
+  if [ "${OCLIV_UNSIGNED_DEV:-}" != "true" ]; then
+    echo "error: OCLIV_RELEASE_SIGNING_KEY_FILE is not set" >&2
+    echo "       Set it to an external 0600 Ed25519 signing key (never committed to Git)" >&2
+    echo "       To build an explicitly non-production unsigned dev bundle: OCLIV_UNSIGNED_DEV=true" >&2
+    exit 1
+  fi
+  NON_PRODUCTION=1
+else
+  # Reject symlinked, non-regular, or group/other-readable signing key files.
+  if [ -L "$SIGNING_KEY_FILE" ] || [ ! -f "$SIGNING_KEY_FILE" ]; then
+    echo "error: signing key must be a regular non-symlink file" >&2
+    exit 1
+  fi
+  KEY_PERM="$(stat -c '%a' "$SIGNING_KEY_FILE" 2>/dev/null || stat -f '%Lp' "$SIGNING_KEY_FILE" 2>/dev/null || echo 777)"
+  case "$KEY_PERM" in
+    400|600) ;;
+    *) echo "error: signing key file has permissive mode $KEY_PERM (require 0600 or 0400)" >&2; exit 1 ;;
+  esac
+  # Derive signing_key_id from canonical release-trust.json if not explicitly provided.
+  if [ -z "$SIGNING_KEY_ID" ] && [ -f "$WT/internal/installer/release-trust.json" ]; then
+    PUB_HEX="$(openssl pkey -in "$SIGNING_KEY_FILE" -pubout -outform DER 2>/dev/null | tail -c 32 | xxd -p -cols 32 | tr -d '\n')"
+    SIGNING_KEY_ID="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(next((k["id"] for k in d.get("keys",[]) if k.get("ed25519","").lower()==sys.argv[2].lower() and k.get("status")!="revoked"), ""))' "$WT/internal/installer/release-trust.json" "$PUB_HEX" 2>/dev/null || true)"
+  fi
+fi
+
+python3 - "$OUT/release-manifest.json" "$SHA" "$BUILD_TIME" "$SOURCE_DATE_EPOCH" "$GO_VER" "$AMD64_SHA" "$ARM64_SHA" "$SBOM_FILE" "$SBOM_SHA" "$SBOM_TOOL" "$GOVULN_STATUS" "$BUILD_CMD" "$OUT/ocliv-version.json" "$SIGNING_KEY_ID" "$NON_PRODUCTION" <<'PY'
 import json, pathlib, sys
 (manifest_path, sha, build_time, epoch, go_ver, amd64_sha, arm64_sha,
- sbom_file, sbom_sha, sbom_tool, govuln, build_cmd, ver_json_path) = sys.argv[1:]
+ sbom_file, sbom_sha, sbom_tool, govuln, build_cmd, ver_json_path,
+ signing_key_id, non_prod) = sys.argv[1:]
 ver_info = {}
 p = pathlib.Path(ver_json_path)
 if p.exists():
@@ -138,6 +172,8 @@ if p.exists():
 manifest = {
     "commit": sha,
     "dirty": False,
+    "non_production": non_prod == "1",
+    "signing_key_id": signing_key_id,
     "build_time": build_time,
     "source_date_epoch": int(epoch),
     "go_version": go_ver,
@@ -156,27 +192,16 @@ manifest = {
 pathlib.Path(manifest_path).write_text(json.dumps(manifest, indent=2) + "\n")
 PY
 
-SIGNING_KEY_FILE="${OCLIV_RELEASE_SIGNING_KEY_FILE:-}"
-if [ -z "$SIGNING_KEY_FILE" ] && [ "${OCLIV_UNSIGNED_DEV:-}" != "true" ]; then
-  echo "error: OCLIV_RELEASE_SIGNING_KEY_FILE is not set" >&2
-  echo "       Set it to an Ed25519 signing key (openssl genpkey -algorithm ed25519 -out key.pem)" >&2
-  echo "       To skip signing for local development builds: OCLIV_UNSIGNED_DEV=true" >&2
-  exit 1
-fi
-
 if [ -n "$SIGNING_KEY_FILE" ]; then
-  if [ ! -f "$SIGNING_KEY_FILE" ]; then
-    echo "error: signing key file not found: $SIGNING_KEY_FILE" >&2
-    exit 1
-  fi
-  echo "==> Signing release manifest"
+  echo "==> Signing release manifest (key_id=${SIGNING_KEY_ID:-custom})"
   RAWSIG="$OUT/release-manifest.json.sig.raw"
-  openssl dgst -sign "$SIGNING_KEY_FILE" -out "$RAWSIG" "$OUT/release-manifest.json"
+  { set +x; } 2>/dev/null
+  openssl pkeyutl -sign -inkey "$SIGNING_KEY_FILE" -rawin -in "$OUT/release-manifest.json" -out "$RAWSIG"
   xxd -p -cols 64 "$RAWSIG" | tr -d '\n' > "$OUT/release-manifest.json.sig"
   rm -f "$RAWSIG"
   echo "Manifest signed: $OUT/release-manifest.json.sig"
 else
-  echo "==> WARNING: Unsigned development build (OCLIV_UNSIGNED_DEV=true)"
+  echo "==> WARNING: Unsigned non-production development build (OCLIV_UNSIGNED_DEV=true)"
 fi
 
 echo "==> Release bundle written to $OUT"

@@ -1,6 +1,8 @@
 package relay
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -21,11 +23,18 @@ func newArtifactServer(t *testing.T, artifactDir string, manifestJSON []byte) *S
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig := ed25519.Sign(priv, manifestJSON)
 	s, err := New(Options{
 		DB:                  db,
 		Namespace:           "t.example.test",
 		ReleaseManifestJSON: manifestJSON,
+		ReleaseManifestSig:  sig,
 		ReleaseArtifactDir:  artifactDir,
+		ReleaseVerifyKeys:   []ed25519.PublicKey{pub},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -255,5 +264,157 @@ func TestValidateArtifactDirInvalidName(t *testing.T) {
 	err := validateArtifactDir(manifest, dir)
 	if err == nil {
 		t.Error("expected error for invalid artifact name, got nil")
+	}
+}
+
+func TestReleaseConfigCoherence(t *testing.T) {
+	content := []byte("fake-binary")
+	manifestJSON, dir := artifactManifest(t, map[string][]byte{
+		"ocliv-linux-amd64": content,
+	})
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	goodSig := ed25519.Sign(priv, manifestJSON)
+	badSig := make([]byte, ed25519.SignatureSize)
+
+	newDB := func(t *testing.T) *store.DB {
+		t.Helper()
+		db, err := store.Open(filepath.Join(t.TempDir(), "ocliv.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		return db
+	}
+
+	cases := []struct {
+		name    string
+		opts    Options
+		wantErr bool
+	}{
+		{
+			name:    "none configured is valid (disabled)",
+			opts:    Options{Namespace: "t.example.test"},
+			wantErr: false,
+		},
+		{
+			name:    "manifest only rejected",
+			opts:    Options{Namespace: "t.example.test", ReleaseManifestJSON: manifestJSON},
+			wantErr: true,
+		},
+		{
+			name:    "artifact dir only rejected",
+			opts:    Options{Namespace: "t.example.test", ReleaseArtifactDir: dir},
+			wantErr: true,
+		},
+		{
+			name:    "sig only rejected",
+			opts:    Options{Namespace: "t.example.test", ReleaseManifestSig: goodSig},
+			wantErr: true,
+		},
+		{
+			name:    "manifest + artifact dir without sig rejected",
+			opts:    Options{Namespace: "t.example.test", ReleaseManifestJSON: manifestJSON, ReleaseArtifactDir: dir},
+			wantErr: true,
+		},
+		{
+			name:    "manifest + artifact dir + bad sig rejected",
+			opts:    Options{Namespace: "t.example.test", ReleaseManifestJSON: manifestJSON, ReleaseArtifactDir: dir, ReleaseManifestSig: badSig, ReleaseVerifyKeys: []ed25519.PublicKey{pub}},
+			wantErr: true,
+		},
+		{
+			name:    "complete valid signed tuple accepted",
+			opts:    Options{Namespace: "t.example.test", ReleaseManifestJSON: manifestJSON, ReleaseArtifactDir: dir, ReleaseManifestSig: goodSig, ReleaseVerifyKeys: []ed25519.PublicKey{pub}},
+			wantErr: false,
+		},
+		{
+			name:    "explicit AllowUnsignedRelease with manifest + dir accepted",
+			opts:    Options{Namespace: "t.example.test", ReleaseManifestJSON: manifestJSON, ReleaseArtifactDir: dir, AllowUnsignedRelease: true},
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.opts.DB = newDB(t)
+			_, err := New(tc.opts)
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestHandleReleaseArtifactSymlinkReplacementRefused(t *testing.T) {
+	content := []byte("valid-binary")
+	manifestJSON, dir := artifactManifest(t, map[string][]byte{
+		"ocliv-linux-amd64": content,
+	})
+	s := newArtifactServer(t, dir, manifestJSON)
+
+	// Replace valid artifact with a symlink after startup validation.
+	target := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(target, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	artPath := filepath.Join(dir, "ocliv-linux-amd64")
+	if err := os.Remove(artPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, artPath); err != nil {
+		t.Fatal(err)
+	}
+
+	r := httptest.NewRequest(http.MethodGet, "/.well-known/ocliv-artifacts/ocliv-linux-amd64", nil)
+	w := httptest.NewRecorder()
+	s.handleReleaseArtifact(w, r)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("symlinked artifact must be refused (404), got %d", w.Code)
+	}
+}
+
+func TestAllowUnsignedDevReleaseRefusedOnPublicRelayHost(t *testing.T) {
+	content := []byte("fake-binary")
+	manifestJSON, dir := artifactManifest(t, map[string][]byte{
+		"ocliv-linux-amd64": content,
+	})
+	db, err := store.Open(filepath.Join(t.TempDir(), "ocliv.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	t.Setenv("OCLIV_ENV", "")
+
+	// Non-loopback RelayHost without OCLIV_ENV=development MUST fail.
+	if _, err := New(Options{
+		DB:                   db,
+		Namespace:            "t.prod.example",
+		RelayHost:            "relay.prod.example",
+		ReleaseManifestJSON:  manifestJSON,
+		ReleaseArtifactDir:   dir,
+		AllowUnsignedRelease: true,
+	}); err == nil {
+		t.Fatal("expected error for AllowUnsignedRelease on non-loopback RelayHost")
+	}
+
+	// Loopback RelayHost succeeds and reports UNSIGNED_DEVELOPMENT.
+	s, err := New(Options{
+		DB:                   db,
+		Namespace:            "t.stage.local",
+		RelayHost:            "127.0.0.1",
+		ReleaseManifestJSON:  manifestJSON,
+		ReleaseArtifactDir:   dir,
+		AllowUnsignedRelease: true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error on loopback dev host: %v", err)
+	}
+	if st := s.StatusSnapshot(); st.ReleaseTrustMode != "UNSIGNED_DEVELOPMENT" {
+		t.Fatalf("ReleaseTrustMode=%q, want UNSIGNED_DEVELOPMENT", st.ReleaseTrustMode)
 	}
 }

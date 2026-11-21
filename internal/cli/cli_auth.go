@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1077,4 +1078,24 @@ func emitKeyRotateResult(res keyRotateResult, jsonOut bool) int {
 		fmt.Printf("  restarted publishers: %s\n", strings.Join(res.RestartedPublishers, ", "))
 	}
 	return apperr.ExitOK
+}
+
+// normalizeRelayAuthority canonicalizes a relay URL to scheme://host for
+// rotation-journal authority binding comparisons.
+func normalizeRelayAuthority(raw string) (string, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", fmt.Errorf("empty relay URL")
+	}
+	if !strings.Contains(s, "://") {
+		s = "https://" + s
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return "", err
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("relay URL has no host")
+	}
+	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host), nil
 }

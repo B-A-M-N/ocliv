@@ -337,41 +337,6 @@ func TestBackendEnvFileSingleFDSymlinkAndOversizedRejected(t *testing.T) {
 	}
 }
 
-func TestPrivilegedSetupUnprivilegedEnrollParsingAndCmd(t *testing.T) {
-	// Malformed SUDO_UID MUST fail closed.
-	t.Setenv("SUDO_USER", "root")
-	t.Setenv("SUDO_UID", "notanumber")
-	t.Setenv("SUDO_GID", "1000")
-	if _, _, err := parseSudoTarget(); err == nil {
-		t.Fatalf("A6 REGRESSION: parseSudoTarget accepted root/malformed SUDO_UID")
-	}
-
-	// Curated child command MUST set Credential, pass code on stdin (NOT argv), and isolate HOME.
-	cmd := buildUnprivilegedEnrollCmd("/usr/local/bin/ocliv", "https://relay.example", "SECRET-CODE-999", sudoTarget{
-		Username: "alice",
-		UID:      1000,
-		GID:      1000,
-		HomeDir:  "/home/alice",
-	})
-	for _, arg := range cmd.Args {
-		if strings.Contains(arg, "SECRET-CODE-999") {
-			t.Fatalf("A6 REGRESSION: enrollment code leaked into argv: %v", cmd.Args)
-		}
-	}
-	if cmd.SysProcAttr == nil || cmd.SysProcAttr.Credential == nil || cmd.SysProcAttr.Credential.Uid != 1000 || cmd.SysProcAttr.Credential.Gid != 1000 {
-		t.Fatalf("A6 REGRESSION: child Credential not set to invoking UID/GID: %+v", cmd.SysProcAttr)
-	}
-	var sawHome bool
-	for _, kv := range cmd.Env {
-		if kv == "HOME=/home/alice" {
-			sawHome = true
-		}
-	}
-	if !sawHome {
-		t.Fatalf("A6 REGRESSION: curated child env missing HOME=/home/alice: %v", cmd.Env)
-	}
-}
-
 func TestKeyRotationVerifiesPublishersUnderNewKeyAndResumesPartial(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -535,9 +500,9 @@ func TestBuildInfoLdflagPrecedenceAndDefaultEdgeConsistency(t *testing.T) {
 		t.Fatalf("A10 REGRESSION: runtimeManifest ignored unified BuildInfo: %+v", m)
 	}
 
-	// A11: DefaultEdgeMode == recommendedEdgeMode == "tunnel".
-	if DefaultEdgeMode() != "tunnel" {
-		t.Fatalf("expected DefaultEdgeMode=tunnel, got %q", DefaultEdgeMode())
+	// A11: DefaultEdgeMode == recommendedEdgeMode == "wildcard".
+	if DefaultEdgeMode() != "wildcard" {
+		t.Fatalf("expected DefaultEdgeMode=wildcard, got %q", DefaultEdgeMode())
 	}
 	if got := recommendedEdgeMode(setup.Detection{Path: setup.PathDirectV4}); got != DefaultEdgeMode() {
 		t.Fatalf("A11 REGRESSION: recommendedEdgeMode=%q != DefaultEdgeMode=%q", got, DefaultEdgeMode())

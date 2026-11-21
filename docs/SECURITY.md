@@ -85,18 +85,68 @@ signature for a different purpose.
 
 ---
 
-## Enrollment
+## Enrollment and Publisher Pairing
 
-One-time enrollment codes authorize a public key to be associated with a
-tenant on the relay. Codes are stored as bcrypt/scrypt verifiers on the relay
-— the plaintext code is never persisted.
+**Publisher-initiated pairing (primary flow):**
+1. Publisher runs `ocliv pair https://<relay-host>` (generating a local Ed25519
+   keypair if needed) and submits its public key to `POST /v1/agent/pair-request`.
+2. The relay returns a short human-readable **display code** (operator-only) and
+   high-entropy **poll credentials** (`poll_id` + `poll_secret`). Only the
+   SHA-256 `poll_verifier` is stored on the relay — never the raw `poll_secret`.
+3. Publisher persists `pair-pending.json` (bound to `key_id`, atomic `0600`
+   write, `O_NOFOLLOW` strict read) before waiting so `ocliv pair resume` works
+   after interruption. Polling uses `POST /v1/agent/pair-status` with constant-time
+   verifier comparison; display-code-only GET polling is refused (`405`).
+4. The operator approves the display code on the relay via
+   `ocliv relay approve <CODE> --tenant <TENANT>`, recording `resolved_tenant_id`
+   and enrolling the public key. On completion, the publisher verifies that the
+   saved `key_id`, local `key_id`, and relay-approved `key_id` all match.
 
-Enrollment codes from `ocliv relay issue-enroll` are single-use and
-time-limited (default 24 hours). The `--out FILE` option writes codes to a
-mode-0600 file rather than stdout.
+**One-time enrollment codes (headless/automated flow):**
+One-time enrollment codes from `ocliv relay issue-enroll` are stored as verifiers
+on the relay — plaintext codes are never persisted. Code files passed to
+`ocliv login --code-file PATH` are opened with `O_NOFOLLOW` and must be regular
+files with mode `0600` and correct ownership.
 
-Code files passed to `ocliv login --code-file PATH` are opened with
-`O_NOFOLLOW` and must be regular files with mode 0600 and correct ownership.
+---
+
+## Release Signature Trust Model
+
+Official release bundles produced by `scripts/release/build-release.sh` include
+`release-manifest.json`, its detached Ed25519 signature `release-manifest.json.sig`
+(signed over the exact manifest bytes via `openssl pkeyutl -sign -rawin`),
+`SHA256SUMS`, and a CycloneDX SBOM (stored outside the binary `artifacts` map).
+
+- **Coherent relay startup:** A relay configured to serve releases must provide
+  the complete validated tuple (`--release-manifest`, `--release-manifest-sig`,
+  `--release-artifacts`), with startup Ed25519 verification and SHA-256
+  verification of every declared binary via `O_NOFOLLOW`. Partial configs fail
+  closed at startup.
+- **Client verification:** Both `ocliv install` and `packaging/install/install-client.sh`
+  require valid Ed25519 signatures against the embedded trusted key set, validate
+  download URLs (HTTPS for non-loopback; HTTP loopback-only), verify SHA-256 and
+  candidate `version --json` commit BEFORE atomic swap, preserve `.prev` safely
+  without following symlinks, and automatically roll back on post-swap failure.
+  Unsigned releases are permitted only via explicit loopback-only development flags.
+
+---
+
+## Capacity Governance and Terminal Lease Tombstones
+
+- **Global caps:** `--max-http-streams`, `--max-ws-streams`, and
+  `--max-publisher-sessions` enforce server-wide ceilings. Publisher session
+  admission runs after cryptographic authentication and before WebSocket upgrade
+  (returning HTTP 503 when full). `/health/ready` remains healthy during visitor
+  stream backpressure while `/health/status` exposes separate `process_ready`,
+  `sessions_ready`, `http_saturated`, and `ws_saturated` signals. Systemd units
+  pin `LimitNOFILE=65536` and `ocliv relay doctor` verifies `RLIMIT_NOFILE`
+  against configured concurrency.
+- **Terminal lease tombstones:** Terminal rows (`REVOKED`, `CLOSED`, `EXPIRED`)
+  in `leases` are retained indefinitely (~200 bytes/row, ~20 MB per 100k leases)
+  as minimal security tombstones required by backup/restore rollback guards and
+  ownership fences. Ephemeral `visitor_sessions` and `access_tokens` attached to
+  terminal leases are pruned after 30 days by the relay maintenance loop without
+  deleting the lease tombstones.
 
 ---
 

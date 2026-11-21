@@ -18,6 +18,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"ocliv/internal/limits"
 )
 
 // Finding is one diagnostic line.
@@ -246,10 +248,13 @@ func isTrustFailure(err error) bool {
 // was started with --relay-host (e.g. temporary *.ts.net ingress);
 // without it the doctor probes (and misdiagnoses) the wrong hostname.
 type RelayInput struct {
-	DataDir    string
-	Domain     string
-	RelayHost  string
-	CACertPath string
+	DataDir        string
+	Domain         string
+	RelayHost      string
+	CACertPath     string
+	MaxHTTPStreams int64
+	MaxWSStreams   int64
+	MaxSessions    int64
 }
 
 // relayAuthorityHost resolves the exact control hostname the relay was
@@ -333,16 +338,35 @@ func CheckRelay(in RelayInput) Result {
 	}
 	add(false, false, "public internet", "not applicable to private staging; NOT VERIFIED for production")
 	add(true, false, "health endpoints", "/health/live, /health/ready, /metrics expected on loopback only (binding not verified by doctor)")
-	// OS file-descriptor budget: each publisher session consumes at least 3 FDs.
-	// A relay running under the default soft limit (1024) will hit EMFILE under load.
+	// OS file-descriptor budget: verify RLIMIT_NOFILE can accommodate the
+	// configured stream and publisher-session concurrency limits.
+	maxHTTP := in.MaxHTTPStreams
+	if maxHTTP <= 0 {
+		maxHTTP = limits.DefaultGlobalMaxHTTPStreams
+	}
+	maxWS := in.MaxWSStreams
+	if maxWS <= 0 {
+		maxWS = limits.DefaultGlobalMaxWSStreams
+	}
+	maxSess := in.MaxSessions
+	if maxSess <= 0 {
+		maxSess = limits.DefaultGlobalMaxSessions
+	}
+	// Worst-case FD estimate: ~3 FDs per publisher session + 1 per active WS
+	// visitor connection + 1 per active HTTP visitor connection + 256 headroom
+	// for SQLite/listeners/logs.
+	neededFDs := uint64(maxSess*3 + maxHTTP + maxWS + 256)
+	if neededFDs < 4096 {
+		neededFDs = 4096
+	}
+	add(true, true, "capacity config", fmt.Sprintf("max_http_streams=%d max_ws_streams=%d max_publisher_sessions=%d (estimated FD need=%d)", maxHTTP, maxWS, maxSess, neededFDs))
 	var rLimit syscall.Rlimit
 	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
 		add(false, false, "fd limit", "could not read RLIMIT_NOFILE: "+shortErr(err))
 	} else {
-		const minFDs = 4096
-		detail := fmt.Sprintf("RLIMIT_NOFILE soft=%d hard=%d", rLimit.Cur, rLimit.Max)
-		if rLimit.Cur < minFDs {
-			add(false, true, "fd limit", detail+" — below recommended minimum "+fmt.Sprintf("%d", minFDs)+"; set LimitNOFILE=65536 in the systemd unit or run ulimit -n 65536")
+		detail := fmt.Sprintf("RLIMIT_NOFILE soft=%d hard=%d (need >=%d for configured concurrency)", rLimit.Cur, rLimit.Max, neededFDs)
+		if rLimit.Cur < neededFDs {
+			add(false, true, "fd limit", detail+" — configured concurrency exceeds process FD ceiling; set LimitNOFILE=65536 in the systemd unit or run ulimit -n 65536")
 		} else {
 			add(true, true, "fd limit", detail)
 		}

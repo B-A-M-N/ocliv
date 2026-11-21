@@ -9,15 +9,14 @@ package cli
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
-	"net/url"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -25,11 +24,7 @@ import (
 	"time"
 
 	"ocliv/internal/apperr"
-	"ocliv/internal/config"
-	"ocliv/internal/identity"
-	"ocliv/internal/relay"
 	"ocliv/internal/setup"
-	"ocliv/internal/store"
 )
 
 // setupManagedDestinations are the system files bootstrap may
@@ -57,7 +52,8 @@ const (
 	defaultEchoV4           = "https://api4.ipify.org"
 	defaultEchoV6           = "https://api6.ipify.org"
 	setupStateSchemaVersion = 2
-	defaultEdgeMode         = "tunnel"
+	setupTemplateVersion    = 2
+	defaultEdgeMode         = "wildcard"
 )
 
 // DefaultEdgeMode is the single-source default edge topology used by setup
@@ -103,22 +99,64 @@ func setupStageIndex(stage string) int {
 // <configDir>/setup-state.json so an interrupted `ocliv setup` can revalidate
 // external evidence and resume cleanly without persisting raw credentials.
 type setupState struct {
-	SchemaVersion  int               `json:"schema_version"`
-	Fingerprint    string            `json:"fingerprint,omitempty"`
-	DetectedPath   string            `json:"detected_path,omitempty"`
-	Hostname       string            `json:"hostname,omitempty"`
-	EdgeMode       string            `json:"edge_mode,omitempty"`
-	ACMEEmail      string            `json:"acme_email,omitempty"`
-	DataDir        string            `json:"data_dir,omitempty"`
-	CompletedStage string            `json:"completed_stage,omitempty"`
-	StageEvidence  map[string]string `json:"stage_evidence,omitempty"`
-	Blocker        string            `json:"blocker,omitempty"`
-	BinaryVersion  string            `json:"binary_version,omitempty"`
-	UpdatedAt      string            `json:"updated_at,omitempty"`
+	SchemaVersion   int               `json:"schema_version"`
+	TemplateVersion int               `json:"template_version,omitempty"`
+	Fingerprint     string            `json:"fingerprint,omitempty"`
+	DetectedPath    string            `json:"detected_path,omitempty"`
+	Hostname        string            `json:"hostname,omitempty"`
+	EdgeMode        string            `json:"edge_mode,omitempty"`
+	ACMEEmail       string            `json:"acme_email,omitempty"`
+	DNSProvider     string            `json:"dns_provider,omitempty"`
+	DNSEnvName      string            `json:"dns_env_name,omitempty"`
+	OutDir          string            `json:"out_dir,omitempty"`
+	DataDir         string            `json:"data_dir,omitempty"`
+	CompletedStage  string            `json:"completed_stage,omitempty"`
+	StageEvidence   map[string]string `json:"stage_evidence,omitempty"`
+	Blocker         string            `json:"blocker,omitempty"`
+	BinaryVersion   string            `json:"binary_version,omitempty"`
+	UpdatedAt       string            `json:"updated_at,omitempty"`
+}
+
+// SetupFingerprint captures every non-secret deployment-affecting input so any
+// change to topology, DNS provider/env-var name, paths, Caddy version, or
+// rendered template version invalidates stale resume evidence.
+type SetupFingerprint struct {
+	Hostname        string `json:"hostname"`
+	EdgeMode        string `json:"edge_mode"`
+	ACMEEmail       string `json:"acme_email"`
+	DNSProvider     string `json:"dns_provider"`
+	DNSEnvName      string `json:"dns_env_name"`
+	OutDir          string `json:"out_dir"`
+	DataDir         string `json:"data_dir"`
+	CaddyVersion    string `json:"caddy_version"`
+	TemplateVersion int    `json:"template_version"`
+}
+
+func computeSetupFingerprint(fp SetupFingerprint) string {
+	fp.Hostname = strings.ToLower(strings.TrimSpace(fp.Hostname))
+	fp.EdgeMode = strings.TrimSpace(fp.EdgeMode)
+	fp.ACMEEmail = strings.TrimSpace(fp.ACMEEmail)
+	fp.DNSProvider = strings.ToLower(strings.TrimSpace(fp.DNSProvider))
+	fp.DNSEnvName = strings.TrimSpace(fp.DNSEnvName)
+	fp.OutDir = strings.TrimSpace(fp.OutDir)
+	fp.DataDir = strings.TrimSpace(fp.DataDir)
+	if fp.CaddyVersion == "" {
+		fp.CaddyVersion = setup.PinnedCaddyVersion
+	}
+	if fp.TemplateVersion == 0 {
+		fp.TemplateVersion = setupTemplateVersion
+	}
+	raw, _ := json.Marshal(fp)
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }
 
 func setupFingerprint(hostname, edge, acmeEmail string) string {
-	return strings.ToLower(strings.TrimSpace(hostname)) + "|" + strings.TrimSpace(edge) + "|" + strings.TrimSpace(acmeEmail)
+	return computeSetupFingerprint(SetupFingerprint{
+		Hostname:  hostname,
+		EdgeMode:  edge,
+		ACMEEmail: acmeEmail,
+	})
 }
 
 func setupStatePath() (string, error) {
@@ -226,9 +264,20 @@ func saveSetupState(st setupState) error {
 		return err
 	}
 	st.SchemaVersion = setupStateSchemaVersion
+	st.TemplateVersion = setupTemplateVersion
 	st.BinaryVersion = BinaryVersion
 	if st.Fingerprint == "" {
-		st.Fingerprint = setupFingerprint(st.Hostname, st.EdgeMode, st.ACMEEmail)
+		st.Fingerprint = computeSetupFingerprint(SetupFingerprint{
+			Hostname:        st.Hostname,
+			EdgeMode:        st.EdgeMode,
+			ACMEEmail:       st.ACMEEmail,
+			DNSProvider:     st.DNSProvider,
+			DNSEnvName:      st.DNSEnvName,
+			OutDir:          st.OutDir,
+			DataDir:         st.DataDir,
+			CaddyVersion:    setup.PinnedCaddyVersion,
+			TemplateVersion: setupTemplateVersion,
+		})
 	}
 	st.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	b, err := json.MarshalIndent(st, "", "  ")
@@ -272,14 +321,27 @@ func revalidateStage(st setupState) func(string) bool {
 			addrs, err := setupLookupHost(ctx, st.Hostname)
 			return err == nil && len(addrs) > 0
 		case stageArtifactsRendered:
-			if st.StageEvidence[stageArtifactsRendered] == "" || st.DataDir == "" {
+			artifactDir := st.OutDir
+			if artifactDir == "" {
+				artifactDir = st.DataDir
+			}
+			if st.StageEvidence[stageArtifactsRendered] == "" || artifactDir == "" {
 				return false
 			}
-			// Rendered Caddyfile is the key deployment artifact; its absence means re-render.
-			_, err := os.Stat(filepath.Join(st.DataDir, "Caddyfile"))
-			return err == nil
+			for _, f := range []string{"Caddyfile", "relay.env", "ocliv-relay.service"} {
+				if _, err := os.Stat(filepath.Join(artifactDir, f)); err != nil {
+					return false
+				}
+			}
+			return true
 		case stageSystemInstalled:
 			if st.StageEvidence[stageSystemInstalled] == "" {
+				return false
+			}
+			if _, err := os.Stat("/etc/caddy/Caddyfile"); err != nil {
+				return false
+			}
+			if _, err := os.Stat("/etc/ocliv/relay.env"); err != nil {
 				return false
 			}
 			return exec.Command("systemctl", "is-enabled", "ocliv-relay").Run() == nil
@@ -345,6 +407,8 @@ func cmdSetup(argv []string) int {
 	outDir := ""
 	dataDir := "/var/lib/ocliv"
 	provider := ""
+	dnsProvider := ""
+	dnsEnv := ""
 	compartment := ""
 	zone := ""
 	confirmCreate := false
@@ -381,6 +445,16 @@ func cmdSetup(argv []string) int {
 		case a == "--acme-email" && i+1 < len(argv):
 			i++
 			acmeEmail = argv[i]
+		case strings.HasPrefix(a, "--dns-provider="):
+			dnsProvider = strings.TrimPrefix(a, "--dns-provider=")
+		case a == "--dns-provider" && i+1 < len(argv):
+			i++
+			dnsProvider = argv[i]
+		case strings.HasPrefix(a, "--dns-env="):
+			dnsEnv = strings.TrimPrefix(a, "--dns-env=")
+		case a == "--dns-env" && i+1 < len(argv):
+			i++
+			dnsEnv = argv[i]
 		case strings.HasPrefix(a, "--out="):
 			outDir = strings.TrimPrefix(a, "--out=")
 		case a == "--out" && i+1 < len(argv):
@@ -441,13 +515,19 @@ func cmdSetup(argv []string) int {
 			if !edgeExplicit && prev.EdgeMode != "" {
 				edge = prev.EdgeMode
 			}
+			if dnsProvider == "" && prev.DNSProvider != "" {
+				dnsProvider = prev.DNSProvider
+			}
+			if outDir == "" && prev.OutDir != "" {
+				outDir = prev.OutDir
+			}
 		}
 	}
 	if edge != "auto" && edge != "tunnel" && edge != "single-host" && edge != "wildcard" {
 		fmt.Fprintln(os.Stderr, "error: --edge must be auto, single-host, wildcard, or tunnel")
 		return apperr.ExitCLIValidation
 	}
-	// A11: Default edge "auto" uses the single-source DefaultEdgeMode() ("tunnel").
+	// A11: Default edge "auto" uses the single-source DefaultEdgeMode() ("wildcard").
 	if edge == "auto" {
 		edge = DefaultEdgeMode()
 	}
@@ -459,7 +539,17 @@ func cmdSetup(argv []string) int {
 		return apperr.ExitInternal
 	}
 	if hasPrev && !check && !dryRun && !refreshDNS {
-		wantFP := setupFingerprint(hostname, edge, acmeEmail)
+		wantFP := computeSetupFingerprint(SetupFingerprint{
+			Hostname:        hostname,
+			EdgeMode:        edge,
+			ACMEEmail:       acmeEmail,
+			DNSProvider:     dnsProvider,
+			DNSEnvName:      dnsEnv,
+			OutDir:          outDir,
+			DataDir:         dataDir,
+			CaddyVersion:    setup.PinnedCaddyVersion,
+			TemplateVersion: setupTemplateVersion,
+		})
 		var revalidated []string
 		resumeStage, revalidated = planSetupResume(prevState, wantFP, revalidateStage(prevState))
 		if len(revalidated) > 0 {
@@ -496,7 +586,22 @@ func cmdSetup(argv []string) int {
 	state.Hostname = hostname
 	state.EdgeMode = edge
 	state.ACMEEmail = acmeEmail
+	state.DNSProvider = dnsProvider
+	state.DNSEnvName = dnsEnv
+	state.OutDir = outDir
 	state.DataDir = dataDir
+	state.TemplateVersion = setupTemplateVersion
+	state.Fingerprint = computeSetupFingerprint(SetupFingerprint{
+		Hostname:        hostname,
+		EdgeMode:        edge,
+		ACMEEmail:       acmeEmail,
+		DNSProvider:     dnsProvider,
+		DNSEnvName:      dnsEnv,
+		OutDir:          outDir,
+		DataDir:         dataDir,
+		CaddyVersion:    setup.PinnedCaddyVersion,
+		TemplateVersion: setupTemplateVersion,
+	})
 	if !check && !dryRun && !refreshDNS && echoV4 == defaultEchoV4 && echoV6 == defaultEchoV6 && !skipStage(stageDetected) {
 		blocker := ""
 		if hostname == "" {
@@ -603,36 +708,36 @@ func cmdSetup(argv []string) int {
 	var detail string
 	if jsonOut {
 		rc, detail = runSuppressedStdout(func() int {
-			return runSetupDNS(ctx, d, hostname, tokenFile, acmeEmail, outDir, dataDir, dryRun, edge)
+			return runSetupDNS(ctx, d, hostname, tokenFile, acmeEmail, outDir, dataDir, dryRun, edge, dnsProvider, dnsEnv, &state, skipStage)
 		})
 	} else {
-		rc = runSetupDNS(ctx, d, hostname, tokenFile, acmeEmail, outDir, dataDir, dryRun, edge)
+		rc = runSetupDNS(ctx, d, hostname, tokenFile, acmeEmail, outDir, dataDir, dryRun, edge, dnsProvider, dnsEnv, &state, skipStage)
 	}
-	stage := "dns_in_progress"
+	stage := state.CompletedStage
+	if stage == "" {
+		stage = "dns_in_progress"
+	}
 	if rc == apperr.ExitOK {
 		if dryRun {
 			stage = "dry_run_ok"
-		} else {
+		} else if acmeEmail != "" {
 			stage = stageComplete // canonical stage name so planSetupResume can index it
 		}
 	}
-	if !dryRun {
-		blocker := "dns_or_provisioning_incomplete"
-		if rc == apperr.ExitOK {
-			blocker = ""
-		}
-		state.Blocker = blocker
+	if !dryRun && rc == apperr.ExitOK && stage == stageComplete {
+		state.Blocker = ""
 		state.DataDir = dataDir
-		if serr := checkpointSetup(&state, stage, map[string]string{
+		if serr := checkpointSetup(&state, stageComplete, map[string]string{
 			"hostname":    hostname,
 			"edge":        edge,
 			stageComplete: time.Now().UTC().Format(time.RFC3339),
 		}); serr != nil {
 			fmt.Fprintln(os.Stderr, "error: cannot persist setup state: "+serr.Error())
-			if rc == apperr.ExitOK {
-				rc = apperr.ExitInternal
-			}
+			rc = apperr.ExitInternal
 		}
+	} else if !dryRun && rc != apperr.ExitOK {
+		state.Blocker = "setup_incomplete"
+		_ = saveSetupState(state)
 	}
 	return emitSetupJSON("setup_dns", stage, detail, rc)
 }
@@ -744,143 +849,134 @@ func readDynv6Token(tokenFile, hostname string) (string, int) {
 	return token, apperr.ExitOK
 }
 
-func runSetupDNS(ctx context.Context, d setup.Detection, hostname, tokenFile, acmeEmail, outDir, dataDir string, dryRun bool, edge string) int {
+func runSetupDNS(ctx context.Context, d setup.Detection, hostname, tokenFile, acmeEmail, outDir, dataDir string, dryRun bool, edge, dnsProvider, dnsEnv string, state *setupState, skipStage func(string) bool) int {
 	token, code := readDynv6Token(tokenFile, hostname)
 	if code != apperr.ExitOK {
 		return code
 	}
 	isDuck := setup.IsDuckDNSZone(hostname)
-	fmt.Printf("dns update: %s -> v4=%s v6=%s (token from %s, redacted)\n",
-		hostname, nonEmpty(d.EgressV4), nonEmpty(d.EgressV6), tokenSourceForHost(tokenFile, hostname))
 	if dryRun {
+		fmt.Printf("dns update: %s -> v4=%s v6=%s (token from %s, redacted)\n",
+			hostname, nonEmpty(d.EgressV4), nonEmpty(d.EgressV6), tokenSourceForHost(tokenFile, hostname))
 		fmt.Printf("dry-run: no request sent\n")
 		return apperr.ExitOK
 	}
-	var updErr error
-	if isDuck {
-		updErr = setup.UpdateDuckDNS(ctx, duckdnsEndpoint(), hostname, token, d.EgressV4, d.EgressV6)
+
+	// Stage 1: DNS_UPDATED
+	if skipStage != nil && skipStage(stageDNSUpdated) {
+		fmt.Printf("setup: skipping %s (already verified)\n", stageDNSUpdated)
 	} else {
-		updErr = setup.UpdateDynv6(ctx, dynv6Endpoint(), hostname, token, d.EgressV4, d.EgressV6)
+		fmt.Printf("dns update: %s -> v4=%s v6=%s (token from %s, redacted)\n",
+			hostname, nonEmpty(d.EgressV4), nonEmpty(d.EgressV6), tokenSourceForHost(tokenFile, hostname))
+		var updErr error
+		if isDuck {
+			updErr = setup.UpdateDuckDNS(ctx, duckdnsEndpoint(), hostname, token, d.EgressV4, d.EgressV6)
+		} else {
+			updErr = setup.UpdateDynv6(ctx, dynv6Endpoint(), hostname, token, d.EgressV4, d.EgressV6)
+		}
+		if updErr != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", updErr)
+			return apperr.ExitRelayTLS
+		}
+		fmt.Printf("dns updated for %s; verify with: dig +short %s A; dig +short %s AAAA\n", hostname, hostname, hostname)
+		if state != nil {
+			_ = checkpointSetup(state, stageDNSUpdated, map[string]string{
+				stageDNSUpdated: time.Now().UTC().Format(time.RFC3339),
+			})
+		}
 	}
-	if updErr != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", updErr)
-		return apperr.ExitRelayTLS
-	}
-	fmt.Printf("dns updated for %s; verify with: dig +short %s A; dig +short %s AAAA\n", hostname, hostname, hostname)
+
 	if acmeEmail == "" {
 		return apperr.ExitOK
 	}
-	return runSetupRender(ctx, d, hostname, token, acmeEmail, outDir, dataDir, edge)
-}
 
-// runSetupRender generates the reviewable deployment for the hostname,
-// self-checks it, confirms DNS resolution against observed egress, and
-// then runs the root-only bootstrap. For dynv6 zones that bootstrap also
-// installs and enables the DNS refresh timer using the validated token;
-// non-root runs print the required operator actions instead.
-func runSetupRender(ctx context.Context, d setup.Detection, hostname, dnsToken, acmeEmail, outDir, dataDir, edge string) int {
-	dir, _, _, err := agentFiles()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error: "+err.Error())
-		return apperr.ExitInternal
-	}
-	if outDir == "" {
-		outDir = filepath.Join(dir, "setup-"+strings.ToLower(hostname))
-	}
-	initArgv := []string{"--domain", hostname, "--edge", edge, "--mcp-host", hostname,
-		"--acme-email", acmeEmail, "--out", outDir}
-	if code := cmdRelayInit(initArgv); code != apperr.ExitOK {
-		return code
-	}
-	if bad := checkInitDir(outDir); len(bad) > 0 {
-		for _, line := range bad {
-			fmt.Fprintln(os.Stderr, "init check: "+line)
-		}
-		return apperr.ExitInternal
-	}
-	matched, addrs, err := verifyDNSResolution(ctx, hostname, []string{d.EgressV4, d.EgressV6})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "dns for %s not resolving here yet (%v); wait for propagation, then re-run `ocliv setup --auto --hostname %s --acme-email %s`\n", hostname, err, hostname, acmeEmail)
-		return apperr.ExitRelayTLS
-	}
-	if !matched {
-		fmt.Fprintf(os.Stderr, "dns for %s resolves to %s here, not to observed egress %s/%s; refusing to persist an unverified endpoint (propagation delay or wrong zone?)\n",
-			hostname, strings.Join(addrs, ","), nonEmpty(d.EgressV4), nonEmpty(d.EgressV6))
-		return apperr.ExitRelayTLS
-	}
-	// The tunnel and wildcard edges serve per-tunnel hostnames under
-	// *.t.<domain> (on-demand ACME). An apex A/AAAA update is not
-	// wildcard provisioning, so those edges must prove a fresh tunnel
-	// hostname resolves here before claiming the deployment is
-	// complete. The single-host edge serves exactly ONE apex hostname
-	// and needs no wildcard record: requiring one there would block a
-	// perfectly valid single-host MCP deployment.
-	if edge == "tunnel" || edge == "wildcard" {
-		if wmatched, _, werr := verifyWildcardDNS(ctx, hostname, []string{d.EgressV4, d.EgressV6}); werr != nil || !wmatched {
-			fmt.Fprintf(os.Stderr, "ACTION REQUIRED: *.t.%s does not resolve to this host here", hostname)
-			if werr != nil {
-				fmt.Fprintf(os.Stderr, " (%v)", werr)
-			}
-			fmt.Fprintf(os.Stderr, "; tunnel hostnames like <id>.t.%s would not validate.\n", hostname)
-			fmt.Fprintf(os.Stderr, "ACTION REQUIRED: create one wildcard record — *.t.%s A %s%s — then re-run `ocliv setup --auto --hostname %s --acme-email %s`\n",
-				hostname, nonEmpty(d.EgressV4), wildcardAAAASuffix(d.EgressV6), hostname, acmeEmail)
+	// Stage 2: DNS_VERIFIED
+	if skipStage != nil && skipStage(stageDNSVerified) {
+		fmt.Printf("setup: skipping %s (already verified)\n", stageDNSVerified)
+	} else {
+		matched, addrs, err := verifyDNSResolution(ctx, hostname, []string{d.EgressV4, d.EgressV6})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "dns for %s not resolving here yet (%v); wait for propagation, then re-run `ocliv relay setup --auto --hostname %s --acme-email %s`\n", hostname, err, hostname, acmeEmail)
 			return apperr.ExitRelayTLS
 		}
-	}
-	_, _, cfgPath, uid, gid, err := setupAgentFiles()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error: "+err.Error())
-		return apperr.ExitInternal
-	}
-	relayURL := "https://" + strings.ToLower(strings.TrimSuffix(strings.TrimSpace(hostname), "."))
-	existing := readExistingRelayURL(cfgPath)
-	// The rendered deployment in outDir is the *candidate* setup; the
-	// recorded relay_url is the *active* client configuration. The
-	// candidate becomes active only after provisioning succeeds —
-	// never on DNS verification alone, which proves nothing about
-	// Caddy, relay startup, or enrollment.
-	fmt.Printf("deployment rendered to %s (candidate; active relay_url unchanged: %s)\n", outDir, nonEmpty(existing))
-	code, completed := runSetupBootstrap(d, hostname, outDir, dataDir, dnsToken)
-	if code == apperr.ExitOK && completed && shouldPersistRelayURL(existing, relayURL, completed) {
-		if err := mergeRelayURL(cfgPath, relayURL); err != nil {
-			fmt.Fprintln(os.Stderr, "error: "+err.Error())
-			return apperr.ExitInternal
+		if !matched {
+			fmt.Fprintf(os.Stderr, "dns for %s resolves to %s here, not to observed egress %s/%s; refusing to proceed with an unverified endpoint (propagation delay or wrong zone?)\n",
+				hostname, strings.Join(addrs, ","), nonEmpty(d.EgressV4), nonEmpty(d.EgressV6))
+			return apperr.ExitRelayTLS
 		}
-		if err := chownIfSudo(cfgPath, uid, gid); err != nil {
-			fmt.Fprintln(os.Stderr, "error: "+err.Error())
-			return apperr.ExitInternal
+		if edge == "tunnel" || edge == "wildcard" {
+			if wmatched, _, werr := verifyWildcardDNS(ctx, hostname, []string{d.EgressV4, d.EgressV6}); werr != nil || !wmatched {
+				fmt.Fprintf(os.Stderr, "ACTION REQUIRED: *.t.%s does not resolve to this host here", hostname)
+				if werr != nil {
+					fmt.Fprintf(os.Stderr, " (%v)", werr)
+				}
+				fmt.Fprintf(os.Stderr, "; tunnel hostnames like <id>.t.%s would not validate.\n", hostname)
+				fmt.Fprintf(os.Stderr, "ACTION REQUIRED: create one wildcard record — *.t.%s A %s%s — then re-run `ocliv relay setup --auto --hostname %s --acme-email %s`\n",
+					hostname, nonEmpty(d.EgressV4), wildcardAAAASuffix(d.EgressV6), hostname, acmeEmail)
+				return apperr.ExitRelayTLS
+			}
 		}
-		fmt.Printf("provisioning complete; relay_url now %s\n", relayURL)
-	} else if code == apperr.ExitOK && completed {
-		fmt.Printf("provisioning complete; relay_url unchanged\n")
+		if state != nil {
+			_ = checkpointSetup(state, stageDNSVerified, map[string]string{
+				stageDNSVerified: strings.Join(addrs, ","),
+			})
+		}
+	}
+
+	// Stage 3: ARTIFACTS_RENDERED
+	if outDir == "" {
+		baseDir := "/var/lib/ocliv"
+		if os.Geteuid() != 0 {
+			dir, _, _, err := agentFiles()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error: "+err.Error())
+				return apperr.ExitInternal
+			}
+			baseDir = dir
+		}
+		outDir = filepath.Join(baseDir, "setup-"+strings.ToLower(hostname))
+	}
+	if state != nil {
+		state.OutDir = outDir
+	}
+	if skipStage != nil && skipStage(stageArtifactsRendered) {
+		fmt.Printf("setup: skipping %s (already verified in %s)\n", stageArtifactsRendered, outDir)
 	} else {
-		fmt.Printf("provisioning incomplete; working relay_url (%s) retained — artifacts kept in %s for inspection\n", nonEmpty(existing), outDir)
+		initArgv := []string{"--domain", hostname, "--edge", edge, "--acme-email", acmeEmail, "--out", outDir}
+		if edge != "wildcard" {
+			initArgv = append(initArgv, "--mcp-host", hostname)
+		} else {
+			if dnsProvider != "" {
+				initArgv = append(initArgv, "--dns-provider", dnsProvider)
+			}
+			if dnsEnv != "" {
+				initArgv = append(initArgv, "--dns-env", dnsEnv)
+			}
+		}
+		if code := cmdRelayInit(initArgv); code != apperr.ExitOK {
+			return code
+		}
+		if bad := checkInitDir(outDir); len(bad) > 0 {
+			for _, line := range bad {
+				fmt.Fprintln(os.Stderr, "init check: "+line)
+			}
+			return apperr.ExitInternal
+		}
+		if state != nil {
+			_ = checkpointSetup(state, stageArtifactsRendered, map[string]string{
+				stageArtifactsRendered: outDir,
+			})
+		}
+	}
+
+	fmt.Printf("deployment rendered to %s\n", outDir)
+	code, completed := runSetupBootstrap(d, hostname, outDir, dataDir, token, dnsProvider, state, skipStage)
+	if code == apperr.ExitOK && completed {
+		fmt.Printf("relay provisioning complete for %s\n", hostname)
+	} else {
+		fmt.Printf("relay provisioning incomplete — artifacts kept in %s for inspection\n", outDir)
 	}
 	return code
-}
-
-// shouldPersistRelayURL decides whether a newly rendered endpoint may
-// replace the recorded client setting. Only completed provisioning
-// qualifies: a failed Caddy install or relay start must never strand
-// the client on a dead endpoint, and a fresh install must not record
-// an endpoint that was never provisioned.
-func shouldPersistRelayURL(existing, next string, provisioned bool) bool {
-	// existing is accepted but unused in the decision: fresh, same,
-	// and replacement URLs all persist exactly when provisioning
-	// completed. It stays a parameter so the call site documents
-	// which working configuration is being replaced.
-	return next != "" && provisioned
-}
-
-// readExistingRelayURL returns the recorded relay_url, or "" when the
-// agent config has none. Unreadable files fail closed to "" only for
-// missing files; other errors surface to the caller via merge errors.
-func readExistingRelayURL(cfgPath string) string {
-	vals, err := config.LoadAgentFile(cfgPath)
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(vals["relay_url"])
 }
 
 // verifyWildcardDNS proves the tunnel namespace resolves here: it
@@ -911,15 +1007,22 @@ func wildcardAAAASuffix(v6 string) string {
 // completed: manual-only plans and hard blocks report ACTION_REQUIRED
 // (ExitRelayTLS), never success, so callers never treat a printed
 // plan as a functioning tunnel.
-func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir, dnsToken string) (int, bool) {
+func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir, dnsToken, dnsProvider string, state *setupState, skipStage func(string) bool) (int, bool) {
 	_, caddyErr := exec.LookPath("caddy")
+	caddyPresent := caddyErr == nil
+	caddyHasDNS := true
+	if caddyPresent && dnsProvider != "" {
+		caddyHasDNS = setup.CaddyHasDNSModule(dnsProvider)
+	}
 	env := setup.BootstrapEnv{
-		AsRoot:       os.Geteuid() == 0,
-		CaddyPresent: caddyErr == nil,
-		Path:         d.Path,
-		Hostname:     hostname,
-		DeployDir:    deployDir,
-		DataDir:      dataDir,
+		AsRoot:            os.Geteuid() == 0,
+		CaddyPresent:      caddyPresent,
+		DNSProvider:       dnsProvider,
+		CaddyHasDNSModule: caddyHasDNS,
+		Path:              d.Path,
+		Hostname:          hostname,
+		DeployDir:         deployDir,
+		DataDir:           dataDir,
 	}
 	self, selfErr := os.Executable()
 	steps, blockReason := setup.PlanBootstrap(env)
@@ -944,9 +1047,33 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir, dnsToken
 			fmt.Printf("manual: %s\n  %s\n", s.Title, s.Manual)
 			continue
 		}
+		// Skip already-proven stages when resuming.
+		if skipStage != nil {
+			switch s.Title {
+			case "install Caddy", "create service account", "install binary", "install launcher",
+				"create data directory", "install relay environment", "install Caddyfile",
+				"activate and reload Caddy", "install systemd unit":
+				if skipStage(stageSystemInstalled) {
+					fmt.Printf("auto: %s ... skipped (stage %s already verified)\n", s.Title, stageSystemInstalled)
+					continue
+				}
+			case "enable and start relay":
+				if skipStage(stageRelayReady) {
+					fmt.Printf("auto: %s ... skipped (stage %s already verified)\n", s.Title, stageRelayReady)
+					continue
+				}
+			case "install and enable dynv6 refresh timer", "install and enable duckdns refresh timer":
+				if skipStage(stageRefreshTimerReady) {
+					fmt.Printf("auto: %s ... skipped (stage %s already verified)\n", s.Title, stageRefreshTimerReady)
+					continue
+				}
+			}
+		}
 		fmt.Printf("auto: %s ... ", s.Title)
 		var err error
 		switch s.Title {
+		case "install Caddy":
+			err = setup.InstallCaddy(dnsProvider)
 		case "create service account":
 			err = setup.EnsureServiceAccount(setup.RelayUser, dataDir)
 		case "install binary":
@@ -970,10 +1097,20 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir, dnsToken
 			}
 		case "install systemd unit":
 			err = setup.InstallUnit(deployDir)
+			if err == nil && state != nil {
+				_ = checkpointSetup(state, stageSystemInstalled, map[string]string{
+					stageSystemInstalled: time.Now().UTC().Format(time.RFC3339),
+				})
+			}
 		case "enable and start relay":
 			err = setup.StartRelay()
 			if err == nil {
 				setup.MarkStarted("ocliv-relay")
+				if state != nil {
+					_ = checkpointSetup(state, stageRelayReady, map[string]string{
+						stageRelayReady: time.Now().UTC().Format(time.RFC3339),
+					})
+				}
 			}
 		case "install and enable dynv6 refresh timer", "install and enable duckdns refresh timer":
 			err = setup.InstallDNSRefresh(hostname, dnsToken, dataDir)
@@ -983,6 +1120,11 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir, dnsToken
 				after := setup.CaptureServiceState("ocliv-dns-refresh.timer")
 				if before.Enabled != after.Enabled || before.Active != after.Active {
 					setup.MarkStarted("ocliv-dns-refresh.timer")
+				}
+				if err == nil && state != nil {
+					_ = checkpointSetup(state, stageRefreshTimerReady, map[string]string{
+						stageRefreshTimerReady: time.Now().UTC().Format(time.RFC3339),
+					})
 				}
 			}
 		default:
@@ -1078,268 +1220,8 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir, dnsToken
 	}
 	_ = setup.CleanDNSRefreshTokenJournal(hostname, dataDir)
 	fmt.Printf("verify externally: from another network, curl -v https://%s/v1/agent/challenge (no -k)\n", hostname)
-	fmt.Printf("to add publishers: on each publisher machine, run `ocliv login --relay https://%s --code-file PATH`\n", hostname)
+	fmt.Printf("to add publishers: on each publisher machine, run `ocliv pair https://%s`, then approve here with `ocliv relay approve <CODE> --tenant <TENANT>`\n", hostname)
 	return apperr.ExitOK, true
-}
-
-// sameRelayAuthority compares two relay URLs by scheme+host (path is
-// ignored for identity; ports must match when present).
-func sameRelayAuthority(a, b string) bool {
-	na, err := normalizeRelayAuthority(a)
-	if err != nil {
-		return false
-	}
-	nb, err := normalizeRelayAuthority(b)
-	if err != nil {
-		return false
-	}
-	return na == nb
-}
-
-func normalizeRelayAuthority(raw string) (string, error) {
-	s := strings.TrimSpace(raw)
-	if s == "" {
-		return "", fmt.Errorf("empty relay URL")
-	}
-	if !strings.Contains(s, "://") {
-		s = "https://" + s
-	}
-	u, err := url.Parse(s)
-	if err != nil {
-		return "", err
-	}
-	if u.Host == "" {
-		return "", fmt.Errorf("relay URL has no host")
-	}
-	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host), nil
-}
-
-// mintSetupCode mints a one-time enrollment code against the relay's
-// own store. It opens the store directly (never constructs a Server,
-// which would reconcile unrelated live lease rows) and never prints
-// the code: it flows straight into the enroll exchange below.
-func mintSetupCode(dataDir, tenant string) (string, error) {
-	db, err := store.Open(filepath.Join(dataDir, "ocliv.db"))
-	if err != nil {
-		return "", err
-	}
-	defer db.Close()
-	return relay.IssueEnrollmentCode(db, tenant, time.Hour, "setup")
-}
-
-// autoEnroll completes enrollment against the just-provisioned relay:
-// mint a code from the relay store, exchange it for registration.
-// Already-enrolled machines are left untouched and report success with
-// an empty key id. The enroll POST itself proves the full chain
-// (DNS → Caddy → loopback relay) works.
-// sudoTarget represents a strictly validated invoking user under sudo (A6).
-type sudoTarget struct {
-	Username string
-	UID      uint32
-	GID      uint32
-	HomeDir  string
-}
-
-// parseSudoTarget strictly parses SUDO_USER, SUDO_UID, and SUDO_GID (A6).
-// Returns (target, true, nil) when running under sudo with valid non-root IDs,
-// (zero, false, nil) when not under sudo, or an error if SUDO_UID/SUDO_GID are
-// malformed, negative, or inconsistent with user.Lookup(SUDO_USER).
-func parseSudoTarget() (sudoTarget, bool, error) {
-	su := strings.TrimSpace(os.Getenv("SUDO_USER"))
-	suUID := strings.TrimSpace(os.Getenv("SUDO_UID"))
-	suGID := strings.TrimSpace(os.Getenv("SUDO_GID"))
-	if su == "" && suUID == "" && suGID == "" {
-		return sudoTarget{}, false, nil
-	}
-	if su == "" || su == "root" {
-		return sudoTarget{}, false, fmt.Errorf("invalid SUDO_USER %q for unprivileged enrollment", su)
-	}
-	u, err := user.Lookup(su)
-	if err != nil || u.HomeDir == "" {
-		return sudoTarget{}, false, fmt.Errorf("cannot resolve SUDO_USER %q: %v", su, err)
-	}
-	uid64, err := strconv.ParseUint(u.Uid, 10, 32)
-	if err != nil || uid64 == 0 {
-		return sudoTarget{}, false, fmt.Errorf("invalid resolved UID %q for SUDO_USER %q", u.Uid, su)
-	}
-	gid64, err := strconv.ParseUint(u.Gid, 10, 32)
-	if err != nil || gid64 == 0 {
-		return sudoTarget{}, false, fmt.Errorf("invalid resolved GID %q for SUDO_USER %q", u.Gid, su)
-	}
-	if suUID != "" {
-		envUID, perr := strconv.ParseUint(suUID, 10, 32)
-		if perr != nil || envUID != uid64 {
-			return sudoTarget{}, false, fmt.Errorf("malformed or mismatched SUDO_UID %q (user %q has uid %d)", suUID, su, uid64)
-		}
-	}
-	if suGID != "" {
-		envGID, perr := strconv.ParseUint(suGID, 10, 32)
-		if perr != nil || envGID != gid64 {
-			return sudoTarget{}, false, fmt.Errorf("malformed or mismatched SUDO_GID %q (user %q has gid %d)", suGID, su, gid64)
-		}
-	}
-	return sudoTarget{
-		Username: su,
-		UID:      uint32(uid64),
-		GID:      uint32(gid64),
-		HomeDir:  u.HomeDir,
-	}, true, nil
-}
-
-// buildUnprivilegedEnrollCmd builds a tightly scoped child process running as
-// target.UID/target.GID with a curated environment and enrollment code passed
-// via stdin (--code-file -), so root never writes into the user's home (A6).
-func buildUnprivilegedEnrollCmd(exe, relayURL, code string, target sudoTarget) *exec.Cmd {
-	args := []string{"login", "--relay", relayURL, "--code-file", "-"}
-	cmd := exec.Command(exe, args...)
-	cmd.Stdin = strings.NewReader(code + "\n")
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Credential: &syscall.Credential{
-			Uid: target.UID,
-			Gid: target.GID,
-		},
-	}
-	env := []string{
-		"HOME=" + target.HomeDir,
-		"USER=" + target.Username,
-		"LOGNAME=" + target.Username,
-		"PATH=" + os.Getenv("PATH"),
-	}
-	if prof := strings.TrimSpace(os.Getenv("OCLIV_PROFILE")); prof != "" {
-		env = append(env, "OCLIV_PROFILE="+prof)
-	}
-	if ca := strings.TrimSpace(os.Getenv("OCLIV_CACERT")); ca != "" {
-		env = append(env, "OCLIV_CACERT="+ca)
-	}
-	cmd.Env = env
-	return cmd
-}
-
-func setupAgentFiles() (dir, keyPath, cfgPath string, uid, gid int, err error) {
-	uid, gid = -1, -1
-	if os.Geteuid() == 0 && os.Getenv("OCLIV_CONFIG_DIR") == "" {
-		if target, ok, perr := parseSudoTarget(); perr != nil {
-			return "", "", "", -1, -1, perr
-		} else if ok {
-			dir = filepath.Join(target.HomeDir, ".config", "ocliv")
-			if prof := config.ActiveProfile(); prof != "" && prof != "default" {
-				dir = filepath.Join(dir, "profiles", prof)
-			}
-			return dir, filepath.Join(dir, config.AgentKeyFile), filepath.Join(dir, config.ConfigFile), int(target.UID), int(target.GID), nil
-		}
-	}
-	dir, keyPath, cfgPath, err = agentFiles()
-	return dir, keyPath, cfgPath, -1, -1, err
-}
-
-func chownIfSudo(path string, uid, gid int) error {
-	if uid >= 0 && gid >= 0 {
-		if err := os.Chown(filepath.Dir(path), uid, gid); err != nil {
-			return fmt.Errorf("chown %s to %d:%d: %w", filepath.Dir(path), uid, gid, err)
-		}
-		if err := os.Chown(path, uid, gid); err != nil {
-			return fmt.Errorf("chown %s to %d:%d: %w", path, uid, gid, err)
-		}
-	}
-	return nil
-}
-
-func autoEnroll(relayURL, dataDir, tenant string) (string, int) {
-	dir, keyPath, cfgPath, uid, gid, err := setupAgentFiles()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error: "+err.Error())
-		return "", apperr.ExitInternal
-	}
-	if _, err := os.Stat(keyPath); err == nil {
-		// An existing key must be verified against the relay currently
-		// being configured AND authenticated with that relay (P1-2) so a
-		// revoked or deleted key is never reported as "already enrolled".
-		recorded := readExistingRelayURL(cfgPath)
-		if recorded == "" {
-			if altDir, derr := config.DataDir(); derr == nil {
-				alt := filepath.Join(altDir, "config.toml")
-				if v := readExistingRelayURL(alt); v != "" {
-					recorded = v
-				}
-			}
-		}
-		if recorded == "" {
-			fmt.Fprintln(os.Stderr, "error: an agent key already exists but its config has no relay_url; cannot verify it belongs to this relay ("+cfgPath+")")
-			fmt.Fprintln(os.Stderr, "action: re-run with the correct relay or remove the stale key/config deliberately (never automatic)")
-			return "", apperr.ExitAuth
-		}
-		if !sameRelayAuthority(recorded, relayURL) {
-			fmt.Fprintf(os.Stderr, "error: existing agent key is enrolled with %s, not %s; refusing to reuse or replace it\n", recorded, relayURL)
-			fmt.Fprintln(os.Stderr, "action: keep the existing key for its relay, or remove it deliberately and re-run (never automatic)")
-			return "", apperr.ExitAuth
-		}
-		existingKey, lerr := identity.Load(keyPath)
-		if lerr != nil {
-			fmt.Fprintf(os.Stderr, "error: existing agent key %s is unreadable: %v\n", keyPath, lerr)
-			return "", apperr.ExitAuth
-		}
-		existingKeyID := "key-" + string(existingKey.ID())
-		admitted, reachable := probeKeyAdmitted(relayURL, existingKey, existingKeyID)
-		if !reachable {
-			fmt.Fprintf(os.Stderr, "error: existing agent key %s could not be verified against %s (relay unreachable)\n", existingKeyID, relayURL)
-			return "", apperr.ExitRelayTLS
-		}
-		if !admitted {
-			fmt.Fprintf(os.Stderr, "error: existing agent key %s is not admitted on %s (revoked or unknown); run `ocliv logout` and re-enroll\n", existingKeyID, relayURL)
-			return "", apperr.ExitAuth
-		}
-		return existingKeyID, apperr.ExitOK
-	}
-	code, err := mintSetupCode(dataDir, tenant)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error: cannot mint enrollment code: "+err.Error())
-		return "", apperr.ExitAuth
-	}
-	// A6: When running as root under sudo, NEVER write identity/config/journal
-	// files into SUDO_USER's home as root. Exec `ocliv login --code-file -` as
-	// the invoking UID/GID with a curated environment, then verify the result.
-	if os.Geteuid() == 0 && os.Getenv("OCLIV_CONFIG_DIR") == "" {
-		target, ok, perr := parseSudoTarget()
-		if perr != nil {
-			fmt.Fprintln(os.Stderr, "error: "+perr.Error())
-			return "", apperr.ExitAuth
-		}
-		if ok {
-			exe, eerr := os.Executable()
-			if eerr != nil {
-				fmt.Fprintln(os.Stderr, "error: resolving ocliv executable: "+eerr.Error())
-				return "", apperr.ExitInternal
-			}
-			cmd := buildUnprivilegedEnrollCmd(exe, relayURL, code, target)
-			out, cerr := cmd.CombinedOutput()
-			if cerr != nil {
-				fmt.Fprintf(os.Stderr, "error: unprivileged enrollment as %s failed: %v\n%s\n", target.Username, cerr, strings.TrimSpace(string(out)))
-				return "", apperr.ExitAuth
-			}
-			enrolledKey, lerr := identity.Load(keyPath)
-			if lerr != nil {
-				fmt.Fprintf(os.Stderr, "error: enrollment child succeeded but %s is unreadable: %v\n", keyPath, lerr)
-				return "", apperr.ExitInternal
-			}
-			return "key-" + string(enrolledKey.ID()), apperr.ExitOK
-		}
-	}
-	if uid >= 0 && os.Getenv("OCLIV_CONFIG_DIR") == "" {
-		_ = os.Setenv("OCLIV_CONFIG_DIR", dir)
-		defer os.Unsetenv("OCLIV_CONFIG_DIR")
-	}
-	id, ecode := performEnroll(relayURL, code, "")
-	if ecode == apperr.ExitOK {
-		if err := chownIfSudo(keyPath, uid, gid); err != nil {
-			fmt.Fprintln(os.Stderr, "error: "+err.Error())
-			return "", apperr.ExitInternal
-		}
-		if err := chownIfSudo(cfgPath, uid, gid); err != nil {
-			fmt.Fprintln(os.Stderr, "error: "+err.Error())
-			return "", apperr.ExitInternal
-		}
-	}
-	return id, ecode
 }
 
 // runSetupProvider handles the provider-relay path for hosts with no
@@ -1470,13 +1352,13 @@ func printSetupNext(d setup.Detection) {
 		}
 		fmt.Printf("- Pick a free DNS name (e.g. a dynv6 hostname) and point it at this host's public %s address.\n", fam)
 		fmt.Printf("- Allow TCP 443 inbound in the host firewall; this host can serve directly (relay stays on 127.0.0.1, Caddy terminates TLS).\n")
-		fmt.Printf("- TCP 80 is needed for the default `--edge tunnel` (its HTTP-01 fallback); `--edge single-host` binds 443 alone and pins TLS-ALPN-01 (HTTP-01 explicitly disabled), so a host where another service owns :80 can run `--edge single-host` unmodified.\n")
-		fmt.Printf("- Re-run `ocliv setup --auto` once DNS resolves here; setup resumes from the stored non-secret setup state.\n")
+		fmt.Printf("- The default `--edge wildcard` issues one wildcard certificate via DNS-01 (pass `--dns-provider NAME`, no per-lease ACME). Use `--edge single-host` if you only need single-host path routes without wildcard DNS, or `--edge tunnel` for noncanonical on-demand lab mode.\n")
+		fmt.Printf("- Re-run `ocliv relay setup --auto` once DNS resolves here; setup resumes from the stored non-secret setup state.\n")
 	case setup.PathNATV4:
 		fmt.Printf("- In the router admin page, forward TCP 443 to this host (%s).\n", firstOr(d.LocalV4, "its LAN address"))
-		fmt.Printf("- Add TCP 80 only if you opt into `--edge tunnel` (HTTP-01 fallback); the default `--edge single-host` needs 443 alone (HTTP-01 explicitly disabled, TLS-ALPN-01 on 443).\n")
-		fmt.Printf("- Pick a free DNS name (e.g. dynv6) pointing at the router's public IPv4; keep it updated if the address changes.\n")
-		fmt.Printf("- Re-run `ocliv setup --auto` after the forward is in place.\n")
+		fmt.Printf("- The default `--edge wildcard` uses DNS-01 on 443 (no TCP 80 required); `--edge single-host` also uses 443 alone (TLS-ALPN-01). Only the noncanonical `--edge tunnel` lab mode needs TCP 80.\n")
+		fmt.Printf("- Pick a DNS name pointing at the router's public IPv4; keep it updated if the address changes.\n")
+		fmt.Printf("- Re-run `ocliv relay setup --auto` after the forward is in place.\n")
 	case setup.PathCGNAT:
 		fmt.Printf("- No direct IPv4 inbound path exists (carrier-grade NAT): port forwarding cannot work.\n")
 		if d.DirectV6 || d.EgressV6 != "" {

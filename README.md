@@ -5,13 +5,30 @@ server, without opening router ports on the sharing machine. The agent
 makes an outbound authenticated connection to a relay; the relay
 serves the public HTTPS edge (Caddy) in front of it.
 
-## 60-second client quickstart
+## 60-second publisher quickstart
 
-You need: the `ocliv` binary, a relay URL, and a one-time enrollment
-code from the relay operator.
+Install on a clean Linux machine (verifies Ed25519 manifest signature + SHA-256 + commit):
 
 ```sh
-ocliv login --relay https://relay.example.net --code-file ./code.txt
+curl -fsS https://relay.example.net/.well-known/install-client.sh | sh -s https://relay.example.net
+# Or self-update an existing binary:
+ocliv install --relay https://relay.example.net
+```
+
+Pair the publisher with your relay (primary flow — no out-of-band secret files needed):
+
+```sh
+# On the publisher machine:
+ocliv pair https://relay.example.net
+# -> prints a short display code (e.g. a1b2-c3d4-e5f6) and waits (or pass --no-wait and later `ocliv pair resume`)
+
+# On the relay host (operator):
+ocliv relay approve a1b2-c3d4-e5f6 --tenant my-tenant
+```
+
+Publish a local app or MCP server:
+
+```sh
 ocliv 3000
 # -> https://<id>.t.example.net  (protected by default)
 
@@ -20,6 +37,8 @@ ocliv mcp 3000 --name mytools
 # --name keeps YOUR publication identity across restarts; the route ID
 # itself is opaque. Run `ocliv mcp list` for the exact public URL.
 ```
+
+(One-time code enrollment via `ocliv login --relay URL --code-file PATH` remains supported for automated/headless provisioning.)
 
 Useful while running it:
 
@@ -69,8 +88,8 @@ serve public HTTPS. For your own relay you need a public IP (no CGNAT),
 a DNS zone, and a host that can run Caddy + `ocliv relay serve`:
 
 ```sh
-ocliv setup --check                          # diagnose first, changes nothing
-ocliv setup --auto --hostname ZONE.dynv6.net --acme-email you@mail
+ocliv relay setup --check                          # diagnose first, changes nothing
+sudo ocliv relay setup --auto --hostname ZONE.example.net --dns-provider cloudflare --acme-email you@mail
 ```
 
 See [docs/SETUP.md](docs/SETUP.md), [docs/HOME-HOST.md](docs/HOME-HOST.md),

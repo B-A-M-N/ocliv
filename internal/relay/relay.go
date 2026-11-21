@@ -6,13 +6,16 @@ package relay
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -69,6 +72,14 @@ type Options struct {
 	// returns 404. Every artifact must be declared in ReleaseManifestJSON before
 	// it can be served; undeclared files are never accessible.
 	ReleaseArtifactDir string
+	// AllowUnsignedRelease permits starting a relay with a release manifest and
+	// artifact directory without ReleaseManifestSig (development/lab use only).
+	// Production relays must provide the full tuple: manifest + signature + artifacts.
+	AllowUnsignedRelease bool
+	// ReleaseVerifyKeys overrides the trusted Ed25519 public keys used to verify
+	// ReleaseManifestSig at startup. When empty, installer.ProductionPublicKeys()
+	// is used. Intended for tests and custom release keychains.
+	ReleaseVerifyKeys []ed25519.PublicKey
 	// EdgeMode explicitly sets the ingress topology for capability advertisement
 	// and configuration validation. Valid values: "tunnel", "wildcard",
 	// "single-host". Empty means unknown — capabilities advertised conservatively.
@@ -102,10 +113,17 @@ func (s *Session) close() {
 	s.closeOnce.Do(func() { close(s.closed) })
 }
 
-// ReadyForSessions reports whether the relay can accept tunnel sessions:
-// SQLite writable (a BEGIN IMMEDIATE probe, rolled back, proves the write
-// lock — Ping alone only proves the process is alive), routing
-// initialized (post-New), and admission maps below the cardinality cap.
+// ReadyForSessions reports whether the relay process and store are healthy and
+// able to serve control-plane traffic: SQLite writable (a BEGIN IMMEDIATE probe,
+// rolled back, proves the write lock — Ping alone only proves the process is
+// alive), routing initialized (post-New), and admission maps below the
+// cardinality cap.
+//
+// Intentional visitor-stream backpressure (HTTP/WS saturation) does NOT mark
+// /health/ready unhealthy, because the relay process and publisher control
+// plane remain healthy; separate data-plane saturation and session-admission
+// signals are exposed via StatusSnapshot() / /health/status.
+//
 // It deliberately excludes public DNS/TLS, route liveness, and MCP
 // compatibility: those are external doctor checks, never relay readiness
 // (P2-2). Never report HTTPS_VERIFIED from this signal.
@@ -116,9 +134,6 @@ func (s *Server) ReadyForSessions() bool {
 	if s.throttle.Keys() >= limits.MaxThrottleKeys ||
 		s.preAuth.Keys() >= limits.MaxThrottleKeys ||
 		s.mcpAdmission.Keys() >= limits.MaxThrottleKeys {
-		return false
-	}
-	if s.globalBudget != nil && s.globalBudget.Saturated() {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -137,6 +152,48 @@ func (s *Server) ReadyForSessions() bool {
 		return false
 	}
 	return true
+}
+
+// RelayStatus separates process/store readiness, publisher-session admission
+// availability, and visitor data-plane saturation so operators and orchestrators
+// can distinguish healthy backpressure from process faults.
+type RelayStatus struct {
+	ProcessReady      bool   `json:"process_ready"`
+	SessionsReady     bool   `json:"sessions_ready"`
+	HTTPSaturated     bool   `json:"http_saturated"`
+	WSSaturated       bool   `json:"ws_saturated"`
+	SessionsSaturated bool   `json:"sessions_saturated"`
+	ActiveHTTPStreams int64  `json:"active_http_streams"`
+	ActiveWSStreams   int64  `json:"active_ws_streams"`
+	ActiveSessions    int64  `json:"active_sessions"`
+	MaxHTTPStreams    int64  `json:"max_http_streams"`
+	MaxWSStreams      int64  `json:"max_ws_streams"`
+	MaxSessions       int64  `json:"max_publisher_sessions"`
+	ReleaseTrustMode  string `json:"release_trust_mode"`
+	ReleaseKeyID      string `json:"release_signing_key_id,omitempty"`
+}
+
+// StatusSnapshot returns the separated readiness and capacity snapshot.
+func (s *Server) StatusSnapshot() RelayStatus {
+	ready := s.ReadyForSessions()
+	st := RelayStatus{
+		ProcessReady:     ready,
+		SessionsReady:    ready,
+		ReleaseTrustMode: s.releaseTrustMode,
+		ReleaseKeyID:     s.releaseKeyID,
+	}
+	if st.ReleaseTrustMode == "" {
+		st.ReleaseTrustMode = "DISABLED"
+	}
+	if s != nil && s.globalBudget != nil {
+		st.ActiveHTTPStreams, st.ActiveWSStreams, st.ActiveSessions = s.globalBudget.Stats()
+		st.MaxHTTPStreams, st.MaxWSStreams, st.MaxSessions = s.globalBudget.Limits()
+		st.HTTPSaturated = s.globalBudget.HTTPSaturated()
+		st.WSSaturated = s.globalBudget.WSSaturated()
+		st.SessionsSaturated = s.globalBudget.SessionsSaturated()
+		st.SessionsReady = ready && !st.SessionsSaturated
+	}
+	return st
 }
 
 // Server is the relay composition root and façade (audit: keep it a
@@ -169,6 +226,8 @@ type Server struct {
 	releaseManifestJSON      []byte
 	releaseManifestSig       []byte
 	releaseArtifactDir       string
+	releaseTrustMode         string
+	releaseKeyID             string
 	edgeMode                 string
 	visitors                 visitorAccess // HMAC key + verifier for visitor sessions
 	log                      Logger
@@ -260,18 +319,60 @@ func New(o Options) (*Server, error) {
 	}
 	s.mux.HandleFunc("/.well-known/ocliv-release-manifest.json", s.handleReleaseManifest)
 	s.mux.HandleFunc("/.well-known/ocliv-release-manifest.json.sig", s.handleReleaseManifestSig)
-	if len(o.ReleaseManifestJSON) > 0 && len(o.ReleaseManifestSig) > 0 {
-		sigHex := hex.EncodeToString(o.ReleaseManifestSig)
-		if err := installer.VerifyManifest(o.ReleaseManifestJSON, sigHex, installer.ProductionPublicKey()); err != nil {
-			return nil, fmt.Errorf("relay startup: release manifest signature invalid: %w", err)
+	// Require coherent release configuration at startup: either none of the
+	// release-serving fields are set (endpoints 404), or the complete tuple
+	// (manifest + artifact dir + valid signature, unless AllowUnsignedRelease
+	// is explicitly enabled for development) is configured and verified.
+	hasManifest := len(o.ReleaseManifestJSON) > 0
+	hasSig := len(o.ReleaseManifestSig) > 0
+	hasArtifacts := o.ReleaseArtifactDir != ""
+	s.releaseTrustMode = "DISABLED"
+	if hasManifest || hasSig || hasArtifacts {
+		if !hasManifest {
+			return nil, fmt.Errorf("relay startup: partial release config: release manifest is required when artifacts or signature are configured")
 		}
-	}
-	if o.ReleaseArtifactDir != "" {
-		// Validate that all manifest-declared artifacts exist before serving.
-		if len(o.ReleaseManifestJSON) > 0 {
-			if err := validateArtifactDir(o.ReleaseManifestJSON, o.ReleaseArtifactDir); err != nil {
-				return nil, fmt.Errorf("release artifacts validation: %w", err)
+		if !hasArtifacts {
+			return nil, fmt.Errorf("relay startup: partial release config: release artifact directory is required when release manifest is configured")
+		}
+		if !hasSig && !o.AllowUnsignedRelease {
+			return nil, fmt.Errorf("relay startup: partial release config: release manifest signature is required (set --release-manifest-sig or explicit dev override)")
+		}
+		if !hasSig && o.AllowUnsignedRelease {
+			// Constrain unsigned dev release mode to explicit development topology:
+			// require either loopback RelayHost (or empty/test) or OCLIV_ENV=development.
+			if !isDevTopologyHost(o.RelayHost) && !strings.EqualFold(strings.TrimSpace(os.Getenv("OCLIV_ENV")), "development") {
+				return nil, fmt.Errorf("relay startup: --allow-unsigned-dev-release refused on non-loopback relay host %q (requires loopback authority or OCLIV_ENV=development)", o.RelayHost)
 			}
+			s.releaseTrustMode = "UNSIGNED_DEVELOPMENT"
+			s.log.Warn("WARNING: relay serving UNSIGNED development release manifest (release_trust_mode=UNSIGNED_DEVELOPMENT)")
+		}
+		if hasSig {
+			sigHex := hex.EncodeToString(o.ReleaseManifestSig)
+			if len(o.ReleaseVerifyKeys) > 0 {
+				if err := installer.VerifyManifestAny(o.ReleaseManifestJSON, sigHex, o.ReleaseVerifyKeys); err != nil {
+					return nil, fmt.Errorf("relay startup: release manifest signature invalid: %w", err)
+				}
+				s.releaseTrustMode = "SIGNED_PRODUCTION"
+			} else {
+				var meta struct {
+					SigningKeyID  string `json:"signing_key_id"`
+					NonProduction bool   `json:"non_production"`
+				}
+				_ = json.Unmarshal(o.ReleaseManifestJSON, &meta)
+				if meta.NonProduction {
+					return nil, fmt.Errorf("relay startup: refusing non_production release manifest")
+				}
+				keyID, err := installer.VerifyManifestWithTrust(o.ReleaseManifestJSON, sigHex, meta.SigningKeyID, installer.ProductionTrustRoot())
+				if err != nil {
+					return nil, fmt.Errorf("relay startup: release manifest signature invalid: %w", err)
+				}
+				s.releaseTrustMode = "SIGNED_PRODUCTION"
+				s.releaseKeyID = keyID
+				s.log.Info("release manifest authenticated", "signing_key_id", keyID)
+			}
+		}
+		if err := validateArtifactDir(o.ReleaseManifestJSON, o.ReleaseArtifactDir); err != nil {
+			return nil, fmt.Errorf("release artifacts validation: %w", err)
 		}
 		s.mux.HandleFunc("/.well-known/ocliv-artifacts/", s.handleReleaseArtifact)
 	}
@@ -321,6 +422,19 @@ func defaultOrI64(val, def int64) int64 {
 		return val
 	}
 	return def
+}
+
+// isDevTopologyHost reports whether host is empty or a loopback address
+// (localhost, 127.0.0.0/8, ::1), used to constrain --allow-unsigned-dev-release.
+func isDevTopologyHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if h == "" || h == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
 }
 
 // validateArtifactDir checks that every artifact declared in manifest.artifacts

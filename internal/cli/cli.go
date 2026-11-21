@@ -165,6 +165,16 @@ func Run(argv []string) int {
 	case "relay":
 		return cmdRelay(argv[1:])
 	case "setup":
+		jsonFlag := false
+		for _, a := range argv[1:] {
+			if a == "--json" {
+				jsonFlag = true
+				break
+			}
+		}
+		if !jsonFlag {
+			fmt.Fprintln(os.Stderr, "note: `ocliv setup` is a compatibility alias for `ocliv relay setup`")
+		}
 		return cmdSetup(argv[1:])
 	case "access":
 		return cmdAccess(argv[1:])
@@ -220,8 +230,9 @@ func Run(argv []string) int {
 func usage(code int) int {
 	fmt.Print(`Ocliv — secure instant HTTPS hosting.
 
-Everyday:
-  ocliv setup [--auto ...]           configure this host once (tunnel edge default)
+Everyday (Publisher):
+  ocliv pair RELAY_URL [--no-wait]   pair this publisher with a relay (primary flow)
+  ocliv pair resume                  complete a pending pairing request
   ocliv host [http|mcp] PORT [--name N]  persistently host HTTP (default) or MCP (systemd + reboot-safe)
   ocliv status [NAME] [--json]       show hosted service or tunnel health and recovery state
   ocliv restart NAME                 non-destructive restart/rebind (preserves URL & sessions)
@@ -229,23 +240,26 @@ Everyday:
   ocliv remove NAME --confirm NAME   permanently retire a hosted publication
   ocliv PORT                  share localhost:PORT over protected HTTPS (ephemeral)
   ocliv doctor                diagnose key, relay, local service, and DNS/TLS
-  ocliv login --relay URL --code-file PATH   enroll this machine once
-  ocliv install --relay URL [--dir DIR] [--yes]   download and install latest release from relay
+  ocliv login --relay URL --code-file PATH   enroll via one-time code (headless/automated)
+  ocliv install --relay URL [--dir DIR] [--yes]   download and verify signed release from relay
   ocliv profile create NAME | use NAME|default | list   separate enrollments
+
+Relay Operator:
+  ocliv relay setup --auto [--edge wildcard|single-host|tunnel] [--dns-provider NAME] [--hostname HOST] [--acme-email ADDR] [--token-file PATH] [--dry-run] [--json]
+  ocliv relay setup --check   diagnose relay host reachability (changes nothing)
+  ocliv relay approve CODE --tenant TENANT [--data DIR]   approve a publisher pairing request
+  ocliv relay init --domain DOMAIN | relay serve --domain DOMAIN [--edge-mode wildcard|single-host|tunnel] | relay doctor | relay issue-enroll | relay revoke-key
 
 Advanced:
   ocliv PORT [--public] [--ipv6] [--name NAME] [--ttl 2h] [--upstream-host H] [--json] [--no-share-link] [--share-link-file PATH]
   ocliv logout
   ocliv access share|rotate|revoke [LEASE]
-  ocliv relay init --domain DOMAIN | relay serve --domain DOMAIN [--mcp-host HOST] [--mcp-port PORT] [--relay-host HOST] | relay doctor | relay issue-enroll
   ocliv mcp expose -- COMMAND [ARGS...]
   ocliv mcp manage
   ocliv mcp publish (--local URL | --stdio -- CMD [ARGS...]) --auth upstream-oauth|ocliv-managed [--relay URL] [--name N] [--ttl D] ...
   ocliv mcp serve --local URL --auth upstream-oauth|fixture-anonymous [--relay URL] ...
   ocliv mcp doctor [--lease ID] [--name LABEL]
   ocliv mcp list|unpublish ...
-  ocliv profile create NAME | use NAME|default | list
-  ocliv setup --auto [--edge single-host|tunnel|wildcard] [--json] [--hostname ZONE.dynv6.net] [--acme-email ADDR] [--token-file PATH] [--dry-run] [--data-dir DIR] [--out DIR] [--refresh-dns] [--provider oracle ...] | setup --check ...
   ocliv version
 `)
 	return code

@@ -6,34 +6,31 @@ This document is the single entry point for current verification status. Dated
 historical qualification records live under `docs/qualification/history/`, and
 structured evidence/receipts live under `docs/qualification/receipts/`.
 
-## Verified Gates (Source & Isolated Staging)
+Evidence is tracked strictly by exact commit SHA and separated into three
+independent tiers: **Source/Unit-Tested**, **Isolated Artifact E2E**, and
+**Public/Off-LAN/Live**. Results from earlier commits are NEVER transferred
+across schema migrations or security-boundary changes.
 
-| Gate | Status | Notes |
+## Verified Evidence by Exact Commit SHA
+
+| Commit SHA | Schema | Source / Unit & Race Matrix | Isolated Artifact E2E (Pi / Staging) | Public / Off-LAN / Live | Notes |
+|---|---|---|---|---|---|
+| `950440e` | V19 | PASS | PASS (29/0 loopback) | NOT VERIFIED | Historical baseline (`history/PI-ISOLATED-RESULT-2026-11-21.md`); does NOT cover V20/V21 pairing, release signing, capacity saturation, or role separation |
+| `8cce9af` | V20 | PASS | NOT VERIFIED | NOT VERIFIED | Superseded by Round 2 & Round 3 remediation |
+| Current branch HEAD | V21 | PASS (verified after final edit) | NOT VERIFIED | NOT VERIFIED | Adds V21 `resolved_tenant_id`, full release-signing trust chain, coherent relay release tuple, staged setup resume, `wildcard` default edge, readiness/capacity separation, terminal lease ephemera pruning, and real Phase F/G/H/I harness |
+
+> **Non-transfer invariant:** Passing `950440e` (V19) does NOT qualify V21
+> builds. A clean detached-worktree exact-SHA release build and fresh isolated
+> Pi qualification run against that exact artifact are required before lifting
+> HOLD.
+
+## Outstanding Promotion Gates (Required Before Lifting HOLD)
+
+| Gate | Tier | Status |
 |---|---|---|
-| Full repository Go tests (`go test ./... -count=1 -timeout=420s`) | **PASS** | Includes `tests/integration` and all internal/packaging/staging packages |
-| Race detector matrix (`internal/relay` standalone + core internal packages) | **PASS** | Zero data races across `relay`, `cli`, `agent`, `config`, `identity`, `protocol`, `store`, `lease`, `setup` |
-| Static checks (`gofmt`, `go vet`, `git diff --check`, `check-repo-hygiene.sh`) | **PASS** | Enforced in CI |
-| Isolated ARM64 Pi staging & real machine reboot recovery (`10.9.66.170`) | **PASS** | Same lease, same visitor HMAC key, same cookie after reboot; production `ocliv-relay` untouched |
-| Pi isolated loopback qualification — 2026-11-21 (commit `950440e`) | **PASS 29/0** | V19 schema, Phase E+F audit items as originally scoped; see `history/PI-ISOLATED-RESULT-2026-11-21.md` for items exercised vs. items present-but-not-exercised |
-| HEAD `8cce9af` — Go test suite (all packages, race matrix) | **PASS** | Source-only; Pi/live qualification NOT YET RUN against this commit |
-
-> **Qualification isolation note:** Results from `950440e` are NOT transferable to
-> `8cce9af`. Five security-relevant commits and a schema migration (V19→V20) landed
-> between them. The Phase A schema check in `qualify-pi-isolated.py` would fail
-> immediately on `950440e`'s result against HEAD. A fresh qual run against `8cce9af`
-> is required before production promotion.
-
-## Outstanding Gates (Required Before Lifting HOLD)
-
-| Gate | Status |
-|---|---|
-| Clean detached-worktree release build + `govulncheck` + SBOM + `release-manifest.json` | **NOT VERIFIED** |
-| Exact-hash staging qualification of the clean release artifact | **NOT VERIFIED** |
-| Off-LAN trusted-TLS public ingress verification | **NOT VERIFIED** |
-| Official ChatGPT OAuth end-to-end acceptance | **NOT VERIFIED** |
-| 24-hour soak test | **NOT VERIFIED** |
-| Production schema/owner inventory & explicit promotion approval | **HOLD** |
-| Phase F — pairing E2E: `ocliv pair --no-wait` → `relay approve` → `ocliv pair resume` → publisher attaches; `poll_verifier` stored, `poll_secret` absent from DB | **NOT VERIFIED** |
-| Phase G — installer/artifacts: relay configured with `--release-manifest`/`--release-artifacts`; manifest served 200, all artifacts SHA256-verified, traversal refused | **NOT VERIFIED** |
-| Phase H — capacity saturation: 3 publishers with `--max-publisher-sessions=2`; 3rd gets HTTP 503 before WS upgrade; slot released on disconnect | **NOT VERIFIED** |
-| Phase I — role separation: relay DB not world-readable; management endpoints require auth; `relay revoke` kills publisher authority | **NOT VERIFIED** |
+| Clean detached-worktree exact-SHA release build (`govulncheck`, SBOM, `SHA256SUMS`, Ed25519 `release-manifest.json.sig`) | Release Provenance | **NOT VERIFIED** |
+| Exact-hash isolated Pi qualification (`qualify-pi-isolated.py`, zero SKIPs): Phases A–E + F (CLI pair → approve → resume → attach) + G (signed manifest/artifacts + tamper rejection) + H (`--max-publisher-sessions=2` saturation + release) + I (role separation + key revocation) | Isolated Artifact E2E | **NOT VERIFIED** |
+| Off-LAN trusted-TLS public ingress verification (no `-k`) | Public / Off-LAN / Live | **NOT VERIFIED** |
+| Official ChatGPT OAuth end-to-end acceptance | Public / Off-LAN / Live | **NOT VERIFIED** |
+| 24-hour soak test | Public / Off-LAN / Live | **NOT VERIFIED** |
+| Production schema/owner inventory & explicit operator promotion approval | Release Governance | **HOLD** |

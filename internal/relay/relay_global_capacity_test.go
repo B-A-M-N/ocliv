@@ -1,6 +1,8 @@
 package relay
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
@@ -67,8 +69,10 @@ func TestGlobalHTTPCapacity(t *testing.T) {
 	}
 }
 
-// TestGlobalBudgetSaturationBlocksReadiness proves ReadyForSessions returns
-// false when the global HTTP budget is fully consumed.
+// TestGlobalBudgetSaturationSeparatesReadiness proves HTTP visitor-stream
+// saturation does NOT flip ReadyForSessions() false (preventing false
+// health remediation during visitor backpressure), while StatusSnapshot()
+// exposes separate process_ready, sessions_ready, and http_saturated signals.
 func TestGlobalBudgetSaturationBlocksReadiness(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "ocliv.db"))
 	if err != nil {
@@ -82,7 +86,7 @@ func TestGlobalBudgetSaturationBlocksReadiness(t *testing.T) {
 		RelayHost:            "relay.example.test",
 		GlobalMaxHTTPStreams: 1,
 		GlobalMaxWSStreams:   100,
-		GlobalMaxSessions:    100,
+		GlobalMaxSessions:    1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -92,21 +96,37 @@ func TestGlobalBudgetSaturationBlocksReadiness(t *testing.T) {
 	if s.globalBudget.Saturated() {
 		t.Fatal("unexpected saturation before any admission")
 	}
+	if !s.ReadyForSessions() {
+		t.Fatal("expected ReadyForSessions() true initially")
+	}
 
-	// Admit the one slot.
+	// Saturate HTTP visitor streams: ReadyForSessions() MUST remain true!
 	if !s.globalBudget.AdmitHTTP() {
-		t.Fatal("expected admission for first slot")
+		t.Fatal("expected admission for first HTTP slot")
+	}
+	if !s.globalBudget.HTTPSaturated() {
+		t.Fatal("expected HTTPSaturated after filling HTTP cap")
+	}
+	if !s.ReadyForSessions() {
+		t.Fatal("ReadyForSessions() must remain true during HTTP visitor-stream saturation")
+	}
+	st := s.StatusSnapshot()
+	if !st.ProcessReady || !st.SessionsReady || !st.HTTPSaturated || st.SessionsSaturated {
+		t.Fatalf("unexpected status during HTTP saturation: %+v", st)
 	}
 
-	// Now saturated.
-	if !s.globalBudget.Saturated() {
-		t.Fatal("expected saturation after filling HTTP cap")
+	// Saturate publisher sessions: ProcessReady stays true, SessionsReady becomes false.
+	if !s.globalBudget.AdmitSession() {
+		t.Fatal("expected admission for first session slot")
+	}
+	st2 := s.StatusSnapshot()
+	if !st2.ProcessReady || st2.SessionsReady || !st2.SessionsSaturated {
+		t.Fatalf("unexpected status during session saturation: %+v", st2)
 	}
 
-	// Release.
+	// Release both.
 	s.globalBudget.ReleaseHTTP()
-
-	// No longer saturated.
+	s.globalBudget.ReleaseSession()
 	if s.globalBudget.Saturated() {
 		t.Fatal("unexpected saturation after release")
 	}
@@ -174,5 +194,27 @@ func TestUnlimitedBudgetAlwaysAdmits(t *testing.T) {
 	}
 	if budget.Saturated() {
 		t.Fatal("unlimited budget should never be saturated")
+	}
+}
+
+// TestHealthStatusNotExposedOnPublicMux proves /health/status is never served
+// on the public relay authority mux (it belongs exclusively to the loopback
+// health listener).
+func TestHealthStatusNotExposedOnPublicMux(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "ocliv.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	s, err := New(Options{DB: db, Namespace: "t.example.test", RelayHost: "relay.example.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest(http.MethodGet, "https://relay.example.test/health/status", nil)
+	r.Host = "relay.example.test"
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	if w.Code == http.StatusOK {
+		t.Fatalf("/health/status must NOT be served on public mux (got 200: %s)", w.Body.String())
 	}
 }

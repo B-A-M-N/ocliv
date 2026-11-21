@@ -160,8 +160,14 @@ func (s *Server) RunAuthzMaintenance(ctx context.Context) {
 					"reclaiming abandoned registrations failed: "+errShort(err))
 			}
 			if _, _, err := s.db.PrunePairingRequests(now, 24*time.Hour); err != nil {
+				s.log.Error("authz maintenance: pruning pairing requests failed", "err", errShort(err))
 				s.db.Audit("system", "", "", "authz-prune", "error",
 					"pruning pairing requests failed: "+errShort(err))
+			}
+			if _, err := s.db.PruneTerminalLeaseEphemera(now, store.TerminalLeaseEphemeraRetention); err != nil {
+				s.log.Error("authz maintenance: pruning terminal lease ephemera failed", "err", errShort(err))
+				s.db.Audit("system", "", "", "authz-prune", "error",
+					"pruning terminal lease ephemera failed: "+errShort(err))
 			}
 		}
 	}

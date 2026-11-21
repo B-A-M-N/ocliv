@@ -298,9 +298,16 @@ CREATE INDEX IF NOT EXISTS idx_pairing_requests_status ON pairing_requests(statu
 // Polling now requires a high-entropy poll_id + poll_verifier that is never
 // equal to the human-readable display code. The display_code column gains a
 // UNIQUE constraint; display-code-only polling is refused at the handler layer.
+// Pre-V20 pending requests have no poll_verifier and cannot be polled under the
+// new protocol, so migration explicitly expires them (pairing requests are
+// intentionally non-surviving across this incompatible protocol upgrade).
 const schemaV20 = `
 ALTER TABLE pairing_requests ADD COLUMN poll_id TEXT;
 ALTER TABLE pairing_requests ADD COLUMN poll_verifier BLOB;
+UPDATE pairing_requests
+  SET status = 'expired',
+      resolved_at = COALESCE(resolved_at, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  WHERE status = 'pending' AND poll_verifier IS NULL;
 UPDATE pairing_requests SET poll_id = id WHERE poll_id IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pairing_requests_poll_id
   ON pairing_requests(poll_id) WHERE poll_id IS NOT NULL;
@@ -309,6 +316,20 @@ DELETE FROM pairing_requests WHERE rowid NOT IN (
 DROP INDEX IF EXISTS idx_pairing_requests_code;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pairing_requests_display_code
   ON pairing_requests(display_code);
+`
+
+// schemaV21 adds a dedicated resolved_tenant_id column to pairing_requests so
+// approved tenant IDs are no longer overloaded into enrollment_code_id. It also
+// expires any legacy pending rows lacking poll_verifier left by earlier V20 DBs.
+const schemaV21 = `
+ALTER TABLE pairing_requests ADD COLUMN resolved_tenant_id TEXT NOT NULL DEFAULT '';
+UPDATE pairing_requests
+  SET resolved_tenant_id = COALESCE(enrollment_code_id, '')
+  WHERE status = 'approved' AND resolved_tenant_id = '';
+UPDATE pairing_requests
+  SET status = 'expired',
+      resolved_at = COALESCE(resolved_at, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  WHERE status = 'pending' AND poll_verifier IS NULL;
 `
 
 // applyMigration runs one versioned migration body and its version
@@ -335,7 +356,7 @@ func applyMigration(sqldb *sql.DB, version int, body string) error {
 }
 
 // currentSchema is the newest version Open must reach.
-const currentSchema = 20
+const currentSchema = 21
 
 // SchemaVersion is the exported current schema version for tools that must
 // refuse unknown/newer databases without opening (and thereby migrating)
@@ -355,6 +376,9 @@ type PairingRequest struct {
 	CreatedAt        time.Time
 	ExpiresAt        time.Time
 	ResolvedAt       *time.Time
+	ResolvedTenantID string
+	// EnrollmentCodeID is retained only for schema backward compatibility;
+	// new code uses ResolvedTenantID exclusively.
 	EnrollmentCodeID string
 }
 
@@ -531,6 +555,7 @@ func Open(path string) (*DB, error) {
 		{18, schemaV18},
 		{19, schemaV19},
 		{20, schemaV20},
+		{21, schemaV21},
 	}
 	for _, m := range migrations {
 		var v int
@@ -686,7 +711,7 @@ func (d *DB) GetPairingRequest(displayCode string) (PairingRequest, error) {
 	row := d.sql.QueryRow(
 		`SELECT id, display_code, COALESCE(poll_id,''), COALESCE(poll_verifier,X''),
 		        public_key, key_id, source_ip, status, created_at, expires_at,
-		        resolved_at, COALESCE(enrollment_code_id,'')
+		        resolved_at, COALESCE(resolved_tenant_id,''), COALESCE(enrollment_code_id,'')
 		 FROM pairing_requests WHERE display_code=?`, displayCode)
 	return scanPairingRequest(row)
 }
@@ -698,7 +723,7 @@ func (d *DB) GetPairingRequestByPollID(pollID string) (PairingRequest, error) {
 	row := d.sql.QueryRow(
 		`SELECT id, display_code, COALESCE(poll_id,''), COALESCE(poll_verifier,X''),
 		        public_key, key_id, source_ip, status, created_at, expires_at,
-		        resolved_at, COALESCE(enrollment_code_id,'')
+		        resolved_at, COALESCE(resolved_tenant_id,''), COALESCE(enrollment_code_id,'')
 		 FROM pairing_requests WHERE poll_id=?`, pollID)
 	return scanPairingRequest(row)
 }
@@ -709,7 +734,7 @@ func (d *DB) ListPendingPairingRequests() ([]PairingRequest, error) {
 	rows, err := d.sql.Query(
 		`SELECT id, display_code, COALESCE(poll_id,''), COALESCE(poll_verifier,X''),
 		        public_key, key_id, source_ip, status, created_at, expires_at,
-		        resolved_at, COALESCE(enrollment_code_id,'')
+		        resolved_at, COALESCE(resolved_tenant_id,''), COALESCE(enrollment_code_id,'')
 		 FROM pairing_requests
 		 WHERE status='pending' AND expires_at > ?
 		 ORDER BY created_at DESC`, now)
@@ -751,16 +776,26 @@ func scanPairingRequest(row pairingScanner) (PairingRequest, error) {
 	var resolvedStr sql.NullString
 	if err := row.Scan(&pr.ID, &pr.DisplayCode, &pr.PollID, &pr.PollVerifier,
 		&pr.PublicKey, &pr.KeyID, &pr.SourceIP,
-		&pr.Status, &createdStr, &expiresStr, &resolvedStr, &pr.EnrollmentCodeID); err != nil {
+		&pr.Status, &createdStr, &expiresStr, &resolvedStr, &pr.ResolvedTenantID, &pr.EnrollmentCodeID); err != nil {
 		if err == sql.ErrNoRows {
 			return PairingRequest{}, apperr.E(apperr.CodeEnrollAuth, "pairing request not found", nil)
 		}
 		return PairingRequest{}, apperr.E(apperr.CodeStoreFault, "scanning pairing request", err)
 	}
-	pr.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
-	pr.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expiresStr)
-	if resolvedStr.Valid {
-		t, _ := time.Parse(time.RFC3339Nano, resolvedStr.String)
+	var err error
+	pr.CreatedAt, err = time.Parse(time.RFC3339Nano, createdStr)
+	if err != nil {
+		return PairingRequest{}, apperr.E(apperr.CodeStoreFault, "corrupt pairing request created_at timestamp", err)
+	}
+	pr.ExpiresAt, err = time.Parse(time.RFC3339Nano, expiresStr)
+	if err != nil {
+		return PairingRequest{}, apperr.E(apperr.CodeStoreFault, "corrupt pairing request expires_at timestamp", err)
+	}
+	if resolvedStr.Valid && resolvedStr.String != "" {
+		t, rerr := time.Parse(time.RFC3339Nano, resolvedStr.String)
+		if rerr != nil {
+			return PairingRequest{}, apperr.E(apperr.CodeStoreFault, "corrupt pairing request resolved_at timestamp", rerr)
+		}
 		pr.ResolvedAt = &t
 	}
 	return pr, nil
@@ -816,4 +851,42 @@ func (d *DB) PrunePairingRequests(now time.Time, resolvedRetention time.Duration
 	}
 	deleted, _ := res2.RowsAffected()
 	return marked, deleted, nil
+}
+
+// TerminalLeaseEphemeraRetention is the retention window before expired or
+// revoked visitor_sessions and access_tokens attached to terminal leases
+// (CLOSED, EXPIRED, REVOKED) are pruned.
+//
+// Security invariant (indefinite lease tombstones): terminal rows in the
+// `leases` table itself are NEVER deleted. Each lease tombstone is ~200 bytes
+// (~20 MB per 100,000 terminal leases) and is required indefinitely by the
+// backup/restore rollback guard (status, generation, token_generation) and
+// ownership fences to prevent authority resurrection. Only bulky ephemeral
+// visitor_sessions and access_tokens referencing terminal leases are pruned.
+const TerminalLeaseEphemeraRetention = 30 * 24 * time.Hour
+
+// PruneTerminalLeaseEphemera deletes expired/revoked visitor_sessions and
+// access_tokens belonging to terminal leases older than retention, without ever
+// deleting the terminal lease tombstone rows themselves.
+func (d *DB) PruneTerminalLeaseEphemera(now time.Time, retention time.Duration) (int64, error) {
+	cutoff := now.UTC().Add(-retention).Format(time.RFC3339Nano)
+	res1, err := d.sql.Exec(
+		`DELETE FROM visitor_sessions
+		 WHERE lease_id IN (SELECT id FROM leases WHERE status IN ('CLOSED','EXPIRED','REVOKED'))
+		   AND (absolute_expires_at < ? OR (revoked_at IS NOT NULL AND revoked_at < ?))`,
+		cutoff, cutoff)
+	if err != nil {
+		return 0, apperr.E(apperr.CodeStoreFault, "pruning terminal lease visitor sessions", err)
+	}
+	n1, _ := res1.RowsAffected()
+	res2, err := d.sql.Exec(
+		`DELETE FROM access_tokens
+		 WHERE lease_id IN (SELECT id FROM leases WHERE status IN ('CLOSED','EXPIRED','REVOKED'))
+		   AND ((expires_at IS NOT NULL AND expires_at < ?) OR (revoked_at IS NOT NULL AND revoked_at < ?))`,
+		cutoff, cutoff)
+	if err != nil {
+		return n1, apperr.E(apperr.CodeStoreFault, "pruning terminal lease access tokens", err)
+	}
+	n2, _ := res2.RowsAffected()
+	return n1 + n2, nil
 }

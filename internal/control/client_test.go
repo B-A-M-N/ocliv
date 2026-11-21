@@ -185,3 +185,34 @@ func TestNewClientRejectsPath(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateDownloadURL(t *testing.T) {
+	cases := []struct {
+		raw     string
+		wantErr bool
+	}{
+		{"https://relay.example.net/.well-known/ocliv-release-manifest.json", false},
+		{"https://cdn.example.net:8443/releases/ocliv-linux-amd64", false},
+		{"http://127.0.0.1:8080/.well-known/ocliv-release-manifest.json", false},
+		{"http://localhost:8080/artifacts/ocliv-linux-amd64", false},
+		{"http://[::1]:8080/manifest.json", false},
+		// Rejected
+		{"", true},
+		{"http://remote.example.net/manifest.json", true},
+		{"ftp://relay.example.net/manifest.json", true},
+		{"https://user:pass@relay.example.net/manifest.json", true},
+		{"https://relay.example.net/manifest.json#frag", true},
+		{"https://relay.example.net/../etc/passwd", true},
+		{"https://relay.example.net/a\\b", true},
+		{"https://", true},
+	}
+	for _, tc := range cases {
+		err := ValidateDownloadURL(tc.raw)
+		if tc.wantErr && err == nil {
+			t.Errorf("ValidateDownloadURL(%q): expected error, got nil", tc.raw)
+		}
+		if !tc.wantErr && err != nil {
+			t.Errorf("ValidateDownloadURL(%q): unexpected error: %v", tc.raw, err)
+		}
+	}
+}

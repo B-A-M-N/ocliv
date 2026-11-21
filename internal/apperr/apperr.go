@@ -1,6 +1,8 @@
 // Package apperr defines Ocliv's explicit error taxonomy and CLI exit codes.
 package apperr
 
+import "errors"
+
 // Exit codes per production spec section 2.2.
 const (
 	ExitOK            = 0
@@ -71,6 +73,16 @@ func (e *Error) Unwrap() error { return e.Err }
 // E builds a typed error.
 func E(code Code, msg string, err error) *Error {
 	return &Error{Code: code, Msg: msg, Err: err}
+}
+
+// CodeOf extracts the apperr.Code from err (unwrapping as needed), or returns
+// "" if err is not an *apperr.Error.
+func CodeOf(err error) Code {
+	var ae *Error
+	if errors.As(err, &ae) && ae != nil {
+		return ae.Code
+	}
+	return ""
 }
 
 // ExitFor maps a fault code to a CLI exit status.

@@ -74,8 +74,14 @@ func (s *Server) handlePairRequest(w http.ResponseWriter, r *http.Request) {
 	sourceIP := clientIP(r)
 
 	// Global capacity: prevent distributed flooding beyond per-IP limits.
+	// Distinguish database faults (503) from actual capacity saturation (429).
 	total, err := s.db.CountPendingPairingRequests()
-	if err != nil || total >= pairingGlobalMax {
+	if err != nil {
+		s.log.Error("pair-request: capacity count failed", "err", errShort(err))
+		http.Error(w, "service temporarily unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if total >= pairingGlobalMax {
 		s.db.Audit("agent", "", "", "pair-request", "denied", "global pairing capacity exceeded")
 		http.Error(w, "relay pairing capacity exceeded; try again later", http.StatusTooManyRequests)
 		return
@@ -176,6 +182,13 @@ func (s *Server) handlePairStatus(w http.ResponseWriter, r *http.Request) {
 
 	pr, err := s.db.GetPairingRequestByPollID(req.PollID)
 	if err != nil {
+		// Distinguish store faults (503) from missing rows (404) so the CLI
+		// retries transient DB outages instead of treating them as expired.
+		if apperr.CodeOf(err) == apperr.CodeStoreFault {
+			s.log.Error("pair-status: store lookup failed", "err", errShort(err))
+			http.Error(w, "service temporarily unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		// Return 404 for not-found AND for wrong credentials — no oracle.
 		http.Error(w, "not found", http.StatusNotFound)
 		return
@@ -201,8 +214,7 @@ func (s *Server) handlePairStatus(w http.ResponseWriter, r *http.Request) {
 
 	resp := pairStatusResp{Status: status}
 	if status == "approved" {
-		// EnrollmentCodeID is repurposed to hold the tenant_id after approval.
-		resp.TenantID = pr.EnrollmentCodeID
+		resp.TenantID = pr.ResolvedTenantID
 		resp.KeyID = pr.KeyID
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -212,6 +224,8 @@ func (s *Server) handlePairStatus(w http.ResponseWriter, r *http.Request) {
 // directly enrolls the publisher's key into the specified tenant, and marks
 // the request as approved. It is a narrow store operation (no Server needed).
 // The operator provides the display code they see on the publisher's screen.
+// If the key is already active in the same tenant, approval is idempotent;
+// if the key is revoked or belongs to a different tenant, approval fails closed.
 func ApprovePairingRequest(db *store.DB, displayCode, tenantID string) (keyID string, err error) {
 	pr, err := db.GetPairingRequest(displayCode)
 	if err != nil {
@@ -224,33 +238,60 @@ func ApprovePairingRequest(db *store.DB, displayCode, tenantID string) (keyID st
 		return "", apperr.E(apperr.CodeEnrollAuth, "pairing request expired", nil)
 	}
 
-	// Suspended tenants cannot receive new publishers (same gate as enrollment).
-	// DB errors are hard failures — not silently treated as "tenant not found".
-	if tenantID != "" {
-		if err := validateEnrollmentTenantState(db, tenantID); err != nil {
-			return "", err
-		}
-	}
-
 	now := time.Now().UTC()
+	var authErr error
 	err = withTx(db.SQL(), func(tx *sql.Tx) error {
+		// Validate tenant state atomically inside the approval transaction.
+		if tenantID != "" {
+			var tStatus string
+			terr := tx.QueryRow(`SELECT status FROM tenants WHERE id=?`, tenantID).Scan(&tStatus)
+			switch {
+			case terr == sql.ErrNoRows:
+				// New tenant will be created below.
+			case terr != nil:
+				return terr
+			case tStatus == "suspended":
+				authErr = apperr.E(apperr.CodeEnrollAuth, fmt.Sprintf("tenant %q is suspended", tenantID), nil)
+				return authErr
+			}
+		}
 		if _, err := tx.Exec(`INSERT OR IGNORE INTO tenants(id, status, created_at, quotas_json) VALUES(?,?,?,?)`,
 			tenantID, "active", now.Format(time.RFC3339Nano), "{}"); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`INSERT INTO agent_keys(id, tenant_id, ed25519_public, status, created_at) VALUES(?,?,?,?,?)`,
-			pr.KeyID, tenantID, pr.PublicKey, "active", now.Format(time.RFC3339Nano)); err != nil {
+		var existingTenant, existingStatus string
+		kerr := tx.QueryRow(`SELECT tenant_id, status FROM agent_keys WHERE id=?`, pr.KeyID).Scan(&existingTenant, &existingStatus)
+		switch {
+		case kerr == sql.ErrNoRows:
+			if _, err := tx.Exec(`INSERT INTO agent_keys(id, tenant_id, ed25519_public, status, created_at) VALUES(?,?,?,?,?)`,
+				pr.KeyID, tenantID, pr.PublicKey, "active", now.Format(time.RFC3339Nano)); err != nil {
+				return err
+			}
+		case kerr != nil:
+			return kerr
+		case existingStatus == "active" && existingTenant == tenantID:
+			// Idempotent: key is already active in this exact tenant.
+		default:
+			authErr = apperr.E(apperr.CodeEnrollAuth,
+				fmt.Sprintf("key %s cannot be enrolled in tenant %q (existing status=%q tenant=%q)", pr.KeyID, tenantID, existingStatus, existingTenant), nil)
+			return authErr
+		}
+		res, err := tx.Exec(
+			`UPDATE pairing_requests SET status='approved', resolved_at=?, resolved_tenant_id=?
+			 WHERE display_code=? AND status='pending'`,
+			now.Format(time.RFC3339Nano), tenantID, displayCode)
+		if err != nil {
 			return err
 		}
-		// EnrollmentCodeID is repurposed to hold the tenant_id for status polling.
-		if _, err := tx.Exec(
-			`UPDATE pairing_requests SET status='approved', resolved_at=?, enrollment_code_id=?
-			 WHERE display_code=? AND status='pending'`,
-			now.Format(time.RFC3339Nano), tenantID, displayCode); err != nil {
-			return err
+		if n, _ := res.RowsAffected(); n != 1 {
+			authErr = apperr.E(apperr.CodeEnrollAuth, "pairing request already resolved", nil)
+			return authErr
 		}
 		return nil
 	})
+	if authErr != nil {
+		return "", authErr
+	}
 	if err != nil {
 		return "", apperr.E(apperr.CodeStoreFault, "approving pairing request", err)
 	}

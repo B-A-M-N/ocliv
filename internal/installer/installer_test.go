@@ -223,3 +223,126 @@ func TestDownloadAndVerifyBadDigest(t *testing.T) {
 		t.Error("dst should not exist after digest mismatch")
 	}
 }
+
+func TestVerifyManifestAnyRotation(t *testing.T) {
+	pub1, priv1, _ := ed25519.GenerateKey(rand.Reader)
+	pub2, priv2, _ := ed25519.GenerateKey(rand.Reader)
+	_, priv3, _ := ed25519.GenerateKey(rand.Reader)
+	msg := []byte(`{"commit":"abc","dirty":false}` + "\n")
+	keys := []ed25519.PublicKey{pub1, pub2}
+
+	if err := VerifyManifestAny(msg, hex.EncodeToString(ed25519.Sign(priv1, msg)), keys); err != nil {
+		t.Fatalf("key1 should verify: %v", err)
+	}
+	if err := VerifyManifestAny(msg, hex.EncodeToString(ed25519.Sign(priv2, msg)), keys); err != nil {
+		t.Fatalf("key2 should verify: %v", err)
+	}
+	if err := VerifyManifestAny(msg, hex.EncodeToString(ed25519.Sign(priv3, msg)), keys); err == nil {
+		t.Fatal("untrusted key3 should be rejected")
+	}
+	if err := VerifyManifestAny(msg, hex.EncodeToString(ed25519.Sign(priv1, msg)), nil); err == nil {
+		t.Fatal("empty key set should be rejected")
+	}
+}
+
+func TestActivateBinaryPrevSymlinkNotFollowedAndRollback(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "ocliv")
+	victim := filepath.Join(dir, "victim.txt")
+	if err := os.WriteFile(victim, []byte("precious"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst, []byte("old-binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Plant a malicious symlink at dst+".prev" pointing at victim.
+	if err := os.Symlink(victim, dst+".prev"); err != nil {
+		t.Fatal(err)
+	}
+	cand := filepath.Join(dir, "cand")
+	if err := os.WriteFile(cand, []byte("new-binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate post-swap check failure: must rollback dst to old-binary AND not clobber victim.
+	err := ActivateBinary(cand, dst, func(string) error {
+		return os.ErrInvalid
+	})
+	if err == nil {
+		t.Fatal("expected post-swap failure")
+	}
+	gotVictim, _ := os.ReadFile(victim)
+	if string(gotVictim) != "precious" {
+		t.Fatalf("victim file was clobbered through .prev symlink: got %q", gotVictim)
+	}
+	gotDst, _ := os.ReadFile(dst)
+	if string(gotDst) != "old-binary" {
+		t.Fatalf("dst was not rolled back: got %q, want old-binary", gotDst)
+	}
+}
+
+func TestVerifyManifestWithTrustLifecycle(t *testing.T) {
+	pubActive, privActive, _ := ed25519.GenerateKey(rand.Reader)
+	pubRetiring, privRetiring, _ := ed25519.GenerateKey(rand.Reader)
+	pubRevoked, privRevoked, _ := ed25519.GenerateKey(rand.Reader)
+	_, privUnknown, _ := ed25519.GenerateKey(rand.Reader)
+
+	tr := TrustRoot{
+		SchemaVersion: 1,
+		Keys: []TrustedKeyEntry{
+			{ID: "k-active", PublicHex: hex.EncodeToString(pubActive), Status: KeyStatusActive},
+			{ID: "k-retiring", PublicHex: hex.EncodeToString(pubRetiring), Status: KeyStatusRetiring},
+			{ID: "k-revoked", PublicHex: hex.EncodeToString(pubRevoked), Status: KeyStatusRevoked},
+		},
+	}
+	msg := []byte(`{"commit":"abc","dirty":false}` + "\n")
+
+	// Active key accepted.
+	if kid, err := VerifyManifestWithTrust(msg, hex.EncodeToString(ed25519.Sign(privActive, msg)), "k-active", tr); err != nil || kid != "k-active" {
+		t.Fatalf("active key rejected: kid=%q err=%v", kid, err)
+	}
+	// Retiring key accepted during overlap.
+	if kid, err := VerifyManifestWithTrust(msg, hex.EncodeToString(ed25519.Sign(privRetiring, msg)), "k-retiring", tr); err != nil || kid != "k-retiring" {
+		t.Fatalf("retiring key rejected: kid=%q err=%v", kid, err)
+	}
+	// Revoked key MUST be rejected (with or without explicit signing_key_id).
+	if _, err := VerifyManifestWithTrust(msg, hex.EncodeToString(ed25519.Sign(privRevoked, msg)), "k-revoked", tr); err == nil {
+		t.Fatal("revoked key with id must be rejected")
+	}
+	if _, err := VerifyManifestWithTrust(msg, hex.EncodeToString(ed25519.Sign(privRevoked, msg)), "", tr); err == nil {
+		t.Fatal("revoked key without id must be rejected")
+	}
+	// Unknown key MUST be rejected.
+	if _, err := VerifyManifestWithTrust(msg, hex.EncodeToString(ed25519.Sign(privUnknown, msg)), "", tr); err == nil {
+		t.Fatal("unknown key must be rejected")
+	}
+}
+
+func TestTrustRootParityWithInstallClientScript(t *testing.T) {
+	tr := ProductionTrustRoot()
+	scriptPath := filepath.Join("..", "..", "packaging", "install", "install-client.sh")
+	raw, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatalf("reading install-client.sh: %v", err)
+	}
+	content := string(raw)
+	for _, k := range tr.Keys {
+		want := k.ID + "|" + k.Status + "|" + k.PublicHex
+		if !containsString(content, want) {
+			t.Errorf("install-client.sh missing canonical trust entry %q from release-trust.json", want)
+		}
+	}
+}
+
+func containsString(s, sub string) bool {
+	return len(sub) > 0 && len(s) >= len(sub) && indexString(s, sub) >= 0
+}
+
+func indexString(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
+}

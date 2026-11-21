@@ -634,7 +634,7 @@ func TestRelayInitLabelsPreparationOnly(t *testing.T) {
 		// Valid (non-placeholder) domain: init now refuses placeholders
 		// before generating, so the fixture uses a real-shaped domain.
 		// The assertion is unchanged: init stays preparation-only.
-		argv := []string{"--domain", "init.test", "--mcp-host", "relay.init.test",
+		argv := []string{"--domain", "init.test", "--edge", "single-host", "--mcp-host", "relay.init.test",
 			"--acme-email", "ops@init.test", "--data", t.TempDir(), "--out", t.TempDir()}
 		if code := cmdRelayInit(argv); code != apperr.ExitOK {
 			t.Fatalf("exit %d", code)

@@ -98,16 +98,27 @@ func (g *GlobalBudget) Stats() (httpStreams, wsStreams, sessions int64) {
 	return g.activeHTTP.Load(), g.activeWS.Load(), g.activeSessions.Load()
 }
 
+// Limits returns the configured per-class ceilings (0 = unlimited).
+func (g *GlobalBudget) Limits() (maxHTTP, maxWS, maxSessions int64) {
+	return g.maxHTTPStreams, g.maxWSStreams, g.maxSessions
+}
+
+// HTTPSaturated returns true when the global HTTP visitor-stream cap is reached.
+func (g *GlobalBudget) HTTPSaturated() bool {
+	return g.maxHTTPStreams > 0 && g.activeHTTP.Load() >= g.maxHTTPStreams
+}
+
+// WSSaturated returns true when the global WebSocket visitor-stream cap is reached.
+func (g *GlobalBudget) WSSaturated() bool {
+	return g.maxWSStreams > 0 && g.activeWS.Load() >= g.maxWSStreams
+}
+
+// SessionsSaturated returns true when the global publisher-session cap is reached.
+func (g *GlobalBudget) SessionsSaturated() bool {
+	return g.maxSessions > 0 && g.activeSessions.Load() >= g.maxSessions
+}
+
 // Saturated returns true if any limited resource class is at or above its cap.
 func (g *GlobalBudget) Saturated() bool {
-	if g.maxHTTPStreams > 0 && g.activeHTTP.Load() >= g.maxHTTPStreams {
-		return true
-	}
-	if g.maxWSStreams > 0 && g.activeWS.Load() >= g.maxWSStreams {
-		return true
-	}
-	if g.maxSessions > 0 && g.activeSessions.Load() >= g.maxSessions {
-		return true
-	}
-	return false
+	return g.HTTPSaturated() || g.WSSaturated() || g.SessionsSaturated()
 }

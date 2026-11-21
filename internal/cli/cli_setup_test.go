@@ -5,9 +5,7 @@ package cli
 // routers, services, or credentials.
 
 import (
-	"bytes"
 	"context"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -153,31 +151,6 @@ func TestSetupFreshInstallDoesNotPersistBeforeProvisioning(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join(home, ".config", "ocliv", "config.toml"))
 	if err == nil && strings.Contains(string(raw), "lab.dynv6.net") {
 		t.Fatalf("fresh relay_url persisted before provisioning completed:\n%s", raw)
-	}
-}
-
-func TestShouldPersistRelayURL(t *testing.T) {
-	for _, tc := range []struct {
-		name        string
-		existing    string
-		next        string
-		provisioned bool
-		want        bool
-	}{
-		{"fresh waits for provisioning", "", "https://lab.dynv6.net", false, false},
-		{"fresh persists after provisioning", "", "https://lab.dynv6.net", true, true},
-		{"same value waits for provisioning", "https://lab.dynv6.net", "https://lab.dynv6.net", false, false},
-		{"same value idempotent after provisioning", "https://lab.dynv6.net", "https://lab.dynv6.net", true, true},
-		{"replacement waits for provisioning", "https://old.example", "https://lab.dynv6.net", false, false},
-		{"replacement after provisioning", "https://old.example", "https://lab.dynv6.net", true, true},
-		{"empty next never persists", "https://old.example", "", true, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := shouldPersistRelayURL(tc.existing, tc.next, tc.provisioned); got != tc.want {
-				t.Fatalf("shouldPersistRelayURL(%q,%q,%v)=%v, want %v",
-					tc.existing, tc.next, tc.provisioned, got, tc.want)
-			}
-		})
 	}
 }
 
@@ -335,26 +308,6 @@ func enrollFixture(t *testing.T) (string, string) {
 	return dir, "http://" + ln.Addr().String()
 }
 
-func TestSetupAutoEnrollEndToEnd(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	dir, url := enrollFixture(t)
-	keyID, code := autoEnroll(url, dir, "home")
-	if code != apperr.ExitOK {
-		t.Fatalf("auto-enroll exit=%d", code)
-	}
-	if keyID == "" {
-		t.Fatal("auto-enroll returned no key id")
-	}
-	if _, err := os.Stat(filepath.Join(home, ".config", "ocliv", "agent.key")); err != nil {
-		t.Fatalf("agent key not saved: %v", err)
-	}
-	// Second run must not burn a new code over the existing key (H07).
-	if _, code := autoEnroll(url, dir, "home"); code != apperr.ExitOK {
-		t.Fatalf("re-run exit=%d, want clean already-enrolled no-op", code)
-	}
-}
-
 func TestSetupProviderFlowIsReadOnlyWithoutConfirm(t *testing.T) {
 	echo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("100.64.5.6\n"))
@@ -496,8 +449,8 @@ func TestSetupPortGuidanceDistinguishesEdges(t *testing.T) {
 		}
 	}
 	// The exception must be named and attributed to the edge that needs it.
-	if !strings.Contains(out, "tunnel edge") {
-		t.Fatalf("guidance does not name the edge that still needs port 80:\n%s", out)
+	if !strings.Contains(out, "tunnel") || !strings.Contains(out, "wildcard") {
+		t.Fatalf("guidance does not name wildcard/tunnel edges:\n%s", out)
 	}
 	// And it must say why for the single-host edge, or the operator cannot
 	// decide which edge to run.
@@ -648,83 +601,6 @@ func TestAgentFilesResolvesSudoUserHomeWhenRoot(t *testing.T) {
 	}
 	if strings.HasPrefix(dir, "/root") {
 		t.Fatalf("expected non-/root dir when SUDO_USER is set, got %q", dir)
-	}
-}
-
-// TestAutoEnrollRejectsDifferentRelay: an existing agent key bound to a
-// different relay must produce an explicit conflict (exit 4), never a silent
-// already-enrolled success, and the key must be preserved. Pre-fix, any
-// existing key reported success regardless of which relay it belonged to.
-func TestAutoEnrollRejectsDifferentRelay(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	dir, url := enrollFixture(t)
-	keyID, code := autoEnroll(url, dir, "home")
-	if code != apperr.ExitOK || keyID == "" {
-		t.Fatalf("initial enroll: exit=%d key=%q", code, keyID)
-	}
-	other := "https://other-relay.example.test"
-	var stderr bytes.Buffer
-	origStderr := os.Stderr
-	r, w, _ := os.Pipe()
-	os.Stderr = w
-	_, code2 := autoEnroll(other, dir, "home")
-	w.Close()
-	os.Stderr = origStderr
-	_, _ = io.Copy(&stderr, r)
-	if code2 != apperr.ExitAuth {
-		t.Fatalf("different-relay re-run: exit=%d, want ExitAuth(%d)", code2, apperr.ExitAuth)
-	}
-	if !strings.Contains(stderr.String(), "other-relay.example.test") || !strings.Contains(stderr.String(), "refusing") {
-		t.Fatalf("conflict message missing relay/refusal detail:\n%s", stderr.String())
-	}
-	// Key must be preserved.
-	if _, err := os.Stat(filepath.Join(home, ".config", "ocliv", "agent.key")); err != nil {
-		t.Fatalf("existing key was disturbed: %v", err)
-	}
-}
-
-// TestAutoEnrollKeyWithoutRelayConfigBlocked: an existing key whose config
-// has no relay_url cannot be verified; the command must fail closed with an
-// actionable message and must not silently treat it as matching.
-func TestAutoEnrollKeyWithoutRelayConfigBlocked(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	dir, url := enrollFixture(t)
-	if _, code := autoEnroll(url, dir, "home"); code != apperr.ExitOK {
-		t.Fatalf("initial enroll: %d", code)
-	}
-	// Erase relay_url from the config.
-	cfg := filepath.Join(home, ".config", "ocliv", "config.toml")
-	raw, err := os.ReadFile(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var kept []string
-	for _, line := range strings.Split(string(raw), "\n") {
-		if !strings.HasPrefix(line, "relay_url") {
-			kept = append(kept, line)
-		}
-	}
-	if err := os.WriteFile(cfg, []byte(strings.Join(kept, "\n")), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	var stderr bytes.Buffer
-	r, w, _ := os.Pipe()
-	origStderr := os.Stderr
-	os.Stderr = w
-	_, code := autoEnroll(url, dir, "home")
-	w.Close()
-	os.Stderr = origStderr
-	_, _ = io.Copy(&stderr, r)
-	if code != apperr.ExitAuth {
-		t.Fatalf("no-relay-url re-run: exit=%d, want ExitAuth", code)
-	}
-	if !strings.Contains(stderr.String(), "relay_url") {
-		t.Fatalf("expected actionable relay_url message, got:\n%s", stderr.String())
-	}
-	if _, err := os.Stat(filepath.Join(home, ".config", "ocliv", "agent.key")); err != nil {
-		t.Fatalf("key disturbed: %v", err)
 	}
 }
 

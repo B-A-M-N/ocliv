@@ -38,10 +38,12 @@ func restrictFileCreation() {
 // cmdRelay handles relay-side operations.
 func cmdRelay(argv []string) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ocliv relay init|serve|doctor|issue-enroll|enroll-ssh|keys|revoke-key|rotate-visitor-key|tenants|pending|approve|backup|validate-backup|restore ...")
+		fmt.Fprintln(os.Stderr, "usage: ocliv relay setup|init|serve|doctor|issue-enroll|enroll-ssh|keys|revoke-key|rotate-visitor-key|tenants|pending|approve|backup|validate-backup|restore ...")
 		return apperr.ExitCLIValidation
 	}
 	switch argv[0] {
+	case "setup":
+		return cmdSetup(argv[1:])
 	case "serve":
 		return cmdRelayServe(argv[1:])
 	case "init":
@@ -512,6 +514,13 @@ func cmdRelayServe(argv []string) int {
 		}
 	}
 
+	allowUnsignedDevRelease := strings.EqualFold(strings.TrimSpace(os.Getenv("OCLIV_ALLOW_UNSIGNED_DEV_RELEASE")), "true")
+	for _, a := range argv {
+		if a == "--allow-unsigned-dev-release" {
+			allowUnsignedDevRelease = true
+		}
+	}
+
 	// Edge mode (tunnel/wildcard/single-host) for capability advertisement.
 	edgeMode := os.Getenv("OCLIV_EDGE_MODE")
 	if v, seen := explicitRelayFlag(argv, "--edge-mode"); seen {
@@ -587,6 +596,7 @@ func cmdRelayServe(argv []string) int {
 		ReleaseManifestJSON:      releaseManifestJSON,
 		ReleaseManifestSig:       releaseManifestSig,
 		ReleaseArtifactDir:       rawArtifactDir,
+		AllowUnsignedRelease:     allowUnsignedDevRelease,
 		EdgeMode:                 edgeMode,
 		GlobalMaxHTTPStreams:     maxHTTPStreams,
 		GlobalMaxWSStreams:       maxWSStreams,
@@ -599,9 +609,14 @@ func cmdRelayServe(argv []string) int {
 	// Readiness is the relay's own prerequisites — writable state,
 	// initialized routing, available capacity — not public DNS/TLS or
 	// route liveness, which stay external doctor checks (P2-2).
-	health := &server.Health{Ready: func() bool {
-		return srv.ReadyForSessions()
-	}}
+	health := &server.Health{
+		Ready: func() bool {
+			return srv.ReadyForSessions()
+		},
+		Status: func() any {
+			return srv.StatusSnapshot()
+		},
+	}
 	// The health/metrics listener binds explicitly on loopback only
 	// (P2): operator-configurable for multi-instance hosts, but never
 	// publicly reachable. A bind failure is reported loudly instead of

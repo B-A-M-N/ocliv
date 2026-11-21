@@ -91,8 +91,8 @@
 - AS-060: No dependence on UPnP or automatic router changes.
 - AS-061: No peer-to-peer NAT traversal requirement.
 - AS-062: No STUN/TURN/ICE subsystem.
-- AS-063: No per-tunnel certificate issuance.
-- AS-064: No per-tunnel DNS changes.
+- AS-063: No per-tunnel certificate issuance. (Production default `--edge wildcard` obeys this via one DNS-01 wildcard cert; `--edge tunnel` / `Caddyfile.tunnel` is an explicit noncanonical lab/compatibility mode only.)
+- AS-064: No per-tunnel DNS changes. (Production default `--edge wildcard` uses one static `*.t.<domain>` wildcard record.)
 - AS-065: No polling-based HTTP forwarding when persistent connections are available.
 - AS-066: No global serialized request queue.
 - AS-067: No design where a slow upload unnecessarily blocks unrelated logical streams.

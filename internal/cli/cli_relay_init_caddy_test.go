@@ -20,7 +20,7 @@ import (
 func generateSingleHost(t *testing.T) string {
 	t.Helper()
 	out := filepath.Join(t.TempDir(), "deploy")
-	argv := []string{"--domain", "hosting.test", "--mcp-host", "relay.hosting.test",
+	argv := []string{"--domain", "hosting.test", "--edge", "single-host", "--mcp-host", "relay.hosting.test",
 		"--acme-email", "op@hosting.test", "--out", out}
 	if code := cmdRelayInit(argv); code != apperr.ExitOK {
 		t.Fatalf("cmdRelayInit generate: exit %d", code)

@@ -24,8 +24,8 @@ remediation narratives live under `docs/audits/history/`.
    - Body-bearing management mutations require negotiated `mgmt_body_sig_v2`; bodyless requests remain `ocliv-mgmt-v1` for rolling compatibility.
    - Private key and env-file loads are single-FD `O_NOFOLLOW` + regular-file + `0600` + owner-checked.
    - Root setup never writes user identity/config files into `SUDO_USER`'s home; enrollment runs as an unprivileged child process via `--code-file -` on stdin.
-4. **Default edge policy:** `DefaultEdgeMode()` (`tunnel`) is the single source of truth for setup execution, recommendations, help text, and docs.
-5. **Release provenance:** Production artifacts must be built from a clean detached worktree at an exact SHA with `-trimpath`, explicit ldflag `BuildCommit`/`BuildTime`/`BuildDirty=false`, `SHA256SUMS`, SBOM, `govulncheck`, and `release-manifest.json` outside Git.
+4. **Default edge policy:** `DefaultEdgeMode()` (`wildcard`) is the single source of truth for setup execution, recommendations, help text, and docs (wildcard DNS + single DNS-01 wildcard cert, no per-lease ACME; `single-host` for single-hostname MCP without wildcard DNS; `tunnel` only as an explicit noncanonical lab/compatibility mode).
+5. **Release provenance:** Production artifacts must be built from a clean detached worktree at an exact SHA with `-trimpath`, explicit ldflag `BuildCommit`/`BuildTime`/`BuildDirty=false`, `SHA256SUMS`, SBOM, `govulncheck`, Ed25519 signature (`release-manifest.json.sig`), and `release-manifest.json` outside Git.
 
 ## Required Validation Commands
 

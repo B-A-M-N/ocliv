@@ -88,6 +88,17 @@ func cmdInstall(argv []string) int {
 			return apperr.ExitCLIValidation
 		}
 		manifestURL = installer.ManifestURL(relayURL)
+	} else {
+		if err := control.ValidateDownloadURL(manifestURL); err != nil {
+			fmt.Fprintln(os.Stderr, "error: invalid --manifest-url: "+err.Error())
+			return apperr.ExitCLIValidation
+		}
+	}
+	if artifactURL != "" {
+		if err := control.ValidateDownloadURL(artifactURL); err != nil {
+			fmt.Fprintln(os.Stderr, "error: invalid --artifact-url: "+err.Error())
+			return apperr.ExitCLIValidation
+		}
 	}
 
 	artifactName := installer.ArtifactName(runtime.GOOS, runtime.GOARCH)
@@ -111,8 +122,7 @@ func cmdInstall(argv []string) int {
 		fmt.Fprintln(os.Stderr, "warning: manifest signature check bypassed via --allow-unsigned-dev-release")
 		m, err = installer.FetchManifest(ctx, client, manifestURL)
 	} else {
-		pubKey := installer.ProductionPublicKey()
-		m, err = installer.FetchManifestSigned(ctx, client, manifestURL, pubKey)
+		m, err = installer.FetchManifestSignedAny(ctx, client, manifestURL, installer.ProductionPublicKeys())
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
@@ -154,13 +164,17 @@ func cmdInstall(argv []string) int {
 
 	if dryRun {
 		fmt.Fprintf(os.Stderr, "dry-run: downloading %s...\n", artifactURL)
-		if err := installer.DownloadAndVerify(ctx, client, artifactURL, entry.SHA256, dst+".dryrun"); err != nil {
-			_ = os.Remove(dst + ".dryrun")
+		tmpPath, err := installer.DownloadToTemp(ctx, client, artifactURL, entry.SHA256, dir)
+		if err != nil {
 			fmt.Fprintln(os.Stderr, "error: "+err.Error())
 			return apperr.ExitRelayTLS
 		}
-		_ = os.Remove(dst + ".dryrun")
-		fmt.Printf("verified: sha256=%s — not installed (dry-run)\n", entry.SHA256)
+		defer os.Remove(tmpPath)
+		if err := installer.ValidateBinaryCandidate(ctx, tmpPath, m); err != nil {
+			fmt.Fprintln(os.Stderr, "error: "+err.Error())
+			return apperr.ExitRelayTLS
+		}
+		fmt.Printf("verified: sha256=%s commit=%s — not installed (dry-run)\n", entry.SHA256, m.Commit)
 		return apperr.ExitOK
 	}
 
@@ -174,7 +188,7 @@ func cmdInstall(argv []string) int {
 	}
 
 	fmt.Fprintf(os.Stderr, "downloading %s...\n", artifactURL)
-	if err := installer.DownloadAndVerify(ctx, client, artifactURL, entry.SHA256, dst); err != nil {
+	if err := installer.DownloadValidateAndInstall(ctx, client, artifactURL, entry.SHA256, dst, m); err != nil {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return apperr.ExitRelayTLS
 	}

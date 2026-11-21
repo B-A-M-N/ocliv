@@ -146,16 +146,18 @@ func TestInstallRollbackRestoresWorkingConfig(t *testing.T) {
 	}
 }
 
-func TestPlanRootWithoutCaddyStopsAtInstall(t *testing.T) {
+func TestPlanRootWithoutCaddyAutoInstalls(t *testing.T) {
 	steps, reason := PlanBootstrap(BootstrapEnv{AsRoot: true, CaddyPresent: false, Path: PathDirectV4})
-	if len(steps) != 1 {
-		t.Fatalf("want exactly the install-caddy step, got %d", len(steps))
+	if reason != "" {
+		t.Fatalf("root without Caddy should auto-install, got blockReason=%q", reason)
 	}
-	if steps[0].Auto {
-		t.Error("caddy install must be manual (package manager, user consent)")
+	if len(steps) < 2 || steps[0].Title != "install Caddy" || !steps[0].Auto {
+		t.Fatalf("expected auto 'install Caddy' as first step, got %+v", steps)
 	}
-	if reason == "" {
-		t.Error("missing re-run guidance after Caddy install")
+	// Non-root without Caddy still blocks with a manual instruction.
+	nrSteps, nrReason := PlanBootstrap(BootstrapEnv{AsRoot: false, CaddyPresent: false, Path: PathDirectV4})
+	if len(nrSteps) != 1 || nrSteps[0].Auto || nrReason == "" {
+		t.Fatalf("non-root without Caddy should block with manual step, got steps=%+v reason=%q", nrSteps, nrReason)
 	}
 }
 

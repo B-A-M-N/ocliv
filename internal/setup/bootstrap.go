@@ -199,12 +199,14 @@ type Step struct {
 // BootstrapEnv is everything the planner may consider. It is gathered,
 // not guessed: AsRoot from the process euid, CaddyPresent from PATH.
 type BootstrapEnv struct {
-	AsRoot       bool
-	CaddyPresent bool
-	Path         Path
-	Hostname     string
-	DeployDir    string
-	DataDir      string
+	AsRoot            bool
+	CaddyPresent      bool
+	DNSProvider       string // non-empty for wildcard DNS-01 edge; ensures Caddy includes the DNS module
+	CaddyHasDNSModule bool   // true when CaddyPresent includes dns.providers.<DNSProvider>
+	Path              Path
+	Hostname          string
+	DeployDir         string
+	DataDir           string
 }
 
 // PlanBootstrap returns the edge-provisioning steps for a viable path,
@@ -219,11 +221,17 @@ func PlanBootstrap(env BootstrapEnv) (steps []Step, blockReason string) {
 	default:
 		return nil, "no viable direct path (" + env.Path.String() + "): resolve the cause in `setup --check`, then re-run"
 	}
-	if !env.CaddyPresent {
+	needCaddy := !env.CaddyPresent || (env.DNSProvider != "" && !env.CaddyHasDNSModule)
+	if needCaddy && !env.AsRoot {
+		manual := "install Caddy from https://caddyserver.com/docs/install (or run `sudo ocliv relay setup --auto` to install a pinned Caddy automatically)"
+		if env.DNSProvider != "" {
+			manual = fmt.Sprintf("install Caddy with the %s DNS module (https://caddyserver.com/download?package=github.com/caddy-dns/%s) or run `sudo ocliv relay setup --auto`", env.DNSProvider, env.DNSProvider)
+		}
 		return []Step{{
 			Title:  "install Caddy",
-			Manual: "install Caddy from https://caddyserver.com/docs/install (apt/dnf/docker), then re-run `ocliv setup --auto`",
-		}}, "re-run after installing Caddy"
+			Auto:   false,
+			Manual: manual,
+		}}, "re-run as root to install Caddy automatically, or install Caddy manually and re-run"
 	}
 	caddyDst := DefaultCleanHostArtifacts.Caddyfile
 	unitDst := DefaultCleanHostArtifacts.Unit
@@ -237,7 +245,14 @@ func PlanBootstrap(env BootstrapEnv) (steps []Step, blockReason string) {
 	mk := func(title, manual string) Step {
 		return Step{Title: title, Auto: env.AsRoot, Manual: manual}
 	}
-	steps = []Step{
+	if needCaddy {
+		manual := fmt.Sprintf("install pinned Caddy v%s to %s", PinnedCaddyVersion, DefaultCaddyBinaryPath)
+		if env.DNSProvider != "" {
+			manual = fmt.Sprintf("install pinned Caddy v%s with dns.providers.%s to %s", PinnedCaddyVersion, env.DNSProvider, DefaultCaddyBinaryPath)
+		}
+		steps = append(steps, mk("install Caddy", manual))
+	}
+	steps = append(steps,
 		// Order is prerequisite order: the account and data dir
 		// must exist before the relay can start; the Caddyfile must
 		// exist before Caddy can load it; the unit must exist
@@ -265,7 +280,7 @@ func PlanBootstrap(env BootstrapEnv) (steps []Step, blockReason string) {
 				filepath.Join(env.DeployDir, "ocliv-relay.service"), unitDst)),
 		mk("enable and start relay",
 			"systemctl enable --now ocliv-relay && systemctl is-active ocliv-relay"),
-	}
+	)
 	// Publisher enrollment is intentionally not part of relay setup.
 	// The relay hosts the tunneling service; publishers are separate machines
 	// that enroll independently via `ocliv login`. Never auto-enroll the relay

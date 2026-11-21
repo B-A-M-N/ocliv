@@ -143,6 +143,7 @@ func TestRelayInitCheckAcceptsGenerated(t *testing.T) {
 	out := t.TempDir()
 	gen := []string{
 		"--domain", "hosting.test",
+		"--edge", "single-host",
 		"--mcp-host", "relay.hosting.test",
 		"--acme-email", "ops@hosting.test",
 		"--data", "/var/lib/ocliv",
@@ -165,6 +166,7 @@ func TestRelayInitCheckRejectsBadDir(t *testing.T) {
 	out := t.TempDir()
 	gen := []string{
 		"--domain", "hosting.test",
+		"--edge", "single-host",
 		"--mcp-host", "relay.hosting.test",
 		"--acme-email", "ops@hosting.test",
 		"--out", out,

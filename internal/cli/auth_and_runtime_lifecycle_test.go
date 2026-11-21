@@ -404,7 +404,7 @@ func TestP2SetupJSONRunsFullTransaction(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
 		t.Fatalf("setup --json stdout is NOT pure valid JSON: %v\nstdout:\n%s", err, out)
 	}
-	if parsed["action"] != "setup_dns" || parsed["completed_stage"] != "dry_run_ok" || parsed["edge_mode"] != "tunnel" {
+	if parsed["action"] != "setup_dns" || parsed["completed_stage"] != "dry_run_ok" || parsed["edge_mode"] != DefaultEdgeMode() {
 		t.Fatalf("unexpected setup JSON payload: %+v", parsed)
 	}
 }
