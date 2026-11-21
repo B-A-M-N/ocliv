@@ -40,7 +40,6 @@ func TestPlanBootstrapCoversFullCleanHostArtifactSet(t *testing.T) {
 		"activate and reload Caddy",
 		"install systemd unit",
 		"enable and start relay",
-		"enroll this machine",
 		"install and enable dynv6 refresh timer",
 	}
 	if len(steps) != len(want) {
@@ -70,8 +69,8 @@ func TestPlanBootstrapNonRootNamesEveryArtifact(t *testing.T) {
 	if reason != "" {
 		t.Fatalf("viable path blocked: %q", reason)
 	}
-	if len(steps) != 11 {
-		t.Fatalf("non-root plan has %d steps, want 11: %v", len(steps), titles(steps))
+	if len(steps) != 10 {
+		t.Fatalf("non-root plan has %d steps, want 10: %v", len(steps), titles(steps))
 	}
 	for _, s := range steps {
 		if s.Auto {

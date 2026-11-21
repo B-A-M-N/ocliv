@@ -192,13 +192,9 @@ func TestP1AccessExplicitTargetAndIncompatibleSingleHostEdge(t *testing.T) {
 		t.Fatalf("expected explicit name app2 -> lse-2, got id=%q err=%v", id, err)
 	}
 
-	// Incompatible single-host setup edge -> `ocliv host 3000` (HTTP) MUST fail fast before writing service state!
-	if err := saveSetupState(setupState{EdgeMode: "single-host", Hostname: "mylab.duckdns.org"}); err != nil {
-		t.Fatal(err)
-	}
-	if code := cmdHostWithOps([]string{"3000", "--name", "webapp", "--json"}, serviceOps{}); code != apperr.ExitCLIValidation {
-		t.Fatalf("expected ExitCLIValidation when hosting HTTP on single-host edge, got %d", code)
-	}
+	// Note: HTTP hosting on a single-host relay is enforced server-side by the relay
+	// (which won't create wildcard subdomain leases). Publisher machines do not read local
+	// relay setup state to gate this — that would be an architecturally invalid coupling.
 }
 
 func TestP1RestartFencedAgainstConcurrentDisable(t *testing.T) {

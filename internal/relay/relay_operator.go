@@ -142,3 +142,21 @@ func UnsuspendTenantDB(db *store.DB, tenantID string) error {
 	}
 	return nil
 }
+
+// GetTenantPolicyDB reads the policy for tenantID directly from the DB
+// (CLI path: no live Server required).
+func GetTenantPolicyDB(db *store.DB, tenantID string) (store.TenantPolicy, error) {
+	var raw string
+	if err := db.SQL().QueryRow(`SELECT quotas_json FROM tenants WHERE id=?`, tenantID).Scan(&raw); err != nil {
+		if err == sql.ErrNoRows {
+			return store.TenantPolicy{}, apperr.E(apperr.CodeEnrollAuth, "unknown tenant", nil)
+		}
+		return store.TenantPolicy{}, apperr.E(apperr.CodeStoreFault, "reading tenant policy", err)
+	}
+	return db.GetTenantPolicy(tenantID), nil
+}
+
+// SetTenantPolicyDB writes policy for tenantID directly to the DB (CLI path).
+func SetTenantPolicyDB(db *store.DB, tenantID string, p store.TenantPolicy) error {
+	return db.SetTenantPolicy(tenantID, p)
+}

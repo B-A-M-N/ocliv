@@ -597,6 +597,23 @@ func (s *Server) serveProxied(w http.ResponseWriter, r *http.Request, t *routeTa
 		return
 	}
 	defer sess.Budget.Release(isWS)
+	if isWS {
+		if !s.globalBudget.AdmitWS() {
+			metrics.Global.CapacityRejects.Add(1)
+			s.db.Audit("visitor", "", t.LeaseID, "admission", "denied", "global websocket capacity exceeded")
+			http.Error(w, "relay at capacity", http.StatusServiceUnavailable)
+			return
+		}
+		defer s.globalBudget.ReleaseWS()
+	} else {
+		if !s.globalBudget.AdmitHTTP() {
+			metrics.Global.CapacityRejects.Add(1)
+			s.db.Audit("visitor", "", t.LeaseID, "admission", "denied", "global http capacity exceeded")
+			http.Error(w, "relay at capacity", http.StatusServiceUnavailable)
+			return
+		}
+		defer s.globalBudget.ReleaseHTTP()
+	}
 
 	if sess.Yamux.IsClosed() {
 		http.Error(w, "agent offline", http.StatusServiceUnavailable)

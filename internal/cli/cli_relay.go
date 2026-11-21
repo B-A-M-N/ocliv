@@ -638,13 +638,23 @@ func cmdRelayDoctor(argv []string) int {
 func cmdIssueEnroll(argv []string) int {
 	_, dataDir, _ := relayFlags(argv)
 	var tenant string
+	var outFile string
 	tenantSet := false
 	ttl := 24 * time.Hour
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
 		if a == "--help" || a == "-h" {
-			fmt.Fprintln(os.Stderr, "usage: ocliv relay issue-enroll [--data DIR] [--tenant NAME] [--ttl DURATION]")
+			fmt.Fprintln(os.Stderr, "usage: ocliv relay issue-enroll [--data DIR] [--tenant NAME] [--ttl DURATION] [--out FILE]")
+			fmt.Fprintln(os.Stderr, "  --out FILE  write code to FILE (mode 0600) instead of stdout")
 			return apperr.ExitCLIValidation
+		}
+		if a == "--out" || strings.HasPrefix(a, "--out=") {
+			v, ok := mcpFlagValue(argv, &i, "out")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			outFile = v
+			continue
 		}
 		if a == "--tenant" {
 			// Space form: the value is the NEXT argument. A missing
@@ -696,8 +706,17 @@ func cmdIssueEnroll(argv []string) int {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return apperr.ExitInternal
 	}
-	fmt.Println("One-time enrollment code (valid 24h, show once):")
-	fmt.Println(code)
+	if outFile != "" {
+		// Write to file with mode 0600 so the credential is private.
+		if werr := os.WriteFile(outFile, []byte(code+"\n"), 0o600); werr != nil {
+			fmt.Fprintln(os.Stderr, "error: writing code to file: "+werr.Error())
+			return apperr.ExitInternal
+		}
+		fmt.Printf("enrollment code written to %s (valid %s, single use)\n", outFile, ttl.Round(time.Second))
+	} else {
+		fmt.Printf("One-time enrollment code (valid %s, show once):\n", ttl.Round(time.Second))
+		fmt.Println(code)
+	}
 	return apperr.ExitOK
 }
 
@@ -794,10 +813,17 @@ func cmdRelayRevokeKey(argv []string) int {
 	return apperr.ExitOK
 }
 
-// cmdRelayTenants implements `ocliv relay tenants suspend|unsuspend`.
+// cmdRelayTenants implements `ocliv relay tenants suspend|unsuspend|policy`.
 func cmdRelayTenants(argv []string) int {
-	if len(argv) == 0 || (argv[0] != "suspend" && argv[0] != "unsuspend") {
-		fmt.Fprintln(os.Stderr, "usage: ocliv relay tenants suspend|unsuspend --tenant ID [--reason TEXT] [--data DIR]")
+	if len(argv) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: ocliv relay tenants suspend|unsuspend|policy ...")
+		return apperr.ExitCLIValidation
+	}
+	if argv[0] == "policy" {
+		return cmdRelayTenantsPolicy(argv[1:])
+	}
+	if argv[0] != "suspend" && argv[0] != "unsuspend" {
+		fmt.Fprintln(os.Stderr, "usage: ocliv relay tenants suspend|unsuspend|policy ...")
 		return apperr.ExitCLIValidation
 	}
 	op := argv[0]
@@ -844,6 +870,132 @@ func cmdRelayTenants(argv []string) int {
 	}
 	db.Audit("operator", tenant, "", "tenant_unsuspend", "ok", reason)
 	fmt.Printf("unsuspended tenant %s (re-enroll publishers explicitly; old keys stay revoked)\n", tenant)
+	return apperr.ExitOK
+}
+
+// cmdRelayTenantsPolicy implements `ocliv relay tenants policy show|set`.
+//
+//	ocliv relay tenants policy show TENANT_ID [--data DIR]
+//	ocliv relay tenants policy set  TENANT_ID [--allow-public=true|false] [--max-active-leases=N] [--max-persistent-leases=N] [--data DIR]
+func cmdRelayTenantsPolicy(argv []string) int {
+	if len(argv) == 0 || (argv[0] != "show" && argv[0] != "set") {
+		fmt.Fprintln(os.Stderr, "usage: ocliv relay tenants policy show|set TENANT_ID [--data DIR] [set flags...]")
+		return apperr.ExitCLIValidation
+	}
+	op := argv[0]
+	if len(argv) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: ocliv relay tenants policy "+op+" TENANT_ID ...")
+		return apperr.ExitCLIValidation
+	}
+	tenantID := argv[1]
+	if tenantID == "" {
+		fmt.Fprintln(os.Stderr, "error: tenant ID required")
+		return apperr.ExitCLIValidation
+	}
+
+	// Parse optional flags for "set".
+	allowPublicSet := false
+	allowPublicVal := false
+	maxActiveSet := false
+	maxActiveVal := 0
+	maxPersistentSet := false
+	maxPersistentVal := 0
+	for i := 2; i < len(argv); i++ {
+		a := argv[i]
+		if a == "--data" && i+1 < len(argv) {
+			i++
+			continue
+		}
+		if strings.HasPrefix(a, "--data=") {
+			continue
+		}
+		if a == "--allow-public" || a == "--allow-public=true" {
+			allowPublicSet = true
+			allowPublicVal = true
+		} else if a == "--allow-public=false" {
+			allowPublicSet = true
+			allowPublicVal = false
+		} else if strings.HasPrefix(a, "--max-active-leases=") {
+			v, err := strconv.Atoi(strings.TrimPrefix(a, "--max-active-leases="))
+			if err != nil || v < 0 {
+				fmt.Fprintln(os.Stderr, "error: --max-active-leases must be a non-negative integer")
+				return apperr.ExitCLIValidation
+			}
+			maxActiveSet = true
+			maxActiveVal = v
+		} else if strings.HasPrefix(a, "--max-persistent-leases=") {
+			v, err := strconv.Atoi(strings.TrimPrefix(a, "--max-persistent-leases="))
+			if err != nil || v < 0 {
+				fmt.Fprintln(os.Stderr, "error: --max-persistent-leases must be a non-negative integer")
+				return apperr.ExitCLIValidation
+			}
+			maxPersistentSet = true
+			maxPersistentVal = v
+		} else {
+			fmt.Fprintf(os.Stderr, "unknown flag: %s\n", a)
+			return apperr.ExitCLIValidation
+		}
+	}
+
+	db, code := openRelayDB(argv[2:])
+	if code != 0 {
+		return code
+	}
+	defer db.Close()
+
+	if op == "show" {
+		p, err := relay.GetTenantPolicyDB(db, tenantID)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error: "+err.Error())
+			return exitForRelayErr(err)
+		}
+		fmt.Printf("tenant:                %s\n", tenantID)
+		fmt.Printf("allow_public:          %v\n", p.AllowPublic)
+		if p.MaxActiveLeases == 0 {
+			fmt.Printf("max_active_leases:     unlimited\n")
+		} else {
+			fmt.Printf("max_active_leases:     %d\n", p.MaxActiveLeases)
+		}
+		if p.MaxPersistentLeases == 0 {
+			fmt.Printf("max_persistent_leases: unlimited\n")
+		} else {
+			fmt.Printf("max_persistent_leases: %d\n", p.MaxPersistentLeases)
+		}
+		return apperr.ExitOK
+	}
+
+	// op == "set": load existing, merge changes, write back.
+	p, err := relay.GetTenantPolicyDB(db, tenantID)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return exitForRelayErr(err)
+	}
+	if allowPublicSet {
+		p.AllowPublic = allowPublicVal
+	}
+	if maxActiveSet {
+		p.MaxActiveLeases = maxActiveVal
+	}
+	if maxPersistentSet {
+		p.MaxPersistentLeases = maxPersistentVal
+	}
+	if err := relay.SetTenantPolicyDB(db, tenantID, p); err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return exitForRelayErr(err)
+	}
+	db.Audit("operator", tenantID, "", "tenant_policy_set", "ok", fmt.Sprintf("allow_public=%v max_active=%d max_persistent=%d", p.AllowPublic, p.MaxActiveLeases, p.MaxPersistentLeases))
+	fmt.Printf("policy updated for tenant %s\n", tenantID)
+	fmt.Printf("  allow_public:          %v\n", p.AllowPublic)
+	if p.MaxActiveLeases == 0 {
+		fmt.Printf("  max_active_leases:     unlimited\n")
+	} else {
+		fmt.Printf("  max_active_leases:     %d\n", p.MaxActiveLeases)
+	}
+	if p.MaxPersistentLeases == 0 {
+		fmt.Printf("  max_persistent_leases: unlimited\n")
+	} else {
+		fmt.Printf("  max_persistent_leases: %d\n", p.MaxPersistentLeases)
+	}
 	return apperr.ExitOK
 }
 

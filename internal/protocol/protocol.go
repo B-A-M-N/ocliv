@@ -34,6 +34,14 @@ const (
 	// CapabilityMgmtBodySignatureV2 is advertised in /v1/agent/challenge when
 	// the relay verifies body-bound ocliv-mgmt-v2 management signatures (P0-1).
 	CapabilityMgmtBodySignatureV2 = "mgmt_body_sig_v2"
+
+	// CapabilityHTTPSubdomainIngress is advertised when the relay serves
+	// per-publisher HTTP tunnel hostnames via wildcard subdomain routing.
+	CapabilityHTTPSubdomainIngress = "http_subdomain_ingress_v1"
+
+	// CapabilityMCPPathIngress is advertised when the relay has a configured
+	// mcpHost and can serve /r/<route-id>/mcp path-based MCP routes.
+	CapabilityMCPPathIngress = "mcp_path_ingress_v1"
 )
 
 // ParseRevision parses a protocol string of the form "ocliv/<N>" into its

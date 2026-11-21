@@ -322,6 +322,16 @@ func (s *Server) allocateNamed(tenantID, keyID string, intent LeaseIntent, now t
 	if err := lease.ValidateLabel(label); err != nil {
 		return nil, attachedMsg{}, err
 	}
+	// Enforce per-tenant persistent lease quota before the expensive insert.
+	if policy := s.db.GetTenantPolicy(tenantID); policy.MaxPersistentLeases > 0 {
+		var persistent int
+		_ = s.db.SQL().QueryRow(
+			`SELECT COUNT(*) FROM leases WHERE tenant_id=? AND COALESCE(persistent,0)=1 AND status NOT IN ('REVOKED','CLOSED','EXPIRED')`,
+			tenantID).Scan(&persistent)
+		if persistent >= policy.MaxPersistentLeases {
+			return nil, attachedMsg{}, apperr.E(apperr.CodeQuotaLease, "tenant persistent lease limit reached", nil)
+		}
+	}
 	return s.insertLease(tenantID, keyID, label, intent, now, &label)
 }
 
@@ -333,6 +343,22 @@ func (s *Server) insertLease(tenantID, keyID, label string, intent LeaseIntent, 
 	mode, err := wantMode(intent)
 	if err != nil {
 		return nil, attachedMsg{}, err
+	}
+	// Enforce tenant policy before the expensive DB transaction.
+	// The relay is authoritative: a publisher cannot bypass this by
+	// constructing a modified client.
+	policy := s.db.GetTenantPolicy(tenantID)
+	if mode == "public" && !policy.AllowPublic {
+		return nil, attachedMsg{}, apperr.E(apperr.CodeCLIValidation, "relay tenant policy denies public exposure; operator must enable allow_public for this tenant", nil)
+	}
+	if policy.MaxActiveLeases > 0 {
+		var active int
+		_ = s.db.SQL().QueryRow(
+			`SELECT COUNT(*) FROM leases WHERE tenant_id=? AND status IN ('ACTIVE','RECONNECTING','PENDING')`,
+			tenantID).Scan(&active)
+		if active >= policy.MaxActiveLeases {
+			return nil, attachedMsg{}, apperr.E(apperr.CodeQuotaLease, "tenant active lease limit reached", nil)
+		}
 	}
 	hostname := label + "." + s.namespace
 	// The initial share secret is prepared before the transaction (no DB

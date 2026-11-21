@@ -265,9 +265,11 @@ func PlanBootstrap(env BootstrapEnv) (steps []Step, blockReason string) {
 				filepath.Join(env.DeployDir, "ocliv-relay.service"), unitDst)),
 		mk("enable and start relay",
 			"systemctl enable --now ocliv-relay && systemctl is-active ocliv-relay"),
-		mk("enroll this machine",
-			fmt.Sprintf("ocliv relay issue-enroll --data %s --tenant home && ocliv login --relay https://%s --code-file -", dataDir, env.Hostname)),
 	}
+	// Publisher enrollment is intentionally not part of relay setup.
+	// The relay hosts the tunneling service; publishers are separate machines
+	// that enroll independently via `ocliv login`. Never auto-enroll the relay
+	// host as a publisher — the relay machine does not run tunnel publishers.
 	lowerHost := strings.ToLower(strings.TrimSuffix(env.Hostname, "."))
 	if strings.HasSuffix(lowerHost, ".dynv6.net") || IsDuckDNSZone(lowerHost) {
 		provider := "dynv6"
@@ -556,6 +558,55 @@ func InstallUnitTo(deployDir, dst string) error {
 // half-installed edge config behind.
 func newFileSentinel(dst string) string { return dst + ".ocliv-new" }
 
+// safeWriteFile atomically writes data to dst, refusing to follow symlinks.
+// A temp file is created in the same directory, written, fsynced, and
+// renamed into place. The Lstat immediately before rename catches TOCTOU
+// races where an attacker replaces dst with a symlink after the caller's
+// own Lstat check. Callers that check the destination before invoking
+// this get defense-in-depth, not a weaker guarantee.
+func safeWriteFile(dst string, data []byte, perm os.FileMode) (retErr error) {
+	dir := filepath.Dir(dst)
+	tmp, err := os.CreateTemp(dir, ".ocliv-tmp-*")
+	if err != nil {
+		return fmt.Errorf("creating temp file for %s: %w", dst, err)
+	}
+	tmpName := tmp.Name()
+	renamed := false
+	defer func() {
+		if !renamed {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return fmt.Errorf("chmod temp file for %s: %w", dst, err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("writing temp file for %s: %w", dst, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("syncing temp file for %s: %w", dst, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("closing temp file for %s: %w", dst, err)
+	}
+	// Lstat dst immediately before rename to detect TOCTOU replacement.
+	if fi, err := os.Lstat(dst); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to write %s: destination is a symlink", dst)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("lstat %s before rename: %w", dst, err)
+	}
+	if err := os.Rename(tmpName, dst); err != nil {
+		return fmt.Errorf("installing %s: %w", dst, err)
+	}
+	renamed = true
+	return nil
+}
+
 // installManagedFile stages a candidate config with clear ownership:
 // an existing file without the ocliv marker is refused (it may
 // belong to another application); a managed file is backed up, the
@@ -567,6 +618,9 @@ func newFileSentinel(dst string) string { return dst + ".ocliv-new" }
 // artifact is more restrictive (the env file) use installManagedFileMode.
 // The backup keeps the PREVIOUS mode so a restore also restores the
 // previous permissions, never silently widening them.
+// All writes use safeWriteFile (temp + atomic rename + pre-rename Lstat)
+// to prevent a local attacker from redirecting a privileged write through
+// a symlink substituted after the caller's own existence check.
 func installManagedFile(dst string, candidate []byte, validate func(string) error) error {
 	return installManagedFileMode(dst, candidate, 0o644, validate)
 }
@@ -574,38 +628,51 @@ func installManagedFile(dst string, candidate []byte, validate func(string) erro
 func installManagedFileMode(dst string, candidate []byte, perm os.FileMode, validate func(string) error) error {
 	existed := true
 	var prevMode os.FileMode = 0o644
-	if prev, err := os.ReadFile(dst); err == nil {
+
+	// Lstat dst before any read to detect symlinks.
+	dstFi, dstErr := os.Lstat(dst)
+	if dstErr == nil {
+		if dstFi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to install %s: destination is a symlink", dst)
+		}
+		prev, err := os.ReadFile(dst)
+		if err != nil {
+			return fmt.Errorf("reading %s: %w", dst, err)
+		}
 		if !strings.Contains(string(prev), ManagedMarker) {
 			return fmt.Errorf("refusing to overwrite unmanaged %s (no %q marker): back it up, move it aside, or adopt it by adding the marker line, then re-run", dst, ManagedMarker)
 		}
-		if fi, serr := os.Stat(dst); serr == nil {
-			prevMode = fi.Mode().Perm()
+		prevMode = dstFi.Mode().Perm()
+		// Lstat the backup path; reject if it is a symlink.
+		bakPath := dst + ".ocliv-bak"
+		if bfi, berr := os.Lstat(bakPath); berr == nil && bfi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to back up %s: backup path %s is a symlink", dst, bakPath)
 		}
-		if err := os.WriteFile(dst+".ocliv-bak", prev, prevMode); err != nil {
+		if err := safeWriteFile(bakPath, prev, prevMode); err != nil {
 			return fmt.Errorf("backing up %s: %w", dst, err)
 		}
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("reading %s: %w", dst, err)
+	} else if !os.IsNotExist(dstErr) {
+		return fmt.Errorf("checking %s: %w", dst, dstErr)
 	} else {
 		existed = false
 	}
-	if err := os.WriteFile(dst, candidate, perm); err != nil {
+
+	if err := safeWriteFile(dst, candidate, perm); err != nil {
 		return fmt.Errorf("installing %s: %w", dst, err)
 	}
-	if err := os.Chmod(dst, perm); err != nil {
-		return fmt.Errorf("chmod %s: %w", dst, err)
-	}
+
 	if validate != nil {
 		if err := validate(dst); err != nil {
-			if prev, rerr := os.ReadFile(dst + ".ocliv-bak"); rerr == nil {
+			bakPath := dst + ".ocliv-bak"
+			if prev, rerr := os.ReadFile(bakPath); rerr == nil {
 				// The restore write is itself fallible (disk full,
 				// permissions, hostile post-write state). A failed
 				// restore must be loud, and the backup must survive
 				// as a recovery artifact — never silently deleted.
-				if werr := os.WriteFile(dst, prev, prevMode); werr != nil {
+				if werr := safeWriteFile(dst, prev, prevMode); werr != nil {
 					return fmt.Errorf("validation failed and previous config restore failed, backup kept at %s.ocliv-bak: %v: %w", dst, werr, err)
 				}
-				if rerr := os.Remove(dst + ".ocliv-bak"); rerr != nil {
+				if rerr := os.Remove(bakPath); rerr != nil {
 					return fmt.Errorf("validation failed, previous config restored but backup removal failed: %v: %w", rerr, err)
 				}
 				return fmt.Errorf("validation failed, previous config restored: %w", err)
@@ -616,8 +683,14 @@ func installManagedFileMode(dst string, candidate []byte, perm os.FileMode, vali
 			return fmt.Errorf("validation failed, installed candidate removed (no previous config): %w", err)
 		}
 	}
+
 	if !existed {
-		if err := os.WriteFile(newFileSentinel(dst), nil, 0o644); err != nil {
+		sentinel := newFileSentinel(dst)
+		// Reject a symlink at the sentinel path too.
+		if sfi, serr := os.Lstat(sentinel); serr == nil && sfi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to journal new file %s: sentinel path %s is a symlink", dst, sentinel)
+		}
+		if err := safeWriteFile(sentinel, nil, 0o644); err != nil {
 			return fmt.Errorf("journaling new file %s: %w", dst, err)
 		}
 	}

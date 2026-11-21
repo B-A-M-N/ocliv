@@ -63,10 +63,10 @@ type initConfig struct {
 }
 
 func parseRelayInit(argv []string) (initConfig, int) {
-	c := initConfig{edge: "single-host"}
+	c := initConfig{edge: DefaultEdgeMode()}
 	_, dataDir, _ := relayFlags(argv)
 	c.dataDir = dataDir
-	usage := "usage: ocliv relay init --domain DOMAIN [--mcp-host HOST] [--acme-email ADDR] [--edge single-host|wildcard|tunnel] [--dns-provider NAME [--dns-env VAR]] [--allow-reserved-domain] [--data DIR] [--out DIR]\n       ocliv relay init --check --out DIR"
+	usage := "usage: ocliv relay init --domain DOMAIN [--mcp-host HOST] [--acme-email ADDR] [--edge tunnel|single-host|wildcard] [--dns-provider NAME [--dns-env VAR]] [--allow-reserved-domain] [--data DIR] [--out DIR]\n       ocliv relay init --check --out DIR\n       Default edge: " + DefaultEdgeMode()
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
 		switch {

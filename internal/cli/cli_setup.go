@@ -760,9 +760,9 @@ func runSetupRender(ctx context.Context, d setup.Detection, hostname, dnsToken, 
 
 // shouldPersistRelayURL decides whether a newly rendered endpoint may
 // replace the recorded client setting. Only completed provisioning
-// qualifies: a failed Caddy install, relay start, or enrollment must
-// never strand the client on a dead endpoint, and a fresh install
-// must not record an endpoint that was never provisioned.
+// qualifies: a failed Caddy install or relay start must never strand
+// the client on a dead endpoint, and a fresh install must not record
+// an endpoint that was never provisioned.
 func shouldPersistRelayURL(existing, next string, provisioned bool) bool {
 	// existing is accepted but unused in the decision: fresh, same,
 	// and replacement URLs all persist exactly when provisioning
@@ -874,15 +874,6 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir, dnsToken
 			if err == nil {
 				setup.MarkStarted("ocliv-relay")
 			}
-		case "enroll this machine":
-			keyID, exit := autoEnroll("https://"+hostname, dataDir, "home")
-			if exit != apperr.ExitOK {
-				err = fmt.Errorf("enrollment failed (exit %d)", exit)
-			} else if keyID != "" {
-				fmt.Printf("enrolled as %s ", keyID)
-			} else {
-				fmt.Printf("already enrolled, key untouched ")
-			}
 		case "install and enable dynv6 refresh timer", "install and enable duckdns refresh timer":
 			err = setup.InstallDNSRefresh(hostname, dnsToken, dataDir)
 			if err == nil {
@@ -986,6 +977,7 @@ func runSetupBootstrap(d setup.Detection, hostname, deployDir, dataDir, dnsToken
 	}
 	_ = setup.CleanDNSRefreshTokenJournal(hostname, dataDir)
 	fmt.Printf("verify externally: from another network, curl -v https://%s/v1/agent/challenge (no -k)\n", hostname)
+	fmt.Printf("to add publishers: on each publisher machine, run `ocliv login --relay https://%s --code-file PATH`\n", hostname)
 	return apperr.ExitOK, true
 }
 

@@ -217,14 +217,6 @@ func cmdHostWithOps(argv []string, ops serviceOps) int {
 	auth = addReq.Auth
 	svcType = addReq.Type
 
-	// Detect incompatible apex-only single-host edge BEFORE mutating service state:
-	// HTTP hosting allocates <name>.t.<domain> subdomains which single-host Caddy does not serve.
-	if svcType == "http" {
-		if st, ok := loadSetupState(); ok && st.EdgeMode == "single-host" {
-			return failValidation("installed setup edge is 'single-host' (apex-only), which serves MCP /r/<id>/mcp routes but not *.t.<domain> HTTP subdomains; use `ocliv host mcp PORT` or re-run `sudo ocliv setup --auto --edge tunnel ...`")
-		}
-	}
-
 	profile := config.ActiveProfile()
 	k, keyID, err := loadKeyForProfile(profile)
 	if err != nil {
@@ -236,12 +228,11 @@ func cmdHostWithOps(argv []string, ops serviceOps) int {
 				State:          ServiceStateUnknown,
 				Health:         HealthBlocked,
 				Error:          fmt.Sprintf("not enrolled in profile %q", profile),
-				RecoveryAction: "run `ocliv setup --auto` on your relay host or `ocliv login` on this machine",
+				RecoveryAction: "run `ocliv login --relay https://YOUR_RELAY --code-file PATH` on this machine first",
 			})
 		} else {
 			fmt.Fprintf(os.Stderr, "not enrolled in profile %q.\n", profile)
-			fmt.Fprintln(os.Stderr, "Run `ocliv setup --auto --hostname YOUR_DOMAIN --acme-email YOU@EXAMPLE.COM` on your relay host,")
-			fmt.Fprintln(os.Stderr, "or `ocliv login --relay https://YOUR_RELAY --code-file PATH` on this machine first.")
+			fmt.Fprintln(os.Stderr, "Run `ocliv login --relay https://YOUR_RELAY --code-file PATH` on this machine first.")
 		}
 		return apperr.ExitAuth
 	}

@@ -87,7 +87,8 @@ func hasCapability(caps []string, want string) bool {
 func (rn *Runner) buildHandshake(nonce []byte, origin, version string) (intentRaw []byte, ts time.Time, sig []byte) {
 	intentRaw, _ = json.Marshal(map[string]any{
 		"port": rn.Cfg.Port, "name": rn.Cfg.Name, "public": rn.Cfg.Public,
-		"ready": rn.leaseIntentReady(), "lease_id": rn.resumeLeaseID(),
+		"access_mode": rn.Cfg.AccessMode,
+		"ready":       rn.leaseIntentReady(), "lease_id": rn.resumeLeaseID(),
 		"ttl_seconds": rn.Cfg.TTLSeconds, "persistent": rn.Cfg.Persistent, "version": protocol.Version,
 	})
 	ts = time.Now().UTC()

@@ -43,6 +43,11 @@ type Options struct {
 	// GoogleVerificationJSON is the operator-configured JSON payload served at
 	// GET /.well-known/google-connected-apps on MCPExternalHost (HTTP 200, no redirect).
 	GoogleVerificationJSON []byte
+	// GlobalMaxHTTPStreams, GlobalMaxWSStreams, GlobalMaxSessions set aggregate
+	// server-wide caps across all leases. Zero uses the package defaults.
+	GlobalMaxHTTPStreams int64
+	GlobalMaxWSStreams   int64
+	GlobalMaxSessions    int64
 }
 
 // Logger is a minimal structured logger to avoid import cycles.
@@ -86,6 +91,9 @@ func (s *Server) ReadyForSessions() bool {
 	if s.throttle.Keys() >= limits.MaxThrottleKeys ||
 		s.preAuth.Keys() >= limits.MaxThrottleKeys ||
 		s.mcpAdmission.Keys() >= limits.MaxThrottleKeys {
+		return false
+	}
+	if s.globalBudget != nil && s.globalBudget.Saturated() {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -142,6 +150,7 @@ type Server struct {
 	preAuth      *limits.Throttle // G07: per-IP cap on pre-auth endpoints
 	mcpAdmission *limits.Throttle // P1-10: per-(source,lease) cap on MCP-profile forwarding
 	budgets      *limits.Registry
+	globalBudget *limits.GlobalBudget
 	mux          *http.ServeMux
 	authz        *authzManager // managed-route authorization (relay_authz.go only)
 	// dispatchHold is a test-only barrier run between the dispatch-time
@@ -199,7 +208,12 @@ func New(o Options) (*Server, error) {
 		preAuth:                  limits.NewThrottle(limits.PreAuthBurst, time.Minute),
 		mcpAdmission:             limits.NewThrottle(limits.MCPAdmissionBurst, time.Minute),
 		budgets:                  limits.NewRegistry(),
-		mux:                      http.NewServeMux(),
+		globalBudget: limits.NewGlobalBudget(
+			defaultOrI64(o.GlobalMaxHTTPStreams, limits.DefaultGlobalMaxHTTPStreams),
+			defaultOrI64(o.GlobalMaxWSStreams, limits.DefaultGlobalMaxWSStreams),
+			defaultOrI64(o.GlobalMaxSessions, limits.DefaultGlobalMaxSessions),
+		),
+		mux: http.NewServeMux(),
 	}
 	if s.log == nil {
 		s.log = noopLog{}
@@ -243,6 +257,14 @@ type noopLog struct{}
 func (noopLog) Info(string, ...any)  {}
 func (noopLog) Warn(string, ...any)  {}
 func (noopLog) Error(string, ...any) {}
+
+// defaultOrI64 returns val when non-zero, otherwise returns def.
+func defaultOrI64(val, def int64) int64 {
+	if val > 0 {
+		return val
+	}
+	return def
+}
 
 // Handler serves both agent control and public ingress. In production Caddy
 // terminates TLS and forwards here over loopback/Unix socket (B03).

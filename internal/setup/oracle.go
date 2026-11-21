@@ -90,14 +90,18 @@ func (a OracleAdapter) Check(ctx context.Context) (string, bool) {
 // documentation, not a capacity claim.
 func (a OracleAdapter) Plan() string {
 	return strings.Join([]string{
+		"[EXPERIMENTAL] Oracle Always Free relay provisioner — launches VM only, manual steps required.",
+		"This provider is INCOMPLETE: it launches a VM but does NOT automatically configure Caddy,",
+		"TLS, DNS, or the relay service. After launch, complete setup manually on the new instance.",
 		"Oracle Always Free relay plan (operator-approved only):",
 		"- shape: VM.Standard.A1.Flex (Ampere ARM, up to 4 OCPU / 24 GB RAM free)",
 		"- image: Canonical Ubuntu 24.04 Minimal aarch64, 50 GB boot volume (free-tier limit)",
 		"- network: VCN + public subnet, ingress TCP 22 (operator IP only), 80, 443",
-		"- relay: loopback-only ocliv + Caddy, installed from the rendered deployment dir",
+		"- relay: loopback-only ocliv + Caddy — YOU must install and configure these after launch",
 		"- cost: $0 while inside Always Free limits; out-of-capacity or limit changes can refuse the launch",
 		"- no guarantee: Oracle may report insufficient free capacity at any time; the launch fails closed, nothing billable is created",
 		"Run again with --confirm-create to execute the `oci compute instance launch` command printed below after your review.",
+		"After launch: SSH to the instance's public IP and run `sudo ocliv setup --auto --hostname YOUR_DOMAIN ...`",
 	}, "\n")
 }
 

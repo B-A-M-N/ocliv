@@ -37,6 +37,7 @@ func TestRelayInitGeneratesSingleHost(t *testing.T) {
 		"--domain", "hosting.test",
 		"--mcp-host", "relay.hosting.test",
 		"--acme-email", "ops@hosting.test",
+		"--edge", "single-host",
 		"--data", "/var/lib/ocliv",
 		"--out", out,
 	}

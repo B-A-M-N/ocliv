@@ -6,6 +6,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -544,6 +545,44 @@ func (d *DB) AuditKey(actor, tenantID, keyID, leaseID, category, result, detail 
 // bounding growth; revocation state itself lives in leases/agent_keys
 // (revoked_at), so pruning audit rows can never resurrect authority.
 const AuditRetention = 90 * 24 * time.Hour
+
+// TenantPolicy governs what a tenant's publishers may expose.
+// Stored as JSON in tenants.quotas_json. Zero value is the safe default
+// (no public exposure, unlimited leases).
+type TenantPolicy struct {
+	AllowPublic         bool `json:"allow_public"`          // default false: public exposure denied
+	MaxActiveLeases     int  `json:"max_active_leases"`     // 0 = unlimited
+	MaxPersistentLeases int  `json:"max_persistent_leases"` // 0 = unlimited
+}
+
+// GetTenantPolicy reads the quota_json policy for tenantID.
+// Returns the zero TenantPolicy (all defaults) on missing or invalid JSON.
+func (d *DB) GetTenantPolicy(tenantID string) TenantPolicy {
+	var raw string
+	if err := d.sql.QueryRow(`SELECT quotas_json FROM tenants WHERE id=?`, tenantID).Scan(&raw); err != nil {
+		return TenantPolicy{}
+	}
+	var p TenantPolicy
+	_ = json.Unmarshal([]byte(raw), &p)
+	return p
+}
+
+// SetTenantPolicy writes policy to quotas_json for tenantID.
+func (d *DB) SetTenantPolicy(tenantID string, p TenantPolicy) error {
+	b, err := json.Marshal(p)
+	if err != nil {
+		return fmt.Errorf("encoding policy: %w", err)
+	}
+	res, err := d.sql.Exec(`UPDATE tenants SET quotas_json=? WHERE id=?`, string(b), tenantID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("tenant %q not found", tenantID)
+	}
+	return nil
+}
 
 // PruneAuditEvents deletes audit rows older than AuditRetention relative
 // to now and returns the deleted count. Times are RFC3339Nano UTC, so

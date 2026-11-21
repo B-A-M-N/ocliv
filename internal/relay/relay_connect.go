@@ -51,12 +51,27 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version": protocol.Version,
-		"capabilities": []string{
-			protocol.CapabilityPersistentNamedLeases,
-			protocol.CapabilityMgmtBodySignatureV2,
-		},
+		"version":      protocol.Version,
+		"capabilities": s.relayCapabilities(),
 	})
+}
+
+// relayCapabilities returns the current capability set for this relay.
+// Base capabilities are always present; optional capabilities reflect
+// actual runtime configuration so publishers can determine available
+// features without reading local relay state.
+func (s *Server) relayCapabilities() []string {
+	caps := []string{
+		protocol.CapabilityPersistentNamedLeases,
+		protocol.CapabilityMgmtBodySignatureV2,
+	}
+	if s.relayHost != "" {
+		caps = append(caps, protocol.CapabilityHTTPSubdomainIngress)
+	}
+	if s.mcpHost != "" {
+		caps = append(caps, protocol.CapabilityMCPPathIngress)
+	}
+	return caps
 }
 
 // maxIntentTTLSeconds bounds requested lease lifetimes (10 years).
@@ -114,10 +129,7 @@ func (s *Server) handleChallenge(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, challengeResp{
 		Nonce: nonceB64, Origin: "https://" + s.relayHost,
 		Version: protocol.Version, Expires: ch.ExpiresAt.UTC().Format(time.RFC3339Nano),
-		Capabilities: []string{
-			protocol.CapabilityPersistentNamedLeases,
-			protocol.CapabilityMgmtBodySignatureV2,
-		},
+		Capabilities: s.relayCapabilities(),
 	})
 }
 
@@ -268,15 +280,23 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		s.db.Audit("agent", tenant, "", "attach", "denied", denyCode)
 		return
 	}
+	if !s.globalBudget.AdmitSession() {
+		conn.Close(websocket.StatusCode(1013), "relay at capacity")
+		s.db.Audit("agent", tenant, ls.ID, "attach", "denied", "global session capacity exceeded")
+		return
+	}
 	raw, _ := json.Marshal(attached)
 	if err := transport.WriteControl(ctx, conn, raw); err != nil {
+		s.globalBudget.ReleaseSession()
 		if _, merr := s.markReconnecting(ls.ID, ls.Generation); merr != nil {
 			s.db.Audit("system", "", ls.ID, "attach", "error", "reconnect transition failed: "+errShort(merr))
 		}
 		conn.Close(1011, "internal")
 		return
 	}
+	// registerSession blocks until the publisher connection ends.
 	s.registerSession(ctx, conn, ls, tenant, keyID, attached.AccessMode)
+	s.globalBudget.ReleaseSession()
 }
 
 // shortKeyID derives the identity key id from the stored key row id.

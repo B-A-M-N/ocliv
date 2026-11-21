@@ -89,18 +89,24 @@ func cmdLogin(argv []string) int {
 		fmt.Fprintln(os.Stderr, "note: enrollment codes never pass through argv; use a file or - for stdin (A07)")
 		return apperr.ExitCLIValidation
 	}
-	var codeRaw []byte
-	var err error
+	var code string
 	if codeFile == "-" {
-		codeRaw, err = io.ReadAll(io.LimitReader(os.Stdin, 4096))
+		raw, err := io.ReadAll(io.LimitReader(os.Stdin, 4096))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error: cannot read code from stdin: "+err.Error())
+			return apperr.ExitCLIValidation
+		}
+		code = strings.TrimSpace(string(raw))
 	} else {
-		codeRaw, err = os.ReadFile(codeFile)
+		var err error
+		// readSecretFileStrict enforces O_NOFOLLOW, regular-file, 0600 mode,
+		// owner check, and bounded read — same treatment as other private credentials.
+		code, err = readSecretFileStrict(codeFile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error: cannot read code file: "+err.Error())
+			return apperr.ExitCLIValidation
+		}
 	}
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error: cannot read code file: "+err.Error())
-		return apperr.ExitCLIValidation
-	}
-	code := strings.TrimSpace(string(codeRaw))
 	if code == "" {
 		fmt.Fprintln(os.Stderr, "error: enrollment code file is empty")
 		return apperr.ExitCLIValidation
@@ -330,7 +336,15 @@ func performEnroll(relayURL, code, cacert string) (string, int) {
 		}
 		tlsCfg.RootCAs = pool
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
+	// Enrollment carries a one-time secret; redirect following must be
+	// refused to prevent leakage of the enrollment code to a redirect
+	// target.
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	if strings.HasPrefix(relayURL, "https") {
 		client.Transport = &http.Transport{TLSClientConfig: tlsCfg}
 	}

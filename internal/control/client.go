@@ -10,7 +10,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -38,8 +40,16 @@ func NewClient(relayURL string, key *identity.KeyPair, keyID string) *Client {
 	}
 }
 
+// noFollow refuses all HTTP redirects. Signed management requests carry
+// X-Ocliv-* authentication headers that must never be forwarded to a
+// redirect target controlled by an adversary.
+var noFollow = func(_ *http.Request, _ []*http.Request) error {
+	return http.ErrUseLastResponse
+}
+
 // HTTPClient builds an HTTP client honoring OCLIV_CACERT without ever
-// disabling TLS verification.
+// disabling TLS verification. It refuses all HTTP redirects and disables
+// ambient HTTP proxy to prevent credential leakage on the control plane.
 func HTTPClient(timeout time.Duration) (*http.Client, error) {
 	if timeout <= 0 {
 		timeout = 15 * time.Second
@@ -48,14 +58,68 @@ func HTTPClient(timeout time.Duration) (*http.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	client := &http.Client{Timeout: timeout}
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
 	if pool != nil {
-		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{
-			MinVersion: tls.VersionTLS12,
-			RootCAs:    pool,
-		}}
+		tlsCfg.RootCAs = pool
 	}
-	return client, nil
+	return &http.Client{
+		Timeout:       timeout,
+		CheckRedirect: noFollow,
+		Transport: &http.Transport{
+			TLSClientConfig: tlsCfg,
+			// No ambient HTTP proxy on the authenticated control plane.
+			Proxy: func(*http.Request) (*url.URL, error) { return nil, nil },
+		},
+	}, nil
+}
+
+// ValidateRelayURL checks that raw is a valid relay base URL:
+//   - scheme is https (or http for explicit loopback development use);
+//   - no userinfo, fragment, or query parameters;
+//   - non-empty host.
+//
+// It does not perform DNS resolution or network access.
+func ValidateRelayURL(raw string) error {
+	if raw == "" {
+		return fmt.Errorf("relay URL is empty")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("relay URL is not parseable: %w", err)
+	}
+	switch u.Scheme {
+	case "https":
+		// always allowed
+	case "http":
+		if !isLoopbackHost(u.Hostname()) {
+			return fmt.Errorf("relay URL scheme %q requires HTTPS for non-loopback hosts; use https://", u.Scheme)
+		}
+	default:
+		return fmt.Errorf("relay URL scheme %q is not supported; use https://", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("relay URL has no host")
+	}
+	if u.User != nil {
+		return fmt.Errorf("relay URL must not contain credentials (userinfo)")
+	}
+	if u.Fragment != "" || u.RawFragment != "" {
+		return fmt.Errorf("relay URL must not contain a fragment")
+	}
+	if u.RawQuery != "" {
+		return fmt.Errorf("relay URL must not contain query parameters")
+	}
+	return nil
+}
+
+// isLoopbackHost returns true for loopback IP addresses (127.0.0.0/8, ::1)
+// and the hostname "localhost".
+func isLoopbackHost(host string) bool {
+	if strings.ToLower(host) == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // ProbeCapabilities discovers relay protocol capabilities before sending a

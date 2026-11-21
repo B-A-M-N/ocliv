@@ -33,6 +33,24 @@ ReadWritePaths=/var/lib/ocliv
 # restart never resurrects REVOKED/EXPIRED/CLOSED leases (reconcileBoot
 # only transitions ACTIVE to RECONNECTING; terminal states stay terminal).
 TimeoutStopSec=30
+# Additional process isolation for a pure Go network daemon.
+# SystemCallFilter is intentionally omitted: goroutine scheduling
+# and the Go runtime require a broad set of syscalls that varies
+# across kernel versions. The restrictions below are safe for
+# loopback-bound relay with SQLite and outbound-only Caddy.
+UMask=0077
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

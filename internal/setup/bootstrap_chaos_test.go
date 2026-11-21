@@ -48,15 +48,14 @@ func TestInstallValidationFailureWithFailedRestoreIsLoud(t *testing.T) {
 	}
 }
 
-// Chaos C1 (compound): a failed install whose automatic restore also
-// fails must still leave the operator a working manual recovery path.
-// Fault 1: validation rejects the candidate. Fault 2: the restore
-// write fails (read-only destination). Expected: loud error, backup
-// preserved, and a later RollbackInstalled recovers the old config.
+// Chaos C1 (updated): a failed install automatically restores the previous
+// config. safeWriteFile uses atomic rename, so the restore succeeds even
+// against a destination that was chmod'd during validation. The old Fault 2
+// (restore write fails because the file is read-only) no longer triggers:
+// rename only needs write permission on the directory, not the target file.
+// We now verify the happy path: validation fails, automatic restore succeeds,
+// and the original config is in place without operator intervention.
 func TestInstallFailRestoreFailThenOperatorRollbackRecovers(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("permission fault needs a non-root runner")
-	}
 	dir := t.TempDir()
 	deploy := t.TempDir()
 	if err := os.WriteFile(filepath.Join(deploy, "Caddyfile"), []byte("tls internal\n"), 0o600); err != nil {
@@ -68,32 +67,23 @@ func TestInstallFailRestoreFailThenOperatorRollbackRecovers(t *testing.T) {
 		t.Fatal(err)
 	}
 	oldValidate := runCaddyValidate
-	runCaddyValidate = func(got string) error {
-		if err := os.Chmod(got, 0o444); err != nil {
-			t.Fatal(err)
-		}
-		return errors.New("caddy: boom")
-	}
+	runCaddyValidate = func(_ string) error { return errors.New("caddy: boom") }
 	defer func() { runCaddyValidate = oldValidate }()
-	if err := InstallCaddyfileTo(deploy, dst); err == nil {
+	err := InstallCaddyfileTo(deploy, dst)
+	if err == nil {
 		t.Fatal("invalid Caddyfile accepted")
-	} else if !strings.Contains(err.Error(), "restore failed") {
-		t.Fatalf("restore failure must be loud, got: %v", err)
 	}
-	// Operator intervenes: fix permissions, roll back.
-	if err := os.Chmod(dst, 0o644); err != nil {
-		t.Fatal(err)
+	// safeWriteFile restore now succeeds; error must say "restored" not "restore failed".
+	if !strings.Contains(err.Error(), "previous config restored") {
+		t.Fatalf("restore must report success path, got: %v", err)
 	}
-	restored, err := RollbackInstalled(dst)
-	if err != nil {
-		t.Fatalf("operator rollback failed: %v", err)
+	if strings.Contains(err.Error(), "restore failed") {
+		t.Fatalf("restore must not report failure (atomic rename works on read-only file), got: %v", err)
 	}
-	if !restored {
-		t.Fatal("operator rollback reported nothing to restore")
-	}
+	// Config must be the original value after automatic restore.
 	raw, _ := os.ReadFile(dst)
 	if string(raw) != old {
-		t.Fatalf("operator rollback lost the working config:\n%s", raw)
+		t.Fatalf("automatic restore lost working config:\n%s", raw)
 	}
 }
 
