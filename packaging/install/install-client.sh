@@ -129,10 +129,12 @@ MANIFEST_TMPFILE="$(mktemp)"
 TMPFILE=""
 PREV_TMP=""
 cleanup() {
-    rm -f "$SIGFILE" "$PUBKEYFILE" "$MANIFEST_TMPFILE"
-    [ -n "$RAWSIGFILE" ] && rm -f "$RAWSIGFILE"
-    [ -n "$TMPFILE" ] && rm -f "$TMPFILE"
-    [ -n "$PREV_TMP" ] && rm -f "$PREV_TMP"
+    _rc=$?
+    rm -f "$SIGFILE" "$PUBKEYFILE" "$MANIFEST_TMPFILE" 2>/dev/null || true
+    if [ -n "$RAWSIGFILE" ]; then rm -f "$RAWSIGFILE" 2>/dev/null || true; fi
+    if [ -n "$TMPFILE" ]; then rm -f "$TMPFILE" 2>/dev/null || true; fi
+    if [ -n "$PREV_TMP" ]; then rm -f "$PREV_TMP" 2>/dev/null || true; fi
+    return "$_rc"
 }
 trap cleanup EXIT
 
