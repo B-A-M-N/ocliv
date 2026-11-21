@@ -14,7 +14,9 @@ ocliv-relay-data/
 ocliv-root.crt
 
 # Built binaries, generated release artifacts, and local scratch state.
-/dist/
+/__pycache__/
+*.pyc
+dist/
 /.scratch/
 /live/
 /lab-backup/
@@ -25,7 +27,9 @@ ocliv-root.crt
 /ocliv-*
 *.tar.gz
 *.zip
-packaging/mcp/dist/
+packaging/mcp/__pycache__/
+*.pyc
+dist/
 
 # Test and tool scratch.
 /tmp/

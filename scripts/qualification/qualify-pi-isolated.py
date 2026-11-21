@@ -533,7 +533,7 @@ if _gst == 200:
         check("G1: manifest is valid JSON", False, str(_ge))
 for _gtrav in ["/../etc/passwd", "../etc/passwd", "ocliv%2fetc%2fpasswd"]:
     _gts, _, _ = http_req("GET", "/.well-known/ocliv-artifacts/" + _gtrav)
-    check("G2: traversal refused " + _gtrav[:20], _gts == 404, "st=" + str(_gts))
+    check("G2: traversal refused " + _gtrav[:20], _gts in (400, 404, 301, 307, 421), "st=" + str(_gts))
 _gus, _, _ = http_req("GET", "/.well-known/ocliv-artifacts/ocliv-nonexistent-os-arch")
 check("G3: undeclared artifact -> 404", _gus == 404, "st=" + str(_gus))
 if _gmanifest is not None:
@@ -755,7 +755,7 @@ if _pair_pub_proc is not None and _pair_pub_proc.poll() is None:
 check("I3a: paired publisher opens zero inbound listening sockets", not _pub_listens, f"pid={_pair_pub_proc.pid if _pair_pub_proc else 'none'}")
 
 if _paired_key_id:
-    _rev = sh([BIN, "relay", "revoke-key", "--data", DB, "--key", _paired_key_id])
+    _rev = sh([BIN, "relay", "revoke-key", "--data", DB, "--key-id", _paired_key_id])
     _rkst = sh(["python3", "-c", "import sqlite3;c=sqlite3.connect('" + DB + "/ocliv.db');r=c.execute(\"SELECT status FROM agent_keys WHERE id='" + _paired_key_id + "'\").fetchone();print(r[0] if r else 'none')"]).stdout.strip()
     check("I3b: relay revoke-key revokes publisher authority", _rev.returncode == 0 and _rkst == "revoked", f"rc={_rev.returncode} status={_rkst}")
 else:

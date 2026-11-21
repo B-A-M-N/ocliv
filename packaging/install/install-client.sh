@@ -227,10 +227,11 @@ fi
 EXPECTED_COMMIT="$(_json_str commit)"
 [ -n "$EXPECTED_COMMIT" ] || die "refusing installation: manifest 'commit' field missing"
 
-# Extract SHA256 for the target artifact from the artifacts block.
+# Extract SHA256 for the target artifact from the artifacts block (handles both
+# compact and multi-line pretty-printed JSON).
 EXPECTED_SHA256="$(printf '%s\n' "$MANIFEST" \
     | tr '{}' '\n' \
-    | grep -A1 "\"${ARTIFACT}\"" \
+    | grep -A4 "\"${ARTIFACT}\"" \
     | grep '"sha256"' \
     | sed 's/.*"sha256"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' \
     | head -1)"
