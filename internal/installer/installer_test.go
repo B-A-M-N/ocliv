@@ -318,6 +318,32 @@ func TestVerifyManifestWithTrustLifecycle(t *testing.T) {
 	}
 }
 
+func TestFetchManifestSignedRejectsNonProductionEvenWithValidSig(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	m := ReleaseManifest{
+		Commit:        "abc123",
+		Dirty:         false,
+		NonProduction: true,
+		Govulncheck:   "pass",
+		Artifacts:     map[string]ArtifactEntry{"ocliv-linux-amd64": {SHA256: "deadbeef"}},
+	}
+	manifestBytes, _ := json.Marshal(m)
+	sigHex := hex.EncodeToString(ed25519.Sign(priv, manifestBytes))
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/manifest.json.sig" {
+			_, _ = w.Write([]byte(sigHex))
+			return
+		}
+		_, _ = w.Write(manifestBytes)
+	}))
+	defer srv.Close()
+
+	if _, err := FetchManifestSigned(context.Background(), srv.Client(), srv.URL+"/manifest.json", pub); err == nil {
+		t.Fatal("FetchManifestSigned must reject non_production=true even with a valid signature")
+	}
+}
+
 func TestTrustRootParityWithInstallClientScript(t *testing.T) {
 	tr := ProductionTrustRoot()
 	scriptPath := filepath.Join("..", "..", "packaging", "install", "install-client.sh")

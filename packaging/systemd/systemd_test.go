@@ -158,3 +158,10 @@ func TestPublisherUnitsShareSupervisionContract(t *testing.T) {
 		t.Fatalf("duplicate publisher env example does not match systemd variable: %s", duplicateEnv)
 	}
 }
+
+func TestRelaySystemdUnitPinsLimitNOFILE(t *testing.T) {
+	unit := RelayUnit()
+	if !strings.Contains(unit, "LimitNOFILE=65536") {
+		t.Fatalf("ocliv-relay.service must enforce LimitNOFILE=65536:\n%s", unit)
+	}
+}

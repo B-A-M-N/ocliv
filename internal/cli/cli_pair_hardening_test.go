@@ -139,3 +139,69 @@ func TestWritePrivateFileAtomicRefusesSymlink(t *testing.T) {
 		t.Fatalf("victim was modified through symlink: %q", got)
 	}
 }
+
+func TestDefaultPairInterruptedResumesSameRequest(t *testing.T) {
+	home := t.TempDir()
+	cfgDir := filepath.Join(home, ".config", "ocliv")
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("OCLIV_CONFIG_DIR", cfgDir)
+
+	var lastKeyID string
+	approved := false
+	pairCalls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/agent/pair-request":
+			pairCalls++
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"pairing_code":       "1234-5678-90ab",
+				"poll_id":            "poll-int",
+				"poll_secret":        "sec-int",
+				"expires_in_seconds": 600,
+			})
+		case "/v1/agent/pair-status":
+			w.Header().Set("Content-Type", "application/json")
+			if approved {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"status":    "approved",
+					"tenant_id": "t-resume",
+					"key_id":    lastKeyID,
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "pending"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	// Default wait mode interrupted (short timeout) before approval: must leave
+	// pair-pending.json persisted on disk so a second invocation can resume.
+	if rc := cmdPair([]string{srv.URL, "--timeout", "100ms"}); rc != apperr.ExitAuth {
+		t.Fatalf("expected timeout ExitAuth, got %d", rc)
+	}
+	if _, err := os.Stat(filepath.Join(cfgDir, "pair-pending.json")); err != nil {
+		t.Fatalf("pair-pending.json not persisted during default wait: %v", err)
+	}
+	_, keyPath, _, err := agentFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, err := identity.Load(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastKeyID = "key-" + string(k.ID())
+	approved = true
+
+	// Second CLI invocation resumes against the SAME pairing request (pairCalls stays 1).
+	if rc := cmdPairResume([]string{"--timeout", "8s"}); rc != apperr.ExitOK {
+		t.Fatalf("pair resume after interrupted default wait failed: rc=%d", rc)
+	}
+	if pairCalls != 1 {
+		t.Fatalf("expected 1 pair-request total, got %d", pairCalls)
+	}
+}

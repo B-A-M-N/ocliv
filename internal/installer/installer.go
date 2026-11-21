@@ -135,6 +135,9 @@ func FetchManifest(ctx context.Context, client *http.Client, manifestURL string)
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&m); err != nil {
 		return nil, fmt.Errorf("manifest parse: %w", err)
 	}
+	if !AllowUnqualifiedRelease && m.NonProduction {
+		return nil, fmt.Errorf("refusing non-production release manifest (non_production=true)")
+	}
 	if m.Dirty {
 		return nil, fmt.Errorf("refusing dirty build: manifest reports dirty=true (non-reproducible provenance)")
 	}

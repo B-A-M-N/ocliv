@@ -149,10 +149,11 @@ func TestExpiredPairingRowsDoNotExhaustGlobalCap(t *testing.T) {
 	for i := 0; i < pairingGlobalMax+50; i++ {
 		_, err := tx.Exec(
 			`INSERT INTO pairing_requests(id, display_code, poll_id, poll_verifier, public_key, key_id, source_ip, status, created_at, expires_at)
-			 VALUES(?,?,?,X'01',X'00','key-x','127.0.0.1','pending',?,?)`,
+			 VALUES(?,?,?,X'01',X'00',?,'127.0.0.1','pending',?,?)`,
 			"exp-"+string(rune('a'+i%26))+hex.EncodeToString([]byte{byte(i >> 8), byte(i)}),
 			hex.EncodeToString([]byte{byte(i >> 8), byte(i), 0xaa, 0xbb}),
 			"poll-"+hex.EncodeToString([]byte{byte(i >> 8), byte(i)}),
+			"key-"+hex.EncodeToString([]byte{byte(i >> 8), byte(i)}),
 			past, past)
 		if err != nil {
 			tx.Rollback()
@@ -174,5 +175,39 @@ func TestExpiredPairingRowsDoNotExhaustGlobalCap(t *testing.T) {
 	s.handlePairRequest(w, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("fresh pair-request blocked by expired rows: got %d (%s), want 200", w.Code, w.Body.String())
+	}
+}
+
+func TestConcurrentPairRequestsOnePendingPerKey(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "ocliv.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s, err := New(Options{DB: db, Namespace: "t.example.test", RelayHost: "relay.example.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	sum := sha256.Sum256(pub)
+	keyID := "key-" + hex.EncodeToString(sum[:identity.KeyIDBytes])
+	body, _ := json.Marshal(map[string]string{"public_key": base64.StdEncoding.EncodeToString(pub)})
+
+	// Submit 3 sequential/rapid pair-requests for the SAME key_id:
+	// at most 1 live status='pending' row may exist in SQLite (enforced by V22 partial unique index).
+	for i := 0; i < 3; i++ {
+		r := httptest.NewRequest(http.MethodPost, "/v1/agent/pair-request", bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		s.handlePairRequest(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("request %d failed: %d (%s)", i+1, w.Code, w.Body.String())
+		}
+	}
+	var pendingCount int
+	if err := db.SQL().QueryRow(`SELECT COUNT(*) FROM pairing_requests WHERE key_id=? AND status='pending'`, keyID).Scan(&pendingCount); err != nil {
+		t.Fatal(err)
+	}
+	if pendingCount != 1 {
+		t.Fatalf("expected exactly 1 live pending request for key %s, got %d", keyID, pendingCount)
 	}
 }

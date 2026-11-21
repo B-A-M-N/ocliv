@@ -245,13 +245,15 @@ relay_args = [
     "--release-manifest=" + REL_MANIFEST_PATH,
     "--release-artifacts=" + RELEASE_DIR,
 ]
+relay_env = dict(os.environ)
 if REL_USE_DEV_UNSIGNED:
     relay_args.append("--allow-unsigned-dev-release")
+    relay_env["OCLIV_ENV"] = "development"
 elif os.path.exists(REL_SIG_PATH):
     relay_args.append("--release-manifest-sig=" + REL_SIG_PATH)
 
 relay_required = ["relay", "serve", "--listen=127.0.0.1:28080", "--data=" + DB]
-relay_proc = start_child(relay_args, os.path.join(S, "relay.log"), required=relay_required)
+relay_proc = start_child(relay_args, os.path.join(S, "relay.log"), env=relay_env, required=relay_required)
 with open(os.path.join(S, "relay.pid"), "x", encoding="ascii") as f:
     f.write(str(relay_proc.pid) + "\n")
 os.chmod(os.path.join(S, "relay.pid"), 0o600)
@@ -324,7 +326,7 @@ print("== Phase A2: restart persistence ==")
 if ra:
     stop_pid(relay_proc.pid, BIN, relay_required)
     relay_proc.wait(timeout=8)
-    relay_proc = start_child(relay_args, os.path.join(S, "relay.log"), required=relay_required)
+    relay_proc = start_child(relay_args, os.path.join(S, "relay.log"), env=relay_env, required=relay_required)
     with open(os.path.join(S, "relay.pid"), "w", encoding="ascii") as f:
         f.write(str(relay_proc.pid) + "\n")
     time.sleep(2)
@@ -645,7 +647,7 @@ if os.path.exists(_install_script) and REL_SIGN_PUB_PEM and os.path.exists(REL_S
 else:
     skip_gate("G5: signed bootstrap install", "install-client.sh or test signing key unavailable")
 
-print("== Phase H: real capacity saturation (--max-publisher-sessions=2) ==")
+print("== Phase H: real capacity saturation (--max-publisher-sessions=2, --max-http-streams=2, --max-ws-streams=2) ==")
 _cap_db = os.path.join(S, "relay-cap-db")
 os.makedirs(_cap_db, mode=0o700, exist_ok=True)
 _cap_base = "http://127.0.0.1:28082"
@@ -659,6 +661,8 @@ _cap_args = [
     "--mcp-port=28082",
     "--health-listen=127.0.0.1:28086",
     "--max-publisher-sessions=2",
+    "--max-http-streams=2",
+    "--max-ws-streams=2",
 ]
 _cap_req = ["relay", "serve", "--listen=127.0.0.1:28082", "--data=" + _cap_db]
 _cap_proc = start_child(_cap_args, os.path.join(S, "relay-cap.log"), required=_cap_req)
@@ -712,6 +716,10 @@ try:
     _st3 = json.loads(urllib.request.urlopen("http://127.0.0.1:28086/health/status", timeout=2).read().decode())
     _p3_txt = open(_p3_log, encoding="utf-8", errors="replace").read() if os.path.exists(_p3_log) else ""
     check("H2: 3rd publisher rejected before WS upgrade (503 / sessions stay 2)", _st3.get("active_sessions") == 2 and ("503" in _p3_txt or "capacity" in _p3_txt.lower() or p3.poll() is not None), f"active={_st3.get('active_sessions')} rc={p3.poll()}")
+    # Verify /health/ready stays 200 while publisher sessions are saturated (process_ready=True, sessions_ready=False)
+    # and all 3 configured limits (http=2, ws=2, sessions=2) are exposed accurately on loopback /health/status.
+    _ready_st = urllib.request.urlopen("http://127.0.0.1:28086/health/ready", timeout=2).status
+    check("H2b: /health/ready stays 200 during saturation & all 3 limits exposed", _ready_st == 200 and _st3.get("max_http_streams") == 2 and _st3.get("max_ws_streams") == 2 and _st3.get("max_publisher_sessions") == 2, f"ready={_ready_st} limits=({_st3.get('max_http_streams')},{_st3.get('max_ws_streams')},{_st3.get('max_publisher_sessions')})")
     # Stop p1, verify slot releases and p3 (or fresh pub) can now connect cleanly.
     stop_pid(p1.pid, BIN, ["mcp", "publish", "--name", "cap1"])
     p1.wait(timeout=8)

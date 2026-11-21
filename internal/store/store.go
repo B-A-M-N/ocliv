@@ -332,6 +332,20 @@ UPDATE pairing_requests
   WHERE status = 'pending' AND poll_verifier IS NULL;
 `
 
+// schemaV22 enforces at most one live pending pairing request per key_id via
+// a partial unique index, after expiring any older duplicate pending rows.
+const schemaV22 = `
+UPDATE pairing_requests
+  SET status = 'expired',
+      resolved_at = COALESCE(resolved_at, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  WHERE status = 'pending'
+    AND rowid NOT IN (
+      SELECT MAX(rowid) FROM pairing_requests WHERE status = 'pending' GROUP BY key_id
+    );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pairing_requests_one_pending_per_key
+  ON pairing_requests(key_id) WHERE status = 'pending';
+`
+
 // applyMigration runs one versioned migration body and its version
 // stamp in a single transaction: a failure anywhere rolls back the
 // body, so a version is never recorded for half-applied work (P1-2).
@@ -356,7 +370,7 @@ func applyMigration(sqldb *sql.DB, version int, body string) error {
 }
 
 // currentSchema is the newest version Open must reach.
-const currentSchema = 21
+const currentSchema = 22
 
 // SchemaVersion is the exported current schema version for tools that must
 // refuse unknown/newer databases without opening (and thereby migrating)
@@ -556,6 +570,7 @@ func Open(path string) (*DB, error) {
 		{19, schemaV19},
 		{20, schemaV20},
 		{21, schemaV21},
+		{22, schemaV22},
 	}
 	for _, m := range migrations {
 		var v int
@@ -687,6 +702,34 @@ func (d *DB) PruneAuditEvents(now time.Time) (int64, error) {
 		return 0, apperr.E(apperr.CodeStoreFault, "pruning audit events", err)
 	}
 	return n, nil
+}
+
+// CreatePairingRequestSuperseding atomically expires any existing pending
+// pairing request for keyID and inserts the new pending request in a single
+// transaction, preserving the one-pending-request-per-key invariant.
+func (d *DB) CreatePairingRequestSuperseding(id, displayCode, pollID string, pollVerifier, pubKey []byte, keyID, sourceIP string, expiresAt time.Time) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return apperr.E(apperr.CodeStoreFault, "beginning pairing transaction", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(
+		`UPDATE pairing_requests SET status='expired', resolved_at=?
+		 WHERE key_id=? AND status='pending'`,
+		now, keyID); err != nil {
+		return apperr.E(apperr.CodeStoreFault, "superseding prior pairing request", err)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO pairing_requests(id, display_code, poll_id, poll_verifier, public_key, key_id, source_ip, status, created_at, expires_at)
+		 VALUES(?,?,?,?,?,?,?,'pending',?,?)`,
+		id, displayCode, pollID, pollVerifier, pubKey, keyID, sourceIP, now, expiresAt.UTC().Format(time.RFC3339Nano)); err != nil {
+		return apperr.E(apperr.CodeStoreFault, "storing pairing request", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return apperr.E(apperr.CodeStoreFault, "committing pairing request", err)
+	}
+	return nil
 }
 
 // CreatePairingRequest stores a new pending publisher-initiated pairing request.

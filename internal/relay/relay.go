@@ -338,30 +338,33 @@ func New(o Options) (*Server, error) {
 			return nil, fmt.Errorf("relay startup: partial release config: release manifest signature is required (set --release-manifest-sig or explicit dev override)")
 		}
 		if !hasSig && o.AllowUnsignedRelease {
-			// Constrain unsigned dev release mode to explicit development topology:
-			// require either loopback RelayHost (or empty/test) or OCLIV_ENV=development.
-			if !isDevTopologyHost(o.RelayHost) && !strings.EqualFold(strings.TrimSpace(os.Getenv("OCLIV_ENV")), "development") {
-				return nil, fmt.Errorf("relay startup: --allow-unsigned-dev-release refused on non-loopback relay host %q (requires loopback authority or OCLIV_ENV=development)", o.RelayHost)
+			// Constrain unsigned dev release mode strictly:
+			// explicit flag AND OCLIV_ENV=development AND loopback authorities only.
+			isDevEnv := strings.EqualFold(strings.TrimSpace(os.Getenv("OCLIV_ENV")), "development")
+			isLoopbackAuth := isDevTopologyHost(o.RelayHost) && (o.MCPExternalHost == "" || isDevTopologyHost(o.MCPExternalHost))
+			if !isDevEnv || !isLoopbackAuth {
+				return nil, fmt.Errorf("relay startup: --allow-unsigned-dev-release refused (requires OCLIV_ENV=development AND loopback relay/mcp authorities; host=%q mcp=%q)", o.RelayHost, o.MCPExternalHost)
 			}
 			s.releaseTrustMode = "UNSIGNED_DEVELOPMENT"
 			s.log.Warn("WARNING: relay serving UNSIGNED development release manifest (release_trust_mode=UNSIGNED_DEVELOPMENT)")
 		}
 		if hasSig {
+			var meta struct {
+				SigningKeyID  string `json:"signing_key_id"`
+				NonProduction bool   `json:"non_production"`
+			}
+			_ = json.Unmarshal(o.ReleaseManifestJSON, &meta)
+			if meta.NonProduction && !o.AllowUnsignedRelease {
+				return nil, fmt.Errorf("relay startup: refusing non_production=true release manifest in production mode")
+			}
 			sigHex := hex.EncodeToString(o.ReleaseManifestSig)
 			if len(o.ReleaseVerifyKeys) > 0 {
 				if err := installer.VerifyManifestAny(o.ReleaseManifestJSON, sigHex, o.ReleaseVerifyKeys); err != nil {
 					return nil, fmt.Errorf("relay startup: release manifest signature invalid: %w", err)
 				}
 				s.releaseTrustMode = "SIGNED_PRODUCTION"
+				s.releaseKeyID = meta.SigningKeyID
 			} else {
-				var meta struct {
-					SigningKeyID  string `json:"signing_key_id"`
-					NonProduction bool   `json:"non_production"`
-				}
-				_ = json.Unmarshal(o.ReleaseManifestJSON, &meta)
-				if meta.NonProduction {
-					return nil, fmt.Errorf("relay startup: refusing non_production release manifest")
-				}
 				keyID, err := installer.VerifyManifestWithTrust(o.ReleaseManifestJSON, sigHex, meta.SigningKeyID, installer.ProductionTrustRoot())
 				if err != nil {
 					return nil, fmt.Errorf("relay startup: release manifest signature invalid: %w", err)
@@ -439,12 +442,26 @@ func isDevTopologyHost(host string) bool {
 
 // validateArtifactDir checks that every artifact declared in manifest.artifacts
 // exists in dir as a regular file (no symlinks) and matches its declared SHA256.
-// Only the "artifacts" map is validated; provenance fields like "sbom" are ignored.
+// If the manifest also declares a provenance SBOM file with a SHA256, that file
+// is likewise verified via O_NOFOLLOW at startup (though never served via the
+// binary artifact endpoint).
 func validateArtifactDir(manifestJSON []byte, dir string) error {
 	var m struct {
 		Artifacts map[string]struct {
 			SHA256 string `json:"sha256"`
 		} `json:"artifacts"`
+		SBOM *struct {
+			Name   string `json:"name"`
+			File   string `json:"file"`
+			SHA256 string `json:"sha256"`
+		} `json:"sbom"`
+		Provenance *struct {
+			SBOM *struct {
+				Format string `json:"format"`
+				File   string `json:"file"`
+				SHA256 string `json:"sha256"`
+			} `json:"sbom"`
+		} `json:"provenance"`
 	}
 	if err := json.Unmarshal(manifestJSON, &m); err != nil {
 		return fmt.Errorf("manifest parse: %w", err)
@@ -456,24 +473,50 @@ func validateArtifactDir(manifestJSON []byte, dir string) error {
 		if entry.SHA256 == "" {
 			return fmt.Errorf("artifact %q has no sha256 in manifest", name)
 		}
-		p := filepath.Join(dir, name)
-		if !strings.HasPrefix(filepath.Clean(p), filepath.Clean(dir)+string(filepath.Separator)) {
-			return fmt.Errorf("artifact name %q escapes artifact directory", name)
+		if err := verifyFileDigestNoFollow(dir, name, entry.SHA256); err != nil {
+			return err
 		}
-		f, _, err := openArtifactSafe(p)
-		if err != nil {
-			return fmt.Errorf("artifact validation: %w", err)
+	}
+	// Verify provenance SBOM digest when declared with a real filename + 64-hex SHA256.
+	var sbomFile, sbomSHA string
+	if m.Provenance != nil && m.Provenance.SBOM != nil {
+		sbomFile = strings.TrimSpace(m.Provenance.SBOM.File)
+		sbomSHA = strings.TrimSpace(m.Provenance.SBOM.SHA256)
+	} else if m.SBOM != nil {
+		sbomFile = strings.TrimSpace(m.SBOM.File)
+		if sbomFile == "" {
+			sbomFile = strings.TrimSpace(m.SBOM.Name)
 		}
-		h := sha256.New()
-		if _, err := io.Copy(h, f); err != nil {
-			f.Close()
-			return fmt.Errorf("hashing artifact %q: %w", name, err)
+		sbomSHA = strings.TrimSpace(m.SBOM.SHA256)
+	}
+	if sbomFile != "" && len(sbomSHA) == 64 {
+		if strings.ContainsAny(sbomFile, `/\`) || strings.Contains(sbomFile, "..") {
+			return fmt.Errorf("invalid provenance sbom filename %q", sbomFile)
 		}
-		f.Close()
-		got := hex.EncodeToString(h.Sum(nil))
-		if !strings.EqualFold(got, entry.SHA256) {
-			return fmt.Errorf("artifact %q SHA256 mismatch: manifest=%s actual=%s", name, entry.SHA256, got)
+		if err := verifyFileDigestNoFollow(dir, sbomFile, sbomSHA); err != nil {
+			return fmt.Errorf("provenance sbom validation: %w", err)
 		}
+	}
+	return nil
+}
+
+func verifyFileDigestNoFollow(dir, name, expectedSHA string) error {
+	p := filepath.Join(dir, name)
+	if !strings.HasPrefix(filepath.Clean(p), filepath.Clean(dir)+string(filepath.Separator)) {
+		return fmt.Errorf("file name %q escapes artifact directory", name)
+	}
+	f, _, err := openArtifactSafe(p)
+	if err != nil {
+		return fmt.Errorf("artifact validation: %w", err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return fmt.Errorf("hashing %q: %w", name, err)
+	}
+	got := hex.EncodeToString(h.Sum(nil))
+	if !strings.EqualFold(got, expectedSHA) {
+		return fmt.Errorf("file %q SHA256 mismatch: manifest=%s actual=%s", name, expectedSHA, got)
 	}
 	return nil
 }

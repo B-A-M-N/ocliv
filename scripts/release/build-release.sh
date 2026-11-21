@@ -11,19 +11,28 @@ umask 077
 
 SKIP_TESTS=0
 ALLOW_MISSING_TOOLS=0
+PRODUCTION_MODE=0
 REF="HEAD"
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --production) PRODUCTION_MODE=1; shift ;;
     --skip-tests) SKIP_TESTS=1; shift ;;
     --allow-missing-tools) ALLOW_MISSING_TOOLS=1; shift ;;
     -h|--help)
-      echo "Usage: $0 [--skip-tests] [--allow-missing-tools] [COMMIT_SHA]"
+      echo "Usage: $0 [--production] [--skip-tests] [--allow-missing-tools] [COMMIT_SHA]"
       exit 0
       ;;
     *) REF="$1"; shift ;;
   esac
 done
+
+if [ "$PRODUCTION_MODE" -eq 1 ]; then
+  if [ "$SKIP_TESTS" -eq 1 ] || [ "$ALLOW_MISSING_TOOLS" -eq 1 ] || [ "${OCLIV_UNSIGNED_DEV:-}" = "true" ]; then
+    echo "error: --production forbids --skip-tests, --allow-missing-tools, and OCLIV_UNSIGNED_DEV=true" >&2
+    exit 1
+  fi
+fi
 
 ROOT="$(git rev-parse --show-toplevel)"
 SHA="$(git -C "$ROOT" rev-parse --verify "${REF}^{commit}")"
@@ -185,6 +194,14 @@ manifest = {
     "artifacts": {
         "ocliv-linux-amd64": {"sha256": amd64_sha},
         "ocliv-linux-arm64": {"sha256": arm64_sha},
+    },
+    "provenance": {
+        "sbom": {
+            "format": "cyclonedx-json" if sbom_file.endswith(".cdx.json") else "go-list-json",
+            "file": sbom_file,
+            "generator": sbom_tool,
+            "sha256": sbom_sha,
+        }
     },
     "sbom": {"sha256": sbom_sha, "name": sbom_file},
     "build_command": build_cmd,

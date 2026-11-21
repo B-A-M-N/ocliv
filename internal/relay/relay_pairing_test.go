@@ -44,6 +44,7 @@ func postPairRequest(t *testing.T, s *Server, pubKey, remoteAddr string) *httpte
 	t.Helper()
 	body, _ := json.Marshal(map[string]string{"public_key": pubKey})
 	req := httptest.NewRequest(http.MethodPost, "/v1/agent/pair-request", bytes.NewReader(body))
+	req.Host = "relay.example.test"
 	req.Header.Set("Content-Type", "application/json")
 	req.RemoteAddr = remoteAddr
 	rec := httptest.NewRecorder()
@@ -107,6 +108,7 @@ func postPairStatus(t *testing.T, s *Server, pollID, pollSecret, remoteAddr stri
 	body, _ := json.Marshal(map[string]string{"poll_id": pollID, "poll_secret": pollSecret})
 	req := httptest.NewRequest(http.MethodPost, "/v1/agent/pair-status", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Host = "relay.example.test"
 	req.RemoteAddr = remoteAddr
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)

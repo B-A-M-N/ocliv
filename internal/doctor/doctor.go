@@ -364,9 +364,12 @@ func CheckRelay(in RelayInput) Result {
 	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
 		add(false, false, "fd limit", "could not read RLIMIT_NOFILE: "+shortErr(err))
 	} else {
-		detail := fmt.Sprintf("RLIMIT_NOFILE soft=%d hard=%d (need >=%d for configured concurrency)", rLimit.Cur, rLimit.Max, neededFDs)
+		safeCeiling := (rLimit.Cur * 80) / 100
+		detail := fmt.Sprintf("RLIMIT_NOFILE soft=%d hard=%d (need >=%d, 80%% safe ceiling=%d)", rLimit.Cur, rLimit.Max, neededFDs, safeCeiling)
 		if rLimit.Cur < neededFDs {
 			add(false, true, "fd limit", detail+" — configured concurrency exceeds process FD ceiling; set LimitNOFILE=65536 in the systemd unit or run ulimit -n 65536")
+		} else if neededFDs > safeCeiling {
+			add(false, true, "fd limit", detail+" — configured concurrency exceeds 80% headroom of RLIMIT_NOFILE; increase LimitNOFILE=65536")
 		} else {
 			add(true, true, "fd limit", detail)
 		}

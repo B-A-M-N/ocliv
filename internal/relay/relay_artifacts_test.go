@@ -338,6 +338,9 @@ func TestReleaseConfigCoherence(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.opts.AllowUnsignedRelease {
+				t.Setenv("OCLIV_ENV", "development")
+			}
 			tc.opts.DB = newDB(t)
 			_, err := New(tc.opts)
 			if tc.wantErr && err == nil {
@@ -388,9 +391,9 @@ func TestAllowUnsignedDevReleaseRefusedOnPublicRelayHost(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	t.Setenv("OCLIV_ENV", "")
 
-	// Non-loopback RelayHost without OCLIV_ENV=development MUST fail.
+	// 1. Public host + OCLIV_ENV=development MUST fail.
+	t.Setenv("OCLIV_ENV", "development")
 	if _, err := New(Options{
 		DB:                   db,
 		Namespace:            "t.prod.example",
@@ -399,10 +402,24 @@ func TestAllowUnsignedDevReleaseRefusedOnPublicRelayHost(t *testing.T) {
 		ReleaseArtifactDir:   dir,
 		AllowUnsignedRelease: true,
 	}); err == nil {
-		t.Fatal("expected error for AllowUnsignedRelease on non-loopback RelayHost")
+		t.Fatal("expected error for AllowUnsignedRelease on public RelayHost even with OCLIV_ENV=development")
 	}
 
-	// Loopback RelayHost succeeds and reports UNSIGNED_DEVELOPMENT.
+	// 2. Loopback host + production env (OCLIV_ENV="") MUST fail.
+	t.Setenv("OCLIV_ENV", "")
+	if _, err := New(Options{
+		DB:                   db,
+		Namespace:            "t.stage.local",
+		RelayHost:            "127.0.0.1",
+		ReleaseManifestJSON:  manifestJSON,
+		ReleaseArtifactDir:   dir,
+		AllowUnsignedRelease: true,
+	}); err == nil {
+		t.Fatal("expected error for AllowUnsignedRelease on loopback without OCLIV_ENV=development")
+	}
+
+	// 3. Loopback host + OCLIV_ENV=development + explicit flag succeeds and reports UNSIGNED_DEVELOPMENT.
+	t.Setenv("OCLIV_ENV", "development")
 	s, err := New(Options{
 		DB:                   db,
 		Namespace:            "t.stage.local",
@@ -431,5 +448,70 @@ func TestAllowUnsignedDevReleaseRefusedOnPublicRelayHost(t *testing.T) {
 	s.Handler().ServeHTTP(rec2, req2)
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("GET artifact via Handler() on relayHost: got %d, want 200", rec2.Code)
+	}
+}
+
+func TestNonProductionManifestRejectedEvenWithValidSignature(t *testing.T) {
+	dir := t.TempDir()
+	binContent := []byte("fake-binary")
+	if err := os.WriteFile(filepath.Join(dir, "ocliv-linux-amd64"), binContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := sha256.Sum256(binContent)
+	manifestJSON, _ := json.Marshal(map[string]any{
+		"commit":         "abc",
+		"dirty":          false,
+		"non_production": true,
+		"govulncheck":    "pass",
+		"artifacts":      map[string]any{"ocliv-linux-amd64": map[string]string{"sha256": hex.EncodeToString(h[:])}},
+	})
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	sig := ed25519.Sign(priv, manifestJSON)
+	db, err := store.Open(filepath.Join(t.TempDir(), "ocliv.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	if _, err := New(Options{
+		DB:                  db,
+		Namespace:           "t.example.test",
+		RelayHost:           "relay.example.test",
+		ReleaseManifestJSON: manifestJSON,
+		ReleaseManifestSig:  sig,
+		ReleaseArtifactDir:  dir,
+		ReleaseVerifyKeys:   []ed25519.PublicKey{pub},
+	}); err == nil {
+		t.Fatal("non_production=true manifest must be rejected even with a valid signature from a trusted key")
+	}
+}
+
+func TestValidateArtifactDirVerifiesProvenanceSBOM(t *testing.T) {
+	dir := t.TempDir()
+	bin := []byte("bin-data")
+	sbom := []byte(`{"bomFormat":"CycloneDX"}`)
+	_ = os.WriteFile(filepath.Join(dir, "ocliv-linux-amd64"), bin, 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "sbom.cdx.json"), sbom, 0o644)
+	hb := sha256.Sum256(bin)
+	hs := sha256.Sum256(sbom)
+
+	goodManifest, _ := json.Marshal(map[string]any{
+		"artifacts": map[string]any{"ocliv-linux-amd64": map[string]string{"sha256": hex.EncodeToString(hb[:])}},
+		"provenance": map[string]any{
+			"sbom": map[string]string{
+				"format": "cyclonedx-json",
+				"file":   "sbom.cdx.json",
+				"sha256": hex.EncodeToString(hs[:]),
+			},
+		},
+	})
+	if err := validateArtifactDir(goodManifest, dir); err != nil {
+		t.Fatalf("valid provenance SBOM should pass: %v", err)
+	}
+
+	// Tamper SBOM on disk -> startup validation MUST fail.
+	_ = os.WriteFile(filepath.Join(dir, "sbom.cdx.json"), []byte(`{"tampered":true}`), 0o644)
+	if err := validateArtifactDir(goodManifest, dir); err == nil {
+		t.Fatal("tampered provenance SBOM must fail validateArtifactDir")
 	}
 }

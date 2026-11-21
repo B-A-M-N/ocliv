@@ -106,14 +106,9 @@ func (s *Server) handlePairRequest(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	id := fmt.Sprintf("pair-%d", now.UnixNano())
 
-	// Supersede any existing pending request from the same key so the publisher
-	// never holds two simultaneously valid display codes.
-	if err := s.db.SupersedePendingPairingRequest(keyID, now); err != nil {
-		s.log.Warn("pair-request: supersede failed", "err", errShort(err))
-		// non-fatal: continue with new request
-	}
-
 	// Retry on UNIQUE constraint collision (display_code and poll_id must be unique).
+	// Supersede + insert runs atomically in one transaction so a publisher key
+	// never holds two simultaneously valid pending display codes.
 	var (
 		displayCode  string
 		pollID       string
@@ -135,7 +130,7 @@ func (s *Server) handlePairRequest(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
-		insertErr = s.db.CreatePairingRequest(id, displayCode, pollID, pollVerifier, rawPub, keyID, sourceIP, now.Add(pairingTTL))
+		insertErr = s.db.CreatePairingRequestSuperseding(id, displayCode, pollID, pollVerifier, rawPub, keyID, sourceIP, now.Add(pairingTTL))
 		if insertErr == nil {
 			break
 		}
