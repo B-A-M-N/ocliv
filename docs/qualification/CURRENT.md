@@ -14,7 +14,14 @@ structured evidence/receipts live under `docs/qualification/receipts/`.
 | Race detector matrix (`internal/relay` standalone + core internal packages) | **PASS** | Zero data races across `relay`, `cli`, `agent`, `config`, `identity`, `protocol`, `store`, `lease`, `setup` |
 | Static checks (`gofmt`, `go vet`, `git diff --check`, `check-repo-hygiene.sh`) | **PASS** | Enforced in CI |
 | Isolated ARM64 Pi staging & real machine reboot recovery (`10.9.66.170`) | **PASS** | Same lease, same visitor HMAC key, same cookie after reboot; production `ocliv-relay` untouched |
-| Pi isolated loopback qualification — 2026-11-21 (commit `950440e`) | **PASS 29/0** | V19 schema, Phase E+F audit items (tenant policy, global budget, pairing flow, installer, capability advertisement, systemd hardening); see `history/PI-ISOLATED-RESULT-2026-11-21.md` |
+| Pi isolated loopback qualification — 2026-11-21 (commit `950440e`) | **PASS 29/0** | V19 schema, Phase E+F audit items as originally scoped; see `history/PI-ISOLATED-RESULT-2026-11-21.md` for items exercised vs. items present-but-not-exercised |
+| HEAD `8cce9af` — Go test suite (all packages, race matrix) | **PASS** | Source-only; Pi/live qualification NOT YET RUN against this commit |
+
+> **Qualification isolation note:** Results from `950440e` are NOT transferable to
+> `8cce9af`. Five security-relevant commits and a schema migration (V19→V20) landed
+> between them. The Phase A schema check in `qualify-pi-isolated.py` would fail
+> immediately on `950440e`'s result against HEAD. A fresh qual run against `8cce9af`
+> is required before production promotion.
 
 ## Outstanding Gates (Required Before Lifting HOLD)
 
@@ -26,6 +33,7 @@ structured evidence/receipts live under `docs/qualification/receipts/`.
 | Official ChatGPT OAuth end-to-end acceptance | **NOT VERIFIED** |
 | 24-hour soak test | **NOT VERIFIED** |
 | Production schema/owner inventory & explicit promotion approval | **HOLD** |
-| Phase F — pairing E2E: `pair-request` → operator approve → `pair-status` poll with `poll_id`/`poll_secret` on real relay, V20 schema confirmed | **NOT VERIFIED** |
-| Phase G — clean-machine bootstrap: `ocliv install` on a fresh machine with no Go/Git/Docker, artifact signature verification pass | **NOT VERIFIED** |
-| Phase H — capacity saturation: global session budget exhausted → 503 before WebSocket upgrade, session slot released on disconnect | **NOT VERIFIED** |
+| Phase F — pairing E2E: `ocliv pair --no-wait` → `relay approve` → `ocliv pair resume` → publisher attaches; `poll_verifier` stored, `poll_secret` absent from DB | **NOT VERIFIED** |
+| Phase G — installer/artifacts: relay configured with `--release-manifest`/`--release-artifacts`; manifest served 200, all artifacts SHA256-verified, traversal refused | **NOT VERIFIED** |
+| Phase H — capacity saturation: 3 publishers with `--max-publisher-sessions=2`; 3rd gets HTTP 503 before WS upgrade; slot released on disconnect | **NOT VERIFIED** |
+| Phase I — role separation: relay DB not world-readable; management endpoints require auth; `relay revoke` kills publisher authority | **NOT VERIFIED** |
