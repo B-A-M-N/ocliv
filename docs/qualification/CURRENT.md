@@ -26,3 +26,6 @@ structured evidence/receipts live under `docs/qualification/receipts/`.
 | Official ChatGPT OAuth end-to-end acceptance | **NOT VERIFIED** |
 | 24-hour soak test | **NOT VERIFIED** |
 | Production schema/owner inventory & explicit promotion approval | **HOLD** |
+| Phase F — pairing E2E: `pair-request` → operator approve → `pair-status` poll with `poll_id`/`poll_secret` on real relay, V20 schema confirmed | **NOT VERIFIED** |
+| Phase G — clean-machine bootstrap: `ocliv install` on a fresh machine with no Go/Git/Docker, artifact signature verification pass | **NOT VERIFIED** |
+| Phase H — capacity saturation: global session budget exhausted → 503 before WebSocket upgrade, session slot released on disconnect | **NOT VERIFIED** |

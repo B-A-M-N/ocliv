@@ -73,19 +73,29 @@ Caddy, and public DNS were not touched.
 - Managed rollback restore refused (resurrect guard triggered)
 - Reset-authority invalidates managed grants, revokes client, clears issuer key
 
-## Changes qualified in this run
+## Changes exercised by this qualification run
 
-The following audit items (Phases E and F) are confirmed working end-to-end
-on ARM64 at this commit:
+The following items are confirmed working end-to-end by the 29 checks above
+(Phases A–E: managed-OAuth routes, security boundaries, restart persistence,
+recovery rehearsal):
 
 - Relay/publisher architectural separation (enrollment removed from relay setup)
-- Server-side tenant policy enforcement (`AllowPublic`, `MaxActiveLeases`, `MaxPersistentLeases`)
-- Global capacity governor (`GlobalBudget` with atomic CAS admission)
-- Capability advertisement (`http_subdomain_ingress_v1`, `mcp_path_ingress_v1`)
-- Control plane redirect protection, `ValidateRelayURL`
+- Server-side tenant policy enforcement (`AllowPublic`, `MaxActiveLeases`, `MaxPersistentLeases`) — exercised via Phase B/D tenant-scoped route admission
+- Global capacity governor (`GlobalBudget` with atomic CAS admission) — present and enforced, not stress-tested (Phase H not yet run)
+- Control plane redirect protection, `ValidateRelayURL` — exercised via management-plane calls
 - `safeWriteFile` atomic write pattern + symlink TOCTOU guards
 - Systemd hardening directives (12 additional directives, relay + dns-refresh)
-- Publisher pairing flow (`/v1/agent/pair-request`, `/v1/agent/pair-status`)
-- `schemaV19` `pairing_requests` table
-- `ocliv install` release artifact installer
-- Relay release manifest endpoint (`/.well-known/ocliv-release-manifest.json`)
+- `schemaV19` `pairing_requests` table — schema migration verified (Phase A: `v=19`)
+
+## Changes present but NOT exercised by this qualification run
+
+The 29 checks (Phases A–E) do NOT exercise the following paths. These items
+are present in the codebase at commit `950440e` and compile correctly, but
+end-to-end correctness has NOT been confirmed here:
+
+- Publisher pairing flow (`/v1/agent/pair-request`, `/v1/agent/pair-status`) — requires Phase F (pairing E2E), not yet scripted
+- Poll-secret split (`poll_id` / `poll_verifier` in schema V20, POST pair-status) — not yet in schema at this commit; Phase F required
+- `ocliv install` release artifact installer / `/.well-known/ocliv-artifacts/` endpoint — requires Phase G (clean-machine bootstrap)
+- Relay release manifest endpoint (`/.well-known/ocliv-release-manifest.json`) with signature verification — not exercised by any Phase A–E check
+- Capability advertisement topology (`http_subdomain_ingress_v1` gated on `EdgeMode`, not relay host) — present but not exercised by loopback run
+- Global session admission ordering (AdmitSession before websocket.Accept) — present; saturation path requires Phase H

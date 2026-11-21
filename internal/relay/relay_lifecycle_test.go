@@ -35,6 +35,14 @@ func newLifecycleServer(t *testing.T) (*Server, *store.DB) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Tests insert leases for "tenant-test" directly; create the tenant row so
+	// GetTenantPolicy does not fail closed on missing tenant.
+	if _, err := db.SQL().Exec(
+		`INSERT OR IGNORE INTO tenants(id, status, created_at, quotas_json) VALUES(?,?,?,?)`,
+		"tenant-test", "active", time.Now().UTC().Format(time.RFC3339Nano), "{}",
+	); err != nil {
+		t.Fatal(err)
+	}
 	return s, db
 }
 

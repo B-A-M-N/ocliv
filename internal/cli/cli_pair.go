@@ -1,5 +1,5 @@
 // Publisher-initiated pairing flow: generate keypair, submit to relay,
-// display the pairing code for the operator to approve.
+// display the pairing code for the operator to approve, and wait for approval.
 package cli
 
 import (
@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -20,28 +21,35 @@ import (
 	"ocliv/internal/identity"
 )
 
-// cmdPair implements `ocliv pair RELAY_URL [--wait] [--timeout D]`.
-// The publisher submits its public key to the relay, displays a short
-// pairing code for the operator to approve, and optionally waits for
-// the approval to complete enrollment automatically.
+// cmdPair implements `ocliv pair RELAY_URL [--no-wait] [--timeout D]`.
+// By default the publisher submits its public key, displays the pairing code
+// for the operator to approve, and waits for approval to complete enrollment.
+// Use --no-wait to exit immediately (credentials are saved for `ocliv pair resume`).
 func cmdPair(argv []string) int {
+	// Handle "resume" subcommand.
+	if len(argv) > 0 && argv[0] == "resume" {
+		return cmdPairResume(argv[1:])
+	}
+
 	var relayURL, cacert string
-	doWait := false
+	doWait := true // wait by default
 	timeout := 10 * time.Minute
 
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
 		switch {
 		case a == "--help" || a == "-h":
-			fmt.Fprintln(os.Stderr, "usage: ocliv pair RELAY_URL [--wait] [--timeout DURATION] [--cacert FILE]")
+			fmt.Fprintln(os.Stderr, "usage: ocliv pair RELAY_URL [--no-wait] [--timeout DURATION] [--cacert FILE]")
+			fmt.Fprintln(os.Stderr, "       ocliv pair resume [--timeout DURATION] [--cacert FILE]")
 			fmt.Fprintln(os.Stderr, "")
 			fmt.Fprintln(os.Stderr, "  RELAY_URL           relay to pair with (https://...)")
-			fmt.Fprintln(os.Stderr, "  --wait              poll until operator approves, then complete enrollment")
-			fmt.Fprintln(os.Stderr, "  --timeout DURATION  max wait time (default 10m; only with --wait)")
+			fmt.Fprintln(os.Stderr, "  --no-wait           print the pairing code and exit without waiting")
+			fmt.Fprintln(os.Stderr, "  --timeout DURATION  max wait time (default 10m)")
 			fmt.Fprintln(os.Stderr, "  --cacert FILE       trust this CA certificate for the relay TLS")
+			fmt.Fprintln(os.Stderr, "  resume              resume polling a previous --no-wait pairing request")
 			return apperr.ExitOK
-		case a == "--wait":
-			doWait = true
+		case a == "--no-wait":
+			doWait = false
 		case a == "--cacert" || strings.HasPrefix(a, "--cacert="):
 			v, ok := mcpFlagValue(argv, &i, "cacert")
 			if !ok {
@@ -68,7 +76,7 @@ func cmdPair(argv []string) int {
 	}
 
 	if relayURL == "" {
-		fmt.Fprintln(os.Stderr, "usage: ocliv pair RELAY_URL [--wait] [--timeout D]")
+		fmt.Fprintln(os.Stderr, "usage: ocliv pair RELAY_URL [--no-wait] [--timeout D]")
 		return apperr.ExitCLIValidation
 	}
 	if err := control.ValidateRelayURL(relayURL); err != nil {
@@ -132,10 +140,16 @@ func cmdPair(argv []string) int {
 
 	var pairResp struct {
 		PairingCode      string `json:"pairing_code"`
+		PollID           string `json:"poll_id"`
+		PollSecret       string `json:"poll_secret"`
 		ExpiresInSeconds int    `json:"expires_in_seconds"`
 	}
 	if err := json.Unmarshal(respBytes, &pairResp); err != nil || pairResp.PairingCode == "" {
 		fmt.Fprintln(os.Stderr, "error: unexpected relay response")
+		return apperr.ExitAuth
+	}
+	if pairResp.PollID == "" || pairResp.PollSecret == "" {
+		fmt.Fprintln(os.Stderr, "error: relay did not return poll credentials (upgrade relay)")
 		return apperr.ExitAuth
 	}
 
@@ -144,15 +158,95 @@ func cmdPair(argv []string) int {
 	fmt.Printf("Ask the relay operator to run:\n  ocliv relay approve %s --tenant TENANT\n", pairResp.PairingCode)
 
 	if !doWait {
-		fmt.Println("\nRun `ocliv pair --wait` to complete enrollment automatically when the operator approves.")
+		if err := savePairPending(relayURL, pairResp.PollID, pairResp.PollSecret, pairResp.ExpiresInSeconds); err != nil {
+			fmt.Fprintln(os.Stderr, "warning: could not save pairing state: "+err.Error())
+		}
+		fmt.Println("\nRun `ocliv pair resume` to complete enrollment when the operator approves.")
 		return apperr.ExitOK
 	}
 
+	return doPairWait(client, relayURL, cfgPath, k, pairResp.PollID, pairResp.PollSecret, timeout)
+}
+
+// cmdPairResume loads saved poll credentials and waits for operator approval.
+func cmdPairResume(argv []string) int {
+	var cacert string
+	timeout := 10 * time.Minute
+
+	for i := 0; i < len(argv); i++ {
+		a := argv[i]
+		switch {
+		case a == "--help" || a == "-h":
+			fmt.Fprintln(os.Stderr, "usage: ocliv pair resume [--timeout DURATION] [--cacert FILE]")
+			return apperr.ExitOK
+		case a == "--cacert" || strings.HasPrefix(a, "--cacert="):
+			v, ok := mcpFlagValue(argv, &i, "cacert")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			cacert = v
+		case a == "--timeout" || strings.HasPrefix(a, "--timeout="):
+			v, ok := mcpFlagValue(argv, &i, "timeout")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			d, err := time.ParseDuration(v)
+			if err != nil || d <= 0 {
+				fmt.Fprintf(os.Stderr, "pair resume: invalid --timeout %q\n", v)
+				return apperr.ExitCLIValidation
+			}
+			timeout = d
+		default:
+			fmt.Fprintf(os.Stderr, "pair resume: unknown flag %q\n", a)
+			return apperr.ExitCLIValidation
+		}
+	}
+	_ = cacert
+
+	st, err := loadPairPending()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitCLIValidation
+	}
+
+	// Check expiry.
+	if exp, perr := time.Parse(time.RFC3339, st.ExpiresAt); perr == nil && time.Now().After(exp) {
+		fmt.Fprintln(os.Stderr, "error: saved pairing request has expired; run `ocliv pair RELAY_URL` again")
+		return apperr.ExitAuth
+	}
+
+	_, _, cfgPath, err := agentFiles()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
+	}
+
+	client, err := control.HTTPClient(15 * time.Second)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error building HTTP client: "+err.Error())
+		return apperr.ExitRelayTLS
+	}
+	defer client.CloseIdleConnections()
+
+	// Load the existing key (must already exist for resume).
+	_, keyPath, _, _ := agentFiles()
+	k, err := identity.Load(keyPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error loading key: "+err.Error())
+		return apperr.ExitInternal
+	}
+
+	fmt.Printf("Resuming pairing with %s...\n", st.RelayURL)
+	return doPairWait(client, st.RelayURL, cfgPath, k, st.PollID, st.PollSecret, timeout)
+}
+
+// doPairWait polls until approved/expired/denied and completes enrollment.
+func doPairWait(client *http.Client, relayURL, cfgPath string, k *identity.KeyPair, pollID, pollSecret string, timeout time.Duration) int {
 	fmt.Printf("\nWaiting for operator approval (timeout %s)...\n", timeout.Round(time.Second))
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	pollURL := strings.TrimRight(relayURL, "/") + "/v1/agent/pair-status?code=" + pairResp.PairingCode
+	pollURL := strings.TrimRight(relayURL, "/") + "/v1/agent/pair-status"
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 
@@ -162,7 +256,7 @@ func cmdPair(argv []string) int {
 			fmt.Fprintln(os.Stderr, "timed out waiting for approval")
 			return apperr.ExitAuth
 		case <-tick.C:
-			status, tenantID, done := pollPairStatus(client, pollURL)
+			status, tenantID, done := pollPairStatus(client, pollURL, pollID, pollSecret)
 			if !done {
 				continue
 			}
@@ -171,6 +265,10 @@ func cmdPair(argv []string) int {
 				if err := mergeRelayURL(cfgPath, relayURL); err != nil {
 					fmt.Fprintln(os.Stderr, "error saving relay URL: "+err.Error())
 					return apperr.ExitInternal
+				}
+				// Remove saved pending state on success.
+				if p, err := pairPendingPath(); err == nil {
+					_ = os.Remove(p)
 				}
 				fmt.Printf("enrolled: key-%s in tenant %q on %s\n", k.ID(), tenantID, relayURL)
 				return apperr.ExitOK
@@ -188,11 +286,12 @@ func cmdPair(argv []string) int {
 	}
 }
 
-// pollPairStatus calls the relay pair-status endpoint and returns
-// (status, tenantID, shouldStop). shouldStop is true when the status
-// is terminal (approved/expired/denied) or the request fails.
-func pollPairStatus(client *http.Client, pollURL string) (status, tenantID string, stop bool) {
-	resp, err := client.Get(pollURL)
+// pollPairStatus calls the relay pair-status endpoint (POST) with the
+// high-entropy poll credentials. Returns (status, tenantID, shouldStop).
+// shouldStop is true when the status is terminal or the request fails.
+func pollPairStatus(client *http.Client, pollURL, pollID, pollSecret string) (status, tenantID string, stop bool) {
+	body, _ := json.Marshal(map[string]string{"poll_id": pollID, "poll_secret": pollSecret})
+	resp, err := client.Post(pollURL, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return "", "", false // transient network error; keep polling
 	}
@@ -219,4 +318,54 @@ func pollPairStatus(client *http.Client, pollURL string) (status, tenantID strin
 	default:
 		return sr.Status, "", false
 	}
+}
+
+// pairPendingState holds the poll credentials saved for `ocliv pair resume`.
+type pairPendingState struct {
+	RelayURL   string `json:"relay_url"`
+	PollID     string `json:"poll_id"`
+	PollSecret string `json:"poll_secret"`
+	ExpiresAt  string `json:"expires_at"`
+}
+
+func pairPendingPath() (string, error) {
+	dir, _, _, err := agentFiles()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "pair-pending.json"), nil
+}
+
+func savePairPending(relayURL, pollID, pollSecret string, expiresInSeconds int) error {
+	p, err := pairPendingPath()
+	if err != nil {
+		return err
+	}
+	exp := time.Now().Add(time.Duration(expiresInSeconds) * time.Second).UTC().Format(time.RFC3339)
+	b, err := json.Marshal(pairPendingState{
+		RelayURL:   relayURL,
+		PollID:     pollID,
+		PollSecret: pollSecret,
+		ExpiresAt:  exp,
+	})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(p, b, 0600)
+}
+
+func loadPairPending() (pairPendingState, error) {
+	p, err := pairPendingPath()
+	if err != nil {
+		return pairPendingState{}, err
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return pairPendingState{}, fmt.Errorf("no pending pairing request found (run `ocliv pair RELAY_URL` first): %w", err)
+	}
+	var st pairPendingState
+	if err := json.Unmarshal(b, &st); err != nil {
+		return pairPendingState{}, fmt.Errorf("corrupt pending pairing state: %w", err)
+	}
+	return st, nil
 }

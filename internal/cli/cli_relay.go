@@ -556,8 +556,8 @@ func cmdRelayServe(argv []string) int {
 		ReleaseManifestJSON:      releaseManifestJSON,
 		ReleaseArtifactDir:       rawArtifactDir,
 		EdgeMode:                 edgeMode,
-		GlobalMaxHTTPStreams:      maxHTTPStreams,
-		GlobalMaxWSStreams:        maxWSStreams,
+		GlobalMaxHTTPStreams:     maxHTTPStreams,
+		GlobalMaxWSStreams:       maxWSStreams,
 		GlobalMaxSessions:        maxSessions,
 	})
 	if err != nil {

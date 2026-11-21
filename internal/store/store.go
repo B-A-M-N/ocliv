@@ -294,6 +294,23 @@ CREATE INDEX IF NOT EXISTS idx_pairing_requests_code ON pairing_requests(display
 CREATE INDEX IF NOT EXISTS idx_pairing_requests_status ON pairing_requests(status, expires_at);
 `
 
+// schemaV20 splits the pairing display code from the polling credential.
+// Polling now requires a high-entropy poll_id + poll_verifier that is never
+// equal to the human-readable display code. The display_code column gains a
+// UNIQUE constraint; display-code-only polling is refused at the handler layer.
+const schemaV20 = `
+ALTER TABLE pairing_requests ADD COLUMN poll_id TEXT;
+ALTER TABLE pairing_requests ADD COLUMN poll_verifier BLOB;
+UPDATE pairing_requests SET poll_id = id WHERE poll_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pairing_requests_poll_id
+  ON pairing_requests(poll_id) WHERE poll_id IS NOT NULL;
+DELETE FROM pairing_requests WHERE rowid NOT IN (
+  SELECT MIN(rowid) FROM pairing_requests GROUP BY display_code);
+DROP INDEX IF EXISTS idx_pairing_requests_code;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pairing_requests_display_code
+  ON pairing_requests(display_code);
+`
+
 // applyMigration runs one versioned migration body and its version
 // stamp in a single transaction: a failure anywhere rolls back the
 // body, so a version is never recorded for half-applied work (P1-2).
@@ -318,7 +335,7 @@ func applyMigration(sqldb *sql.DB, version int, body string) error {
 }
 
 // currentSchema is the newest version Open must reach.
-const currentSchema = 19
+const currentSchema = 20
 
 // SchemaVersion is the exported current schema version for tools that must
 // refuse unknown/newer databases without opening (and thereby migrating)
@@ -329,6 +346,8 @@ const SchemaVersion = currentSchema
 type PairingRequest struct {
 	ID               string
 	DisplayCode      string
+	PollID           string
+	PollVerifier     []byte
 	PublicKey        []byte
 	KeyID            string
 	SourceIP         string
@@ -511,6 +530,7 @@ func Open(path string) (*DB, error) {
 		{17, schemaV17},
 		{18, schemaV18},
 		{19, schemaV19},
+		{20, schemaV20},
 	}
 	for _, m := range migrations {
 		var v int
@@ -592,15 +612,21 @@ type TenantPolicy struct {
 }
 
 // GetTenantPolicy reads the quota_json policy for tenantID.
-// Returns the zero TenantPolicy (all defaults) on missing or invalid JSON.
-func (d *DB) GetTenantPolicy(tenantID string) TenantPolicy {
+// Returns an error on missing tenant, corrupt JSON, or database failure —
+// never silently returns zero-value (which would mean unlimited quotas).
+func (d *DB) GetTenantPolicy(tenantID string) (TenantPolicy, error) {
 	var raw string
 	if err := d.sql.QueryRow(`SELECT quotas_json FROM tenants WHERE id=?`, tenantID).Scan(&raw); err != nil {
-		return TenantPolicy{}
+		if err == sql.ErrNoRows {
+			return TenantPolicy{}, apperr.E(apperr.CodeStoreFault, "tenant not found", err)
+		}
+		return TenantPolicy{}, apperr.E(apperr.CodeStoreFault, "reading tenant policy", err)
 	}
 	var p TenantPolicy
-	_ = json.Unmarshal([]byte(raw), &p)
-	return p
+	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		return TenantPolicy{}, apperr.E(apperr.CodeStoreFault, "corrupt tenant policy JSON", err)
+	}
+	return p, nil
 }
 
 // SetTenantPolicy writes policy to quotas_json for tenantID.
@@ -639,12 +665,14 @@ func (d *DB) PruneAuditEvents(now time.Time) (int64, error) {
 }
 
 // CreatePairingRequest stores a new pending publisher-initiated pairing request.
-func (d *DB) CreatePairingRequest(id, displayCode string, pubKey []byte, keyID, sourceIP string, expiresAt time.Time) error {
+// pollID is the opaque lookup key; pollVerifier is the SHA-256 hash of the
+// poll secret — the raw secret is never stored.
+func (d *DB) CreatePairingRequest(id, displayCode, pollID string, pollVerifier, pubKey []byte, keyID, sourceIP string, expiresAt time.Time) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err := d.sql.Exec(
-		`INSERT INTO pairing_requests(id, display_code, public_key, key_id, source_ip, status, created_at, expires_at)
-		 VALUES(?,?,?,?,?,'pending',?,?)`,
-		id, displayCode, pubKey, keyID, sourceIP, now, expiresAt.UTC().Format(time.RFC3339Nano))
+		`INSERT INTO pairing_requests(id, display_code, poll_id, poll_verifier, public_key, key_id, source_ip, status, created_at, expires_at)
+		 VALUES(?,?,?,?,?,?,?,'pending',?,?)`,
+		id, displayCode, pollID, pollVerifier, pubKey, keyID, sourceIP, now, expiresAt.UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return apperr.E(apperr.CodeStoreFault, "storing pairing request", err)
 	}
@@ -652,11 +680,26 @@ func (d *DB) CreatePairingRequest(id, displayCode string, pubKey []byte, keyID, 
 }
 
 // GetPairingRequest looks up a pairing request by its display code.
+// Used by operator-side approval (ApprovePairingRequest) — the display
+// code is typed by the human operator, not held by the publisher.
 func (d *DB) GetPairingRequest(displayCode string) (PairingRequest, error) {
 	row := d.sql.QueryRow(
-		`SELECT id, display_code, public_key, key_id, source_ip, status, created_at, expires_at,
+		`SELECT id, display_code, COALESCE(poll_id,''), COALESCE(poll_verifier,X''),
+		        public_key, key_id, source_ip, status, created_at, expires_at,
 		        resolved_at, COALESCE(enrollment_code_id,'')
 		 FROM pairing_requests WHERE display_code=?`, displayCode)
+	return scanPairingRequest(row)
+}
+
+// GetPairingRequestByPollID looks up a pairing request by its high-entropy
+// poll_id. The caller must verify the poll secret against PollVerifier using
+// constant-time comparison — this function does not perform secret verification.
+func (d *DB) GetPairingRequestByPollID(pollID string) (PairingRequest, error) {
+	row := d.sql.QueryRow(
+		`SELECT id, display_code, COALESCE(poll_id,''), COALESCE(poll_verifier,X''),
+		        public_key, key_id, source_ip, status, created_at, expires_at,
+		        resolved_at, COALESCE(enrollment_code_id,'')
+		 FROM pairing_requests WHERE poll_id=?`, pollID)
 	return scanPairingRequest(row)
 }
 
@@ -664,7 +707,8 @@ func (d *DB) GetPairingRequest(displayCode string) (PairingRequest, error) {
 func (d *DB) ListPendingPairingRequests() ([]PairingRequest, error) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	rows, err := d.sql.Query(
-		`SELECT id, display_code, public_key, key_id, source_ip, status, created_at, expires_at,
+		`SELECT id, display_code, COALESCE(poll_id,''), COALESCE(poll_verifier,X''),
+		        public_key, key_id, source_ip, status, created_at, expires_at,
 		        resolved_at, COALESCE(enrollment_code_id,'')
 		 FROM pairing_requests
 		 WHERE status='pending' AND expires_at > ?
@@ -705,7 +749,8 @@ func scanPairingRequest(row pairingScanner) (PairingRequest, error) {
 	var pr PairingRequest
 	var createdStr, expiresStr string
 	var resolvedStr sql.NullString
-	if err := row.Scan(&pr.ID, &pr.DisplayCode, &pr.PublicKey, &pr.KeyID, &pr.SourceIP,
+	if err := row.Scan(&pr.ID, &pr.DisplayCode, &pr.PollID, &pr.PollVerifier,
+		&pr.PublicKey, &pr.KeyID, &pr.SourceIP,
 		&pr.Status, &createdStr, &expiresStr, &resolvedStr, &pr.EnrollmentCodeID); err != nil {
 		if err == sql.ErrNoRows {
 			return PairingRequest{}, apperr.E(apperr.CodeEnrollAuth, "pairing request not found", nil)
@@ -719,4 +764,40 @@ func scanPairingRequest(row pairingScanner) (PairingRequest, error) {
 		pr.ResolvedAt = &t
 	}
 	return pr, nil
+}
+
+// CountPendingPairingRequests returns the total number of pending pairing
+// requests relay-wide for global cap enforcement.
+func (d *DB) CountPendingPairingRequests() (int, error) {
+	var n int
+	if err := d.sql.QueryRow(
+		`SELECT COUNT(*) FROM pairing_requests WHERE status='pending'`).Scan(&n); err != nil {
+		return 0, apperr.E(apperr.CodeStoreFault, "counting pending pairing requests", err)
+	}
+	return n, nil
+}
+
+// PrunePairingRequests durably expires pending requests past their TTL and
+// deletes old resolved requests. It returns (marked, deleted, error).
+// resolvedRetention is how long to keep resolved rows before pruning (e.g. 24h).
+func (d *DB) PrunePairingRequests(now time.Time, resolvedRetention time.Duration) (int64, int64, error) {
+	nowStr := now.UTC().Format(time.RFC3339Nano)
+	cutoff := now.UTC().Add(-resolvedRetention).Format(time.RFC3339Nano)
+	res, err := d.sql.Exec(
+		`UPDATE pairing_requests SET status='expired', resolved_at=?
+		 WHERE status='pending' AND expires_at <= ?`,
+		nowStr, nowStr)
+	if err != nil {
+		return 0, 0, apperr.E(apperr.CodeStoreFault, "expiring pairing requests", err)
+	}
+	marked, _ := res.RowsAffected()
+	res2, err := d.sql.Exec(
+		`DELETE FROM pairing_requests
+		 WHERE status IN ('approved','denied','expired') AND resolved_at < ?`,
+		cutoff)
+	if err != nil {
+		return marked, 0, apperr.E(apperr.CodeStoreFault, "pruning pairing requests", err)
+	}
+	deleted, _ := res2.RowsAffected()
+	return marked, deleted, nil
 }

@@ -144,16 +144,10 @@ func UnsuspendTenantDB(db *store.DB, tenantID string) error {
 }
 
 // GetTenantPolicyDB reads the policy for tenantID directly from the DB
-// (CLI path: no live Server required).
+// (CLI path: no live Server required). Delegates to db.GetTenantPolicy which
+// now returns an error on missing tenant, corrupt JSON, or database failure.
 func GetTenantPolicyDB(db *store.DB, tenantID string) (store.TenantPolicy, error) {
-	var raw string
-	if err := db.SQL().QueryRow(`SELECT quotas_json FROM tenants WHERE id=?`, tenantID).Scan(&raw); err != nil {
-		if err == sql.ErrNoRows {
-			return store.TenantPolicy{}, apperr.E(apperr.CodeEnrollAuth, "unknown tenant", nil)
-		}
-		return store.TenantPolicy{}, apperr.E(apperr.CodeStoreFault, "reading tenant policy", err)
-	}
-	return db.GetTenantPolicy(tenantID), nil
+	return db.GetTenantPolicy(tenantID)
 }
 
 // SetTenantPolicyDB writes policy for tenantID directly to the DB (CLI path).

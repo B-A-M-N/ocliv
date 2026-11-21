@@ -65,16 +65,17 @@ const (
 func DefaultEdgeMode() string { return defaultEdgeMode }
 
 // Explicit setup state-machine stages (A9).
+// stageEnrollmentComplete is intentionally absent: relay provisioning no
+// longer enrolls a publisher. The relay is a separate role from publishers.
 const (
-	stageDetected           = "DETECTED"
-	stageDNSUpdated         = "DNS_UPDATED"
-	stageDNSVerified        = "DNS_VERIFIED"
-	stageArtifactsRendered  = "ARTIFACTS_RENDERED"
-	stageSystemInstalled    = "SYSTEM_INSTALLED"
-	stageRelayReady         = "RELAY_READY"
-	stageEnrollmentComplete = "ENROLLMENT_COMPLETE"
-	stageRefreshTimerReady  = "REFRESH_TIMER_READY"
-	stageComplete           = "COMPLETE"
+	stageDetected          = "DETECTED"
+	stageDNSUpdated        = "DNS_UPDATED"
+	stageDNSVerified       = "DNS_VERIFIED"
+	stageArtifactsRendered = "ARTIFACTS_RENDERED"
+	stageSystemInstalled   = "SYSTEM_INSTALLED"
+	stageRelayReady        = "RELAY_READY"
+	stageRefreshTimerReady = "REFRESH_TIMER_READY"
+	stageComplete          = "COMPLETE"
 )
 
 var setupStageOrder = []string{
@@ -84,7 +85,6 @@ var setupStageOrder = []string{
 	stageArtifactsRendered,
 	stageSystemInstalled,
 	stageRelayReady,
-	stageEnrollmentComplete,
 	stageRefreshTimerReady,
 	stageComplete,
 }
@@ -237,6 +237,60 @@ func saveSetupState(st setupState) error {
 	return writeAtomic0600(p, string(b)+"\n")
 }
 
+// checkpointSetup persists a completed stage with evidence, preserving all
+// previously accumulated evidence (not replacing the whole map).
+func checkpointSetup(st *setupState, stage string, evidence map[string]string) error {
+	if st.StageEvidence == nil {
+		st.StageEvidence = make(map[string]string)
+	}
+	for k, v := range evidence {
+		st.StageEvidence[k] = v
+	}
+	st.CompletedStage = stage
+	return saveSetupState(*st)
+}
+
+// revalidateStage returns a per-stage validator that checks recorded evidence
+// rather than merely testing if the key is non-empty. Future iterations can
+// add live re-verification (DNS lookup, file hash check, health probe) here
+// without changing the planSetupResume contract.
+func revalidateStage(st setupState) func(string) bool {
+	return func(stage string) bool {
+		switch stage {
+		case stageDetected:
+			return st.StageEvidence[stageDetected] != ""
+		case stageDNSUpdated:
+			return st.StageEvidence[stageDNSUpdated] != ""
+		case stageDNSVerified:
+			// Hostname must be known and DNS verification evidence recorded.
+			return st.Hostname != "" && st.StageEvidence[stageDNSVerified] != ""
+		case stageArtifactsRendered:
+			return st.StageEvidence[stageArtifactsRendered] != ""
+		case stageSystemInstalled:
+			return st.StageEvidence[stageSystemInstalled] != ""
+		case stageRelayReady:
+			return st.StageEvidence[stageRelayReady] != ""
+		case stageRefreshTimerReady:
+			return st.StageEvidence[stageRefreshTimerReady] != ""
+		case stageComplete:
+			return st.CompletedStage == stageComplete
+		default:
+			return false
+		}
+	}
+}
+
+// stageAtOrBefore reports whether stage a is at or before stage b in the
+// canonical stage order. Both stages must be valid; unknown stages return false.
+func stageAtOrBefore(a, b string) bool {
+	ia := setupStageIndex(a)
+	ib := setupStageIndex(b)
+	if ia < 0 || ib < 0 {
+		return false
+	}
+	return ia <= ib
+}
+
 // runSuppressedStdout executes fn while capturing stdout so --json mode emits
 // strictly one valid JSON document to stdout with zero human-prose prefix.
 func runSuppressedStdout(fn func() int) (int, string) {
@@ -377,14 +431,25 @@ func cmdSetup(argv []string) int {
 		edge = DefaultEdgeMode()
 	}
 	// A9: Validate persisted setup-state schema strictly before resuming.
-	if prevState, hasPrev, serr := loadSetupStateStrict(); serr != nil {
+	var resumeStage string
+	prevState, hasPrev, serr := loadSetupStateStrict()
+	if serr != nil {
 		fmt.Fprintln(os.Stderr, "error: "+serr.Error())
 		return apperr.ExitInternal
-	} else if hasPrev && !check && !dryRun && !refreshDNS {
+	}
+	if hasPrev && !check && !dryRun && !refreshDNS {
 		wantFP := setupFingerprint(hostname, edge, acmeEmail)
-		_, _ = planSetupResume(prevState, wantFP, func(stage string) bool {
-			return prevState.StageEvidence[stage] != ""
-		})
+		var revalidated []string
+		resumeStage, revalidated = planSetupResume(prevState, wantFP, revalidateStage(prevState))
+		if len(revalidated) > 0 {
+			fmt.Fprintf(os.Stderr, "setup: resuming from %s (revalidated: %s)\n",
+				resumeStage, strings.Join(revalidated, ", "))
+		}
+	}
+	// skipStage returns true when resuming past a stage that is already complete,
+	// allowing the setup flow to skip re-executing and re-checkpointing it.
+	skipStage := func(stage string) bool {
+		return resumeStage != "" && stageAtOrBefore(stage, resumeStage)
 	}
 	if dryRun && hostname == "" {
 		fmt.Fprintln(os.Stderr, "--dry-run needs --hostname ZONE.dynv6.net (or ZONE.duckdns.org)")
@@ -393,20 +458,20 @@ func cmdSetup(argv []string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	d := setup.Gather(ctx, echoV4, echoV6)
-	if !check && !dryRun && !refreshDNS && echoV4 == defaultEchoV4 && echoV6 == defaultEchoV6 {
+	// state accumulates setup progress; evidence merges incrementally via checkpointSetup.
+	state := setupState{
+		DetectedPath: d.Path.String(),
+		Hostname:     hostname,
+		EdgeMode:     edge,
+		ACMEEmail:    acmeEmail,
+	}
+	if !check && !dryRun && !refreshDNS && echoV4 == defaultEchoV4 && echoV6 == defaultEchoV6 && !skipStage(stageDetected) {
 		blocker := ""
 		if hostname == "" {
 			blocker = "hostname_required"
 		}
-		if serr := saveSetupState(setupState{
-			DetectedPath:   d.Path.String(),
-			Hostname:       hostname,
-			EdgeMode:       edge,
-			ACMEEmail:      acmeEmail,
-			CompletedStage: stageDetected,
-			StageEvidence:  map[string]string{stageDetected: d.Path.String()},
-			Blocker:        blocker,
-		}); serr != nil {
+		state.Blocker = blocker
+		if serr := checkpointSetup(&state, stageDetected, map[string]string{stageDetected: d.Path.String()}); serr != nil {
 			fmt.Fprintln(os.Stderr, "error: cannot persist setup state: "+serr.Error())
 			return apperr.ExitInternal
 		}
@@ -518,15 +583,8 @@ func cmdSetup(argv []string) int {
 		if rc == apperr.ExitOK {
 			blocker = ""
 		}
-		if serr := saveSetupState(setupState{
-			DetectedPath:   d.Path.String(),
-			Hostname:       hostname,
-			EdgeMode:       edge,
-			ACMEEmail:      acmeEmail,
-			CompletedStage: stage,
-			StageEvidence:  map[string]string{"hostname": hostname, "edge": edge},
-			Blocker:        blocker,
-		}); serr != nil {
+		state.Blocker = blocker
+		if serr := checkpointSetup(&state, stage, map[string]string{"hostname": hostname, "edge": edge}); serr != nil {
 			fmt.Fprintln(os.Stderr, "error: cannot persist setup state: "+serr.Error())
 			if rc == apperr.ExitOK {
 				rc = apperr.ExitInternal

@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -21,6 +22,7 @@ const (
 	pairingTTL        = 10 * time.Minute
 	pairingRateLimit  = 5                // max pending per IP per window
 	pairingRateWindow = 10 * time.Minute // window for rate limiting
+	pairingGlobalMax  = 1000             // max pending requests relay-wide
 )
 
 type pairRequestBody struct {
@@ -29,7 +31,14 @@ type pairRequestBody struct {
 
 type pairRequestResp struct {
 	PairingCode      string `json:"pairing_code"`
+	PollID           string `json:"poll_id"`
+	PollSecret       string `json:"poll_secret"`
 	ExpiresInSeconds int    `json:"expires_in_seconds"`
+}
+
+type pairStatusReq struct {
+	PollID     string `json:"poll_id"`
+	PollSecret string `json:"poll_secret"`
 }
 
 type pairStatusResp struct {
@@ -40,7 +49,8 @@ type pairStatusResp struct {
 
 // handlePairRequest handles POST /v1/agent/pair-request.
 // Publisher submits its public key; relay stores a pending pairing request
-// and returns a short human-readable display code for the operator to approve.
+// and returns a short human-readable display code (for the operator) and a
+// high-entropy poll_id + poll_secret (for publisher status polling).
 func (s *Server) handlePairRequest(w http.ResponseWriter, r *http.Request) {
 	if !s.checkPreAuth(w, r, "pair-request") {
 		return
@@ -61,6 +71,14 @@ func (s *Server) handlePairRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sourceIP := clientIP(r)
+
+	// Global capacity: prevent distributed flooding beyond per-IP limits.
+	total, err := s.db.CountPendingPairingRequests()
+	if err != nil || total >= pairingGlobalMax {
+		s.db.Audit("agent", "", "", "pair-request", "denied", "global pairing capacity exceeded")
+		http.Error(w, "relay pairing capacity exceeded; try again later", http.StatusTooManyRequests)
+		return
+	}
 
 	// Rate limit: max pairingRateLimit pending requests per IP per window.
 	n, err := s.db.CountRecentPairingRequestsByIP(sourceIP, time.Now().Add(-pairingRateWindow))
@@ -85,10 +103,17 @@ func (s *Server) handlePairRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	pollID, pollSecret, pollVerifier, err := mintPollCredentials()
+	if err != nil {
+		s.log.Error("pair-request: mint poll credentials failed", "err", errShort(err))
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
 	now := time.Now().UTC()
 	id := fmt.Sprintf("pair-%d", now.UnixNano())
 
-	if err := s.db.CreatePairingRequest(id, displayCode, rawPub, keyID, sourceIP, now.Add(pairingTTL)); err != nil {
+	if err := s.db.CreatePairingRequest(id, displayCode, pollID, pollVerifier, rawPub, keyID, sourceIP, now.Add(pairingTTL)); err != nil {
 		s.log.Error("pair-request: store failed", "err", errShort(err))
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -96,35 +121,50 @@ func (s *Server) handlePairRequest(w http.ResponseWriter, r *http.Request) {
 	s.db.Audit("agent", "", "", "pair-request", "ok", "created key="+keyID)
 	writeJSON(w, http.StatusOK, pairRequestResp{
 		PairingCode:      displayCode,
+		PollID:           pollID,
+		PollSecret:       pollSecret,
 		ExpiresInSeconds: int(pairingTTL.Seconds()),
 	})
 }
 
-// handlePairStatus handles GET /v1/agent/pair-status?code=XXXX-XXXX-XXXX.
-// Returns the current status and, when approved, the tenant and key IDs.
+// handlePairStatus handles POST /v1/agent/pair-status.
+// The publisher authenticates with its high-entropy poll_id + poll_secret.
+// The human display code is never accepted here — it is operator-only.
 func (s *Server) handlePairStatus(w http.ResponseWriter, r *http.Request) {
 	if !s.checkPreAuth(w, r, "pair-status") {
 		return
 	}
-	if r.Method != http.MethodGet {
+	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	code := r.URL.Query().Get("code")
-	if code == "" {
-		http.Error(w, "missing code parameter", http.StatusBadRequest)
+	var req pairStatusReq
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.PollID == "" || req.PollSecret == "" {
+		http.Error(w, "missing poll_id or poll_secret", http.StatusBadRequest)
 		return
 	}
 
-	pr, err := s.db.GetPairingRequest(code)
+	pr, err := s.db.GetPairingRequestByPollID(req.PollID)
 	if err != nil {
-		var ae *apperr.Error
-		if asApperr(err, &ae) && ae.Code == apperr.CodeEnrollAuth {
-			http.Error(w, "not found", http.StatusNotFound)
-			return
-		}
-		s.log.Error("pair-status: lookup failed", "err", errShort(err))
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		// Return 404 for not-found AND for wrong credentials — no oracle.
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	// Constant-time comparison against stored verifier (prevents timing oracle).
+	secretBytes, err := base64.RawURLEncoding.DecodeString(req.PollSecret)
+	if err != nil || len(pr.PollVerifier) == 0 {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	hash := sha256.Sum256(secretBytes)
+	if subtle.ConstantTimeCompare(hash[:], pr.PollVerifier) != 1 {
+		s.db.Audit("agent", "", "", "pair-status", "denied", "wrong poll secret")
+		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
 
@@ -134,19 +174,18 @@ func (s *Server) handlePairStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := pairStatusResp{Status: status}
-
 	if status == "approved" {
-		// Return the tenant and key so the publisher can finalize local config.
-		resp.TenantID = pr.EnrollmentCodeID // repurposed: holds tenant_id after approval
+		// EnrollmentCodeID is repurposed to hold the tenant_id after approval.
+		resp.TenantID = pr.EnrollmentCodeID
 		resp.KeyID = pr.KeyID
 	}
-
 	writeJSON(w, http.StatusOK, resp)
 }
 
 // ApprovePairingRequest looks up a pending pairing request by display code,
 // directly enrolls the publisher's key into the specified tenant, and marks
 // the request as approved. It is a narrow store operation (no Server needed).
+// The operator provides the display code they see on the publisher's screen.
 func ApprovePairingRequest(db *store.DB, displayCode, tenantID string) (keyID string, err error) {
 	pr, err := db.GetPairingRequest(displayCode)
 	if err != nil {
@@ -194,7 +233,7 @@ func ApprovePairingRequest(db *store.DB, displayCode, tenantID string) (keyID st
 }
 
 // mintPairingCode generates a 12-hex-char display code in XXXX-XXXX-XXXX format
-// using crypto/rand.
+// using crypto/rand. This is the human-readable operator display code only.
 func mintPairingCode() (string, error) {
 	b := make([]byte, 6)
 	if _, err := rand.Read(b); err != nil {
@@ -202,4 +241,23 @@ func mintPairingCode() (string, error) {
 	}
 	s := hex.EncodeToString(b) // 12 lowercase hex chars
 	return fmt.Sprintf("%s-%s-%s", s[0:4], s[4:8], s[8:12]), nil
+}
+
+// mintPollCredentials generates a high-entropy poll ID and secret.
+// The poll_id is used for database lookup; the poll_secret is returned to the
+// publisher and never stored — only its SHA-256 hash (poll_verifier) is stored.
+func mintPollCredentials() (pollID, pollSecret string, verifier []byte, err error) {
+	idBuf := make([]byte, 16)
+	secBuf := make([]byte, 32)
+	if _, err = rand.Read(idBuf); err != nil {
+		return "", "", nil, fmt.Errorf("CSPRNG failure: %w", err)
+	}
+	if _, err = rand.Read(secBuf); err != nil {
+		return "", "", nil, fmt.Errorf("CSPRNG failure: %w", err)
+	}
+	pollID = base64.RawURLEncoding.EncodeToString(idBuf)
+	pollSecret = base64.RawURLEncoding.EncodeToString(secBuf)
+	hash := sha256.Sum256(secBuf)
+	verifier = hash[:]
+	return pollID, pollSecret, verifier, nil
 }

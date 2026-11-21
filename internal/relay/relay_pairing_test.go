@@ -101,8 +101,21 @@ func TestPairRequestRateLimitEnforced(t *testing.T) {
 	}
 }
 
+// postPairStatus calls POST /v1/agent/pair-status with poll credentials.
+func postPairStatus(t *testing.T, s *Server, pollID, pollSecret, remoteAddr string) *httptest.ResponseRecorder {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"poll_id": pollID, "poll_secret": pollSecret})
+	req := httptest.NewRequest(http.MethodPost, "/v1/agent/pair-status", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = remoteAddr
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
 // TestPairStatusPendingAfterRequest proves that immediately after a pair
-// request the status endpoint returns "pending".
+// request the status endpoint returns "pending" when polled with the
+// high-entropy poll_id + poll_secret credentials.
 func TestPairStatusPendingAfterRequest(t *testing.T) {
 	s, _ := newPairingServer(t)
 	pub := genPubKeyBase64(t)
@@ -112,16 +125,17 @@ func TestPairStatusPendingAfterRequest(t *testing.T) {
 	}
 	var pairResp struct {
 		PairingCode string `json:"pairing_code"`
+		PollID      string `json:"poll_id"`
+		PollSecret  string `json:"poll_secret"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &pairResp); err != nil {
 		t.Fatal(err)
 	}
+	if pairResp.PollID == "" || pairResp.PollSecret == "" {
+		t.Fatal("pair-request: missing poll_id or poll_secret in response")
+	}
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/agent/pair-status?code="+pairResp.PairingCode, nil)
-	req.RemoteAddr = "192.0.2.11:1234"
-	rec2 := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec2, req)
-
+	rec2 := postPairStatus(t, s, pairResp.PollID, pairResp.PollSecret, "192.0.2.11:1234")
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("pair-status: want 200, got %d: %s", rec2.Code, rec2.Body.String())
 	}
@@ -136,6 +150,29 @@ func TestPairStatusPendingAfterRequest(t *testing.T) {
 	}
 }
 
+// TestPairStatusWrongSecretReturns404 proves the timing-oracle protection:
+// a correct poll_id with a wrong poll_secret returns 404 (not 401/403).
+func TestPairStatusWrongSecretReturns404(t *testing.T) {
+	s, _ := newPairingServer(t)
+	pub := genPubKeyBase64(t)
+	rec := postPairRequest(t, s, pub, "192.0.2.50:1234")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("pair-request: %d", rec.Code)
+	}
+	var pairResp struct {
+		PollID     string `json:"poll_id"`
+		PollSecret string `json:"poll_secret"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &pairResp); err != nil {
+		t.Fatal(err)
+	}
+	// Use correct poll_id but wrong secret.
+	rec2 := postPairStatus(t, s, pairResp.PollID, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "192.0.2.50:1234")
+	if rec2.Code != http.StatusNotFound {
+		t.Fatalf("wrong secret: want 404, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+}
+
 // TestPairApproveAndStatusApproved proves the full pairing flow:
 // pair-request → relay.ApprovePairingRequest → pair-status returns "approved".
 func TestPairApproveAndStatusApproved(t *testing.T) {
@@ -147,12 +184,17 @@ func TestPairApproveAndStatusApproved(t *testing.T) {
 	}
 	var pairResp struct {
 		PairingCode string `json:"pairing_code"`
+		PollID      string `json:"poll_id"`
+		PollSecret  string `json:"poll_secret"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &pairResp); err != nil {
 		t.Fatal(err)
 	}
+	if pairResp.PollID == "" || pairResp.PollSecret == "" {
+		t.Fatal("pair-request: missing poll credentials")
+	}
 
-	// Operator approves the request.
+	// Operator approves using the display code (not the poll credentials).
 	keyID, err := ApprovePairingRequest(db, pairResp.PairingCode, "home")
 	if err != nil {
 		t.Fatalf("ApprovePairingRequest: %v", err)
@@ -170,12 +212,8 @@ func TestPairApproveAndStatusApproved(t *testing.T) {
 		t.Fatalf("key status=%q, want active", status)
 	}
 
-	// Status endpoint should now return "approved".
-	req := httptest.NewRequest(http.MethodGet, "/v1/agent/pair-status?code="+pairResp.PairingCode, nil)
-	req.RemoteAddr = "192.0.2.20:1234"
-	rec2 := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec2, req)
-
+	// Publisher polls with high-entropy credentials; should now return "approved".
+	rec2 := postPairStatus(t, s, pairResp.PollID, pairResp.PollSecret, "192.0.2.20:1234")
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("pair-status: want 200, got %d", rec2.Code)
 	}
