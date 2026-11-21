@@ -147,7 +147,7 @@ _lv=_sk_create.recv(200).decode(); _sk_create.close()
 check("A: health live","ok" in _lv,_lv.strip().splitlines()[-1] if _lv else "empty")
 # schema
 sv=sh(["python3","-c","import sqlite3;print(sqlite3.connect('"+DB+"/ocliv.db').execute('SELECT MAX(v) FROM schema_version').fetchone()[0])"]).stdout.strip()
-check("A: schema V12",sv=="12","v="+sv)
+check("A: schema V19",sv=="19","v="+sv)
 
 print("== Phase A2: restart persistence ==")
 if ra:

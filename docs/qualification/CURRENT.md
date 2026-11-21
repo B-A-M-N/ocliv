@@ -14,6 +14,7 @@ structured evidence/receipts live under `docs/qualification/receipts/`.
 | Race detector matrix (`internal/relay` standalone + core internal packages) | **PASS** | Zero data races across `relay`, `cli`, `agent`, `config`, `identity`, `protocol`, `store`, `lease`, `setup` |
 | Static checks (`gofmt`, `go vet`, `git diff --check`, `check-repo-hygiene.sh`) | **PASS** | Enforced in CI |
 | Isolated ARM64 Pi staging & real machine reboot recovery (`10.9.66.170`) | **PASS** | Same lease, same visitor HMAC key, same cookie after reboot; production `ocliv-relay` untouched |
+| Pi isolated loopback qualification — 2026-11-21 (commit `950440e`) | **PASS 29/0** | V19 schema, Phase E+F audit items (tenant policy, global budget, pairing flow, installer, capability advertisement, systemd hardening); see `history/PI-ISOLATED-RESULT-2026-11-21.md` |
 
 ## Outstanding Gates (Required Before Lifting HOLD)
 
