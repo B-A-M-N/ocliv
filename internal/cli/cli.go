@@ -180,6 +180,10 @@ func Run(argv []string) int {
 		return cmdGoogle(argv[1:])
 	case "connect":
 		return cmdConnect(argv[1:])
+	case "pair":
+		return cmdPair(argv[1:])
+	case "install":
+		return cmdInstall(argv[1:])
 	case "host":
 		return cmdHost(argv[1:])
 	case "restart":
@@ -226,6 +230,7 @@ Everyday:
   ocliv PORT                  share localhost:PORT over protected HTTPS (ephemeral)
   ocliv doctor                diagnose key, relay, local service, and DNS/TLS
   ocliv login --relay URL --code-file PATH   enroll this machine once
+  ocliv install --relay URL [--dir DIR] [--yes]   download and install latest release from relay
   ocliv profile create NAME | use NAME|default | list   separate enrollments
 
 Advanced:

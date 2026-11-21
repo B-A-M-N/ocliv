@@ -48,6 +48,10 @@ type Options struct {
 	GlobalMaxHTTPStreams int64
 	GlobalMaxWSStreams   int64
 	GlobalMaxSessions    int64
+	// ReleaseManifestJSON is the release-manifest.json payload served at
+	// GET /.well-known/ocliv-release-manifest.json. If nil the endpoint
+	// returns 404 — no manifest configured by the operator.
+	ReleaseManifestJSON []byte
 }
 
 // Logger is a minimal structured logger to avoid import cycles.
@@ -141,6 +145,7 @@ type Server struct {
 	mcpPort                  int
 	autoApproveRedirectHosts []string
 	googleVerificationJSON   []byte
+	releaseManifestJSON      []byte
 	visitors                 visitorAccess // HMAC key + verifier for visitor sessions
 	log                      Logger
 
@@ -200,6 +205,7 @@ func New(o Options) (*Server, error) {
 		mcpPort:                  port,
 		autoApproveRedirectHosts: autoApprove,
 		googleVerificationJSON:   append([]byte(nil), o.GoogleVerificationJSON...),
+		releaseManifestJSON:      append([]byte(nil), o.ReleaseManifestJSON...),
 		visitors:                 newVisitorAccess(o.ServerKey),
 		log:                      o.Logger,
 		registry:                 newSessionRegistry(),
@@ -225,7 +231,10 @@ func New(o Options) (*Server, error) {
 		}
 		s.authz = m
 	}
+	s.mux.HandleFunc("/.well-known/ocliv-release-manifest.json", s.handleReleaseManifest)
 	s.mux.HandleFunc("/v1/agent/enroll", s.handleEnroll)
+	s.mux.HandleFunc("/v1/agent/pair-request", s.handlePairRequest)
+	s.mux.HandleFunc("/v1/agent/pair-status", s.handlePairStatus)
 	s.mux.HandleFunc("/v1/agent/capabilities", s.handleCapabilities)
 	s.mux.HandleFunc("/v1/agent/challenge", s.handleChallenge)
 	s.mux.HandleFunc("/v1/agent/connect", s.handleConnect)

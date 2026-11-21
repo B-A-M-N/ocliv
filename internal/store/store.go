@@ -273,6 +273,27 @@ const schemaV18 = `
 ALTER TABLE leases ADD COLUMN persistent INTEGER NOT NULL DEFAULT 0;
 `
 
+// schemaV19 adds publisher-initiated pairing requests. A publisher can
+// submit its public key to get a short display code; the relay operator
+// then approves the code to complete enrollment without exchanging secrets
+// out-of-band. Rate-limited per source IP, single-use, 10-minute TTL.
+const schemaV19 = `
+CREATE TABLE IF NOT EXISTS pairing_requests (
+  id TEXT PRIMARY KEY,
+  display_code TEXT NOT NULL,
+  public_key BLOB NOT NULL,
+  key_id TEXT NOT NULL,
+  source_ip TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  resolved_at TEXT,
+  enrollment_code_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pairing_requests_code ON pairing_requests(display_code);
+CREATE INDEX IF NOT EXISTS idx_pairing_requests_status ON pairing_requests(status, expires_at);
+`
+
 // applyMigration runs one versioned migration body and its version
 // stamp in a single transaction: a failure anywhere rolls back the
 // body, so a version is never recorded for half-applied work (P1-2).
@@ -297,12 +318,26 @@ func applyMigration(sqldb *sql.DB, version int, body string) error {
 }
 
 // currentSchema is the newest version Open must reach.
-const currentSchema = 18
+const currentSchema = 19
 
 // SchemaVersion is the exported current schema version for tools that must
 // refuse unknown/newer databases without opening (and thereby migrating)
 // them, such as the restore-time read-only preflight.
 const SchemaVersion = currentSchema
+
+// PairingRequest is one pending publisher-initiated pairing request.
+type PairingRequest struct {
+	ID               string
+	DisplayCode      string
+	PublicKey        []byte
+	KeyID            string
+	SourceIP         string
+	Status           string
+	CreatedAt        time.Time
+	ExpiresAt        time.Time
+	ResolvedAt       *time.Time
+	EnrollmentCodeID string
+}
 
 // DB wraps the SQLite handle.
 type DB struct {
@@ -475,6 +510,7 @@ func Open(path string) (*DB, error) {
 		{16, schemaV16},
 		{17, schemaV17},
 		{18, schemaV18},
+		{19, schemaV19},
 	}
 	for _, m := range migrations {
 		var v int
@@ -600,4 +636,87 @@ func (d *DB) PruneAuditEvents(now time.Time) (int64, error) {
 		return 0, apperr.E(apperr.CodeStoreFault, "pruning audit events", err)
 	}
 	return n, nil
+}
+
+// CreatePairingRequest stores a new pending publisher-initiated pairing request.
+func (d *DB) CreatePairingRequest(id, displayCode string, pubKey []byte, keyID, sourceIP string, expiresAt time.Time) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := d.sql.Exec(
+		`INSERT INTO pairing_requests(id, display_code, public_key, key_id, source_ip, status, created_at, expires_at)
+		 VALUES(?,?,?,?,?,'pending',?,?)`,
+		id, displayCode, pubKey, keyID, sourceIP, now, expiresAt.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return apperr.E(apperr.CodeStoreFault, "storing pairing request", err)
+	}
+	return nil
+}
+
+// GetPairingRequest looks up a pairing request by its display code.
+func (d *DB) GetPairingRequest(displayCode string) (PairingRequest, error) {
+	row := d.sql.QueryRow(
+		`SELECT id, display_code, public_key, key_id, source_ip, status, created_at, expires_at,
+		        resolved_at, COALESCE(enrollment_code_id,'')
+		 FROM pairing_requests WHERE display_code=?`, displayCode)
+	return scanPairingRequest(row)
+}
+
+// ListPendingPairingRequests returns all pending, non-expired pairing requests, newest first.
+func (d *DB) ListPendingPairingRequests() ([]PairingRequest, error) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	rows, err := d.sql.Query(
+		`SELECT id, display_code, public_key, key_id, source_ip, status, created_at, expires_at,
+		        resolved_at, COALESCE(enrollment_code_id,'')
+		 FROM pairing_requests
+		 WHERE status='pending' AND expires_at > ?
+		 ORDER BY created_at DESC`, now)
+	if err != nil {
+		return nil, apperr.E(apperr.CodeStoreFault, "listing pairing requests", err)
+	}
+	defer rows.Close()
+	var out []PairingRequest
+	for rows.Next() {
+		pr, err := scanPairingRequest(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, pr)
+	}
+	return out, rows.Err()
+}
+
+// CountRecentPairingRequestsByIP returns how many pending requests were submitted
+// from sourceIP in the last window duration (rate-limit helper).
+func (d *DB) CountRecentPairingRequestsByIP(sourceIP string, since time.Time) (int, error) {
+	var n int
+	err := d.sql.QueryRow(
+		`SELECT COUNT(*) FROM pairing_requests WHERE source_ip=? AND created_at > ? AND status='pending'`,
+		sourceIP, since.UTC().Format(time.RFC3339Nano)).Scan(&n)
+	if err != nil {
+		return 0, apperr.E(apperr.CodeStoreFault, "counting pairing requests", err)
+	}
+	return n, nil
+}
+
+type pairingScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanPairingRequest(row pairingScanner) (PairingRequest, error) {
+	var pr PairingRequest
+	var createdStr, expiresStr string
+	var resolvedStr sql.NullString
+	if err := row.Scan(&pr.ID, &pr.DisplayCode, &pr.PublicKey, &pr.KeyID, &pr.SourceIP,
+		&pr.Status, &createdStr, &expiresStr, &resolvedStr, &pr.EnrollmentCodeID); err != nil {
+		if err == sql.ErrNoRows {
+			return PairingRequest{}, apperr.E(apperr.CodeEnrollAuth, "pairing request not found", nil)
+		}
+		return PairingRequest{}, apperr.E(apperr.CodeStoreFault, "scanning pairing request", err)
+	}
+	pr.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+	pr.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expiresStr)
+	if resolvedStr.Valid {
+		t, _ := time.Parse(time.RFC3339Nano, resolvedStr.String)
+		pr.ResolvedAt = &t
+	}
+	return pr, nil
 }

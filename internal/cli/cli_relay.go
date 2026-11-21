@@ -36,7 +36,7 @@ func restrictFileCreation() {
 // cmdRelay handles relay-side operations.
 func cmdRelay(argv []string) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ocliv relay init|serve|doctor|issue-enroll|enroll-ssh|keys|revoke-key|rotate-visitor-key|tenants|backup|validate-backup|restore ...")
+		fmt.Fprintln(os.Stderr, "usage: ocliv relay init|serve|doctor|issue-enroll|enroll-ssh|keys|revoke-key|rotate-visitor-key|tenants|pending|approve|backup|validate-backup|restore ...")
 		return apperr.ExitCLIValidation
 	}
 	switch argv[0] {
@@ -58,6 +58,10 @@ func cmdRelay(argv []string) int {
 		return cmdRelayRotateVisitorKey(argv[1:])
 	case "tenants":
 		return cmdRelayTenants(argv[1:])
+	case "pending":
+		return cmdRelayPending(argv[1:])
+	case "approve":
+		return cmdRelayApprove(argv[1:])
 	case "backup":
 		return cmdRelayBackup(argv[1:])
 	case "validate-backup":
@@ -1154,6 +1158,83 @@ func cmdRelayEnrollSSH(argv []string) int {
 		fmt.Fprintf(os.Stderr, "enroll-ssh: remote login failed: %v\n", err)
 		return apperr.ExitInternal
 	}
+	return apperr.ExitOK
+}
+
+// cmdRelayPending lists pending publisher-initiated pairing requests.
+func cmdRelayPending(argv []string) int {
+	db, exitCode := openRelayDB(argv)
+	if exitCode != apperr.ExitOK {
+		return exitCode
+	}
+	defer db.Close()
+	requests, err := db.ListPendingPairingRequests()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
+	}
+	if len(requests) == 0 {
+		fmt.Println("no pending pairing requests")
+		return apperr.ExitOK
+	}
+	fmt.Printf("%-17s  %-20s  %-18s  %s\n", "CODE", "KEY-ID", "SOURCE-IP", "AGE")
+	now := time.Now()
+	for _, pr := range requests {
+		age := now.Sub(pr.CreatedAt).Round(time.Second)
+		fmt.Printf("%-17s  %-20s  %-18s  %s\n", pr.DisplayCode, pr.KeyID, pr.SourceIP, age)
+	}
+	return apperr.ExitOK
+}
+
+// cmdRelayApprove approves a pending pairing request and directly enrolls the publisher key.
+func cmdRelayApprove(argv []string) int {
+	_, dataDir, _ := relayFlags(argv)
+	var tenant string
+	tenantSet := false
+	var code string
+	for i := 0; i < len(argv); i++ {
+		a := argv[i]
+		if a == "--help" || a == "-h" {
+			fmt.Fprintln(os.Stderr, "usage: ocliv relay approve CODE --tenant TENANT [--data DIR]")
+			return apperr.ExitCLIValidation
+		}
+		if a == "--tenant" || strings.HasPrefix(a, "--tenant=") {
+			v, ok := mcpFlagValue(argv, &i, "tenant")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			tenant = v
+			tenantSet = true
+			continue
+		}
+		if !strings.HasPrefix(a, "--") && code == "" {
+			code = a
+			continue
+		}
+	}
+	if code == "" {
+		fmt.Fprintln(os.Stderr, "usage: ocliv relay approve CODE --tenant TENANT [--data DIR]")
+		return apperr.ExitCLIValidation
+	}
+	if !tenantSet || strings.TrimSpace(tenant) == "" {
+		fmt.Fprintln(os.Stderr, "approve: --tenant is required")
+		return apperr.ExitCLIValidation
+	}
+	restrictFileCreation()
+	db, err := store.Open(filepath.Join(dataDir, "ocliv.db"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitInternal
+	}
+	defer db.Close()
+	keyID, err := relay.ApprovePairingRequest(db, code, tenant)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return exitForRelayErr(err)
+	}
+	fmt.Printf("approved: %s enrolled in tenant %q\n", keyID, tenant)
+	fmt.Println("the publisher's `ocliv pair --wait` will complete automatically,")
+	fmt.Println("or they can run: ocliv login --relay <URL> (key already registered)")
 	return apperr.ExitOK
 }
 

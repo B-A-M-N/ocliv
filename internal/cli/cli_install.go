@@ -1,0 +1,168 @@
+// Publisher binary self-install from relay release manifest.
+package cli
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+
+	"ocliv/internal/apperr"
+	"ocliv/internal/control"
+	"ocliv/internal/installer"
+)
+
+func cmdInstall(argv []string) int {
+	var relayURL, manifestURL, artifactURL, dir string
+	yes, dryRun := false, false
+
+	for i := 0; i < len(argv); i++ {
+		a := argv[i]
+		switch {
+		case a == "--help" || a == "-h":
+			fmt.Fprintln(os.Stderr, "usage: ocliv install --relay URL [--dir DIR] [--yes] [--dry-run]")
+			fmt.Fprintln(os.Stderr, "       ocliv install --manifest-url URL [--artifact-url URL] [--dir DIR] [--yes] [--dry-run]")
+			fmt.Fprintln(os.Stderr, "")
+			fmt.Fprintln(os.Stderr, "  --relay URL         fetch manifest from relay's well-known endpoint")
+			fmt.Fprintln(os.Stderr, "  --manifest-url URL  fetch manifest from explicit URL")
+			fmt.Fprintln(os.Stderr, "  --artifact-url URL  download artifact from explicit URL (skips auto-detection)")
+			fmt.Fprintln(os.Stderr, "  --dir DIR           install directory (default: directory of current binary)")
+			fmt.Fprintln(os.Stderr, "  --yes               skip confirmation prompt")
+			fmt.Fprintln(os.Stderr, "  --dry-run           download and verify digest but do not install")
+			return apperr.ExitOK
+		case a == "--relay" || strings.HasPrefix(a, "--relay="):
+			v, ok := mcpFlagValue(argv, &i, "relay")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			relayURL = v
+		case a == "--manifest-url" || strings.HasPrefix(a, "--manifest-url="):
+			v, ok := mcpFlagValue(argv, &i, "manifest-url")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			manifestURL = v
+		case a == "--artifact-url" || strings.HasPrefix(a, "--artifact-url="):
+			v, ok := mcpFlagValue(argv, &i, "artifact-url")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			artifactURL = v
+		case a == "--dir" || strings.HasPrefix(a, "--dir="):
+			v, ok := mcpFlagValue(argv, &i, "dir")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			dir = v
+		case a == "--yes":
+			yes = true
+		case a == "--dry-run":
+			dryRun = true
+		default:
+			fmt.Fprintf(os.Stderr, "error: unknown flag %q\n", a)
+			return apperr.ExitCLIValidation
+		}
+	}
+
+	if relayURL == "" && manifestURL == "" {
+		fmt.Fprintln(os.Stderr, "error: --relay or --manifest-url required")
+		fmt.Fprintln(os.Stderr, "usage: ocliv install --relay URL [--dir DIR] [--yes]")
+		return apperr.ExitCLIValidation
+	}
+	if relayURL != "" && manifestURL != "" {
+		fmt.Fprintln(os.Stderr, "error: --relay and --manifest-url are mutually exclusive")
+		return apperr.ExitCLIValidation
+	}
+
+	if relayURL != "" {
+		if err := control.ValidateRelayURL(relayURL); err != nil {
+			fmt.Fprintln(os.Stderr, "error: "+err.Error())
+			return apperr.ExitCLIValidation
+		}
+		manifestURL = installer.ManifestURL(relayURL)
+	}
+
+	artifactName := installer.ArtifactName(runtime.GOOS, runtime.GOARCH)
+
+	client, err := control.HTTPClient(30 * time.Second)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: building HTTP client: "+err.Error())
+		return apperr.ExitRelayTLS
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	fmt.Fprintf(os.Stderr, "fetching manifest from %s...\n", manifestURL)
+	m, err := installer.FetchManifest(ctx, client, manifestURL)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitRelayTLS
+	}
+	fmt.Printf("manifest: commit=%s build_time=%s govulncheck=%s\n", m.Commit, m.BuildTime, m.Govulncheck)
+	if m.Govulncheck != "pass" {
+		fmt.Fprintf(os.Stderr, "warning: govulncheck=%q (not 'pass')\n", m.Govulncheck)
+	}
+
+	entry, ok := m.Artifacts[artifactName]
+	if !ok {
+		var available []string
+		for k := range m.Artifacts {
+			available = append(available, k)
+		}
+		fmt.Fprintf(os.Stderr, "error: no artifact for %s in manifest\navailable: %s\n", artifactName, strings.Join(available, ", "))
+		return apperr.ExitCLIValidation
+	}
+
+	if artifactURL == "" {
+		if relayURL != "" {
+			artifactURL = installer.ArtifactURL(relayURL, artifactName)
+		} else {
+			fmt.Fprintln(os.Stderr, "error: --artifact-url required when using --manifest-url")
+			return apperr.ExitCLIValidation
+		}
+	}
+
+	if dir == "" {
+		exe, err := os.Executable()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error: cannot determine executable path: "+err.Error())
+			return apperr.ExitCLIValidation
+		}
+		dir = filepath.Dir(exe)
+	}
+	dst := filepath.Join(dir, "ocliv")
+
+	if dryRun {
+		fmt.Fprintf(os.Stderr, "dry-run: downloading %s...\n", artifactURL)
+		if err := installer.DownloadAndVerify(ctx, client, artifactURL, entry.SHA256, dst+".dryrun"); err != nil {
+			_ = os.Remove(dst + ".dryrun")
+			fmt.Fprintln(os.Stderr, "error: "+err.Error())
+			return apperr.ExitRelayTLS
+		}
+		_ = os.Remove(dst + ".dryrun")
+		fmt.Printf("verified: sha256=%s — not installed (dry-run)\n", entry.SHA256)
+		return apperr.ExitOK
+	}
+
+	if !yes {
+		fmt.Printf("Install %s to %s? [y/N] ", artifactName, dst)
+		scanner := bufio.NewScanner(os.Stdin)
+		if !scanner.Scan() || strings.ToLower(strings.TrimSpace(scanner.Text())) != "y" {
+			fmt.Fprintln(os.Stderr, "aborted")
+			return apperr.ExitCLIValidation
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "downloading %s...\n", artifactURL)
+	if err := installer.DownloadAndVerify(ctx, client, artifactURL, entry.SHA256, dst); err != nil {
+		fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		return apperr.ExitRelayTLS
+	}
+	fmt.Printf("installed: %s (commit %s)\n", dst, m.Commit)
+	return apperr.ExitOK
+}
