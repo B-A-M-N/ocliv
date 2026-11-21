@@ -18,8 +18,22 @@ across schema migrations or security-boundary changes.
 | `950440e` | V19 | PASS | PASS (29/0 loopback) | NOT VERIFIED | Historical baseline (`history/PI-ISOLATED-RESULT-2026-11-21.md`); superseded |
 | `8cce9af` | V20 | PASS | NOT VERIFIED | NOT VERIFIED | Superseded by Round 2 & Round 3 remediation |
 | `2f635e470183ed464150bdaceb2c1e674313cc27` | V21 | PASS (full suite + race matrix) | **PASS 60/0/0** (0 SKIP, 0 FAIL, strict release mode) | NOT VERIFIED | Clean detached-worktree ARM64 artifact (`3b59bfddd623b133cd6112b17b2e35186adc4ea38e0f9db35e217f608fb853d3`); Phases A–I all PASS on `10.9.66.170`; production `ocliv-relay` (PID 1577) and `caddy` (PID 1574) untouched |
+| `11dead068fa06f4dc152b5950aad5f6e233fdd94` | V22 | PASS (unit + hygiene + vet) | **PASS 61/0/0** + **V19→V22 migration 10/0** + **soak harness smoke PASS** | NOT VERIFIED | Clean detached-worktree ARM64 artifact (`3b9ba712670d2769929b93152b0fe5af46cccfe7f04b14c6cc255d5c06b0bb67`); adds V22 one-pending-per-key index, strict `OCLIV_ENV=development AND loopback` gate, `non_production` refusal, provenance SBOM startup verification, and Phase H 3-limit + `/health/ready` checks; production `ocliv-relay` (PID 1577) and `caddy` (PID 1574) untouched |
 
-## Latest Isolated Pi Qualification Receipt (`2f635e4`)
+## Latest Isolated Pi Qualification Receipt (`11dead0`)
+
+- **Date:** 2026-11-21
+- **Candidate Commit SHA:** `11dead068fa06f4dc152b5950aad5f6e233fdd94` (`dirty=false`, `govulncheck=pass`, schema `V22`)
+- **ARM64 Binary SHA-256 (verified post-transfer on Pi):** `3b9ba712670d2769929b93152b0fe5af46cccfe7f04b14c6cc255d5c06b0bb67`
+- **Release Manifest SHA-256:** `cfa6e7ea6613d6f2d4231352f21e9b5ed8c59a704ac4e2819385677e192acdb7`
+- **Signing Key ID:** `stage-ephemeral-11dead0` (ephemeral external `0600` Ed25519 staging key)
+- **Pi Stage Directory:** `/home/bamn/ocliv-stage/stage-11dead0-2026-11-21`
+- **Strict Qualification (`qualify-pi-isolated.py`):** **PASS 61 / SKIP 0 / FAIL 0**
+- **V19→V22 Migration Rehearsal (`rehearse-prod-migration.py` against read-only copy of `stage-950440e` DB):** **PASS 10 / FAIL 0** (`PRAGMA integrity_check=ok`, `foreign_key_check=[]`, keys/leases/publications/OAuth grants/revocations preserved, backup + validate-backup + restore `--reset-authority` PASS)
+- **Soak Harness Smoke (`soak-isolated.py --duration 10`):** **PASS** (FDs `11->11`, RSS `14972KB->15348KB`, `process_ready=true`)
+- **Production Isolation Proof:** `ocliv-relay` MainPID `1577` → `1577`, `caddy` MainPID `1574` → `1574` (untouched).
+
+## Prior Isolated Pi Qualification Receipt (`2f635e4` — preserved)
 
 - **Date:** 2026-11-21
 - **Candidate Commit SHA:** `2f635e470183ed464150bdaceb2c1e674313cc27` (`dirty=false`, `govulncheck=pass`, schema `V21`)
