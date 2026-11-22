@@ -8,10 +8,14 @@ keys, full 64-hex canonical semantic digests of security-critical authority
 columns, legacy pairing expiration, and full backup/validate/restore with the
 first-class `--reset-authority` mutation contract + live relay readiness.
 
+Fail-closed scratch cleanup: verifies complete removal of the temporary
+directory containing the copied DB before writing a PASS receipt.
+
 NEVER mutates the source database or touches any running production relay.
 
 Usage:
-  rehearse-prod-migration.py --bin /path/to/ocliv --src-db /path/to/ocliv.db [--receipt-out PATH]
+  rehearse-prod-migration.py --bin /path/to/ocliv --src-db /path/to/ocliv.db \
+      [--qualification-receipt qual-receipt.json] [--receipt-out mig-receipt.json]
 """
 import argparse, datetime, hashlib, json, os, shutil, socket, sqlite3, subprocess, sys, tempfile, time
 import urllib.request
@@ -19,6 +23,7 @@ import urllib.request
 parser = argparse.ArgumentParser(description="Ocliv transactionally consistent migration rehearsal")
 parser.add_argument("--bin", required=True, help="Path to candidate ocliv binary")
 parser.add_argument("--src-db", required=True, help="Path to source ocliv.db (read-only online snapshot)")
+parser.add_argument("--qualification-receipt", default="", help="Optional strict qualification receipt JSON to bind candidate provenance")
 parser.add_argument("--receipt-out", default="", help="Optional path to write provenance-bound JSON receipt")
 args = parser.parse_args()
 
@@ -28,7 +33,6 @@ PASS, FAIL = [], []
 RESET_CONTRACT_VERSION = 1
 
 INVENTORY_QUERIES = {
-    # Full authority columns (must be identical across schema migration)
     "tenants": ("tenants", "SELECT id, status, quotas_json FROM tenants ORDER BY id"),
     "agent_keys": ("agent_keys", "SELECT id, tenant_id, hex(ed25519_public), status, COALESCE(revoked_at,'') FROM agent_keys ORDER BY id"),
     "leases": ("leases", "SELECT id, tenant_id, agent_key_id, hostname, label, port, access_mode, status, COALESCE(expires_at,'') FROM leases ORDER BY id"),
@@ -37,7 +41,6 @@ INVENTORY_QUERIES = {
     "authz_clients": ("authz_clients", "SELECT id, COALESCE(tenant_id,''), COALESCE(route_id,''), COALESCE(revoked_at,'') FROM authz_clients ORDER BY id"),
     "authz_grants": ("authz_grants", "SELECT client_id, tenant_id, route_id, status FROM authz_grants ORDER BY client_id, tenant_id, route_id"),
     "authz_revocations": ("authz_revocations", "SELECT jti, client_id, tenant_id, route_id FROM authz_revocations ORDER BY jti"),
-    # Identity-only columns (must remain identical even across --reset-authority)
     "agent_keys_identity": ("agent_keys", "SELECT id, tenant_id, hex(ed25519_public) FROM agent_keys ORDER BY id"),
     "leases_identity": ("leases", "SELECT id, tenant_id, agent_key_id, hostname, label, port, access_mode, COALESCE(expires_at,'') FROM leases ORDER BY id"),
     "mcp_publications_identity": ("mcp_publications", "SELECT route_id, tenant_id, owner_key_id, external_host, profile, pub_name FROM mcp_publications ORDER BY route_id"),
@@ -86,10 +89,7 @@ def table_exists(conn, table):
 
 
 def semantic_digest(conn, table, sql, allow_absent=False):
-    """Return full 64-hex canonical sorted SHA-256 digest of security-critical rows.
-
-    Inspects sqlite_master first so genuine SQL/corruption OperationalErrors always propagate.
-    """
+    """Return full 64-hex canonical sorted SHA-256 digest of security-critical rows."""
     if not table_exists(conn, table):
         if allow_absent:
             return "TABLE_ABSENT"
@@ -123,25 +123,56 @@ if ver_res.returncode != 0:
     print("FAIL: candidate binary failed version --json:", ver_res.stderr, file=sys.stderr)
     sys.exit(1)
 ver_info = json.loads(ver_res.stdout)
+cand_commit = ver_info.get("build_commit") or ver_info.get("commit") or ""
 expected_schema = int(ver_info["schema_version"])
 bin_sha = sha256_file(args.bin)
+
+bound_provenance = {}
+if args.qualification_receipt:
+    with open(args.qualification_receipt, encoding="utf-8") as qf:
+        qr = json.load(qf)
+    errs = []
+    if qr.get("mode") != "strict-production":
+        errs.append(f"mode={qr.get('mode')!r} != 'strict-production'")
+    if qr.get("ok") is not True:
+        errs.append(f"ok={qr.get('ok')!r}")
+    if qr.get("skip_count") != 0:
+        errs.append(f"skip_count={qr.get('skip_count')!r}")
+    if qr.get("ephemeral_state_retained") is not False:
+        errs.append(f"ephemeral_state_retained={qr.get('ephemeral_state_retained')!r}")
+    if qr.get("candidate_commit") != cand_commit:
+        errs.append(f"commit mismatch: receipt={qr.get('candidate_commit')} bin={cand_commit}")
+    if qr.get("qual_binary_sha256") != bin_sha:
+        errs.append(f"binary sha256 mismatch: receipt={qr.get('qual_binary_sha256')} bin={bin_sha}")
+    if errs:
+        raise SystemExit("FAIL: --qualification-receipt validation failed: " + "; ".join(errs))
+    bound_provenance = {
+        "qualification_receipt": os.path.realpath(args.qualification_receipt),
+        "manifest_sha256": qr.get("manifest_sha256", ""),
+        "release_sequence": qr.get("release_sequence"),
+        "signing_key_id": qr.get("signing_key_id", ""),
+        "sbom_actual_sha256": qr.get("sbom_actual_sha256", ""),
+    }
 
 work = tempfile.mkdtemp(prefix="ocliv-mig-rehearsal-")
 os.chmod(work, 0o700)
 receipt_data = {
     "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "reset_contract_version": RESET_CONTRACT_VERSION,
-    "candidate_commit": ver_info.get("build_commit") or ver_info.get("commit") or "",
+    "candidate_commit": cand_commit,
     "binary_sha256": bin_sha,
     "expected_schema": expected_schema,
     "src_db": os.path.realpath(args.src_db),
 }
+receipt_data.update(bound_provenance)
+
+cleanup_ok = False
+cleanup_err = ""
 try:
     copy_dir = os.path.join(work, "data")
     os.makedirs(copy_dir, mode=0o700)
     dst_db = os.path.join(copy_dir, "ocliv.db")
 
-    # Transactionally consistent read-only online snapshot via SQLite backup API.
     src_conn = sqlite3.connect(f"file:{args.src_db}?mode=ro", uri=True)
     src_journal_mode = src_conn.execute("PRAGMA journal_mode").fetchone()[0]
     src_schema = src_conn.execute("SELECT MAX(v) FROM schema_version").fetchone()[0]
@@ -157,7 +188,6 @@ try:
     receipt_data["snapshot_sha256"] = snap_sha
     print(f"SNAPSHOT: src_journal_mode={src_journal_mode} src_schema=V{src_schema} sha256={snap_sha}", flush=True)
 
-    # Pre-migration may legitimately be an older schema (e.g. V19); allow_absent=True only before migration.
     before = collect_inventory(dst_db, allow_absent=(src_schema < expected_schema))
     receipt_data["pre_migration"] = before
     print("PRE-MIGRATION:", json.dumps(before), flush=True)
@@ -165,7 +195,6 @@ try:
     mig = subprocess.run([args.bin, "relay", "pending", "--data", copy_dir], capture_output=True, text=True)
     check("M1: candidate binary opens and migrates online snapshot cleanly", mig.returncode == 0, f"rc={mig.returncode} {mig.stderr[:120]}")
 
-    # Post-migration: EVERY V22 inventory table is mandatory (allow_absent=False).
     after = collect_inventory(dst_db, allow_absent=False)
     receipt_data["post_migration"] = after
     print("POST-MIGRATION:", json.dumps(after), flush=True)
@@ -198,7 +227,6 @@ try:
     check("M8: zero unpollable legacy pending pairing rows", legacy_unpolled == 0, f"count={legacy_unpolled}")
     check("M9: at most one pending pairing row per key_id", dup_pending == 0, f"dups={dup_pending}")
 
-    # Backup + validate-backup + restore --reset-authority + full contract validation + live relay readiness.
     bak = os.path.join(work, "migrated.db")
     r_bak = subprocess.run([args.bin, "relay", "backup", "--data", copy_dir, "--out", bak], capture_output=True, text=True)
     r_val = subprocess.run([args.bin, "relay", "validate-backup", "--in", bak], capture_output=True, text=True)
@@ -231,7 +259,6 @@ try:
               r_ic == "ok" and len(r_fk) == 0 and r_sv == expected_schema and unchanged_ok and reset_ok,
               f"ic={r_ic} sv={r_sv} preserved_diffs={preserved_diffs} reset_counts={reset_counts}")
 
-        # Boot candidate relay against restored DB on loopback and prove /health/ready == 200.
         lport = pick_free_port()
         hport = pick_free_port()
         rlog = open(os.path.join(work, "restored-relay.log"), "w", encoding="utf-8")
@@ -260,16 +287,27 @@ try:
             rlog.close()
         check("M10c: candidate relay boots and reports /health/ready 200 on restored DB", ready_ok)
 finally:
-    shutil.rmtree(work, ignore_errors=True)
+    # Fail-closed scratch cleanup: prove removal without ignore_errors.
+    try:
+        shutil.rmtree(work)
+        cleanup_ok = not os.path.exists(work)
+    except Exception as exc:
+        cleanup_ok = False
+        cleanup_err = str(exc)
 
+if not cleanup_ok:
+    check("M11: fail-closed scratch directory removal", False, f"work={work} err={cleanup_err}")
+
+receipt_data["scratch_cleanup_ok"] = cleanup_ok
+receipt_data["scratch_retained"] = not cleanup_ok
 receipt_data["pass_count"] = len(PASS)
 receipt_data["fail_count"] = len(FAIL)
 receipt_data["failed"] = FAIL
-receipt_data["ok"] = len(FAIL) == 0
+receipt_data["ok"] = (len(FAIL) == 0) and cleanup_ok
 if args.receipt_out:
     with open(args.receipt_out, "w", encoding="utf-8") as rf:
         json.dump(receipt_data, rf, indent=2)
 
 print(f"\n== MIGRATION REHEARSAL SUMMARY ==\nPASS {len(PASS)}\nFAIL {len(FAIL)} {FAIL}")
-if FAIL:
+if FAIL or not cleanup_ok:
     sys.exit(1)

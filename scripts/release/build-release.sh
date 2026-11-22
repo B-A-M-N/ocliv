@@ -12,6 +12,7 @@ umask 077
 SKIP_TESTS=0
 ALLOW_MISSING_TOOLS=0
 PRODUCTION_MODE=0
+RELEASE_SEQUENCE="${OCLIV_RELEASE_SEQUENCE:-}"
 REF="HEAD"
 
 while [ $# -gt 0 ]; do
@@ -19,8 +20,10 @@ while [ $# -gt 0 ]; do
     --production) PRODUCTION_MODE=1; shift ;;
     --skip-tests) SKIP_TESTS=1; shift ;;
     --allow-missing-tools) ALLOW_MISSING_TOOLS=1; shift ;;
+    --release-sequence) RELEASE_SEQUENCE="$2"; shift 2 ;;
+    --release-sequence=*) RELEASE_SEQUENCE="${1#*=}"; shift ;;
     -h|--help)
-      echo "Usage: $0 [--production] [--skip-tests] [--allow-missing-tools] [COMMIT_SHA]"
+      echo "Usage: $0 [--production] [--release-sequence N] [--skip-tests] [--allow-missing-tools] [COMMIT_SHA]"
       exit 0
       ;;
     *) REF="$1"; shift ;;
@@ -32,6 +35,11 @@ if [ "$PRODUCTION_MODE" -eq 1 ]; then
     echo "error: --production forbids --skip-tests, --allow-missing-tools, and OCLIV_UNSIGNED_DEV=true" >&2
     exit 1
   fi
+  case "$RELEASE_SEQUENCE" in
+    ''|0|*[!0-9]*)
+      echo "error: --production requires an explicit positive monotonic --release-sequence N (or OCLIV_RELEASE_SEQUENCE)" >&2
+      exit 1 ;;
+  esac
 fi
 
 ROOT="$(git rev-parse --show-toplevel)"
@@ -170,9 +178,14 @@ else
   fi
 fi
 
-python3 - "$OUT/release-manifest.json" "$SHA" "$BUILD_TIME" "$SOURCE_DATE_EPOCH" "$GO_VER" "$AMD64_SHA" "$ARM64_SHA" "$SBOM_FILE" "$SBOM_SHA" "$SBOM_TOOL" "$SBOM_TOOL_VERSION" "$GOVULN_STATUS" "$BUILD_CMD" "$OUT/ocliv-version.json" "$SIGNING_KEY_ID" "$NON_PRODUCTION" <<'PY'
+if [ -z "$RELEASE_SEQUENCE" ]; then
+  # Non-production fallback: commit height (strictly monotonic with history, immune to clock skew).
+  RELEASE_SEQUENCE="$(git -C "$ROOT" rev-list --count "$SHA")"
+fi
+
+python3 - "$OUT/release-manifest.json" "$SHA" "$BUILD_TIME" "$SOURCE_DATE_EPOCH" "$RELEASE_SEQUENCE" "$GO_VER" "$AMD64_SHA" "$ARM64_SHA" "$SBOM_FILE" "$SBOM_SHA" "$SBOM_TOOL" "$SBOM_TOOL_VERSION" "$GOVULN_STATUS" "$BUILD_CMD" "$OUT/ocliv-version.json" "$SIGNING_KEY_ID" "$NON_PRODUCTION" <<'PY'
 import json, pathlib, sys
-(manifest_path, sha, build_time, epoch, go_ver, amd64_sha, arm64_sha,
+(manifest_path, sha, build_time, epoch, rel_seq, go_ver, amd64_sha, arm64_sha,
  sbom_file, sbom_sha, sbom_tool, sbom_tool_ver, govuln, build_cmd, ver_json_path,
  signing_key_id, non_prod) = sys.argv[1:]
 ver_info = {}
@@ -181,7 +194,7 @@ if p.exists():
     ver_info = json.loads(p.read_text())
 manifest = {
     "manifest_version": 1,
-    "release_sequence": int(epoch),
+    "release_sequence": int(rel_seq),
     "commit": sha,
     "dirty": False,
     "non_production": non_prod == "1",

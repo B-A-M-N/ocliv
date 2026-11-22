@@ -429,10 +429,28 @@ func DownloadAndVerify(ctx context.Context, client *http.Client, artifactURL, ex
 	return nil
 }
 
-// CheckReleaseSequence enforces monotonic release anti-rollback against
-// seqPath. If seqPath holds a higher sequence than seq and allowDowngrade is
-// false, an error is returned before activation.
+// ReleaseSequenceState records the exact installed release identity for
+// anti-rollback enforcement: a release_sequence identifies one immutable release.
+type ReleaseSequenceState struct {
+	ReleaseSequence int64  `json:"release_sequence"`
+	Commit          string `json:"commit"`
+	ArtifactSHA256  string `json:"artifact_sha256"`
+}
+
+// CheckReleaseSequence enforces monotonic release anti-rollback against seqPath.
+// For full immutable-identity verification on equal sequence numbers, use
+// CheckReleaseSequenceIdentity.
 func CheckReleaseSequence(seqPath string, seq int64, allowDowngrade bool) error {
+	return CheckReleaseSequenceIdentity(seqPath, seq, "", "", allowDowngrade)
+}
+
+// CheckReleaseSequenceIdentity enforces monotonic release anti-rollback AND
+// immutable release identity against seqPath:
+//   - new_seq < old_seq -> reject (unless allowDowngrade)
+//   - new_seq == old_seq with identical (commit, artifactSHA) -> allow idempotent reinstall
+//   - new_seq == old_seq with different identity -> reject (unless allowDowngrade)
+//   - new_seq > old_seq -> allow
+func CheckReleaseSequenceIdentity(seqPath string, seq int64, commit, artifactSHA string, allowDowngrade bool) error {
 	if seq <= 0 {
 		return fmt.Errorf("refusing non-positive release_sequence=%d", seq)
 	}
@@ -450,29 +468,58 @@ func CheckReleaseSequence(seqPath string, seq int64, allowDowngrade bool) error 
 		}
 		return fmt.Errorf("reading release sequence %s: %w", seqPath, err)
 	}
-	var prev int64
-	if _, serr := fmt.Sscanf(strings.TrimSpace(string(raw)), "%d", &prev); serr != nil {
-		return fmt.Errorf("corrupt release sequence file %s", seqPath)
+	trimmed := strings.TrimSpace(string(raw))
+	var prev ReleaseSequenceState
+	if strings.HasPrefix(trimmed, "{") {
+		if jerr := json.Unmarshal([]byte(trimmed), &prev); jerr != nil || prev.ReleaseSequence <= 0 {
+			return fmt.Errorf("corrupt JSON release sequence file %s", seqPath)
+		}
+	} else {
+		if _, serr := fmt.Sscanf(trimmed, "%d", &prev.ReleaseSequence); serr != nil || prev.ReleaseSequence <= 0 {
+			return fmt.Errorf("corrupt release sequence file %s", seqPath)
+		}
 	}
-	if seq < prev && !allowDowngrade {
-		return fmt.Errorf("refusing release downgrade: manifest release_sequence=%d < installed=%d", seq, prev)
+	if seq < prev.ReleaseSequence && !allowDowngrade {
+		return fmt.Errorf("refusing release downgrade: manifest release_sequence=%d < installed=%d", seq, prev.ReleaseSequence)
+	}
+	if seq == prev.ReleaseSequence && !allowDowngrade {
+		if prev.Commit != "" && commit != "" && prev.Commit != commit {
+			return fmt.Errorf("refusing same release_sequence=%d with different commit (installed=%q manifest=%q)", seq, prev.Commit, commit)
+		}
+		if prev.ArtifactSHA256 != "" && artifactSHA != "" && !strings.EqualFold(prev.ArtifactSHA256, artifactSHA) {
+			return fmt.Errorf("refusing same release_sequence=%d with different artifact_sha256 (installed=%q manifest=%q)", seq, prev.ArtifactSHA256, artifactSHA)
+		}
 	}
 	return nil
 }
 
-// RecordReleaseSequence atomically persists seq to seqPath (mode 0644) and
-// fsyncs the parent directory.
+// RecordReleaseSequence atomically persists seq to seqPath (mode 0644).
 func RecordReleaseSequence(seqPath string, seq int64) error {
+	return RecordReleaseSequenceIdentity(seqPath, seq, "", "")
+}
+
+// RecordReleaseSequenceIdentity atomically persists the full ReleaseSequenceState
+// JSON to seqPath (mode 0644) and fsyncs the parent directory.
+func RecordReleaseSequenceIdentity(seqPath string, seq int64, commit, artifactSHA string) error {
 	if seq <= 0 {
-		return nil
+		return fmt.Errorf("refusing to record non-positive release_sequence=%d", seq)
 	}
+	data, err := json.Marshal(ReleaseSequenceState{
+		ReleaseSequence: seq,
+		Commit:          commit,
+		ArtifactSHA256:  strings.ToLower(artifactSHA),
+	})
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
 	dir := filepath.Dir(seqPath)
 	tmp, err := os.CreateTemp(dir, ".ocliv-seq-*")
 	if err != nil {
 		return err
 	}
 	tmpName := tmp.Name()
-	if _, err := fmt.Fprintf(tmp, "%d\n", seq); err != nil {
+	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
 		_ = os.Remove(tmpName)
 		return err
@@ -500,17 +547,17 @@ func RecordReleaseSequence(seqPath string, seq int64) error {
 }
 
 // DownloadValidateAndInstall downloads artifactURL into dst's directory,
-// verifies SHA256, checks monotonic release_sequence anti-rollback, runs
-// pre-swap candidate validation (`version --json` + manifest commit/protocol/
-// schema check), safely preserves dst+".prev", atomically activates dst, runs
-// post-swap validation with automatic rollback on failure, and records the
-// accepted release_sequence.
+// verifies SHA256, checks monotonic release_sequence + immutable identity
+// anti-rollback, runs pre-swap candidate validation (`version --json` +
+// manifest commit/protocol/schema/dirty check), safely preserves dst+".prev",
+// atomically activates dst, runs post-swap validation with automatic rollback
+// on failure, and records the accepted ReleaseSequenceState.
 func DownloadValidateAndInstall(ctx context.Context, client *http.Client, artifactURL, expected, dst string, manifest *ReleaseManifest) error {
 	dir := filepath.Dir(dst)
 	seqPath := filepath.Join(dir, ".ocliv-release-seq")
 	allowDowngrade := strings.TrimSpace(os.Getenv("OCLIV_ALLOW_DOWNGRADE")) == "1"
 	if manifest != nil && manifest.ReleaseSequence > 0 {
-		if err := CheckReleaseSequence(seqPath, manifest.ReleaseSequence, allowDowngrade); err != nil {
+		if err := CheckReleaseSequenceIdentity(seqPath, manifest.ReleaseSequence, manifest.Commit, expected, allowDowngrade); err != nil {
 			return err
 		}
 	}
@@ -529,7 +576,9 @@ func DownloadValidateAndInstall(ctx context.Context, client *http.Client, artifa
 		return err
 	}
 	if manifest != nil && manifest.ReleaseSequence > 0 {
-		_ = RecordReleaseSequence(seqPath, manifest.ReleaseSequence)
+		if err := RecordReleaseSequenceIdentity(seqPath, manifest.ReleaseSequence, manifest.Commit, expected); err != nil {
+			return fmt.Errorf("recording release sequence: %w", err)
+		}
 	}
 	return nil
 }

@@ -404,6 +404,23 @@ func TestReleaseSequenceAntiRollback(t *testing.T) {
 	if err := CheckReleaseSequence(seqPath, 0, false); err == nil {
 		t.Fatal("non-positive release_sequence must be refused")
 	}
+	// Immutable identity on equal sequence: same identity allowed, different commit or SHA refused.
+	idSeqPath := filepath.Join(t.TempDir(), ".ocliv-release-seq")
+	if err := RecordReleaseSequenceIdentity(idSeqPath, 50, "commit-a", "sha-a"); err != nil {
+		t.Fatalf("record identity: %v", err)
+	}
+	if err := CheckReleaseSequenceIdentity(idSeqPath, 50, "commit-a", "sha-a", false); err != nil {
+		t.Fatalf("idempotent reinstall with identical identity should pass: %v", err)
+	}
+	if err := CheckReleaseSequenceIdentity(idSeqPath, 50, "commit-b", "sha-a", false); err == nil {
+		t.Fatal("same release_sequence with different commit must be refused")
+	}
+	if err := CheckReleaseSequenceIdentity(idSeqPath, 50, "commit-a", "sha-b", false); err == nil {
+		t.Fatal("same release_sequence with different artifact_sha256 must be refused")
+	}
+	if err := CheckReleaseSequenceIdentity(idSeqPath, 51, "commit-b", "sha-b", false); err != nil {
+		t.Fatalf("higher sequence with new identity should pass: %v", err)
+	}
 }
 
 func TestFetchManifestSignedRejectsMissingVersionOrSequence(t *testing.T) {
@@ -650,6 +667,18 @@ func TestInstallClientScriptMultiKeyRotationAndPinning(t *testing.T) {
 	curManifest, curSig = makeSignedFull("active-n-key", 30, 22, "", goodBin, privActive)
 	if rc, out := runInstall(instDir); rc == 0 {
 		t.Fatalf("manifest missing protocol_version should fail, got rc=0: %s", out)
+	}
+
+	// 12. Same release_sequence (20) with identical identity succeeds (idempotent reinstall),
+	//     but same release_sequence (20) with different binary bytes MUST be rejected.
+	curManifest, curSig = makeSignedFull("active-n-key", 20, 22, "ocliv/1", goodBin, privActive)
+	if rc, out := runInstall(instDir); rc != 0 {
+		t.Fatalf("idempotent reinstall at seq=20 should pass, got rc=%d: %s", rc, out)
+	}
+	altBin := append(append([]byte{}, goodBin...), []byte("# alt\n")...)
+	curManifest, curSig = makeSignedFull("active-n-key", 20, 22, "ocliv/1", altBin, privActive)
+	if rc, out := runInstall(instDir); rc == 0 {
+		t.Fatalf("same release_sequence=20 with different artifact_sha256 must be rejected, got rc=0: %s", out)
 	}
 }
 

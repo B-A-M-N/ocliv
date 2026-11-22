@@ -83,7 +83,7 @@ def start_child(args, log_path, env=None, required=None):
     return proc
 
 
-def cleanup():
+def stop_all_children():
     errors = []
     for proc, executable, required in reversed(CHILDREN):
         if proc.poll() is not None:
@@ -98,10 +98,22 @@ def cleanup():
                 proc.wait(timeout=3)
         except Exception as exc:
             errors.append(str(exc))
+    return errors
+
+
+_CLEANED_UP = False
+
+
+def cleanup():
+    global _CLEANED_UP
+    if _CLEANED_UP:
+        return
+    errors = stop_all_children()
     if ARGS.keep_workdir:
         print(f"WARNING: --keep-workdir enabled; ephemeral secret workdir retained at {WORK_DIR}", file=sys.stderr, flush=True)
-    else:
+    elif os.path.exists(WORK_DIR):
         shutil.rmtree(WORK_DIR, ignore_errors=True)
+    _CLEANED_UP = True
     if errors:
         print("CLEANUP ERROR: " + "; ".join(errors), file=sys.stderr, flush=True)
         os._exit(1)
@@ -147,7 +159,7 @@ def tally():
             r = urllib.request.urlopen("http://127.0.0.1:28099/__tally__", timeout=5)
             return json.loads(r.read().decode())
         except Exception:
-            start_child(["python3", UPSTREAM, "28099"], os.path.join(S, "upstream.log"), env=ENV, required=[UPSTREAM, "28099"])
+            start_child(["python3", UPSTREAM, "28099"], os.path.join(WORK_DIR, "upstream.log"), env=ENV, required=[UPSTREAM, "28099"])
             time.sleep(1)
     return {"execs": -1}
 
@@ -244,19 +256,31 @@ if not ARGS.smoke:
         raise RuntimeError(f"strict release mode requires positive integer release_sequence (got {_rseq!r})")
     if not _strict_m.get("signing_key_id"):
         raise RuntimeError("strict release mode requires non-empty signing_key_id in manifest")
-    # Mandatory SBOM provenance byte binding in strict mode.
+    # Mandatory SBOM provenance byte, containment, and CycloneDX toolchain binding in strict mode.
     _sbom_obj = (_strict_m.get("provenance") or {}).get("sbom") or {}
     _sbom_file = _sbom_obj.get("file") or ""
     _sbom_decl = _sbom_obj.get("sha256") or ""
     if not _sbom_file or not _sbom_decl:
         raise RuntimeError("strict release mode requires provenance.sbom.file and provenance.sbom.sha256 in manifest")
+    if os.path.isabs(_sbom_file) or "/" in _sbom_file or "\\" in _sbom_file or ".." in _sbom_file:
+        raise RuntimeError(f"strict release mode refuses non-contained sbom.file={_sbom_file!r}")
+    if _sbom_obj.get("format") != "cyclonedx-json":
+        raise RuntimeError(f"strict release mode requires sbom.format == 'cyclonedx-json' (got {_sbom_obj.get('format')!r})")
+    if _sbom_obj.get("generator") != "cyclonedx-gomod":
+        raise RuntimeError(f"strict release mode requires sbom.generator == 'cyclonedx-gomod' (got {_sbom_obj.get('generator')!r})")
+    if not _sbom_obj.get("generator_version"):
+        raise RuntimeError("strict release mode requires non-empty sbom.generator_version")
     _sbom_path = os.path.join(RELEASE_DIR, _sbom_file)
-    if not os.path.isfile(_sbom_path):
-        raise RuntimeError(f"strict release mode: declared SBOM file missing: {_sbom_path}")
+    if os.path.islink(_sbom_path) or not os.path.isfile(_sbom_path):
+        raise RuntimeError(f"strict release mode: declared SBOM file missing or symlink: {_sbom_path}")
     SBOM_DECLARED_SHA256 = _sbom_decl
     SBOM_ACTUAL_SHA256 = sha256_file(_sbom_path)
     if SBOM_ACTUAL_SHA256 != SBOM_DECLARED_SHA256:
         raise RuntimeError(f"strict release mode: SBOM SHA256 mismatch (declared={SBOM_DECLARED_SHA256} actual={SBOM_ACTUAL_SHA256})")
+    with open(_sbom_path, encoding="utf-8") as _sf:
+        _sbom_doc = json.load(_sf)
+    if _sbom_doc.get("bomFormat") != "CycloneDX" or not _sbom_doc.get("specVersion"):
+        raise RuntimeError(f"strict release mode: SBOM document is not valid CycloneDX (bomFormat={_sbom_doc.get('bomFormat')!r} specVersion={_sbom_doc.get('specVersion')!r})")
     SBOM_META = _sbom_obj
     # Cryptographic/byte-for-byte binding: tested binary == signed bundle artifact == manifest identity.
     if _strict_m.get("commit") != BIN_COMMIT:
@@ -353,7 +377,7 @@ elif os.path.exists(REL_SIG_PATH):
     relay_args.append("--release-manifest-sig=" + REL_SIG_PATH)
 
 relay_required = ["relay", "serve", "--listen=127.0.0.1:28080", "--data=" + DB]
-relay_proc = start_child(relay_args, os.path.join(S, "relay.log"), env=relay_env, required=relay_required)
+relay_proc = start_child(relay_args, os.path.join(WORK_DIR, "relay.log"), env=relay_env, required=relay_required)
 with open(os.path.join(WORK_DIR, "relay.pid"), "x", encoding="ascii") as f:
     f.write(str(relay_proc.pid) + "\n")
 os.chmod(os.path.join(WORK_DIR, "relay.pid"), 0o600)
@@ -368,7 +392,7 @@ for _ in range(100):
 else:
     raise RuntimeError("candidate relay health endpoint timed out")
 
-start_child(["python3", UPSTREAM, "28099"], os.path.join(S, "upstream.log"), env=ENV, required=[UPSTREAM, "28099"])
+start_child(["python3", UPSTREAM, "28099"], os.path.join(WORK_DIR, "upstream.log"), env=ENV, required=[UPSTREAM, "28099"])
 for _ in range(50):
     try:
         urllib.request.urlopen("http://127.0.0.1:28099/__tally__", timeout=1).close()
@@ -406,12 +430,12 @@ if not ra:
             pass
     if login.returncode:
         raise RuntimeError("staging login failed: " + login.stderr[:200])
-    start_child([BIN, "mcp", "publish", "--local", "http://127.0.0.1:28099/mcp", "--auth", "ocliv-managed", "--name", "qa", "--ttl", "30m", "--relay", BASE], os.path.join(S, "pub-qa.log"), env=ENV, required=["mcp", "publish", "--name", "qa"])
+    start_child([BIN, "mcp", "publish", "--local", "http://127.0.0.1:28099/mcp", "--auth", "ocliv-managed", "--name", "qa", "--ttl", "30m", "--relay", BASE], os.path.join(WORK_DIR, "pub-qa.log"), env=ENV, required=["mcp", "publish", "--name", "qa"])
     time.sleep(5)
     cr = db_routes()
     ra = cr[0] if cr else None
 if ra and not rb:
-    start_child([BIN, "mcp", "publish", "--local", "http://127.0.0.1:28099/mcp", "--auth", "ocliv-managed", "--name", "qb", "--ttl", "30m", "--relay", BASE], os.path.join(S, "pub-qb.log"), env=ENV, required=["mcp", "publish", "--name", "qb"])
+    start_child([BIN, "mcp", "publish", "--local", "http://127.0.0.1:28099/mcp", "--auth", "ocliv-managed", "--name", "qb", "--ttl", "30m", "--relay", BASE], os.path.join(WORK_DIR, "pub-qb.log"), env=ENV, required=["mcp", "publish", "--name", "qb"])
     time.sleep(5)
     cr = db_routes()
     rb = cr[1] if len(cr) > 1 else None
@@ -432,7 +456,7 @@ print("== Phase A2: restart persistence ==")
 if ra:
     stop_pid(relay_proc.pid, BIN, relay_required)
     relay_proc.wait(timeout=8)
-    relay_proc = start_child(relay_args, os.path.join(S, "relay.log"), env=relay_env, required=relay_required)
+    relay_proc = start_child(relay_args, os.path.join(WORK_DIR, "relay.log"), env=relay_env, required=relay_required)
     with open(os.path.join(WORK_DIR, "relay.pid"), "w", encoding="ascii") as f:
         f.write(str(relay_proc.pid) + "\n")
     time.sleep(2)
@@ -620,7 +644,7 @@ try:
         _dkp = _dbk.stdout.strip().split()
         check("F7: enrolled key active in pair-test tenant", len(_dkp) == 2 and _dkp[0] == "pair-test" and _dkp[1] == "active", "db=" + _dbk.stdout.strip())
         # F8: real publisher attach using the newly paired identity
-        _pair_pub_proc = start_child([BIN, "mcp", "publish", "--local", "http://127.0.0.1:28099/mcp", "--auth", "ocliv-managed", "--name", "pair-pub", "--ttl", "10m", "--relay", BASE], os.path.join(S, "pub-pair.log"), env=_pair_env, required=["mcp", "publish", "--name", "pair-pub"])
+        _pair_pub_proc = start_child([BIN, "mcp", "publish", "--local", "http://127.0.0.1:28099/mcp", "--auth", "ocliv-managed", "--name", "pair-pub", "--ttl", "10m", "--relay", BASE], os.path.join(WORK_DIR, "pub-pair.log"), env=_pair_env, required=["mcp", "publish", "--name", "pair-pub"])
         _attached = False
         for _ in range(30):
             _rc = sh(["python3", "-c", "import sqlite3;c=sqlite3.connect('" + DB + "/ocliv.db');print(c.execute(\"SELECT COUNT(*) FROM leases WHERE tenant_id='pair-test' AND status='ACTIVE'\").fetchone()[0])"]).stdout.strip()
@@ -783,7 +807,7 @@ _cap_args = [
     "--max-ws-streams=2",
 ]
 _cap_req = ["relay", "serve", "--listen=127.0.0.1:28082", "--data=" + _cap_db]
-_cap_proc = start_child(_cap_args, os.path.join(S, "relay-cap.log"), required=_cap_req)
+_cap_proc = start_child(_cap_args, os.path.join(WORK_DIR, "relay-cap.log"), required=_cap_req)
 for _ in range(80):
     try:
         urllib.request.urlopen("http://127.0.0.1:28086/health/live", timeout=1).close()
@@ -814,8 +838,8 @@ try:
     h2, e2 = _enroll_cap_pub(2)
     h3, e3 = _enroll_cap_pub(3)
     _cap_homes = [h1, h2, h3]
-    p1 = start_child([BIN, "mcp", "publish", "--local", "http://127.0.0.1:28099/mcp", "--auth", "ocliv-managed", "--name", "cap1", "--ttl", "10m", "--relay", _cap_base], os.path.join(S, "cap-pub1.log"), env=e1, required=["mcp", "publish", "--name", "cap1"])
-    p2 = start_child([BIN, "mcp", "publish", "--local", "http://127.0.0.1:28099/mcp", "--auth", "ocliv-managed", "--name", "cap2", "--ttl", "10m", "--relay", _cap_base], os.path.join(S, "cap-pub2.log"), env=e2, required=["mcp", "publish", "--name", "cap2"])
+    p1 = start_child([BIN, "mcp", "publish", "--local", "http://127.0.0.1:28099/mcp", "--auth", "ocliv-managed", "--name", "cap1", "--ttl", "10m", "--relay", _cap_base], os.path.join(WORK_DIR, "cap-pub1.log"), env=e1, required=["mcp", "publish", "--name", "cap1"])
+    p2 = start_child([BIN, "mcp", "publish", "--local", "http://127.0.0.1:28099/mcp", "--auth", "ocliv-managed", "--name", "cap2", "--ttl", "10m", "--relay", _cap_base], os.path.join(WORK_DIR, "cap-pub2.log"), env=e2, required=["mcp", "publish", "--name", "cap2"])
     _two_up = False
     for _ in range(30):
         try:
@@ -828,7 +852,7 @@ try:
         time.sleep(0.5)
     check("H1: 2 publishers admitted up to --max-publisher-sessions=2", _two_up, f"status={_st_json if _two_up else 'timeout'}")
     # Start 3rd publisher — must be rejected (503) while 2 are active.
-    _p3_log = os.path.join(S, "cap-pub3.log")
+    _p3_log = os.path.join(WORK_DIR, "cap-pub3.log")
     p3 = start_child([BIN, "mcp", "publish", "--local", "http://127.0.0.1:28099/mcp", "--auth", "ocliv-managed", "--name", "cap3", "--ttl", "10m", "--relay", _cap_base], _p3_log, env=e3, required=["mcp", "publish", "--name", "cap3"])
     time.sleep(3)
     _st3 = json.loads(urllib.request.urlopen("http://127.0.0.1:28086/health/status", timeout=2).read().decode())
@@ -843,7 +867,7 @@ try:
     p1.wait(timeout=8)
     _re_admitted = False
     if p3.poll() is not None:
-        p3 = start_child([BIN, "mcp", "publish", "--local", "http://127.0.0.1:28099/mcp", "--auth", "ocliv-managed", "--name", "cap3b", "--ttl", "10m", "--relay", _cap_base], os.path.join(S, "cap-pub3b.log"), env=e3, required=["mcp", "publish", "--name", "cap3b"])
+        p3 = start_child([BIN, "mcp", "publish", "--local", "http://127.0.0.1:28099/mcp", "--auth", "ocliv-managed", "--name", "cap3b", "--ttl", "10m", "--relay", _cap_base], os.path.join(WORK_DIR, "cap-pub3b.log"), env=e3, required=["mcp", "publish", "--name", "cap3b"])
     for _ in range(30):
         _st4 = json.loads(urllib.request.urlopen("http://127.0.0.1:28086/health/status", timeout=2).read().decode())
         _lcnt = sh(["python3", "-c", "import sqlite3;c=sqlite3.connect('" + _cap_db + "/ocliv.db');print(c.execute(\"SELECT COUNT(*) FROM leases WHERE label IN ('cap3','cap3b') AND status='ACTIVE'\").fetchone()[0])"]).stdout.strip()
@@ -932,7 +956,7 @@ try:
     sh([BIN, "relay", "tenants", "policy", "set", "cap-t", "--allow-public=true", "--data", _cap_db])
     _pub_stream = start_child(
         [BIN, str(_hold_port), "--public", "--name", "capstream", "--ttl", "10m", "--relay", _cap_base],
-        os.path.join(S, "cap-stream.log"), env=e1, required=[str(_hold_port), "--public", "--name", "capstream"]
+        os.path.join(WORK_DIR, "cap-stream.log"), env=e1, required=[str(_hold_port), "--public", "--name", "capstream"]
     )
     _stream_host = ""
     for _ in range(40):
@@ -1103,7 +1127,7 @@ check("I4: publisher home contains zero relay DB / Caddy / DNS credentials", not
 shutil.rmtree(_pair_home, ignore_errors=True)
 
 # I5: relay log does not leak raw private key hex strings
-_ilog = os.path.join(S, "relay.log")
+_ilog = os.path.join(WORK_DIR, "relay.log")
 _ikey_leak = False
 _ihex = []
 if os.path.exists(_ilog):
@@ -1113,12 +1137,30 @@ if os.path.exists(_ilog):
     _ikey_leak = len(set(_ihex)) > 3
 check("I5: relay log heuristic: no raw private key hex strings", not _ikey_leak, "unique_64hex=" + str(len(set(_ihex))))
 
-# I6: strict allowlist check over retained stage dir S (all mutable/security state lives in WORK_DIR).
+# Fail-closed ephemeral cleanup BEFORE evaluating I6 and writing the final receipt.
+_child_stop_errs = stop_all_children()
+_scratch_cleanup_ok = False
+_scratch_cleanup_err = ""
+if ARGS.keep_workdir:
+    print(f"WARNING: --keep-workdir enabled; ephemeral workdir retained at {WORK_DIR}", file=sys.stderr, flush=True)
+    _scratch_cleanup_ok = False
+else:
+    try:
+        shutil.rmtree(WORK_DIR)
+        _scratch_cleanup_ok = (not os.path.exists(WORK_DIR)) and (len(_child_stop_errs) == 0)
+    except Exception as _ce:
+        _scratch_cleanup_ok = False
+        _scratch_cleanup_err = str(_ce)
+_CLEANED_UP = True
+if not ARGS.keep_workdir:
+    check("I5b: fail-closed ephemeral WORK_DIR removal verified", _scratch_cleanup_ok, f"stop_errs={_child_stop_errs} err={_scratch_cleanup_err}")
+
+# I6: strict allowlist check over retained stage dir S (zero raw logs, zero keys/DBs/secrets).
 _ALLOWED_EXACT = {
     os.path.basename(BIN),
     "ocliv-arm64", "ocliv", "ocliv-linux-arm64", "ocliv-linux-amd64",
     "qualify-pi-isolated.py", "rehearse-prod-migration.py", "soak-isolated.py",
-    "install-client.sh", "mcp_upstream.py",
+    "verify-promotion-evidence.py", "install-client.sh", "mcp_upstream.py",
     "qual-receipt.json", "mig-receipt.json", "soak-receipt.json",
     "release-manifest.json", "release-manifest.json.sig",
 }
@@ -1130,16 +1172,18 @@ for _rroot, _rdirs, _rfiles in os.walk(S):
         if _rel_dir == "release-bundle-stage":
             if _rf.startswith("ocliv-linux-") or _rf in ("release-manifest.json", "release-manifest.json.sig", "sbom.cdx.json", "go-module-inventory.json"):
                 continue
-        if _rel_dir == "." and (_rf in _ALLOWED_EXACT or _rf.endswith(".log") or _rf.endswith("-receipt.json")):
+        if _rel_dir == "." and (_rf in _ALLOWED_EXACT or _rf.endswith("-receipt.json")):
             continue
         _unexpected_retained.append(_rel)
-check("I6: retained stage dir matches strict public allowlist (zero keys/DBs/secrets)", len(_unexpected_retained) == 0, f"unexpected={_unexpected_retained}")
+check("I6: retained stage dir matches strict public allowlist (zero raw logs/keys/DBs/secrets)", len(_unexpected_retained) == 0, f"unexpected={_unexpected_retained}")
 
+_ephemeral_retained = bool(ARGS.keep_workdir) or (not _scratch_cleanup_ok)
 _bundle_art_path = os.path.join(RELEASE_DIR, ARTIFACT_NAME) if RELEASE_DIR else ""
 _receipt = {
     "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "mode": "isolated-staging-smoke" if ARGS.smoke else "strict-production",
-    "ephemeral_state_retained": bool(ARGS.keep_workdir),
+    "ephemeral_state_retained": _ephemeral_retained,
+    "scratch_cleanup_ok": _scratch_cleanup_ok,
     "candidate_commit": BIN_COMMIT,
     "qual_binary_sha256": BIN_SHA256,
     "signed_artifact_name": ARTIFACT_NAME,
@@ -1162,7 +1206,7 @@ _receipt = {
     "fail_count": len(FAIL),
     "skipped": SKIP,
     "failed": FAIL,
-    "ok": (not FAIL) and (not SKIP or ARGS.smoke) and (not ARGS.keep_workdir),
+    "ok": (not FAIL) and (not SKIP or ARGS.smoke) and (not _ephemeral_retained) and _scratch_cleanup_ok,
 }
 _default_receipt = os.path.join(S, "qual-receipt.json")
 with open(_default_receipt, "w", encoding="utf-8") as _rf:

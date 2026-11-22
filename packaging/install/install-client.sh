@@ -238,22 +238,15 @@ case "$RELEASE_SEQ" in
         die "refusing installation: manifest 'release_sequence' must be a positive integer (got '${RELEASE_SEQ:-missing}')" ;;
 esac
 
-# Anti-rollback: reject symlink/non-regular sequence file and enforce monotonic release_sequence.
+# Anti-rollback: reject symlink/non-regular sequence file; enforce monotonic
+# release_sequence AND immutable release identity (same seq with different
+# commit or artifact_sha256 is refused).
 SEQ_FILE="${INSTALL_DIR}/.ocliv-release-seq"
 if [ -L "$SEQ_FILE" ]; then
     die "refusing symlink release sequence file $SEQ_FILE"
 fi
 if [ -e "$SEQ_FILE" ] && [ ! -f "$SEQ_FILE" ]; then
     die "refusing non-regular release sequence file $SEQ_FILE"
-fi
-if [ -f "$SEQ_FILE" ]; then
-    PREV_SEQ="$(tr -d ' \r\n' < "$SEQ_FILE" || true)"
-    case "$PREV_SEQ" in
-        ''|0|*[!0-9]*) die "corrupt release sequence file $SEQ_FILE" ;;
-    esac
-    if [ "$RELEASE_SEQ" -lt "$PREV_SEQ" ] && [ "${OCLIV_ALLOW_DOWNGRADE:-}" != "1" ]; then
-        die "refusing release downgrade: manifest release_sequence=$RELEASE_SEQ < installed=$PREV_SEQ (set OCLIV_ALLOW_DOWNGRADE=1 to override)"
-    fi
 fi
 
 NON_PROD="$(_json_bool non_production || true)"
@@ -305,6 +298,42 @@ case "$EXPECTED_SHA256" in
 [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
     *) die "manifest SHA256 for $ARTIFACT is not 64 hex characters (got: '$EXPECTED_SHA256')" ;;
 esac
+
+# Enforce anti-rollback & immutable identity against SEQ_FILE before downloading.
+if [ -f "$SEQ_FILE" ]; then
+    _seq_raw="$(cat "$SEQ_FILE" || true)"
+    case "$_seq_raw" in
+        *{*)
+            PREV_SEQ="$(printf '%s\n' "$_seq_raw" | tr ',' '\n' | grep '"release_sequence"' \
+                | sed 's/.*"release_sequence"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/' | head -1 || true)"
+            PREV_COMMIT="$(printf '%s\n' "$_seq_raw" | tr ',' '\n' | grep '"commit"' \
+                | sed 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1 || true)"
+            PREV_SHA="$(printf '%s\n' "$_seq_raw" | tr ',' '\n' | grep '"artifact_sha256"' \
+                | sed 's/.*"artifact_sha256"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1 || true)"
+            ;;
+        *)
+            PREV_SEQ="$(printf '%s' "$_seq_raw" | tr -d ' \r\n')"
+            PREV_COMMIT=""
+            PREV_SHA=""
+            ;;
+    esac
+    case "$PREV_SEQ" in
+        ''|0|*[!0-9]*) die "corrupt release sequence file $SEQ_FILE" ;;
+    esac
+    if [ "${OCLIV_ALLOW_DOWNGRADE:-}" != "1" ]; then
+        if [ "$RELEASE_SEQ" -lt "$PREV_SEQ" ]; then
+            die "refusing release downgrade: manifest release_sequence=$RELEASE_SEQ < installed=$PREV_SEQ (set OCLIV_ALLOW_DOWNGRADE=1 to override)"
+        fi
+        if [ "$RELEASE_SEQ" -eq "$PREV_SEQ" ]; then
+            if [ -n "$PREV_COMMIT" ] && [ "$PREV_COMMIT" != "$EXPECTED_COMMIT" ]; then
+                die "refusing same release_sequence=$RELEASE_SEQ with different commit (installed=$PREV_COMMIT manifest=$EXPECTED_COMMIT)"
+            fi
+            if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" != "$EXPECTED_SHA256" ]; then
+                die "refusing same release_sequence=$RELEASE_SEQ with different artifact_sha256 (installed=$PREV_SHA manifest=$EXPECTED_SHA256)"
+            fi
+        fi
+    fi
+fi
 info "expected SHA256: $EXPECTED_SHA256 (commit: $EXPECTED_COMMIT)"
 
 # ---------------------------------------------------------------------------
@@ -403,9 +432,9 @@ if ! _verify_binary "$DEST"; then
     exit 1
 fi
 
-# Persist accepted release_sequence atomically ONLY after all post-swap checks pass.
+# Persist accepted release identity JSON atomically ONLY after all post-swap checks pass.
 _seq_tmp="$(mktemp "${INSTALL_DIR}/.ocliv-seq.XXXXXX")"
-if ! ( printf '%s\n' "$RELEASE_SEQ" > "$_seq_tmp" && chmod 644 "$_seq_tmp" && mv "$_seq_tmp" "$SEQ_FILE" ); then
+if ! ( printf '{"release_sequence":%s,"commit":"%s","artifact_sha256":"%s"}\n' "$RELEASE_SEQ" "$EXPECTED_COMMIT" "$EXPECTED_SHA256" > "$_seq_tmp" && chmod 644 "$_seq_tmp" && mv "$_seq_tmp" "$SEQ_FILE" ); then
     rm -f "$_seq_tmp" 2>/dev/null || true
     printf 'error: failed to persist release_sequence %s; rolling back\n' "$RELEASE_SEQ" >&2
     _rollback_dest
