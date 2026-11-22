@@ -6,7 +6,7 @@ database (never copying raw -wal/-shm files independently), migrates the
 snapshot with the candidate `ocliv` binary, verifies SQLite integrity, foreign
 keys, full 64-hex canonical semantic digests of security-critical authority
 columns, legacy pairing expiration, and full backup/validate/restore with the
-explicit `--reset-authority` mutation contract + live relay readiness.
+first-class `--reset-authority` mutation contract + live relay readiness.
 
 NEVER mutates the source database or touches any running production relay.
 
@@ -24,6 +24,46 @@ args = parser.parse_args()
 
 PASS, FAIL = [], []
 
+# First-class --reset-authority transformation contract (versioned for auditability).
+RESET_CONTRACT_VERSION = 1
+
+INVENTORY_QUERIES = {
+    # Full authority columns (must be identical across schema migration)
+    "tenants": ("tenants", "SELECT id, status, quotas_json FROM tenants ORDER BY id"),
+    "agent_keys": ("agent_keys", "SELECT id, tenant_id, hex(ed25519_public), status, COALESCE(revoked_at,'') FROM agent_keys ORDER BY id"),
+    "leases": ("leases", "SELECT id, tenant_id, agent_key_id, hostname, label, port, access_mode, status, COALESCE(expires_at,'') FROM leases ORDER BY id"),
+    "terminal_leases": ("leases", "SELECT id, status, generation, token_generation FROM leases WHERE status IN ('CLOSED','EXPIRED','REVOKED') ORDER BY id"),
+    "mcp_publications": ("mcp_publications", "SELECT route_id, tenant_id, owner_key_id, external_host, profile, pub_name, COALESCE(revoked_at,'') FROM mcp_publications ORDER BY route_id"),
+    "authz_clients": ("authz_clients", "SELECT id, COALESCE(tenant_id,''), COALESCE(route_id,''), COALESCE(revoked_at,'') FROM authz_clients ORDER BY id"),
+    "authz_grants": ("authz_grants", "SELECT client_id, tenant_id, route_id, status FROM authz_grants ORDER BY client_id, tenant_id, route_id"),
+    "authz_revocations": ("authz_revocations", "SELECT jti, client_id, tenant_id, route_id FROM authz_revocations ORDER BY jti"),
+    # Identity-only columns (must remain identical even across --reset-authority)
+    "agent_keys_identity": ("agent_keys", "SELECT id, tenant_id, hex(ed25519_public) FROM agent_keys ORDER BY id"),
+    "leases_identity": ("leases", "SELECT id, tenant_id, agent_key_id, hostname, label, port, access_mode, COALESCE(expires_at,'') FROM leases ORDER BY id"),
+    "mcp_publications_identity": ("mcp_publications", "SELECT route_id, tenant_id, owner_key_id, external_host, profile, pub_name FROM mcp_publications ORDER BY route_id"),
+    "authz_clients_identity": ("authz_clients", "SELECT id, COALESCE(tenant_id,''), COALESCE(route_id,'') FROM authz_clients ORDER BY id"),
+}
+
+MUST_PRESERVE = (
+    "tenants",
+    "agent_keys_identity",
+    "leases_identity",
+    "mcp_publications_identity",
+    "authz_clients_identity",
+    "authz_revocations",
+)
+
+RESET_TO_ZERO = {
+    "non_revoked_keys": "SELECT COUNT(*) FROM agent_keys WHERE status<>'revoked'",
+    "live_leases": "SELECT COUNT(*) FROM leases WHERE status IN ('ACTIVE','RECONNECTING')",
+    "unrevoked_publications": "SELECT COUNT(*) FROM mcp_publications WHERE revoked_at IS NULL",
+    "unrevoked_authz_clients": "SELECT COUNT(*) FROM authz_clients WHERE revoked_at IS NULL",
+    "non_revoked_authz_grants": "SELECT COUNT(*) FROM authz_grants WHERE status<>'revoked'",
+    "authz_issuer_keys": "SELECT COUNT(*) FROM authz_issuer_key",
+    "unrevoked_access_tokens": "SELECT COUNT(*) FROM access_tokens WHERE revoked_at IS NULL",
+    "unrevoked_visitor_sessions": "SELECT COUNT(*) FROM visitor_sessions WHERE revoked_at IS NULL",
+}
+
 
 def check(name, ok, note=""):
     (PASS if ok else FAIL).append(name)
@@ -38,37 +78,36 @@ def sha256_file(path):
     return h.hexdigest()
 
 
-def semantic_digest(conn, sql):
-    """Return full 64-hex canonical sorted SHA-256 digest of security-critical rows."""
-    try:
-        rows = conn.execute(sql).fetchall()
-    except sqlite3.OperationalError:
-        return "TABLE_ABSENT"
+def table_exists(conn, table):
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    return row is not None
+
+
+def semantic_digest(conn, table, sql, allow_absent=False):
+    """Return full 64-hex canonical sorted SHA-256 digest of security-critical rows.
+
+    Inspects sqlite_master first so genuine SQL/corruption OperationalErrors always propagate.
+    """
+    if not table_exists(conn, table):
+        if allow_absent:
+            return "TABLE_ABSENT"
+        raise RuntimeError(f"required table {table!r} is absent from database")
+    rows = conn.execute(sql).fetchall()
     canon = "\n".join(json.dumps(list(r), separators=(",", ":")) for r in rows)
     return hashlib.sha256(canon.encode("utf-8")).hexdigest() + f"(n={len(rows)})"
 
 
-def collect_inventory(db_path):
+def collect_inventory(db_path, allow_absent=False):
     c = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    inv = {
-        "schema": c.execute("SELECT MAX(v) FROM schema_version").fetchone()[0],
-        # Full authority columns (must be identical across schema migration)
-        "tenants": semantic_digest(c, "SELECT id, status, quotas_json FROM tenants ORDER BY id"),
-        "agent_keys": semantic_digest(c, "SELECT id, tenant_id, hex(ed25519_public), status, COALESCE(revoked_at,'') FROM agent_keys ORDER BY id"),
-        "leases": semantic_digest(c, "SELECT id, tenant_id, agent_key_id, hostname, label, port, access_mode, status, COALESCE(expires_at,'') FROM leases ORDER BY id"),
-        "terminal_leases": semantic_digest(c, "SELECT id, status, generation, token_generation FROM leases WHERE status IN ('CLOSED','EXPIRED','REVOKED') ORDER BY id"),
-        "mcp_publications": semantic_digest(c, "SELECT route_id, tenant_id, owner_key_id, external_host, profile, pub_name, COALESCE(revoked_at,'') FROM mcp_publications ORDER BY route_id"),
-        "authz_clients": semantic_digest(c, "SELECT id, COALESCE(tenant_id,''), COALESCE(route_id,''), COALESCE(revoked_at,'') FROM authz_clients ORDER BY id"),
-        "authz_grants": semantic_digest(c, "SELECT client_id, tenant_id, route_id, status FROM authz_grants ORDER BY client_id, tenant_id, route_id"),
-        "authz_revocations": semantic_digest(c, "SELECT jti, client_id, tenant_id, route_id FROM authz_revocations ORDER BY jti"),
-        # Identity-only columns (must remain identical even across --reset-authority)
-        "agent_keys_identity": semantic_digest(c, "SELECT id, tenant_id, hex(ed25519_public) FROM agent_keys ORDER BY id"),
-        "leases_identity": semantic_digest(c, "SELECT id, tenant_id, agent_key_id, hostname, label, port, access_mode, COALESCE(expires_at,'') FROM leases ORDER BY id"),
-        "mcp_publications_identity": semantic_digest(c, "SELECT route_id, tenant_id, owner_key_id, external_host, profile, pub_name FROM mcp_publications ORDER BY route_id"),
-        "authz_clients_identity": semantic_digest(c, "SELECT id, COALESCE(tenant_id,''), COALESCE(route_id,'') FROM authz_clients ORDER BY id"),
-    }
-    c.close()
-    return inv
+    try:
+        inv = {"schema": c.execute("SELECT MAX(v) FROM schema_version").fetchone()[0]}
+        for key, (table, sql) in INVENTORY_QUERIES.items():
+            inv[key] = semantic_digest(c, table, sql, allow_absent=allow_absent)
+        return inv
+    finally:
+        c.close()
 
 
 def pick_free_port():
@@ -91,6 +130,7 @@ work = tempfile.mkdtemp(prefix="ocliv-mig-rehearsal-")
 os.chmod(work, 0o700)
 receipt_data = {
     "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "reset_contract_version": RESET_CONTRACT_VERSION,
     "candidate_commit": ver_info.get("build_commit") or ver_info.get("commit") or "",
     "binary_sha256": bin_sha,
     "expected_schema": expected_schema,
@@ -117,17 +157,21 @@ try:
     receipt_data["snapshot_sha256"] = snap_sha
     print(f"SNAPSHOT: src_journal_mode={src_journal_mode} src_schema=V{src_schema} sha256={snap_sha}", flush=True)
 
-    before = collect_inventory(dst_db)
+    # Pre-migration may legitimately be an older schema (e.g. V19); allow_absent=True only before migration.
+    before = collect_inventory(dst_db, allow_absent=(src_schema < expected_schema))
     receipt_data["pre_migration"] = before
     print("PRE-MIGRATION:", json.dumps(before), flush=True)
 
     mig = subprocess.run([args.bin, "relay", "pending", "--data", copy_dir], capture_output=True, text=True)
     check("M1: candidate binary opens and migrates online snapshot cleanly", mig.returncode == 0, f"rc={mig.returncode} {mig.stderr[:120]}")
 
-    after = collect_inventory(dst_db)
+    # Post-migration: EVERY V22 inventory table is mandatory (allow_absent=False).
+    after = collect_inventory(dst_db, allow_absent=False)
     receipt_data["post_migration"] = after
     print("POST-MIGRATION:", json.dumps(after), flush=True)
-    check(f"M2: schema reached V{expected_schema}", after["schema"] == expected_schema, f"got={after['schema']}")
+    check(f"M2: schema reached V{expected_schema} with all required tables present",
+          after["schema"] == expected_schema and all(v != "TABLE_ABSENT" for v in after.values()),
+          f"got={after['schema']}")
     check("M3: semantic digests of tenants/keys/leases/publications identical",
           after["tenants"] == before["tenants"]
           and after["agent_keys"] == before["agent_keys"]
@@ -170,34 +214,22 @@ try:
         r_ic = rc_conn.execute("PRAGMA integrity_check").fetchone()[0]
         r_fk = rc_conn.execute("PRAGMA foreign_key_check").fetchall()
         r_sv = rc_conn.execute("SELECT MAX(v) FROM schema_version").fetchone()[0]
-        # Explicit --reset-authority transformed-state assertions (must all be 0):
-        reset_counts = {
-            "non_revoked_keys": rc_conn.execute("SELECT COUNT(*) FROM agent_keys WHERE status<>'revoked'").fetchone()[0],
-            "live_leases": rc_conn.execute("SELECT COUNT(*) FROM leases WHERE status IN ('ACTIVE','RECONNECTING')").fetchone()[0],
-            "unrevoked_publications": rc_conn.execute("SELECT COUNT(*) FROM mcp_publications WHERE revoked_at IS NULL").fetchone()[0],
-            "unrevoked_authz_clients": rc_conn.execute("SELECT COUNT(*) FROM authz_clients WHERE revoked_at IS NULL").fetchone()[0],
-            "non_revoked_authz_grants": rc_conn.execute("SELECT COUNT(*) FROM authz_grants WHERE status<>'revoked'").fetchone()[0],
-            "authz_issuer_keys": rc_conn.execute("SELECT COUNT(*) FROM authz_issuer_key").fetchone()[0],
-            "unrevoked_access_tokens": rc_conn.execute("SELECT COUNT(*) FROM access_tokens WHERE revoked_at IS NULL").fetchone()[0],
-            "unrevoked_visitor_sessions": rc_conn.execute("SELECT COUNT(*) FROM visitor_sessions WHERE revoked_at IS NULL").fetchone()[0],
-        }
-        # Pre-existing terminal lease tombstones must still exist with unchanged status/generation.
+        reset_counts = {name: rc_conn.execute(sql).fetchone()[0] for name, sql in RESET_TO_ZERO.items()}
         rc_conn.close()
-        rst_inv = collect_inventory(rst_db)
-        receipt_data["post_restore_reset_authority"] = {"inventory": rst_inv, "reset_counts": reset_counts}
+        rst_inv = collect_inventory(rst_db, allow_absent=False)
+        preserved_diffs = [k for k in MUST_PRESERVE if rst_inv[k] != after[k]]
+        receipt_data["post_restore_reset_authority"] = {
+            "reset_contract_version": RESET_CONTRACT_VERSION,
+            "inventory": rst_inv,
+            "preserved_diffs": preserved_diffs,
+            "reset_counts": reset_counts,
+        }
 
-        unchanged_ok = (
-            rst_inv["tenants"] == after["tenants"]
-            and rst_inv["agent_keys_identity"] == after["agent_keys_identity"]
-            and rst_inv["leases_identity"] == after["leases_identity"]
-            and rst_inv["mcp_publications_identity"] == after["mcp_publications_identity"]
-            and rst_inv["authz_clients_identity"] == after["authz_clients_identity"]
-            and rst_inv["authz_revocations"] == after["authz_revocations"]
-        )
+        unchanged_ok = len(preserved_diffs) == 0
         reset_ok = all(v == 0 for v in reset_counts.values())
         check("M10b: restored DB full --reset-authority contract (unchanged identities + all authority revoked)",
               r_ic == "ok" and len(r_fk) == 0 and r_sv == expected_schema and unchanged_ok and reset_ok,
-              f"ic={r_ic} sv={r_sv} unchanged_ok={unchanged_ok} reset_counts={reset_counts}")
+              f"ic={r_ic} sv={r_sv} preserved_diffs={preserved_diffs} reset_counts={reset_counts}")
 
         # Boot candidate relay against restored DB on loopback and prove /health/ready == 200.
         lport = pick_free_port()

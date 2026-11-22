@@ -25,13 +25,15 @@ parser.add_argument("--keep-workdir", action="store_true", help="debug-only: kee
 ARGS = parser.parse_args()
 
 S = os.path.dirname(os.path.realpath(__file__))
+WORK_DIR = tempfile.mkdtemp(prefix="ocliv-qual-work-")
+os.chmod(WORK_DIR, 0o700)
 BIN = os.path.join(S, "ocliv-arm64")
 if not os.path.exists(BIN):
     for cand in (os.path.join(S, "ocliv"), os.path.join(S, "ocliv-linux-amd64"), os.path.join(S, "ocliv-linux-arm64")):
         if os.path.exists(cand):
             BIN = cand
             break
-DB = os.path.join(S, "relay-data-fresh")
+DB = os.path.join(WORK_DIR, "relay-data-fresh")
 UPSTREAM = os.path.join(S, "mcp_upstream.py")
 BASE = "http://127.0.0.1:28080"
 HOST = "127.0.0.1:28080"
@@ -41,8 +43,6 @@ PASS = []
 FAIL = []
 SKIP = []
 CHILDREN = []
-WORK_DIR = tempfile.mkdtemp(prefix="ocliv-qual-work-")
-os.chmod(WORK_DIR, 0o700)
 os.umask(0o077)
 
 
@@ -163,7 +163,7 @@ def db_routes(db_dir=DB):
     return sh(["python3", "-c", q]).stdout.split()
 
 
-ENV = {"HOME": os.path.join(S, "qual-home"), "OCLIV_RELAY_URL": BASE}
+ENV = {"HOME": os.path.join(WORK_DIR, "qual-home"), "OCLIV_RELAY_URL": BASE}
 os.makedirs(ENV["HOME"], mode=0o700, exist_ok=True)
 os.chmod(ENV["HOME"], 0o700)
 
@@ -215,8 +215,14 @@ ARTIFACT_NAME = f"ocliv-linux-{_ARCH}"
 BIN_SHA256 = sha256_file(BIN)
 ACTIVE_MANIFEST = {}
 
+SBOM_DECLARED_SHA256 = ""
+SBOM_ACTUAL_SHA256 = ""
+SBOM_META = {}
+
 if not ARGS.smoke:
     print("== MODE: STRICT RELEASE QUALIFICATION ==", flush=True)
+    if ARGS.keep_workdir:
+        raise RuntimeError("strict release mode refuses --keep-workdir (ephemeral security state must not be retained)")
     if not RELEASE_DIR or not os.path.isdir(RELEASE_DIR):
         raise RuntimeError("strict release mode requires --release-dir DIR pointing to a production-signed release bundle (pass --smoke for non-release staging smoke)")
     REL_MANIFEST_PATH = os.path.join(RELEASE_DIR, "release-manifest.json")
@@ -229,6 +235,8 @@ if not ARGS.smoke:
         raise RuntimeError("strict release mode refuses non_production=true manifest")
     if _strict_m.get("dirty") is not False:
         raise RuntimeError("strict release mode refuses dirty manifest")
+    if _strict_m.get("govulncheck") != "pass":
+        raise RuntimeError(f"strict release mode requires govulncheck == 'pass' (got {_strict_m.get('govulncheck')!r})")
     if _strict_m.get("manifest_version") != 1:
         raise RuntimeError(f"strict release mode requires manifest_version == 1 (got {_strict_m.get('manifest_version')!r})")
     _rseq = _strict_m.get("release_sequence")
@@ -236,16 +244,33 @@ if not ARGS.smoke:
         raise RuntimeError(f"strict release mode requires positive integer release_sequence (got {_rseq!r})")
     if not _strict_m.get("signing_key_id"):
         raise RuntimeError("strict release mode requires non-empty signing_key_id in manifest")
-    if not ((_strict_m.get("provenance") or {}).get("sbom")):
-        raise RuntimeError("strict release mode requires provenance.sbom in manifest")
+    # Mandatory SBOM provenance byte binding in strict mode.
+    _sbom_obj = (_strict_m.get("provenance") or {}).get("sbom") or {}
+    _sbom_file = _sbom_obj.get("file") or ""
+    _sbom_decl = _sbom_obj.get("sha256") or ""
+    if not _sbom_file or not _sbom_decl:
+        raise RuntimeError("strict release mode requires provenance.sbom.file and provenance.sbom.sha256 in manifest")
+    _sbom_path = os.path.join(RELEASE_DIR, _sbom_file)
+    if not os.path.isfile(_sbom_path):
+        raise RuntimeError(f"strict release mode: declared SBOM file missing: {_sbom_path}")
+    SBOM_DECLARED_SHA256 = _sbom_decl
+    SBOM_ACTUAL_SHA256 = sha256_file(_sbom_path)
+    if SBOM_ACTUAL_SHA256 != SBOM_DECLARED_SHA256:
+        raise RuntimeError(f"strict release mode: SBOM SHA256 mismatch (declared={SBOM_DECLARED_SHA256} actual={SBOM_ACTUAL_SHA256})")
+    SBOM_META = _sbom_obj
     # Cryptographic/byte-for-byte binding: tested binary == signed bundle artifact == manifest identity.
     if _strict_m.get("commit") != BIN_COMMIT:
         raise RuntimeError(f"release bundle commit ({_strict_m.get('commit')}) != qualification binary commit ({BIN_COMMIT})")
     if int(_strict_m.get("schema_version") or 0) != int(EXPECTED_SCHEMA):
         raise RuntimeError(f"release bundle schema_version ({_strict_m.get('schema_version')}) != qualification binary schema ({EXPECTED_SCHEMA})")
-    _bin_proto = BIN_VER_INFO.get("protocol_version") or ""
-    if _strict_m.get("protocol_version") and _bin_proto and _strict_m.get("protocol_version") != _bin_proto:
-        raise RuntimeError(f"release bundle protocol_version ({_strict_m.get('protocol_version')}) != qualification binary ({_bin_proto})")
+    _manifest_proto = _strict_m.get("protocol_version")
+    _bin_proto = BIN_VER_INFO.get("protocol_version")
+    if not isinstance(_manifest_proto, str) or not _manifest_proto:
+        raise RuntimeError("strict release manifest missing protocol_version")
+    if not isinstance(_bin_proto, str) or not _bin_proto:
+        raise RuntimeError("qualification binary missing protocol_version")
+    if _manifest_proto != _bin_proto:
+        raise RuntimeError(f"release bundle protocol_version ({_manifest_proto}) != qualification binary ({_bin_proto})")
     _bundle_bin = os.path.join(RELEASE_DIR, ARTIFACT_NAME)
     if not os.path.isfile(_bundle_bin):
         raise RuntimeError(f"release bundle missing platform artifact {_bundle_bin}")
@@ -329,9 +354,9 @@ elif os.path.exists(REL_SIG_PATH):
 
 relay_required = ["relay", "serve", "--listen=127.0.0.1:28080", "--data=" + DB]
 relay_proc = start_child(relay_args, os.path.join(S, "relay.log"), env=relay_env, required=relay_required)
-with open(os.path.join(S, "relay.pid"), "x", encoding="ascii") as f:
+with open(os.path.join(WORK_DIR, "relay.pid"), "x", encoding="ascii") as f:
     f.write(str(relay_proc.pid) + "\n")
-os.chmod(os.path.join(S, "relay.pid"), 0o600)
+os.chmod(os.path.join(WORK_DIR, "relay.pid"), 0o600)
 for _ in range(100):
     try:
         urllib.request.urlopen("http://127.0.0.1:28085/health/live", timeout=1).close()
@@ -408,7 +433,7 @@ if ra:
     stop_pid(relay_proc.pid, BIN, relay_required)
     relay_proc.wait(timeout=8)
     relay_proc = start_child(relay_args, os.path.join(S, "relay.log"), env=relay_env, required=relay_required)
-    with open(os.path.join(S, "relay.pid"), "w", encoding="ascii") as f:
+    with open(os.path.join(WORK_DIR, "relay.pid"), "w", encoding="ascii") as f:
         f.write(str(relay_proc.pid) + "\n")
     time.sleep(2)
     st, _, _ = http_req("POST", "/r/" + ra + "/mcp", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}), {"Content-Type": "application/json"})
@@ -539,16 +564,18 @@ st, b, loc, cx = consent(ra, cidA, ch2, pair2, cch2)
 check("D: consent challenge replay rejected", not cx, "st=" + str(st))
 
 print("== Phase E: recovery rehearsal (staging only) ==")
-st = sh([BIN, "relay", "backup", "--data", DB, "--out", S + "/pre-revoke.db"])
+_pre_rev = os.path.join(WORK_DIR, "pre-revoke.db")
+_reset_dir = os.path.join(WORK_DIR, "reset-dir")
+st = sh([BIN, "relay", "backup", "--data", DB, "--out", _pre_rev])
 check("E: guarded backup (pre-revoke)", st.returncode == 0, "rc=" + str(st.returncode))
 sh([BIN, "authz", "revoke", "--data", DB, "--client", cidA, "--tenant", "t1", "--route", ra], ENV)
-st = sh([BIN, "relay", "restore", "--data", DB, "--in", S + "/pre-revoke.db", "--relay-stopped"])
+st = sh([BIN, "relay", "restore", "--data", DB, "--in", _pre_rev, "--relay-stopped"])
 out = st.stdout + st.stderr
 check("E: managed rollback restore refused", st.returncode != 0 and "resurrect" in out, f"rc={st.returncode} {out[:90]}")
-os.makedirs(S + "/reset-dir", exist_ok=True)
-subprocess.run(["rm", "-f", S + "/reset-dir/ocliv.db"])
-st = sh([BIN, "relay", "restore", "--data", S + "/reset-dir", "--in", S + "/pre-revoke.db", "--reset-authority", "--relay-stopped"])
-res = sh(["python3", "-c", "import sqlite3;c=sqlite3.connect('" + S + "/reset-dir/ocliv.db');print('ag',c.execute(\"SELECT COUNT(*) FROM authz_grants WHERE status='active'\").fetchone()[0]);print('cr',c.execute('SELECT COUNT(*) FROM authz_clients WHERE revoked_at IS NOT NULL').fetchone()[0]);print('ik',c.execute('SELECT COUNT(*) FROM authz_issuer_key').fetchone()[0])"]).stdout
+os.makedirs(_reset_dir, exist_ok=True)
+subprocess.run(["rm", "-f", os.path.join(_reset_dir, "ocliv.db")])
+st = sh([BIN, "relay", "restore", "--data", _reset_dir, "--in", _pre_rev, "--reset-authority", "--relay-stopped"])
+res = sh(["python3", "-c", "import sqlite3;c=sqlite3.connect('" + _reset_dir + "/ocliv.db');print('ag',c.execute(\"SELECT COUNT(*) FROM authz_grants WHERE status='active'\").fetchone()[0]);print('cr',c.execute('SELECT COUNT(*) FROM authz_clients WHERE revoked_at IS NOT NULL').fetchone()[0]);print('ik',c.execute('SELECT COUNT(*) FROM authz_issuer_key').fetchone()[0])"]).stdout
 check("E: reset-authority invalidates managed+key", st.returncode == 0 and "ag 0" in res and "cr" in res and "ik 0" in res, f"rc={st.returncode} {res.replace(chr(10), ' ')}")
 
 print("== Phase F: pairing E2E (pair --no-wait -> approve -> resume -> attach) ==")
@@ -739,7 +766,7 @@ else:
     skip_gate("G5: signed bootstrap install", "install-client.sh or test signing key unavailable")
 
 print("== Phase H: real capacity saturation (--max-publisher-sessions=2, --max-http-streams=2, --max-ws-streams=2) ==")
-_cap_db = os.path.join(S, "relay-cap-db")
+_cap_db = os.path.join(WORK_DIR, "relay-cap-db")
 os.makedirs(_cap_db, mode=0o700, exist_ok=True)
 _cap_base = "http://127.0.0.1:28082"
 _cap_args = [
@@ -1086,18 +1113,33 @@ if os.path.exists(_ilog):
     _ikey_leak = len(set(_ihex)) > 3
 check("I5: relay log heuristic: no raw private key hex strings", not _ikey_leak, "unique_64hex=" + str(len(set(_ihex))))
 
-# I6: zero retained ephemeral secret files (enrollment codes, signing PEMs) in stage dir S.
-_retained_secrets = []
-for _rroot, _, _rfiles in os.walk(S):
+# I6: strict allowlist check over retained stage dir S (all mutable/security state lives in WORK_DIR).
+_ALLOWED_EXACT = {
+    os.path.basename(BIN),
+    "ocliv-arm64", "ocliv", "ocliv-linux-arm64", "ocliv-linux-amd64",
+    "qualify-pi-isolated.py", "rehearse-prod-migration.py", "soak-isolated.py",
+    "install-client.sh", "mcp_upstream.py",
+    "qual-receipt.json", "mig-receipt.json", "soak-receipt.json",
+    "release-manifest.json", "release-manifest.json.sig",
+}
+_unexpected_retained = []
+for _rroot, _rdirs, _rfiles in os.walk(S):
+    _rel_dir = os.path.relpath(_rroot, S)
     for _rf in _rfiles:
-        if _rf == "qc.txt" or _rf.endswith(".pem"):
-            _retained_secrets.append(os.path.relpath(os.path.join(_rroot, _rf), S))
-check("I6: zero ephemeral secret files (*.pem, qc.txt) retained in stage dir", len(_retained_secrets) == 0, f"found={_retained_secrets}")
+        _rel = _rf if _rel_dir == "." else os.path.join(_rel_dir, _rf)
+        if _rel_dir == "release-bundle-stage":
+            if _rf.startswith("ocliv-linux-") or _rf in ("release-manifest.json", "release-manifest.json.sig", "sbom.cdx.json", "go-module-inventory.json"):
+                continue
+        if _rel_dir == "." and (_rf in _ALLOWED_EXACT or _rf.endswith(".log") or _rf.endswith("-receipt.json")):
+            continue
+        _unexpected_retained.append(_rel)
+check("I6: retained stage dir matches strict public allowlist (zero keys/DBs/secrets)", len(_unexpected_retained) == 0, f"unexpected={_unexpected_retained}")
 
 _bundle_art_path = os.path.join(RELEASE_DIR, ARTIFACT_NAME) if RELEASE_DIR else ""
 _receipt = {
     "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "mode": "isolated-staging-smoke" if ARGS.smoke else "strict-production",
+    "ephemeral_state_retained": bool(ARGS.keep_workdir),
     "candidate_commit": BIN_COMMIT,
     "qual_binary_sha256": BIN_SHA256,
     "signed_artifact_name": ARTIFACT_NAME,
@@ -1108,14 +1150,19 @@ _receipt = {
     "schema_version": int(EXPECTED_SCHEMA),
     "protocol_version": BIN_VER_INFO.get("protocol_version") or "",
     "signing_key_id": ACTIVE_MANIFEST.get("signing_key_id") or "",
-    "sbom": (ACTIVE_MANIFEST.get("provenance") or {}).get("sbom") or {},
+    "sbom_declared_sha256": SBOM_DECLARED_SHA256,
+    "sbom_actual_sha256": SBOM_ACTUAL_SHA256,
+    "sbom_generator": SBOM_META.get("generator") or "",
+    "sbom_generator_version": SBOM_META.get("generator_version") or "",
+    "sbom_file": SBOM_META.get("file") or "",
+    "sbom_format": SBOM_META.get("format") or "",
     "stage_dir": S,
     "pass_count": len(PASS),
     "skip_count": len(SKIP),
     "fail_count": len(FAIL),
     "skipped": SKIP,
     "failed": FAIL,
-    "ok": not FAIL and (not SKIP or ARGS.smoke),
+    "ok": (not FAIL) and (not SKIP or ARGS.smoke) and (not ARGS.keep_workdir),
 }
 _default_receipt = os.path.join(S, "qual-receipt.json")
 with open(_default_receipt, "w", encoding="utf-8") as _rf:

@@ -229,6 +229,12 @@ func FetchManifestSignedAny(ctx context.Context, client *http.Client, manifestUR
 	if m.ReleaseSequence <= 0 {
 		return nil, fmt.Errorf("refusing release manifest: missing or non-positive release_sequence=%d", m.ReleaseSequence)
 	}
+	if m.SchemaVersion <= 0 {
+		return nil, fmt.Errorf("refusing release manifest: missing or non-positive schema_version=%d", m.SchemaVersion)
+	}
+	if strings.TrimSpace(m.ProtocolVersion) == "" {
+		return nil, fmt.Errorf("refusing release manifest: missing protocol_version")
+	}
 	if m.Dirty {
 		return nil, fmt.Errorf("refusing dirty build: manifest reports dirty=true")
 	}
@@ -315,7 +321,7 @@ func ValidateBinaryCandidate(ctx context.Context, binPath string, manifest *Rele
 		Version         string `json:"version"`
 		Commit          string `json:"commit"`
 		BuildCommit     string `json:"build_commit"`
-		Dirty           bool   `json:"dirty"`
+		Dirty           *bool  `json:"dirty"`
 		ProtocolVersion string `json:"protocol_version"`
 		SchemaVersion   int    `json:"schema_version"`
 	}
@@ -325,8 +331,13 @@ func ValidateBinaryCandidate(ctx context.Context, binPath string, manifest *Rele
 	if info.Version == "" {
 		return fmt.Errorf("candidate binary reported empty version")
 	}
-	if info.Dirty && !AllowUnqualifiedRelease {
-		return fmt.Errorf("candidate binary reports dirty=true")
+	if !AllowUnqualifiedRelease {
+		if info.Dirty == nil {
+			return fmt.Errorf("candidate binary missing required 'dirty' field")
+		}
+		if *info.Dirty {
+			return fmt.Errorf("candidate binary reports dirty=true")
+		}
 	}
 	if manifest != nil {
 		gotCommit := info.BuildCommit
@@ -336,10 +347,16 @@ func ValidateBinaryCandidate(ctx context.Context, binPath string, manifest *Rele
 		if manifest.Commit != "" && gotCommit != manifest.Commit {
 			return fmt.Errorf("candidate commit %q does not match manifest commit %q", gotCommit, manifest.Commit)
 		}
-		if manifest.ProtocolVersion != "" && info.ProtocolVersion != manifest.ProtocolVersion {
+		if manifest.ProtocolVersion == "" || info.ProtocolVersion == "" {
+			return fmt.Errorf("protocol_version required in both manifest (%q) and candidate binary (%q)", manifest.ProtocolVersion, info.ProtocolVersion)
+		}
+		if info.ProtocolVersion != manifest.ProtocolVersion {
 			return fmt.Errorf("candidate protocol_version %q does not match manifest %q", info.ProtocolVersion, manifest.ProtocolVersion)
 		}
-		if manifest.SchemaVersion > 0 && info.SchemaVersion != manifest.SchemaVersion {
+		if manifest.SchemaVersion <= 0 || info.SchemaVersion <= 0 {
+			return fmt.Errorf("schema_version required in both manifest (%d) and candidate binary (%d)", manifest.SchemaVersion, info.SchemaVersion)
+		}
+		if info.SchemaVersion != manifest.SchemaVersion {
 			return fmt.Errorf("candidate schema_version %d does not match manifest %d", info.SchemaVersion, manifest.SchemaVersion)
 		}
 	}

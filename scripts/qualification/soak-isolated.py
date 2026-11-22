@@ -9,24 +9,46 @@ Runs an isolated loopback relay, a local HTTP upstream, and TWO live publisher l
     and monotonically advancing upstream hit counter.
   - Deliberate mid-soak publisher disconnect/reconnect: proves Lane 2 FAILS while publisher
     is disconnected and RECOVERS to 200 + exact nonce after reconnect.
-  - Pairing rate-limit recovery invariant: never swallows errors; tracks consecutive 429s
-    and pending pairing count from SQLite, requiring recovery without restart.
-  - Configurable warm-up + post-warm-up median baseline + full-series min/median/p95/max/slope
-    statistics for FDs and RSS + WAL peak/end + provenance-bound JSON receipt.
+  - Deterministic pairing 429 recovery & drain window: tracks consecutive 429s and pending
+    pairings against a TTL/cadence-derived bound; if any 429 occurs, a subsequent 200 MUST
+    occur before pass; during the final drain window, verifies expired_still_pending == 0
+    and pending count returns to near-zero.
+  - Warm-up + rolling-window trend gating (for >=6h runs) + `--release-gate` mode enforcing
+    24h duration, >=300s warm-up, >=720s drain, <=60s interval, and mandatory receipt output.
 
 Usage:
-  soak-isolated.py --bin /path/to/ocliv [--duration 86400] [--warmup 300] [--sample-interval 60] [--receipt-out PATH]
+  soak-isolated.py --bin /path/to/ocliv --release-gate --receipt-out soak-24h.json
+  soak-isolated.py --bin /path/to/ocliv --duration 20 --sample-interval 5 --receipt-out soak-smoke.json
 """
-import argparse, base64, datetime, hashlib, http.server, json, os, shutil, socket, sqlite3, statistics
+import argparse, base64, datetime, hashlib, http.server, json, math, os, shutil, socket, sqlite3, statistics
 import subprocess, sys, tempfile, threading, time, urllib.error, urllib.parse, urllib.request
+
+PAIRING_TTL_SEC = 600  # 10-minute pairing request expiry
 
 parser = argparse.ArgumentParser(description="Ocliv isolated dual-lane workload soak driver")
 parser.add_argument("--bin", required=True, help="Path to candidate ocliv binary")
 parser.add_argument("--duration", type=int, default=86400, help="Soak duration in seconds (default 86400 = 24h)")
-parser.add_argument("--warmup", type=int, default=0, help="Warm-up period in seconds before establishing baseline (e.g. 300 for 24h)")
+parser.add_argument("--warmup", type=int, default=-1, help="Warm-up period in seconds (-1 auto: 300s if duration>=600 else 0)")
+parser.add_argument("--drain", type=int, default=-1, help="Final pairing drain/recovery window in seconds (-1 auto: 720s if duration>=3600 else 0)")
 parser.add_argument("--sample-interval", type=int, default=60, help="Sampling interval in seconds")
-parser.add_argument("--receipt-out", default="", help="Optional path to write provenance-bound JSON soak receipt")
+parser.add_argument("--receipt-out", default="", help="Path to write provenance-bound JSON soak receipt (required with --release-gate)")
+parser.add_argument("--release-gate", action="store_true", help="Enforce strict 24h release-gate parameters (duration>=86400, warmup>=300, drain>=720, interval<=60, receipt-out)")
 args = parser.parse_args()
+
+warmup_sec = args.warmup if args.warmup >= 0 else (300 if args.duration >= 600 else 0)
+drain_sec = args.drain if args.drain >= 0 else (720 if args.duration >= 3600 else 0)
+
+if args.release_gate:
+    if args.duration < 86400:
+        raise SystemExit(f"--release-gate requires --duration >= 86400 (got {args.duration})")
+    if warmup_sec < 300:
+        raise SystemExit(f"--release-gate requires --warmup >= 300 (got {warmup_sec})")
+    if drain_sec < 720:
+        raise SystemExit(f"--release-gate requires --drain >= 720 (got {drain_sec})")
+    if args.sample_interval > 60 or args.sample_interval <= 0:
+        raise SystemExit(f"--release-gate requires 1 <= --sample-interval <= 60 (got {args.sample_interval})")
+    if not args.receipt_out:
+        raise SystemExit("--release-gate requires --receipt-out PATH")
 
 
 def pick_port():
@@ -50,7 +72,6 @@ def series_stats(xs, ts):
         return {}
     s_xs = sorted(xs)
     p95_idx = min(len(s_xs) - 1, int(0.95 * (len(s_xs) - 1)))
-    # Ordinary least-squares linear slope in units per hour.
     slope_per_hr = 0.0
     if len(xs) >= 2 and ts[-1] > ts[0]:
         t_mean = statistics.mean(ts)
@@ -191,6 +212,23 @@ def probe_dataplane(public_host, nonce):
         return -1, {}
 
 
+def send_pair_request():
+    pub_b64 = base64.b64encode(os.urandom(32)).decode()
+    preq = urllib.request.Request(
+        f"{base_url}/v1/agent/pair-request",
+        data=json.dumps({"public_key": pub_b64}).encode(),
+        headers={"Host": "127.0.0.1", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(preq, timeout=5) as resp:
+            return resp.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception:
+        return -1
+
+
 try:
     for _ in range(80):
         try:
@@ -242,21 +280,24 @@ try:
         raise RuntimeError(f"soak publishers did not register both lanes (route_id={route_id!r}, public_host={public_host!r})")
 
     start = time.time()
-    warmup_sec = min(args.warmup, max(0, args.duration // 3))
+    eff_warmup = min(warmup_sec, max(0, args.duration // 3))
+    eff_drain = min(drain_sec, max(0, args.duration // 3))
+    drain_start_t = args.duration - eff_drain
     reconnected = False
     last_upstream_hit = 0
     consecutive_429 = 0
     saw_429 = False
+    expired_still_pending_end = 0
 
     while time.time() - start < args.duration:
         elapsed = time.time() - start
+        in_drain = eff_drain > 0 and elapsed >= drain_start_t
 
         # Deliberate mid-soak disconnect + failure verification + reconnect on Lane 2 (data plane).
-        if not reconnected and elapsed >= max(3, args.duration / 2):
+        if not reconnected and elapsed >= max(3, (args.duration - eff_drain) / 2):
             pub_http_proc.terminate()
             pub_http_proc.wait(timeout=8)
             time.sleep(1)
-            # Confirm Lane 2 FAILS while publisher is disconnected (proving real data-plane traversal).
             disc_st, _ = probe_dataplane(public_host, "disconnected-check")
             if disc_st != 200:
                 counts["disconnect_failed_as_expected"] = True
@@ -303,34 +344,22 @@ try:
         else:
             counts["dataplane_unexpected_fail"] += 1
 
-        # 3. Pairing request lifecycle with 429 recovery tracking (never wedged permanently).
-        counts["pair_attempted"] += 1
-        pub_b64 = base64.b64encode(os.urandom(32)).decode()
-        preq = urllib.request.Request(
-            f"{base_url}/v1/agent/pair-request",
-            data=json.dumps({"public_key": pub_b64}).encode(),
-            headers={"Host": "127.0.0.1", "Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(preq, timeout=5) as resp:
-                if resp.status == 200:
-                    counts["pair_ok"] += 1
-                    if saw_429 and consecutive_429 > 0:
-                        counts["pair_recovered_after_429"] = True
-                    consecutive_429 = 0
-                else:
-                    counts["pair_unexpected_fail"] += 1
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
+        # 3. Pairing request lifecycle (paused during final drain window so pending rows expire & prune).
+        if not in_drain:
+            counts["pair_attempted"] += 1
+            pst = send_pair_request()
+            if pst == 200:
+                counts["pair_ok"] += 1
+                if saw_429:
+                    counts["pair_recovered_after_429"] = True
+                consecutive_429 = 0
+            elif pst == 429:
                 counts["pair_expected_429"] += 1
                 saw_429 = True
                 consecutive_429 += 1
                 counts["pair_max_consecutive_429"] = max(counts["pair_max_consecutive_429"], consecutive_429)
             else:
                 counts["pair_unexpected_fail"] += 1
-        except Exception:
-            counts["pair_unexpected_fail"] += 1
 
         st = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{hport}/health/status", timeout=3).read().decode())
         fd_count = len(os.listdir(f"/proc/{relay.pid}/fd"))
@@ -342,18 +371,24 @@ try:
                     break
         wal_path = os.path.join(db_dir, "ocliv.db-wal")
         wal_bytes = os.path.getsize(wal_path) if os.path.exists(wal_path) else 0
+        now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         pc = sqlite3.connect(f"file:{db_dir}/ocliv.db?mode=ro", uri=True)
         pending_pairings = pc.execute("SELECT COUNT(*) FROM pairing_requests WHERE status='pending'").fetchone()[0]
+        expired_still_pending_end = pc.execute(
+            "SELECT COUNT(*) FROM pairing_requests WHERE status='pending' AND expires_at < ?", (now_iso,)
+        ).fetchone()[0]
         pc.close()
 
         t_now = int(time.time() - start)
         sample = {
             "t": t_now,
-            "in_warmup": t_now < warmup_sec,
+            "in_warmup": t_now < eff_warmup,
+            "in_drain": in_drain,
             "fds": fd_count,
             "rss_kb": rss_kb,
             "wal_bytes": wal_bytes,
             "pending_pairings": pending_pairings,
+            "expired_still_pending": expired_still_pending_end,
             "process_ready": st.get("process_ready"),
             "active_sessions": st.get("active_sessions"),
         }
@@ -363,22 +398,59 @@ try:
         if rem > 0:
             time.sleep(min(args.sample_interval, max(1, int(rem))))
 
+    # Final post-drain recovery probe if drain window was active or if 429 was observed.
+    if eff_drain > 0 or (saw_429 and not counts["pair_recovered_after_429"]):
+        counts["pair_attempted"] += 1
+        final_pst = send_pair_request()
+        if final_pst == 200:
+            counts["pair_ok"] += 1
+            if saw_429:
+                counts["pair_recovered_after_429"] = True
+        elif final_pst == 429:
+            counts["pair_expected_429"] += 1
+        else:
+            counts["pair_unexpected_fail"] += 1
+
     post_warmup = [s for s in samples if not s["in_warmup"]] or samples
     base_n = min(3, len(post_warmup))
     fd_baseline = statistics.median([s["fds"] for s in post_warmup[:base_n]])
     rss_baseline = statistics.median([s["rss_kb"] for s in post_warmup[:base_n]])
     ts_post = [s["t"] for s in post_warmup]
+
+    # Derived pending-pairing bound: ceil(pairing_TTL / sample_interval) + conservative jitter.
+    expected_active_pairings = math.ceil(PAIRING_TTL_SEC / max(1, args.sample_interval))
+    allowed_pending_max = expected_active_pairings + 10
+
+    # Rolling-window comparison for long runs (>= 6 hours).
+    window_comparison = {}
+    if args.duration >= 21600 and len(post_warmup) >= 10:
+        t0 = post_warmup[0]["t"]
+        t_end = post_warmup[-1]["t"]
+        first_hr = [s for s in post_warmup if s["t"] <= t0 + 3600]
+        final_hr = [s for s in post_warmup if s["t"] >= t_end - 3600]
+        if first_hr and final_hr:
+            window_comparison = {
+                "first_hour_fd_median": statistics.median([s["fds"] for s in first_hr]),
+                "final_hour_fd_median": statistics.median([s["fds"] for s in final_hr]),
+                "first_hour_rss_median": statistics.median([s["rss_kb"] for s in first_hr]),
+                "final_hour_rss_median": statistics.median([s["rss_kb"] for s in final_hr]),
+            }
+
     stats = {
-        "warmup_sec": warmup_sec,
+        "warmup_sec": eff_warmup,
+        "drain_sec": eff_drain,
         "post_warmup_samples": len(post_warmup),
         "fd_baseline": fd_baseline,
         "rss_kb_baseline": rss_baseline,
         "fds": series_stats([s["fds"] for s in post_warmup], ts_post),
         "rss_kb": series_stats([s["rss_kb"] for s in post_warmup], ts_post),
+        "window_comparison": window_comparison,
         "wal_max_bytes": max(s["wal_bytes"] for s in samples) if samples else 0,
         "wal_end_bytes": samples[-1]["wal_bytes"] if samples else 0,
+        "allowed_pending_max": allowed_pending_max,
         "pending_pairings_max": max(s["pending_pairings"] for s in samples) if samples else 0,
         "pending_pairings_end": samples[-1]["pending_pairings"] if samples else 0,
+        "expired_still_pending_end": expired_still_pending_end,
     }
 
     failures = []
@@ -397,23 +469,40 @@ try:
             failures.append("mid-soak publisher reconnect did not restore Lane 2 data plane")
     if samples and samples[-1]["active_sessions"] != 2:
         failures.append(f"final active_sessions={samples[-1]['active_sessions']}, want baseline 2")
-    if saw_429 and not counts["pair_recovered_after_429"] and counts["pair_max_consecutive_429"] >= 10:
-        failures.append(f"pairing limiter wedged: {counts['pair_max_consecutive_429']} consecutive 429s without recovery")
-    if stats["pending_pairings_max"] > 500:
-        failures.append(f"pending_pairings exceeded bound: max={stats['pending_pairings_max']}")
+    # Deterministic 429 recovery invariant: any observed 429 MUST be followed by a 200 before pass.
+    if saw_429 and not counts["pair_recovered_after_429"]:
+        failures.append(f"pairing 429 occurred ({counts['pair_expected_429']}x) with no subsequent 200 recovery")
+    if stats["pending_pairings_max"] > allowed_pending_max:
+        failures.append(f"pending_pairings exceeded derived bound: max={stats['pending_pairings_max']} > allowed={allowed_pending_max}")
+    if eff_drain >= PAIRING_TTL_SEC:
+        if expired_still_pending_end > 0:
+            failures.append(f"drain failed: expired_still_pending={expired_still_pending_end} > 0")
+        if stats["pending_pairings_end"] > 2:
+            failures.append(f"drain failed: pending_pairings_end={stats['pending_pairings_end']} did not return near zero")
     if stats["fds"]["max"] > fd_baseline + 24:
         failures.append(f"FD growth exceeded bound: baseline={fd_baseline} max={stats['fds']['max']}")
     if stats["wal_max_bytes"] > 32 * 1024 * 1024:
         failures.append(f"WAL exceeded 32 MiB bound: max={stats['wal_max_bytes']}")
     if stats["rss_kb"]["max"] > rss_baseline * 2 + 32768:
         failures.append(f"RSS growth exceeded bound: baseline={rss_baseline}KB max={stats['rss_kb']['max']}KB")
+    # Rolling-window trend gate for long soaks (>= 6 hours).
+    if window_comparison:
+        if window_comparison["final_hour_fd_median"] > window_comparison["first_hour_fd_median"] + 8:
+            failures.append(f"FD rolling-window growth: {window_comparison['first_hour_fd_median']} -> {window_comparison['final_hour_fd_median']}")
+        if window_comparison["final_hour_rss_median"] > window_comparison["first_hour_rss_median"] * 1.5 + 32768:
+            failures.append(f"RSS rolling-window growth: {window_comparison['first_hour_rss_median']}KB -> {window_comparison['final_hour_rss_median']}KB")
+        if stats["fds"]["slope_per_hour"] > 0.5:
+            failures.append(f"sustained positive FD slope: {stats['fds']['slope_per_hour']}/hr")
 
     receipt = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "release_gate": bool(args.release_gate),
         "candidate_commit": ver_info.get("build_commit") or ver_info.get("commit") or "",
         "binary_sha256": bin_sha,
         "schema_version": ver_info.get("schema_version"),
         "duration_sec": args.duration,
+        "warmup_sec": eff_warmup,
+        "drain_sec": eff_drain,
         "sample_interval_sec": args.sample_interval,
         "counts": counts,
         "stats": stats,

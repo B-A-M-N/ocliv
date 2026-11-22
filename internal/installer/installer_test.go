@@ -92,6 +92,8 @@ func TestFetchManifestSignedVerifies(t *testing.T) {
 		ReleaseSequence: 1,
 		Commit:          "abc123",
 		Dirty:           false,
+		ProtocolVersion: "ocliv/1",
+		SchemaVersion:   22,
 		Govulncheck:     "pass",
 		Artifacts:       map[string]ArtifactEntry{"ocliv-linux-amd64": {SHA256: "deadbeef"}},
 	}
@@ -412,11 +414,19 @@ func TestFetchManifestSignedRejectsMissingVersionOrSequence(t *testing.T) {
 	}{
 		{
 			name: "missing manifest_version",
-			m:    ReleaseManifest{ReleaseSequence: 10, Commit: "abc", Govulncheck: "pass", Artifacts: map[string]ArtifactEntry{"ocliv-linux-amd64": {SHA256: "deadbeef"}}},
+			m:    ReleaseManifest{ReleaseSequence: 10, Commit: "abc", ProtocolVersion: "ocliv/1", SchemaVersion: 22, Govulncheck: "pass", Artifacts: map[string]ArtifactEntry{"ocliv-linux-amd64": {SHA256: "deadbeef"}}},
 		},
 		{
 			name: "missing release_sequence",
-			m:    ReleaseManifest{ManifestVersion: 1, Commit: "abc", Govulncheck: "pass", Artifacts: map[string]ArtifactEntry{"ocliv-linux-amd64": {SHA256: "deadbeef"}}},
+			m:    ReleaseManifest{ManifestVersion: 1, Commit: "abc", ProtocolVersion: "ocliv/1", SchemaVersion: 22, Govulncheck: "pass", Artifacts: map[string]ArtifactEntry{"ocliv-linux-amd64": {SHA256: "deadbeef"}}},
+		},
+		{
+			name: "missing schema_version",
+			m:    ReleaseManifest{ManifestVersion: 1, ReleaseSequence: 10, Commit: "abc", ProtocolVersion: "ocliv/1", Govulncheck: "pass", Artifacts: map[string]ArtifactEntry{"ocliv-linux-amd64": {SHA256: "deadbeef"}}},
+		},
+		{
+			name: "missing protocol_version",
+			m:    ReleaseManifest{ManifestVersion: 1, ReleaseSequence: 10, Commit: "abc", SchemaVersion: 22, Govulncheck: "pass", Artifacts: map[string]ArtifactEntry{"ocliv-linux-amd64": {SHA256: "deadbeef"}}},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -487,11 +497,10 @@ func TestInstallClientScriptMultiKeyRotationAndPinning(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Build a fake ocliv executable that responds to `version --json` with the commit.
+	// Build a fake ocliv executable that responds to `version --json` with full metadata.
 	const commitSHA = "deadbeef1234567890"
-	fakeBin := []byte(fmt.Sprintf("#!/bin/sh\necho '{\"version\":\"0.0.0-test\",\"build_commit\":\"%s\",\"schema_version\":22}'\n", commitSHA))
-	binSum := sha256.Sum256(fakeBin)
-	binHex := hex.EncodeToString(binSum[:])
+	goodBin := []byte(fmt.Sprintf("#!/bin/sh\necho '{\"version\":\"0.0.0-test\",\"build_commit\":\"%s\",\"dirty\":false,\"protocol_version\":\"ocliv/1\",\"schema_version\":22}'\n", commitSHA))
+	curBin := goodBin
 	artifact := ArtifactName(runtime.GOOS, runtime.GOARCH)
 
 	var curManifest []byte
@@ -503,14 +512,16 @@ func TestInstallClientScriptMultiKeyRotationAndPinning(t *testing.T) {
 		case "/.well-known/ocliv-release-manifest.json.sig":
 			_, _ = w.Write([]byte(curSig))
 		case "/.well-known/ocliv-artifacts/" + artifact:
-			_, _ = w.Write(fakeBin)
+			_, _ = w.Write(curBin)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer srv.Close()
 
-	makeSigned := func(signingKeyID string, seq int64, signer ed25519.PrivateKey) ([]byte, string) {
+	makeSignedFull := func(signingKeyID string, seq int64, schema int, proto string, bin []byte, signer ed25519.PrivateKey) ([]byte, string) {
+		curBin = bin
+		sum := sha256.Sum256(bin)
 		m := map[string]any{
 			"manifest_version": 1,
 			"release_sequence": seq,
@@ -518,8 +529,14 @@ func TestInstallClientScriptMultiKeyRotationAndPinning(t *testing.T) {
 			"dirty":            false,
 			"govulncheck":      "pass",
 			"artifacts": map[string]any{
-				artifact: map[string]any{"sha256": binHex},
+				artifact: map[string]any{"sha256": hex.EncodeToString(sum[:])},
 			},
+		}
+		if schema > 0 {
+			m["schema_version"] = schema
+		}
+		if proto != "" {
+			m["protocol_version"] = proto
 		}
 		if signingKeyID != "" {
 			m["signing_key_id"] = signingKeyID
@@ -528,6 +545,9 @@ func TestInstallClientScriptMultiKeyRotationAndPinning(t *testing.T) {
 		raw = append(raw, '\n')
 		sig := hex.EncodeToString(ed25519.Sign(signer, raw))
 		return raw, sig
+	}
+	makeSigned := func(signingKeyID string, seq int64, signer ed25519.PrivateKey) ([]byte, string) {
+		return makeSignedFull(signingKeyID, seq, 22, "ocliv/1", goodBin, signer)
 	}
 
 	runInstall := func(instDir string, extraEnv ...string) (int, string) {
@@ -607,6 +627,42 @@ func TestInstallClientScriptMultiKeyRotationAndPinning(t *testing.T) {
 	curManifest, curSig = makeSigned("active-n-key", 20, privActive)
 	if rc, out := runInstall(symDir); rc == 0 {
 		t.Fatalf("symlink .ocliv-release-seq should fail, got rc=0: %s", out)
+	}
+
+	// 11. Fail-closed negatives: missing dirty, malformed dirty, missing schema_version, missing protocol_version.
+	missingDirtyBin := []byte(fmt.Sprintf("#!/bin/sh\necho '{\"version\":\"0.0.0-test\",\"build_commit\":\"%s\",\"protocol_version\":\"ocliv/1\",\"schema_version\":22}'\n", commitSHA))
+	curManifest, curSig = makeSignedFull("active-n-key", 30, 22, "ocliv/1", missingDirtyBin, privActive)
+	if rc, out := runInstall(instDir); rc == 0 {
+		t.Fatalf("binary missing dirty field should fail, got rc=0: %s", out)
+	}
+
+	malformedDirtyBin := []byte(fmt.Sprintf("#!/bin/sh\necho '{\"version\":\"0.0.0-test\",\"build_commit\":\"%s\",\"dirty\":\"no\",\"protocol_version\":\"ocliv/1\",\"schema_version\":22}'\n", commitSHA))
+	curManifest, curSig = makeSignedFull("active-n-key", 30, 22, "ocliv/1", malformedDirtyBin, privActive)
+	if rc, out := runInstall(instDir); rc == 0 {
+		t.Fatalf("binary with malformed dirty field should fail, got rc=0: %s", out)
+	}
+
+	curManifest, curSig = makeSignedFull("active-n-key", 30, 0, "ocliv/1", goodBin, privActive)
+	if rc, out := runInstall(instDir); rc == 0 {
+		t.Fatalf("manifest missing schema_version should fail, got rc=0: %s", out)
+	}
+
+	curManifest, curSig = makeSignedFull("active-n-key", 30, 22, "", goodBin, privActive)
+	if rc, out := runInstall(instDir); rc == 0 {
+		t.Fatalf("manifest missing protocol_version should fail, got rc=0: %s", out)
+	}
+}
+
+func TestValidateBinaryCandidateRejectsMissingDirty(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only")
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake")
+	_ = os.WriteFile(bin, []byte("#!/bin/sh\necho '{\"version\":\"1.0.0\",\"build_commit\":\"abc\",\"protocol_version\":\"ocliv/1\",\"schema_version\":22}'\n"), 0o755)
+	m := &ReleaseManifest{Commit: "abc", ProtocolVersion: "ocliv/1", SchemaVersion: 22}
+	if err := ValidateBinaryCandidate(context.Background(), bin, m); err == nil {
+		t.Fatal("ValidateBinaryCandidate must reject binary missing dirty field")
 	}
 }
 

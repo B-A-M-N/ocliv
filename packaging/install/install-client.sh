@@ -277,7 +277,11 @@ fi
 EXPECTED_COMMIT="$(_json_str commit)"
 [ -n "$EXPECTED_COMMIT" ] || die "refusing installation: manifest 'commit' field missing"
 EXPECTED_SCHEMA="$(_json_int schema_version || true)"
+case "$EXPECTED_SCHEMA" in
+    ''|0|*[!0-9]*) die "refusing installation: manifest 'schema_version' missing or invalid (got '${EXPECTED_SCHEMA:-missing}')" ;;
+esac
 EXPECTED_PROTOCOL="$(_json_str protocol_version || true)"
+[ -n "$EXPECTED_PROTOCOL" ] || die "refusing installation: manifest 'protocol_version' field missing"
 
 # Extract SHA256 for the target artifact from the artifacts block (handles both
 # compact and multi-line pretty-printed JSON).
@@ -320,9 +324,9 @@ info "SHA256 verified"
 
 chmod 755 "$TMPFILE"
 
-# Comprehensive candidate validator: verifies version --json succeeds, version is
-# non-empty, dirty=false, commit matches EXPECTED_COMMIT, and schema/protocol
-# match the authenticated manifest when declared. Sets VERIFIED_VERSION.
+# Comprehensive candidate validator: fails closed unless version --json succeeds,
+# version is non-empty, dirty is explicitly false, commit matches EXPECTED_COMMIT,
+# schema_version matches EXPECTED_SCHEMA, and protocol_version matches EXPECTED_PROTOCOL.
 VERIFIED_VERSION=""
 _verify_binary() {
     _bin="$1"
@@ -331,10 +335,8 @@ _verify_binary() {
         | sed 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1)"
     [ -n "$_bver" ] || return 1
     _bdirty="$(printf '%s\n' "$_vjson" | tr ',' '\n' | grep '"dirty"' \
-        | sed 's/.*"dirty"[[:space:]]*:[[:space:]]*\([a-z]*\).*/\1/' | head -1 || true)"
-    if [ "$_bdirty" = "true" ]; then
-        return 1
-    fi
+        | sed 's/.*"dirty"[[:space:]]*:[[:space:]]*\([a-zA-Z0-9"]*\)[^a-zA-Z0-9"]*.*/\1/' | head -1 || true)"
+    [ "$_bdirty" = "false" ] || return 1
     _bcommit="$(printf '%s\n' "$_vjson" | tr ',' '\n' | grep '"build_commit"' \
         | sed 's/.*"build_commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1)"
     if [ -z "$_bcommit" ]; then
@@ -342,16 +344,12 @@ _verify_binary() {
             | sed 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1)"
     fi
     [ -n "$_bcommit" ] && [ "$_bcommit" = "$EXPECTED_COMMIT" ] || return 1
-    if [ -n "$EXPECTED_SCHEMA" ]; then
-        _bschema="$(printf '%s\n' "$_vjson" | tr ',' '\n' | grep '"schema_version"' \
-            | sed 's/.*"schema_version"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/' | head -1 || true)"
-        [ "$_bschema" = "$EXPECTED_SCHEMA" ] || return 1
-    fi
-    if [ -n "$EXPECTED_PROTOCOL" ]; then
-        _bproto="$(printf '%s\n' "$_vjson" | tr ',' '\n' | grep '"protocol_version"' \
-            | sed 's/.*"protocol_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1 || true)"
-        [ "$_bproto" = "$EXPECTED_PROTOCOL" ] || return 1
-    fi
+    _bschema="$(printf '%s\n' "$_vjson" | tr ',' '\n' | grep '"schema_version"' \
+        | sed 's/.*"schema_version"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/' | head -1 || true)"
+    [ "$_bschema" = "$EXPECTED_SCHEMA" ] || return 1
+    _bproto="$(printf '%s\n' "$_vjson" | tr ',' '\n' | grep '"protocol_version"' \
+        | sed 's/.*"protocol_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1 || true)"
+    [ "$_bproto" = "$EXPECTED_PROTOCOL" ] || return 1
     VERIFIED_VERSION="$_bver"
     return 0
 }
