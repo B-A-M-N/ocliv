@@ -123,7 +123,7 @@ if command -v cyclonedx-gomod >/dev/null 2>&1; then
   SBOM_FILE="sbom.cdx.json"
   SBOM_TOOL="cyclonedx-gomod"
   SBOM_TOOL_VERSION="$(cyclonedx-gomod version 2>/dev/null | head -1 || echo unknown)"
-  GOFLAGS="-buildvcs=false" cyclonedx-gomod app -json -output "$OUT/$SBOM_FILE" -main ./cmd/ocliv .
+  GOFLAGS="-buildvcs=false" cyclonedx-gomod mod -json -output "$OUT/$SBOM_FILE" .
 else
   if [ "$PRODUCTION_MODE" -eq 1 ] || [ "$ALLOW_MISSING_TOOLS" -eq 0 ]; then
     echo "error: canonical SBOM generator cyclonedx-gomod is not installed (install: go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest)" >&2
