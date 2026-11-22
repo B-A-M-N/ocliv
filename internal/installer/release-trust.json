@@ -2,8 +2,8 @@
   "schema_version": 1,
   "keys": [
     {
-      "id": "release-2026-v1-placeholder",
-      "ed25519": "0000000000000000000000000000000000000000000000000000000000000000",
+      "id": "release-2026-v1",
+      "ed25519": "219093940b4311b518f3d5c0a2b4f851a7ccbf510bec5d8963f41e5dbb3a714b",
       "status": "active"
     }
   ]

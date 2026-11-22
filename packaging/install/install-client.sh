@@ -16,7 +16,7 @@ die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 info() { printf 'info: %s\n' "$*"; }
 
 # BEGIN GENERATED TRUST ROOT (from internal/installer/release-trust.json)
-TRUSTED_RELEASE_KEYS='release-2026-v1-placeholder|active|0000000000000000000000000000000000000000000000000000000000000000'
+TRUSTED_RELEASE_KEYS='release-2026-v1|active|219093940b4311b518f3d5c0a2b4f851a7ccbf510bec5d8963f41e5dbb3a714b'
 # END GENERATED TRUST ROOT
 # Test-only trust override (ONLY honored when OCLIV_ALLOW_TEST_TRUST=1 AND
 # OCLIV_ENV=development AND RELAY_URL is loopback).
