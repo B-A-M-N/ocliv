@@ -302,6 +302,7 @@ esac
 # Enforce anti-rollback & immutable identity against SEQ_FILE before downloading.
 if [ -f "$SEQ_FILE" ]; then
     _seq_raw="$(cat "$SEQ_FILE" || true)"
+    _is_legacy_seq=0
     case "$_seq_raw" in
         *{*)
             PREV_SEQ="$(printf '%s\n' "$_seq_raw" | tr ',' '\n' | grep '"release_sequence"' \
@@ -310,8 +311,12 @@ if [ -f "$SEQ_FILE" ]; then
                 | sed 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1 || true)"
             PREV_SHA="$(printf '%s\n' "$_seq_raw" | tr ',' '\n' | grep '"artifact_sha256"' \
                 | sed 's/.*"artifact_sha256"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1 || true)"
+            if [ -z "$PREV_COMMIT" ] || [ -z "$PREV_SHA" ]; then
+                die "incomplete JSON release sequence file $SEQ_FILE (missing commit or artifact_sha256)"
+            fi
             ;;
         *)
+            _is_legacy_seq=1
             PREV_SEQ="$(printf '%s' "$_seq_raw" | tr -d ' \r\n')"
             PREV_COMMIT=""
             PREV_SHA=""
@@ -325,10 +330,13 @@ if [ -f "$SEQ_FILE" ]; then
             die "refusing release downgrade: manifest release_sequence=$RELEASE_SEQ < installed=$PREV_SEQ (set OCLIV_ALLOW_DOWNGRADE=1 to override)"
         fi
         if [ "$RELEASE_SEQ" -eq "$PREV_SEQ" ]; then
-            if [ -n "$PREV_COMMIT" ] && [ "$PREV_COMMIT" != "$EXPECTED_COMMIT" ]; then
+            if [ "$_is_legacy_seq" = "1" ]; then
+                die "refusing same release_sequence=$RELEASE_SEQ against legacy integer state (identity unverifiable; advance release_sequence)"
+            fi
+            if [ "$PREV_COMMIT" != "$EXPECTED_COMMIT" ]; then
                 die "refusing same release_sequence=$RELEASE_SEQ with different commit (installed=$PREV_COMMIT manifest=$EXPECTED_COMMIT)"
             fi
-            if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" != "$EXPECTED_SHA256" ]; then
+            if [ "$PREV_SHA" != "$EXPECTED_SHA256" ]; then
                 die "refusing same release_sequence=$RELEASE_SEQ with different artifact_sha256 (installed=$PREV_SHA manifest=$EXPECTED_SHA256)"
             fi
         fi

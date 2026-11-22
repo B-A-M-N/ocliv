@@ -370,25 +370,25 @@ func TestTrustRootParityWithInstallClientScript(t *testing.T) {
 
 func TestReleaseSequenceAntiRollback(t *testing.T) {
 	seqPath := filepath.Join(t.TempDir(), ".ocliv-release-seq")
-	if err := CheckReleaseSequence(seqPath, 100, false); err != nil {
+	if err := CheckReleaseSequenceIdentity(seqPath, 100, "c1", "s1", false); err != nil {
 		t.Fatalf("initial sequence should pass: %v", err)
 	}
-	if err := RecordReleaseSequence(seqPath, 100); err != nil {
+	if err := RecordReleaseSequenceIdentity(seqPath, 100, "c1", "s1"); err != nil {
 		t.Fatalf("record sequence: %v", err)
 	}
-	// Equal or higher sequence allowed.
-	if err := CheckReleaseSequence(seqPath, 100, false); err != nil {
-		t.Fatalf("equal sequence should pass: %v", err)
+	// Equal sequence with same identity or higher sequence allowed.
+	if err := CheckReleaseSequenceIdentity(seqPath, 100, "c1", "s1", false); err != nil {
+		t.Fatalf("equal sequence with identical identity should pass: %v", err)
 	}
-	if err := CheckReleaseSequence(seqPath, 200, false); err != nil {
+	if err := CheckReleaseSequenceIdentity(seqPath, 200, "c2", "s2", false); err != nil {
 		t.Fatalf("higher sequence should pass: %v", err)
 	}
 	// Lower sequence MUST be rejected without override.
-	if err := CheckReleaseSequence(seqPath, 99, false); err == nil {
+	if err := CheckReleaseSequenceIdentity(seqPath, 99, "c0", "s0", false); err == nil {
 		t.Fatal("lower release_sequence must be refused without allowDowngrade")
 	}
 	// Explicit override allows downgrade.
-	if err := CheckReleaseSequence(seqPath, 99, true); err != nil {
+	if err := CheckReleaseSequenceIdentity(seqPath, 99, "c0", "s0", true); err != nil {
 		t.Fatalf("explicit allowDowngrade should pass: %v", err)
 	}
 	// Symlink sequence file must be refused.
@@ -397,29 +397,35 @@ func TestReleaseSequenceAntiRollback(t *testing.T) {
 	_ = os.WriteFile(victim, []byte("1\n"), 0o600)
 	symSeq := filepath.Join(symDir, ".ocliv-release-seq")
 	_ = os.Symlink(victim, symSeq)
-	if err := CheckReleaseSequence(symSeq, 100, false); err == nil {
+	if err := CheckReleaseSequenceIdentity(symSeq, 100, "c1", "s1", false); err == nil {
 		t.Fatal("symlink release sequence file must be refused")
 	}
 	// Non-positive sequence must be refused.
-	if err := CheckReleaseSequence(seqPath, 0, false); err == nil {
+	if err := CheckReleaseSequenceIdentity(seqPath, 0, "c1", "s1", false); err == nil {
 		t.Fatal("non-positive release_sequence must be refused")
 	}
-	// Immutable identity on equal sequence: same identity allowed, different commit or SHA refused.
-	idSeqPath := filepath.Join(t.TempDir(), ".ocliv-release-seq")
-	if err := RecordReleaseSequenceIdentity(idSeqPath, 50, "commit-a", "sha-a"); err != nil {
-		t.Fatalf("record identity: %v", err)
-	}
-	if err := CheckReleaseSequenceIdentity(idSeqPath, 50, "commit-a", "sha-a", false); err != nil {
-		t.Fatalf("idempotent reinstall with identical identity should pass: %v", err)
-	}
-	if err := CheckReleaseSequenceIdentity(idSeqPath, 50, "commit-b", "sha-a", false); err == nil {
+	// Immutable identity on equal sequence: different commit or SHA refused.
+	if err := CheckReleaseSequenceIdentity(seqPath, 100, "c-other", "s1", false); err == nil {
 		t.Fatal("same release_sequence with different commit must be refused")
 	}
-	if err := CheckReleaseSequenceIdentity(idSeqPath, 50, "commit-a", "sha-b", false); err == nil {
+	if err := CheckReleaseSequenceIdentity(seqPath, 100, "c1", "s-other", false); err == nil {
 		t.Fatal("same release_sequence with different artifact_sha256 must be refused")
 	}
-	if err := CheckReleaseSequenceIdentity(idSeqPath, 51, "commit-b", "sha-b", false); err != nil {
-		t.Fatalf("higher sequence with new identity should pass: %v", err)
+	// Legacy plain-integer state: equal sequence MUST be rejected (unverifiable identity),
+	// higher sequence allowed and migrates cleanly to JSON.
+	legPath := filepath.Join(t.TempDir(), ".ocliv-release-seq")
+	_ = os.WriteFile(legPath, []byte("266\n"), 0o644)
+	if err := CheckReleaseSequenceIdentity(legPath, 266, "c1", "s1", false); err == nil {
+		t.Fatal("equal release_sequence against legacy integer state must be refused")
+	}
+	if err := CheckReleaseSequenceIdentity(legPath, 267, "c1", "s1", false); err != nil {
+		t.Fatalf("higher release_sequence against legacy integer state should pass: %v", err)
+	}
+	// Incomplete JSON state (missing commit/artifact_sha256) must be treated as corrupt.
+	incPath := filepath.Join(t.TempDir(), ".ocliv-release-seq")
+	_ = os.WriteFile(incPath, []byte(`{"release_sequence":266}`+"\n"), 0o644)
+	if err := CheckReleaseSequenceIdentity(incPath, 267, "c1", "s1", false); err == nil {
+		t.Fatal("incomplete JSON release sequence file must be refused")
 	}
 }
 
@@ -679,6 +685,23 @@ func TestInstallClientScriptMultiKeyRotationAndPinning(t *testing.T) {
 	curManifest, curSig = makeSignedFull("active-n-key", 20, 22, "ocliv/1", altBin, privActive)
 	if rc, out := runInstall(instDir); rc == 0 {
 		t.Fatalf("same release_sequence=20 with different artifact_sha256 must be rejected, got rc=0: %s", out)
+	}
+
+	// 13. Legacy plain-integer .ocliv-release-seq: equal seq rejected, higher seq migrates to JSON.
+	legDir := filepath.Join(tmpDir, "leg-inst")
+	_ = os.MkdirAll(legDir, 0o755)
+	_ = os.WriteFile(filepath.Join(legDir, ".ocliv-release-seq"), []byte("266\n"), 0o644)
+	curManifest, curSig = makeSignedFull("active-n-key", 266, 22, "ocliv/1", goodBin, privActive)
+	if rc, out := runInstall(legDir); rc == 0 {
+		t.Fatalf("equal release_sequence against legacy integer state must be rejected, got rc=0: %s", out)
+	}
+	curManifest, curSig = makeSignedFull("active-n-key", 267, 22, "ocliv/1", goodBin, privActive)
+	if rc, out := runInstall(legDir); rc != 0 {
+		t.Fatalf("higher release_sequence against legacy integer state should migrate cleanly, got rc=%d: %s", rc, out)
+	}
+	migratedSeq, _ := os.ReadFile(filepath.Join(legDir, ".ocliv-release-seq"))
+	if !strings.Contains(string(migratedSeq), `"commit":"`+commitSHA+`"`) {
+		t.Fatalf("expected migrated JSON release sequence file, got: %q", string(migratedSeq))
 	}
 }
 

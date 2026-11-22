@@ -23,9 +23,23 @@ import urllib.request
 parser = argparse.ArgumentParser(description="Ocliv transactionally consistent migration rehearsal")
 parser.add_argument("--bin", required=True, help="Path to candidate ocliv binary")
 parser.add_argument("--src-db", required=True, help="Path to source ocliv.db (read-only online snapshot)")
-parser.add_argument("--qualification-receipt", default="", help="Optional strict qualification receipt JSON to bind candidate provenance")
-parser.add_argument("--receipt-out", default="", help="Optional path to write provenance-bound JSON receipt")
+parser.add_argument("--qualification-receipt", default="", help="Strict qualification receipt JSON to bind candidate provenance (required with --production-gate)")
+parser.add_argument("--expected-source-db", default="", help="Expected realpath of production source DB (required with --production-gate, e.g. /var/lib/ocliv/ocliv.db)")
+parser.add_argument("--production-gate", action="store_true", help="Enforce production migration gate (requires --qualification-receipt, --expected-source-db, --receipt-out)")
+parser.add_argument("--receipt-out", default="", help="Path to write provenance-bound JSON receipt (required with --production-gate)")
 args = parser.parse_args()
+
+if args.production_gate:
+    if not args.qualification_receipt:
+        raise SystemExit("--production-gate requires --qualification-receipt PATH")
+    if not args.expected_source_db:
+        raise SystemExit("--production-gate requires --expected-source-db PATH (e.g. /var/lib/ocliv/ocliv.db)")
+    if not args.receipt_out:
+        raise SystemExit("--production-gate requires --receipt-out PATH")
+    if os.path.realpath(args.src_db) != os.path.realpath(args.expected_source_db):
+        raise SystemExit(
+            f"--production-gate source DB mismatch: src={os.path.realpath(args.src_db)} != expected={os.path.realpath(args.expected_source_db)}"
+        )
 
 PASS, FAIL = [], []
 
@@ -158,11 +172,13 @@ work = tempfile.mkdtemp(prefix="ocliv-mig-rehearsal-")
 os.chmod(work, 0o700)
 receipt_data = {
     "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "production_gate": bool(args.production_gate),
     "reset_contract_version": RESET_CONTRACT_VERSION,
     "candidate_commit": cand_commit,
     "binary_sha256": bin_sha,
     "expected_schema": expected_schema,
     "src_db": os.path.realpath(args.src_db),
+    "source_db_realpath": os.path.realpath(args.src_db),
 }
 receipt_data.update(bound_provenance)
 

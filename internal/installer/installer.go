@@ -470,23 +470,31 @@ func CheckReleaseSequenceIdentity(seqPath string, seq int64, commit, artifactSHA
 	}
 	trimmed := strings.TrimSpace(string(raw))
 	var prev ReleaseSequenceState
+	isLegacyInt := false
 	if strings.HasPrefix(trimmed, "{") {
 		if jerr := json.Unmarshal([]byte(trimmed), &prev); jerr != nil || prev.ReleaseSequence <= 0 {
 			return fmt.Errorf("corrupt JSON release sequence file %s", seqPath)
+		}
+		if prev.Commit == "" || prev.ArtifactSHA256 == "" {
+			return fmt.Errorf("incomplete JSON release sequence file %s (missing commit or artifact_sha256)", seqPath)
 		}
 	} else {
 		if _, serr := fmt.Sscanf(trimmed, "%d", &prev.ReleaseSequence); serr != nil || prev.ReleaseSequence <= 0 {
 			return fmt.Errorf("corrupt release sequence file %s", seqPath)
 		}
+		isLegacyInt = true
 	}
 	if seq < prev.ReleaseSequence && !allowDowngrade {
 		return fmt.Errorf("refusing release downgrade: manifest release_sequence=%d < installed=%d", seq, prev.ReleaseSequence)
 	}
 	if seq == prev.ReleaseSequence && !allowDowngrade {
-		if prev.Commit != "" && commit != "" && prev.Commit != commit {
+		if isLegacyInt {
+			return fmt.Errorf("refusing same release_sequence=%d against legacy integer state (identity unverifiable; advance release_sequence)", seq)
+		}
+		if commit == "" || prev.Commit != commit {
 			return fmt.Errorf("refusing same release_sequence=%d with different commit (installed=%q manifest=%q)", seq, prev.Commit, commit)
 		}
-		if prev.ArtifactSHA256 != "" && artifactSHA != "" && !strings.EqualFold(prev.ArtifactSHA256, artifactSHA) {
+		if artifactSHA == "" || !strings.EqualFold(prev.ArtifactSHA256, artifactSHA) {
 			return fmt.Errorf("refusing same release_sequence=%d with different artifact_sha256 (installed=%q manifest=%q)", seq, prev.ArtifactSHA256, artifactSHA)
 		}
 	}

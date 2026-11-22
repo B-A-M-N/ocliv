@@ -1172,7 +1172,7 @@ for _rroot, _rdirs, _rfiles in os.walk(S):
         if _rel_dir == "release-bundle-stage":
             if _rf.startswith("ocliv-linux-") or _rf in ("release-manifest.json", "release-manifest.json.sig", "sbom.cdx.json", "go-module-inventory.json"):
                 continue
-        if _rel_dir == "." and (_rf in _ALLOWED_EXACT or _rf.endswith("-receipt.json")):
+        if _rel_dir == "." and _rf in _ALLOWED_EXACT:
             continue
         _unexpected_retained.append(_rel)
 check("I6: retained stage dir matches strict public allowlist (zero raw logs/keys/DBs/secrets)", len(_unexpected_retained) == 0, f"unexpected={_unexpected_retained}")
@@ -1185,6 +1185,7 @@ _receipt = {
     "ephemeral_state_retained": _ephemeral_retained,
     "scratch_cleanup_ok": _scratch_cleanup_ok,
     "candidate_commit": BIN_COMMIT,
+    "binary_sha256": BIN_SHA256,
     "qual_binary_sha256": BIN_SHA256,
     "signed_artifact_name": ARTIFACT_NAME,
     "signed_artifact_sha256": sha256_file(_bundle_art_path) if _bundle_art_path and os.path.isfile(_bundle_art_path) else "",
