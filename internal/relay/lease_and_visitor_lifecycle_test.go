@@ -488,7 +488,11 @@ func TestP1VisitorKeyRejectsSymlinkAndPermissiveMode(t *testing.T) {
 	}
 
 	dir2 := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir2, visitorKeyFileName), []byte(strings.Repeat("cd", 32)+"\n"), 0o644); err != nil {
+	keyPath2 := filepath.Join(dir2, visitorKeyFileName)
+	if err := os.WriteFile(keyPath2, []byte(strings.Repeat("cd", 32)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(keyPath2, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := LoadOrCreateVisitorKey(dir2); err == nil {
