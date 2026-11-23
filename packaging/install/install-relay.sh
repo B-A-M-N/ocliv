@@ -107,12 +107,25 @@ TMPDIR_WORK="$(mktemp -d "${TMPDIR:-/tmp}/ocliv-install.XXXXXX")"
 trap 'rm -rf "$TMPDIR_WORK"' EXIT
 
 MANIFEST="${TMPDIR_WORK}/release-manifest.json"
+SIG_RAW="${TMPDIR_WORK}/release-manifest.json.sig.raw"
 SIG="${TMPDIR_WORK}/release-manifest.json.sig"
 BIN="${TMPDIR_WORK}/${ARTIFACT}"
 
 info "fetching signed release manifest (${VERSION}) for ${ARTIFACT}..."
 _fetch "${BASE_URL}/release-manifest.json" "$MANIFEST"
-_fetch "${BASE_URL}/release-manifest.json.sig" "$SIG"
+_fetch "${BASE_URL}/release-manifest.json.sig" "$SIG_RAW"
+
+SIGLEN="$(wc -c < "$SIG_RAW" | tr -d ' ')"
+if [ "$SIGLEN" = "64" ]; then
+    cp "$SIG_RAW" "$SIG"
+else
+    SIGHEX="$(tr -d ' \t\r\n' < "$SIG_RAW")"
+    if [ "${#SIGHEX}" = "128" ]; then
+        printf '%s' "$SIGHEX" | _hex_to_bin > "$SIG"
+    else
+        die "manifest signature has unexpected length $SIGLEN (expected 64 raw bytes or 128 hex chars)"
+    fi
+fi
 
 VERIFIED=0
 OLD_IFS="$IFS"

@@ -87,11 +87,23 @@ if not key_hex:
 
 spki = bytes.fromhex("302a300506032b6570032100" + key_hex)
 pem = "-----BEGIN PUBLIC KEY-----\n" + base64.b64encode(spki).decode("ascii") + "\n-----END PUBLIC KEY-----\n"
-with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=True) as tf:
+raw_sig = pathlib.Path(sig_path).read_bytes()
+if len(raw_sig) != 64:
+    stripped = raw_sig.strip()
+    if len(stripped) == 128:
+        try:
+            raw_sig = bytes.fromhex(stripped.decode("ascii"))
+        except Exception as exc:
+            sys.exit(f"error: invalid hex signature in {sig_path}: {exc}")
+    else:
+        sys.exit(f"error: unexpected signature length {len(raw_sig)} in {sig_path} (want 64 raw bytes or 128 hex chars)")
+with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=True) as tf, tempfile.NamedTemporaryFile("wb", suffix=".sig", delete=True) as sf:
     tf.write(pem)
     tf.flush()
+    sf.write(raw_sig)
+    sf.flush()
     res = subprocess.run(
-        ["openssl", "pkeyutl", "-verify", "-pubin", "-inkey", tf.name, "-rawin", "-in", manifest_path, "-sigfile", sig_path],
+        ["openssl", "pkeyutl", "-verify", "-pubin", "-inkey", tf.name, "-rawin", "-in", manifest_path, "-sigfile", sf.name],
         capture_output=True, text=True,
     )
     if res.returncode != 0:
