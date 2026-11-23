@@ -1264,8 +1264,8 @@ func cmdRelayEnrollSSH(argv []string) int {
 		fmt.Fprintln(os.Stderr, "enroll-ssh: --target must be USER@HOST without leading '-' or whitespace")
 		return apperr.ExitCLIValidation
 	}
-	if profile != "" && (strings.HasPrefix(profile, "-") || strings.ContainsAny(profile, " \t\r\n")) {
-		fmt.Fprintln(os.Stderr, "enroll-ssh: invalid --profile")
+	if profile != "" && !validProfileName(profile) {
+		fmt.Fprintln(os.Stderr, "enroll-ssh: invalid --profile (must match ^[A-Za-z0-9._-]+$ without leading '-')")
 		return apperr.ExitCLIValidation
 	}
 	restrictFileCreation()
@@ -1280,11 +1280,7 @@ func cmdRelayEnrollSSH(argv []string) int {
 		fmt.Fprintln(os.Stderr, "error: "+err.Error())
 		return exitForRelayErr(err)
 	}
-	remoteArgs := []string{"--", target, "ocliv", "login", "--relay", relayURL, "--code-file", "-"}
-	if profile != "" {
-		remoteArgs = append(remoteArgs, "--profile", profile)
-	}
-	cmd := exec.Command("ssh", remoteArgs...)
+	cmd := exec.Command("ssh", "--", target, buildSSHLoginCommand(relayURL, profile))
 	cmd.Stdin = strings.NewReader(code + "\n")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

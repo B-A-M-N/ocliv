@@ -167,20 +167,21 @@ func (s *Server) ProtectedResourceMetadata() map[string]any {
 func (s *Server) AuthorizationServerMetadata() map[string]any {
 	base := s.IssuerURL
 	return map[string]any{
-		"issuer":                                     base,
-		"authorization_endpoint":                     base + "/authorize",
-		"token_endpoint":                             base + "/token",
-		"registration_endpoint":                      base + "/register",
-		"revocation_endpoint":                        base + "/revoke",
-		"jwks_uri":                                   base + "/jwks",
-		"response_types_supported":                   []string{"code"},
-		"response_modes_supported":                   []string{"query"},
-		"grant_types_supported":                      []string{"authorization_code", "refresh_token"},
-		"code_challenge_methods_supported":           []string{"S256"},
-		"scopes_supported":                           []string{"mcp:tools", "offline_access"},
-		"token_endpoint_auth_methods_supported":      []string{"none", "client_secret_basic", "client_secret_post"},
-		"revocation_endpoint_auth_methods_supported": []string{"none"},
-		"resource_indicators_supported":              true,
+		"issuer":                                         base,
+		"authorization_endpoint":                         base + "/authorize",
+		"token_endpoint":                                 base + "/token",
+		"registration_endpoint":                          base + "/register",
+		"revocation_endpoint":                            base + "/revoke",
+		"jwks_uri":                                       base + "/jwks",
+		"response_types_supported":                       []string{"code"},
+		"response_modes_supported":                       []string{"query"},
+		"grant_types_supported":                          []string{"authorization_code", "refresh_token"},
+		"code_challenge_methods_supported":               []string{"S256"},
+		"scopes_supported":                               []string{"mcp:tools", "offline_access"},
+		"token_endpoint_auth_methods_supported":          []string{"none", "client_secret_basic", "client_secret_post"},
+		"revocation_endpoint_auth_methods_supported":     []string{"none"},
+		"resource_indicators_supported":                  true,
+		"authorization_response_iss_parameter_supported": true,
 	}
 }
 
@@ -338,7 +339,13 @@ func (s *Server) ServeRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	registerFn := func() error {
 		if matchedPolicy != nil {
-			return s.Store.TryRegisterClientWithDirectGrant(client, s.tenant(), s.RouteID)
+			err := s.Store.TryRegisterClientWithTrustPolicy(client, s.tenant(), s.RouteID, matchedPolicy.ID)
+			if err == ErrTrustPolicyInactive {
+				// Policy was revoked or changed concurrently; fall back cleanly to pending.
+				matchedPolicy = nil
+				return s.Store.TryRegisterClientWithPendingGrant(client, s.tenant(), s.RouteID)
+			}
+			return err
 		}
 		return s.Store.TryRegisterClientWithPendingGrant(client, s.tenant(), s.RouteID)
 	}
@@ -460,6 +467,31 @@ func (s *Server) canAutoApproveClient(c *Client) bool {
 // fresh authorization renders the consent page, and only a completed consent
 // (the operator's single-use pairing credential against a one-time
 // challenge) mints a code. A revoked client is rejected outright.
+// redirectAuthorizationError emits an RFC 6749 §4.1.2.1 + RFC 9207 OAuth
+// authorization error redirect containing error, optional error_description,
+// original state, and exact iss. It MUST ONLY be called after client_id and
+// redirect_uri have been validated against the client's registered URIs.
+func redirectAuthorizationError(w http.ResponseWriter, r *http.Request, redirectURI, state, errCode, errDesc, issuerURL string) {
+	u, err := url.Parse(redirectURI)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errCode, "error_description": errDesc})
+		return
+	}
+	params := u.Query()
+	params.Set("error", errCode)
+	if errDesc != "" {
+		params.Set("error_description", errDesc)
+	}
+	if state != "" {
+		params.Set("state", state)
+	}
+	if issuerURL != "" {
+		params.Set("iss", issuerURL)
+	}
+	u.RawQuery = params.Encode()
+	http.Redirect(w, r, u.String(), http.StatusFound)
+}
+
 func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -474,23 +506,8 @@ func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 	challengeMethod := q.Get("code_challenge_method")
 	resource := q["resource"]
 
-	if responseType != "code" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported_response_type"})
-		return
-	}
-	grantedScope, err := normalizeGrantedScopes(q.Get("scope"))
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_scope", "error_description": err.Error()})
-		return
-	}
-	// MCP authorization spec + RFC 8707: the canonical resource is required
-	// and must be this route exactly. A token for another resource is never
-	// issued for this route.
-	if !hasExactResource(resource, s.RouteURL) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_target",
-			"error_description": "resource must be this route's canonical URL"})
-		return
-	}
+	// Step 1 (BEFORE redirect_uri is trusted): validate client and exact
+	// redirect_uri membership. Never redirect an attacker-controlled URI.
 	client, err := s.scopedClient(clientID)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_client"})
@@ -504,15 +521,34 @@ func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": err.Error()})
 		return
 	}
+
+	// Step 2 (AFTER client and redirect_uri are verified): OAuth authorization
+	// errors redirect back to redirect_uri with state and RFC 9207 `iss`.
+	if responseType != "code" {
+		redirectAuthorizationError(w, r, redirectURI, state, "unsupported_response_type", "only response_type=code is supported", s.IssuerURL)
+		return
+	}
+	grantedScope, err := normalizeGrantedScopes(q.Get("scope"))
+	if err != nil {
+		redirectAuthorizationError(w, r, redirectURI, state, "invalid_scope", err.Error(), s.IssuerURL)
+		return
+	}
+	// MCP authorization spec + RFC 8707: the canonical resource is required
+	// and must be this route exactly. A token for another resource is never
+	// issued for this route.
+	if !hasExactResource(resource, s.RouteURL) {
+		redirectAuthorizationError(w, r, redirectURI, state, "invalid_target", "resource must be this route's canonical URL", s.IssuerURL)
+		return
+	}
 	if challengeMethod != "S256" || challenge == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "PKCE S256 required"})
+		redirectAuthorizationError(w, r, redirectURI, state, "invalid_request", "PKCE S256 required", s.IssuerURL)
 		return
 	}
 	// The challenge must be a well-formed S256 value (RFC 7636 §4.2: the
 	// base64url encoding of a 32-byte SHA-256 digest). Anything else is
 	// rejected here rather than stored for the token step to discover.
 	if err := ValidateCodeChallengeS256(challenge); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": err.Error()})
+		redirectAuthorizationError(w, r, redirectURI, state, "invalid_request", err.Error(), s.IssuerURL)
 		return
 	}
 	grant, err := s.Store.GetGrant(clientID, s.tenant(), s.RouteID)
@@ -520,7 +556,7 @@ func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 		grant = nil
 	}
 	if grant != nil && grant.Status == GrantRevoked {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "access_denied", "error_description": "client revoked"})
+		redirectAuthorizationError(w, r, redirectURI, state, "access_denied", "client revoked", s.IssuerURL)
 		return
 	}
 	if exactOperatorApprovedBinding(grant, client, s.tenant(), s.RouteID, redirectURI) &&

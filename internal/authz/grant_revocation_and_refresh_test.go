@@ -325,7 +325,7 @@ func TestResourceParameterMustMatchRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	authorize := func(resource string) int {
+	authorize := func(resource string) (int, string) {
 		q := url.Values{}
 		q.Set("client_id", clientID)
 		q.Set("redirect_uri", "http://127.0.0.1:59999/cb")
@@ -338,31 +338,33 @@ func TestResourceParameterMustMatchRoute(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+q.Encode(), nil)
 		rec := httptest.NewRecorder()
 		s.ServeAuthorize(rec, req)
-		return rec.Code
+		return rec.Code, rec.Header().Get("Location")
 	}
 	// The canonical resource is required (MCP authorization spec) and must
-	// match the route exactly.
-	if code := authorize(""); code == http.StatusFound {
-		t.Fatal("authorize without resource was allowed")
+	// match the route exactly. Errors after redirect_uri verification return
+	// RFC 9207 error redirects with error=invalid_target, iss, and no code.
+	if code, loc := authorize(""); code != http.StatusFound || !strings.Contains(loc, "error=invalid_target") || strings.Contains(loc, "code=") {
+		t.Fatalf("authorize without resource = %d loc=%q, want error=invalid_target redirect without code", code, loc)
 	}
-	if code := authorize("https://evil.example/r/x/mcp"); code != http.StatusBadRequest {
-		t.Fatalf("authorize with a foreign resource = %d, want 400 invalid_target", code)
+	if code, loc := authorize("https://evil.example/r/x/mcp"); code != http.StatusFound || !strings.Contains(loc, "error=invalid_target") || strings.Contains(loc, "code=") {
+		t.Fatalf("authorize with a foreign resource = %d loc=%q, want error=invalid_target redirect without code", code, loc)
 	}
 	// The canonical resource is ACCEPTED. Every authorization goes through
 	// the consent page, so the success status is the consent page (200),
 	// not a redirect: the authorize request must carry only standard
 	// OAuth parameters.
-	if code := authorize(s.RouteURL); code != http.StatusOK {
+	if code, _ := authorize(s.RouteURL); code != http.StatusOK {
 		t.Fatalf("authorize with the canonical resource = %d, want 200 consent page", code)
 	}
 }
 
 func TestDuplicateResourceParametersRejected(t *testing.T) {
 	s, _, _ := newTestServer(t)
+	clientID := register(t, s, "https://client.example/cb")
 	foreign := "https://relay.test/r/other/mcp"
 
 	q := url.Values{}
-	q.Set("client_id", "client")
+	q.Set("client_id", clientID)
 	q.Set("redirect_uri", "https://client.example/cb")
 	q.Set("response_type", "code")
 	q.Set("code_challenge", CodeChallengeS256(pkceTestVerifier))
@@ -371,8 +373,9 @@ func TestDuplicateResourceParametersRejected(t *testing.T) {
 	q.Add("resource", foreign)
 	rec := httptest.NewRecorder()
 	s.ServeAuthorize(rec, httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+q.Encode(), nil))
-	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid_target") {
-		t.Fatalf("authorize accepted ambiguous resource parameters: status=%d body=%s", rec.Code, rec.Body.String())
+	loc := rec.Header().Get("Location")
+	if rec.Code != http.StatusFound || !strings.Contains(loc, "error=invalid_target") || strings.Contains(loc, "code=") {
+		t.Fatalf("authorize accepted ambiguous resource parameters: status=%d loc=%q body=%s", rec.Code, loc, rec.Body.String())
 	}
 
 	consent := url.Values{}

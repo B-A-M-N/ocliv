@@ -366,10 +366,14 @@ func TestAuthorizeRequiresPKCE(t *testing.T) {
 	client := register(t, s, "https://client.example/cb")
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/oauth/authorize?response_type=code&client_id="+client+
-		"&redirect_uri=https%3A%2F%2Fclient.example%2Fcb", nil)
+		"&redirect_uri=https%3A%2F%2Fclient.example%2Fcb&resource="+url.QueryEscape(s.RouteURL), nil)
 	s.ServeAuthorize(w, r)
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("missing PKCE: status=%d", w.Code)
+	if w.Code != http.StatusFound {
+		t.Fatalf("missing PKCE: status=%d, want 302 error redirect", w.Code)
+	}
+	loc, _ := url.Parse(w.Header().Get("Location"))
+	if loc.Query().Get("error") != "invalid_request" || loc.Query().Get("code") != "" || loc.Query().Get("iss") != s.IssuerURL {
+		t.Fatalf("missing PKCE redirect=%q, want error=invalid_request with iss and no code", loc.String())
 	}
 }
 
@@ -381,8 +385,12 @@ func TestAuthorizeRejectsWrongResource(t *testing.T) {
 		"&redirect_uri=https%3A%2F%2Fclient.example%2Fcb&code_challenge="+CodeChallengeS256("0123456789abcdefghijklmnopqrstuvwxyzABCDEFG")+
 		"&code_challenge_method=S256&resource=https%3A%2F%2Fother.test%2Fr%2Fx%2Fmcp", nil)
 	s.ServeAuthorize(w, r)
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("wrong resource: status=%d", w.Code)
+	if w.Code != http.StatusFound {
+		t.Fatalf("wrong resource: status=%d, want 302 error redirect", w.Code)
+	}
+	loc, _ := url.Parse(w.Header().Get("Location"))
+	if loc.Query().Get("error") != "invalid_target" || loc.Query().Get("code") != "" || loc.Query().Get("iss") != s.IssuerURL {
+		t.Fatalf("wrong resource redirect=%q, want error=invalid_target with iss and no code", loc.String())
 	}
 }
 

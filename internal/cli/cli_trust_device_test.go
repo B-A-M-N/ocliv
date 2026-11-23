@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -151,5 +152,45 @@ func TestDeviceAddValidation(t *testing.T) {
 	}
 	if code := cmdDevice([]string{"add", "--local-user", "-baduser", "--relay", "https://relay.example"}); code != apperr.ExitCLIValidation {
 		t.Fatalf("device add with invalid local-user exit=%d, want ExitCLIValidation", code)
+	}
+	for _, badProfile := range []string{"-lead", "a;id", "a&&id", "$(id)", "`id`", "a'b", `a"b`, "a b"} {
+		if validProfileName(badProfile) {
+			t.Fatalf("validProfileName(%q) = true, want false", badProfile)
+		}
+		if code := cmdDevice([]string{"add", "user@host", "--relay", "https://relay.example", "--profile", badProfile}); code != apperr.ExitCLIValidation {
+			t.Fatalf("device add with bad profile %q exit=%d, want ExitCLIValidation", badProfile, code)
+		}
+	}
+	for _, goodProfile := range []string{"default", "prod-1", "stage_2.0"} {
+		if !validProfileName(goodProfile) {
+			t.Fatalf("validProfileName(%q) = false, want true", goodProfile)
+		}
+	}
+}
+
+func TestSSHCommandQuotingPreservesLiteralArguments(t *testing.T) {
+	adversarial := []string{
+		"https://relay.example;touch /tmp/pwned",
+		"https://relay.example&&id",
+		"https://relay.example/$(id)",
+		"https://relay.example/`id`",
+		"https://relay.example/a'b\"c",
+	}
+	for _, payload := range adversarial {
+		// Execute the quoted command string via /bin/sh with printf to verify
+		// POSIX shell treats every adversarial byte as a single literal argument.
+		cmdStr := buildSSHCommandString("printf", "%s", payload)
+		out, err := exec.Command("/bin/sh", "-c", cmdStr).Output()
+		if err != nil {
+			t.Fatalf("sh -c %q failed: %v", cmdStr, err)
+		}
+		if string(out) != payload {
+			t.Fatalf("shell quoting altered payload: got %q, want %q", string(out), payload)
+		}
+		// Verify buildSSHInstallCommand downloads to a temp file before executing (no `curl | sh`).
+		inst := buildSSHInstallCommand(payload)
+		if strings.Contains(inst, "| sh") || !strings.Contains(inst, "mktemp") {
+			t.Fatalf("install command should use mktemp download-then-execute, got: %s", inst)
+		}
 	}
 }

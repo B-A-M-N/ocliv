@@ -262,15 +262,21 @@ func (s *SQLStore) TryRegisterClientWithPendingGrant(c Client, tenant, route str
 	return nil
 }
 
-// TryRegisterClientWithDirectGrant atomically enforces the per-route quota,
-// inserts the client, AND seeds an ACTIVE direct grant (skip_pairing=1) in one
-// transaction. Called only when an active route-scoped trust policy matches.
-func (s *SQLStore) TryRegisterClientWithDirectGrant(c Client, tenant, route string) error {
+// TryRegisterClientWithTrustPolicy atomically re-verifies that policyID is
+// still active, unrevoked, scoped to (tenant, route), and exact-matching
+// c.RedirectURIs inside the SAME SQL transaction that enforces the per-route
+// quota, inserts the client, and seeds the ACTIVE direct grant (skip_pairing=1).
+// If the policy was revoked concurrently, it rolls back and returns
+// ErrTrustPolicyInactive so ServeRegister can fall back to pending registration.
+func (s *SQLStore) TryRegisterClientWithTrustPolicy(c Client, tenant, route, policyID string) error {
 	if c.ID == "" {
 		return fmt.Errorf("authz: client id is required")
 	}
-	if tenant == "" || route == "" {
-		return fmt.Errorf("authz: tenant and route are required for direct grant")
+	if tenant == "" || route == "" || policyID == "" {
+		return ErrTrustPolicyInactive
+	}
+	if c.Tenant != tenant || c.Route != route {
+		return ErrTrustPolicyInactive
 	}
 	uris, err := json.Marshal(c.RedirectURIs)
 	if err != nil {
@@ -286,6 +292,32 @@ func (s *SQLStore) TryRegisterClientWithDirectGrant(c Client, tenant, route stri
 		return fmt.Errorf("authz: register tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	var (
+		polTenant   string
+		polRoute    string
+		polURIsJSON string
+		polEnabled  int
+		polRevoked  sql.NullString
+	)
+	err = tx.QueryRow(
+		`SELECT tenant_id, route_id, redirect_uris_json, enabled, revoked_at
+		 FROM authz_trust_policies WHERE id=?`,
+		policyID,
+	).Scan(&polTenant, &polRoute, &polURIsJSON, &polEnabled, &polRevoked)
+	if err == sql.ErrNoRows {
+		return ErrTrustPolicyInactive
+	}
+	if err != nil {
+		return fmt.Errorf("authz: verify trust policy: %w", err)
+	}
+	if polTenant != tenant || polRoute != route || polEnabled != 1 || polRevoked.Valid {
+		return ErrTrustPolicyInactive
+	}
+	var polURIs []string
+	if uerr := json.Unmarshal([]byte(polURIsJSON), &polURIs); uerr != nil || !ExactRedirectURISetEqual(polURIs, c.RedirectURIs) {
+		return ErrTrustPolicyInactive
+	}
 	var n int
 	if err := tx.QueryRow(
 		`SELECT COUNT(1) FROM authz_clients WHERE tenant_id=? AND route_id=?`,

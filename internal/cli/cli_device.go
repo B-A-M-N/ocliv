@@ -101,6 +101,59 @@ func validLocalUsername(u string) bool {
 	return true
 }
 
+// validProfileName constrains profile names to safe literal characters
+// matching ^[A-Za-z0-9._-]+$ (no leading '-').
+func validProfileName(p string) bool {
+	if p == "" || len(p) > 64 || strings.HasPrefix(p, "-") {
+		return false
+	}
+	for _, r := range p {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+// shellQuote wraps s in POSIX single quotes, escaping embedded single quotes
+// via '\” so every byte is treated literally by the remote POSIX shell.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// buildSSHCommandString joins argv into a single POSIX-shell-safe command
+// string so OpenSSH remote shell execution preserves exact argv boundaries.
+func buildSSHCommandString(args ...string) string {
+	quoted := make([]string, len(args))
+	for i, a := range args {
+		quoted[i] = shellQuote(a)
+	}
+	return strings.Join(quoted, " ")
+}
+
+// buildSSHLoginCommand builds the remote command string for `ocliv login`
+// reading the one-time enrollment code from stdin.
+func buildSSHLoginCommand(relayURL, profile string) string {
+	args := []string{"ocliv", "login", "--relay", relayURL, "--code-file", "-"}
+	if profile != "" {
+		args = append(args, "--profile", profile)
+	}
+	return buildSSHCommandString(args...)
+}
+
+// buildSSHInstallCommand builds a POSIX-shell-safe remote command string that
+// downloads the signed client bootstrap script to a temporary file, verifies
+// download success before execution, runs it with quoted arguments, and cleans
+// up the temporary file on exit.
+func buildSSHInstallCommand(relayURL string) string {
+	installURL := strings.TrimRight(relayURL, "/") + "/install-client.sh"
+	return fmt.Sprintf(
+		`tmp=$(mktemp) && trap 'rm -f "$tmp"' EXIT && curl -fsSL %s -o "$tmp" && sh "$tmp" --relay %s --yes`,
+		shellQuote(installURL),
+		shellQuote(relayURL),
+	)
+}
+
 func cmdDeviceAdd(argv []string) int {
 	_, dataDir, _ := relayFlags(argv)
 	var target, localUser, relayURL, tenant, profile string
@@ -173,8 +226,8 @@ func cmdDeviceAdd(argv []string) int {
 		fmt.Fprintf(os.Stderr, "device add: invalid --relay URL: %v\n", err)
 		return apperr.ExitCLIValidation
 	}
-	if profile != "" && (strings.HasPrefix(profile, "-") || strings.ContainsAny(profile, " \t\r\n")) {
-		fmt.Fprintln(os.Stderr, "device add: invalid --profile")
+	if profile != "" && !validProfileName(profile) {
+		fmt.Fprintln(os.Stderr, "device add: invalid --profile (must match ^[A-Za-z0-9._-]+$ without leading '-')")
 		return apperr.ExitCLIValidation
 	}
 	if tenant == "" {
@@ -269,8 +322,7 @@ func enrollSSHDevice(dataDir, relayURL, tenant, target, profile string, autoInst
 				fmt.Fprintf(os.Stderr, "Install it on %s first, or re-run with `--install` to download the signed client release from %s.\n", target, relayURL)
 				return apperr.ExitCLIValidation
 			}
-			installURL := strings.TrimRight(relayURL, "/") + "/install-client.sh"
-			installCmd := exec.Command("ssh", "--", target, "curl", "-fsSL", installURL, "|", "sh", "-s", "--", "--relay", relayURL, "--yes")
+			installCmd := exec.Command("ssh", "--", target, buildSSHInstallCommand(relayURL))
 			installCmd.Stdin = os.Stdin
 			installCmd.Stdout = os.Stdout
 			installCmd.Stderr = os.Stderr
@@ -296,11 +348,7 @@ func enrollSSHDevice(dataDir, relayURL, tenant, target, profile string, autoInst
 		return exitForRelayErr(err)
 	}
 
-	remoteArgs := []string{"--", target, "ocliv", "login", "--relay", relayURL, "--code-file", "-"}
-	if profile != "" {
-		remoteArgs = append(remoteArgs, "--profile", profile)
-	}
-	cmd := exec.Command("ssh", remoteArgs...)
+	cmd := exec.Command("ssh", "--", target, buildSSHLoginCommand(relayURL, profile))
 	cmd.Stdin = strings.NewReader(code + "\n")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

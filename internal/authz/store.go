@@ -41,6 +41,11 @@ const (
 // no safely evictable unapproved registration.
 var ErrClientQuota = fmt.Errorf("authz: route client quota exhausted")
 
+// ErrTrustPolicyInactive reports that a trust policy matched prior to
+// registration is no longer active, enabled, unrevoked, or exact-matching
+// inside the atomic registration transaction.
+var ErrTrustPolicyInactive = fmt.Errorf("authz: trust policy is inactive or revoked")
+
 // GrantStatus is the operator approval state of a client grant.
 type GrantStatus string
 
@@ -187,11 +192,12 @@ type Store interface {
 	// TryRegisterClientWithPendingGrant atomically registers a client and
 	// creates its initial GrantPending row in one transaction.
 	TryRegisterClientWithPendingGrant(c Client, tenant, route string) error
-	// TryRegisterClientWithDirectGrant atomically registers a client and
-	// creates an ACTIVE Grant with SkipPairing=true in one transaction.
-	// Used only when an active route-scoped ClientTrustPolicy matches the
-	// client's exact redirect_uris set.
-	TryRegisterClientWithDirectGrant(c Client, tenant, route string) error
+	// TryRegisterClientWithTrustPolicy atomically verifies that policyID is
+	// still active, unrevoked, scoped to (tenant, route), and exact-matching
+	// c.RedirectURIs, then registers the client and creates an ACTIVE Grant
+	// with SkipPairing=true in one transaction. Returns ErrTrustPolicyInactive
+	// if the policy was revoked or modified concurrently.
+	TryRegisterClientWithTrustPolicy(c Client, tenant, route, policyID string) error
 
 	// Trust policy management (route-scoped exact-redirect policies).
 	CreateTrustPolicy(p ClientTrustPolicy) error
@@ -1070,17 +1076,27 @@ func (m *MemStore) RevokeOpaqueRefreshForClient(clientID string) error {
 	return nil
 }
 
-// TryRegisterClientWithDirectGrant atomically registers a client and creates
-// its ACTIVE direct grant (SkipPairing=true).
-func (m *MemStore) TryRegisterClientWithDirectGrant(c Client, tenant, route string) error {
+// TryRegisterClientWithTrustPolicy atomically verifies policyID under the
+// store mutex, registers the client, and creates its ACTIVE direct grant.
+func (m *MemStore) TryRegisterClientWithTrustPolicy(c Client, tenant, route, policyID string) error {
 	if c.ID == "" {
 		return fmt.Errorf("authz: client id is required")
 	}
-	if tenant == "" || route == "" {
-		return fmt.Errorf("authz: tenant and route are required for direct grant")
+	if tenant == "" || route == "" || policyID == "" {
+		return ErrTrustPolicyInactive
+	}
+	if c.Tenant != tenant || c.Route != route {
+		return ErrTrustPolicyInactive
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	pol, ok := m.trustPolicies[policyID]
+	if !ok || !pol.Enabled || pol.RevokedAt != nil || pol.TenantID != tenant || pol.RouteID != route {
+		return ErrTrustPolicyInactive
+	}
+	if !ExactRedirectURISetEqual(pol.RedirectURIs, c.RedirectURIs) {
+		return ErrTrustPolicyInactive
+	}
 	if err := m.tryRegisterClientLocked(c); err != nil {
 		return err
 	}

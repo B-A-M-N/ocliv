@@ -6,7 +6,7 @@
 
 **Securely connect local MCP tools and web services to remote AI clients without exposing the machine running them.**
 
-![Go 1.24+](https://img.shields.io/badge/Go-1.24%2B-00ADD8?logo=go&logoColor=white)
+![Go 1.26+](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)
 ![Pure Go](https://img.shields.io/badge/CGO-disabled-4c1)
 ![OAuth 2.1 + PKCE](https://img.shields.io/badge/OAuth%202.1-PKCE%20S256-blueviolet)
 ![Architecture](https://img.shields.io/badge/Publisher-Outbound--Only-success)
@@ -197,7 +197,7 @@ Every managed MCP route (`ocliv-managed`) runs a route-scoped OAuth 2.1 Authoriz
 
 - **Default-deny registration:** Unknown Dynamic Client Registrations land in `pending` state and cannot mint tokens until approved.
 - **Route-scoped exact-redirect trust policies:** Running `ocliv host mcp 8765 --name tools --trust chatgpt` (or `ocliv trust tools chatgpt`) persists a durable trust policy scoped strictly to that `(tenant, route)` pinning ChatGPT's exact HTTPS callback (`https://chatgpt.com/connector_platform_oauth_redirect`). Any extra, wrong, non-HTTPS, cross-route, or cross-tenant redirect URI fails closed to pending approval.
-- **Full PKCE + audit trail:** Auto-approved registrations still enforce PKCE S256, route-bound RFC 8707 resource indicators, and emit a distinct `authz-auto-approve` audit event. Revoking the client or policy takes effect immediately.
+- **Full PKCE + audit trail:** Auto-approved registrations still enforce PKCE S256, route-bound RFC 8707 resource indicators, RFC 9207 `iss` parameters on authorization responses, and emit a distinct `authz-auto-approve` audit event. Revoking a trust policy (`ocliv untrust`) immediately stops **future** automatic approvals for new registrations; previously approved clients retain access until explicitly revoked with `ocliv revoke client <CLIENT_ID>`.
 
 See [docs/MCP-HOSTING.md](docs/MCP-HOSTING.md) for stdio bridging, upstream OAuth, and client integration details.
 
@@ -233,7 +233,7 @@ See [docs/SETUP.md](docs/SETUP.md), [docs/HOME-HOST.md](docs/HOME-HOST.md), [doc
 
 ## Development
 
-Requires Go 1.24+ (single Go module, `CGO_ENABLED=0`).
+Requires Go 1.26+ (single Go module, `CGO_ENABLED=0`).
 
 ```sh
 # Build binary:

@@ -161,8 +161,12 @@ func TestAutoApproveNeverResurrectsRevokedGrant(t *testing.T) {
 
 	w2 := httptest.NewRecorder()
 	s.ServeAuthorize(w2, httptest.NewRequest(http.MethodGet, u, nil))
-	if w2.Code != http.StatusBadRequest {
-		t.Fatalf("revoked authorize status=%d body=%s, want 400", w2.Code, w2.Body.String())
+	if w2.Code != http.StatusFound {
+		t.Fatalf("revoked authorize status=%d body=%s, want 302 access_denied redirect", w2.Code, w2.Body.String())
+	}
+	loc2, _ := url.Parse(w2.Header().Get("Location"))
+	if loc2.Query().Get("error") != "access_denied" || loc2.Query().Get("code") != "" || loc2.Query().Get("iss") != s.IssuerURL {
+		t.Fatalf("revoked authorize redirect=%q, want error=access_denied with iss and no code", loc2.String())
 	}
 	g, err := s.Store.GetGrant(clientID, s.tenant(), s.RouteID)
 	if err != nil || g.Status != GrantRevoked {
