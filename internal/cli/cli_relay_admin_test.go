@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 func seedAdminDB(t *testing.T, dir string) {

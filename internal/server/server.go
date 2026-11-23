@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"ocliv/internal/metrics"
+	"github.com/B-A-M-N/ocliv/internal/metrics"
 )
 
 // Health holds readiness and capacity status probes.

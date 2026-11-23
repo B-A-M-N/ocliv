@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/access"
+	"github.com/B-A-M-N/ocliv/internal/access"
 )
 
 // TestMCPUpstreamOAuthHeaderBoundary proves the header boundary on the

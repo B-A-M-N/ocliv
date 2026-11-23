@@ -23,7 +23,7 @@ import (
 	"errors"
 	"fmt"
 
-	"ocliv/internal/protocol"
+	"github.com/B-A-M-N/ocliv/internal/protocol"
 )
 
 // ErrLeaseOwnership marks the terminal denial an agent receives when the

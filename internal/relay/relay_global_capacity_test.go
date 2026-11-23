@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/limits"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/limits"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 // TestGlobalHTTPCapacity proves the global HTTP cap fires independently of

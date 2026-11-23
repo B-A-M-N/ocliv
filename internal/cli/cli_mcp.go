@@ -23,9 +23,9 @@ import (
 	"syscall"
 	"time"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/config"
-	"ocliv/internal/mcp"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/mcp"
 )
 
 // manageTools is the complete tool surface of `ocliv mcp manage`. It is a

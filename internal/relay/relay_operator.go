@@ -11,8 +11,8 @@ import (
 	"database/sql"
 	"time"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 // KeyInfo is one enrolled publisher identity for operator listing.

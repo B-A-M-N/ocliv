@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/access"
+	"github.com/B-A-M-N/ocliv/internal/access"
 )
 
 // TestRevokeDuringUseDeniesAfterCommit: with dozens of in-flight visitor

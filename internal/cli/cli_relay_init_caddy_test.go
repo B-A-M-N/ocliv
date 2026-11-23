@@ -14,7 +14,7 @@ import (
 	"strings"
 	"testing"
 
-	"ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
 )
 
 func generateSingleHost(t *testing.T) string {

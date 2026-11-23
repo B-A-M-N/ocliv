@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/agent"
-	"ocliv/internal/identity"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/agent"
+	"github.com/B-A-M-N/ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 func TestPass6P0_5RotateVisitorKeyPreservesOwner(t *testing.T) {

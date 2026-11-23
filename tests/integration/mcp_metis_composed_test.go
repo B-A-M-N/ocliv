@@ -18,7 +18,7 @@ import (
 	"strings"
 	"testing"
 
-	"ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/config"
 )
 
 // metisExpectedToolCount is the tool list Metis serves with the

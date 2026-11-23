@@ -13,7 +13,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 // managedRollbackFixture builds a live DB with an approved managed client

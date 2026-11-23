@@ -16,11 +16,11 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/agent"
-	"ocliv/internal/apperr"
-	"ocliv/internal/config"
-	"ocliv/internal/identity"
-	"ocliv/internal/server"
+	"github.com/B-A-M-N/ocliv/internal/agent"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/server"
 )
 
 func writeDerivedEnrollResponse(w http.ResponseWriter, r *http.Request, tenant string) {

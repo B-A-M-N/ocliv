@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	mcpadapter "github.com/B-A-M-N/ocliv/internal/mcp"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
-	"ocliv/internal/apperr"
-	mcpadapter "ocliv/internal/mcp"
 )
 
 // Publication tiers (P1-D) must never report active unless the relay

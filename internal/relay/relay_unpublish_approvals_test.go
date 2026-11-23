@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/authz"
-	"ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/authz"
+	"github.com/B-A-M-N/ocliv/internal/lease"
 )
 
 // TestUnpublishRetiresRouteApprovals is the failing-first regression for a

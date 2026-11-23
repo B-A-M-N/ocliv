@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/lease"
 )
 
 // postChallenge drives the mux-level challenge endpoint as a loopback

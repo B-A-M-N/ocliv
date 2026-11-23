@@ -32,8 +32,8 @@ import (
 
 	"github.com/hashicorp/yamux"
 
-	"ocliv/internal/limits"
-	"ocliv/internal/protocol"
+	"github.com/B-A-M-N/ocliv/internal/limits"
+	"github.com/B-A-M-N/ocliv/internal/protocol"
 )
 
 // hijackRecorder is an http.ResponseWriter whose connection the test can

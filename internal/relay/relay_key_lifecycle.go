@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/identity"
 )
 
 // handleAgentKeyRotate atomically enrolls a replacement Ed25519 public key

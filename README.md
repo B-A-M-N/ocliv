@@ -10,6 +10,7 @@
 ![Pure Go](https://img.shields.io/badge/CGO-disabled-4c1)
 ![OAuth 2.1 + PKCE](https://img.shields.io/badge/OAuth%202.1-PKCE%20S256-blueviolet)
 ![Architecture](https://img.shields.io/badge/Publisher-Outbound--Only-success)
+![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-blue)
 
 Ocliv is a self-hosted secure tunnel and MCP publishing platform that turns local services into persistent HTTPS endpoints without exposing inbound ports on the machine running them. It combines outbound-only tunnels, durable service identities, managed OAuth for MCP, and immediate revocation behind one CLI.
 
@@ -40,6 +41,18 @@ Trusted clients: ChatGPT
 
 Ready.
 ```
+
+---
+
+## Platform Support
+
+| Component | Linux | macOS | Windows |
+|---|---:|---:|---:|
+| Relay (`ocliv setup` / `ocliv relay serve`) | ✅ Supported | — | — |
+| Persistent publisher (`ocliv host`) | ✅ Supported | — | — |
+| Signed release binaries | `amd64` / `arm64` | — | — |
+
+Ocliv `v0.1` targets `systemd`-based Linux systems (`linux/amd64` and `linux/arm64`). Native `launchd` and Windows Service persistence are not currently supported.
 
 ---
 
@@ -107,7 +120,23 @@ flowchart TB
 
 ## Quick Start
 
-### 1. Provision a relay host
+### 1. Install `ocliv` (Linux x86_64 / ARM64)
+
+Quick verified install from GitHub Releases (verifies the Ed25519 manifest signature against the embedded release trust root and checks SHA-256 — no Go, Git, or Docker required):
+
+```sh
+# Latest stable release (or pin with OCLIV_VERSION=v0.1.0):
+curl -fsSL https://raw.githubusercontent.com/B-A-M-N/ocliv/master/packaging/install/install-relay.sh | sudo sh
+ocliv version
+```
+
+Or download `ocliv-linux-amd64` / `ocliv-linux-arm64` directly from [GitHub Releases](https://github.com/B-A-M-N/ocliv/releases), or install from source with Go 1.26+:
+
+```sh
+go install github.com/B-A-M-N/ocliv/cmd/ocliv@latest
+```
+
+### 2. Provision the relay host
 
 Publisher machines never need open ports. Your relay host needs a public IP, DNS, and Caddy + `ocliv`:
 
@@ -122,9 +151,9 @@ sudo ocliv setup --auto \
   --acme-email ops@example.net
 ```
 
-### 2. Enroll a publisher device
+### 3. Enroll a publisher device
 
-Enroll any SSH-reachable machine directly from the relay host (no codes to copy):
+Enroll any SSH-reachable Linux machine directly from the relay host (no codes to copy):
 
 ```sh
 # Remote machine over SSH (installs signed client if missing with --install):
@@ -144,7 +173,7 @@ ocliv pair https://relay.example.net
 ocliv relay approve <CODE> --tenant default
 ```
 
-### 3. Host a local MCP server or web app
+### 4. Host a local MCP server or web app
 
 ```sh
 # Persistent MCP server with ChatGPT trusted (managed OAuth):
@@ -272,3 +301,11 @@ go test ./... -count=1 -timeout=420s
 ## Origin
 
 Ocliv was originally developed as a Meta hackathon project exploring secure infrastructure for connecting local AI tools and MCP services to remote AI clients. It has since evolved into a broader self-hosted publishing and authorization platform.
+
+---
+
+## License
+
+Ocliv is licensed under the **GNU Affero General Public License v3.0 only (`AGPL-3.0-only`)** — see [LICENSE](LICENSE).
+
+Organizations that do not wish to comply with `AGPL-3.0-only` obligations may obtain a separate commercial license; see [LICENSING.md](LICENSING.md). The Ocliv name and logo are reserved trademarks; see [TRADEMARKS.md](TRADEMARKS.md). For contributor guidelines and CLA terms, see [CONTRIBUTING.md](CONTRIBUTING.md).

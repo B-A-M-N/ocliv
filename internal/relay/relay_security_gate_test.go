@@ -5,8 +5,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"ocliv/internal/authz"
-	"ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/authz"
+	"github.com/B-A-M-N/ocliv/internal/lease"
 )
 
 func TestOuterHostGateAdmitsAppendedASMetadata(t *testing.T) {

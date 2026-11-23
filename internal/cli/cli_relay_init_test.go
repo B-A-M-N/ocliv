@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
 )
 
 func TestRelayInitRefusesPlaceholder(t *testing.T) {

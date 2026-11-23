@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"ocliv/internal/config"
-	"ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/identity"
 
 	"golang.org/x/term"
 )

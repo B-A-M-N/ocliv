@@ -18,10 +18,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/setup"
-	edgecaddy "ocliv/packaging/caddy"
-	edgesystemd "ocliv/packaging/systemd"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/setup"
+	edgecaddy "github.com/B-A-M-N/ocliv/packaging/caddy"
+	edgesystemd "github.com/B-A-M-N/ocliv/packaging/systemd"
 )
 
 // initCaddyValidate runs a real `caddy validate` on a generated

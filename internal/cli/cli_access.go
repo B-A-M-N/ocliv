@@ -8,8 +8,8 @@ import (
 	"os"
 	"strings"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/config"
 )
 
 // resolveAccessTarget resolves a lease ID explicitly by service NAME or --lease,

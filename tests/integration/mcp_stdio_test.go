@@ -15,7 +15,7 @@ import (
 	"strings"
 	"testing"
 
-	"ocliv/internal/mcp"
+	"github.com/B-A-M-N/ocliv/internal/mcp"
 )
 
 // adapterUpstream starts a cat-backed adapter and returns its loopback

@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/identity"
 )
 
 // TestHTTPClientRefusesRedirects verifies that HTTPClient never follows HTTP

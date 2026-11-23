@@ -16,8 +16,8 @@ import (
 	"strings"
 	"time"
 
-	"ocliv/internal/limits"
-	"ocliv/internal/protocol"
+	"github.com/B-A-M-N/ocliv/internal/limits"
+	"github.com/B-A-M-N/ocliv/internal/protocol"
 )
 
 // serveLocalWS performs the local HTTP/1.1 upgrade against the fixed

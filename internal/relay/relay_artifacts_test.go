@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 func newArtifactServer(t *testing.T, artifactDir string, manifestJSON []byte) *Server {

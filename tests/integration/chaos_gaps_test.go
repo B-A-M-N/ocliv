@@ -21,10 +21,10 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/agent"
-	"ocliv/internal/config"
-	"ocliv/internal/relay"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/agent"
+	"github.com/B-A-M-N/ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/relay"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 // partitionLink is a transparent TCP forward proxy between the agent and

@@ -13,10 +13,10 @@ import (
 	"strings"
 	"time"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/authz"
-	"ocliv/internal/config"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/authz"
+	"github.com/B-A-M-N/ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 func cmdConnect(argv []string) int {

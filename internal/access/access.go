@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
 )
 
 // Visitor credential contract (spec 1.3).

@@ -97,7 +97,7 @@ else
   GOVULN_STATUS="not_installed"
 fi
 
-LDFLAGS="-s -w -X ocliv/internal/cli.BuildCommit=${SHA} -X ocliv/internal/cli.BuildTime=${BUILD_TIME} -X ocliv/internal/cli.BuildDirty=false"
+LDFLAGS="-s -w -X github.com/B-A-M-N/ocliv/internal/cli.BuildCommit=${SHA} -X github.com/B-A-M-N/ocliv/internal/cli.BuildTime=${BUILD_TIME} -X github.com/B-A-M-N/ocliv/internal/cli.BuildDirty=false"
 BUILD_CMD="CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags=\"${LDFLAGS}\" ./cmd/ocliv"
 
 echo "==> Building linux/amd64 and linux/arm64 artifacts"
@@ -136,9 +136,14 @@ else
   go list -m -json all >"$OUT/$SBOM_FILE"
 fi
 
+cp "$WT/LICENSE" "$OUT/LICENSE"
+if [ -f "$WT/packaging/mcp/docs/THIRD_PARTY_LICENSES" ]; then
+  cp "$WT/packaging/mcp/docs/THIRD_PARTY_LICENSES" "$OUT/THIRD_PARTY_LICENSES"
+fi
+
 (
   cd "$OUT"
-  sha256sum ocliv-linux-amd64 ocliv-linux-arm64 "$SBOM_FILE" > SHA256SUMS
+  sha256sum ocliv-linux-amd64 ocliv-linux-arm64 "$SBOM_FILE" LICENSE > SHA256SUMS
 )
 
 GO_VER="$(go version | awk '{print $3}')"

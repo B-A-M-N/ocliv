@@ -16,9 +16,9 @@ import (
 	"syscall"
 	"time"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/control"
-	"ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/control"
+	"github.com/B-A-M-N/ocliv/internal/identity"
 )
 
 // cmdPair implements `ocliv pair RELAY_URL [--no-wait] [--timeout D]`.

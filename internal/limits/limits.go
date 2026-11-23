@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/metrics"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/metrics"
 )
 
 // Defaults per spec section 6; operator-adjustable down or up within a cap.

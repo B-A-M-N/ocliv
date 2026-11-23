@@ -12,8 +12,8 @@ import (
 
 	"github.com/coder/websocket"
 
-	"ocliv/internal/protocol"
-	"ocliv/internal/transport"
+	"github.com/B-A-M-N/ocliv/internal/protocol"
+	"github.com/B-A-M-N/ocliv/internal/transport"
 )
 
 // Handshake phases extracted from Runner.once, which orchestrates them.

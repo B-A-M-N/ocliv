@@ -11,7 +11,7 @@ import (
 	"strings"
 	"syscall"
 
-	"ocliv/packaging/systemd"
+	"github.com/B-A-M-N/ocliv/packaging/systemd"
 )
 
 // DefaultCleanHostArtifacts names the destinations a complete clean-host

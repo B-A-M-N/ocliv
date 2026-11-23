@@ -16,7 +16,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 // enrollmentTenants returns the tenant bindings of every enrollment code

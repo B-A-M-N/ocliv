@@ -15,8 +15,8 @@ package relay
 // The mapping lives here so the wire contract has a single source of truth
 // and the agent cannot drift from it.
 import (
-	"ocliv/internal/apperr"
-	"ocliv/internal/protocol"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/protocol"
 )
 
 // attachCloseCode maps an allocation/resume denial to the websocket close

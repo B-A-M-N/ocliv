@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/identity"
-	"ocliv/internal/limits"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/limits"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 // newLimitServer builds a relay with a permissive pre-auth limiter so the

@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/identity"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 func TestApprovePairingIdempotentAndTenantIsolation(t *testing.T) {

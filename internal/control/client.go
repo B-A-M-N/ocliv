@@ -18,10 +18,10 @@ import (
 	"strings"
 	"time"
 
-	"ocliv/internal/agent"
-	"ocliv/internal/config"
-	"ocliv/internal/identity"
-	"ocliv/internal/protocol"
+	"github.com/B-A-M-N/ocliv/internal/agent"
+	"github.com/B-A-M-N/ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/protocol"
 )
 
 // Client performs signed management requests against a single relay authority.

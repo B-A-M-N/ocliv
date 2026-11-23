@@ -13,7 +13,7 @@ import (
 	"strconv"
 	"strings"
 
-	"ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
 )
 
 // Defaults for ordinary operation.

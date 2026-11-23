@@ -21,7 +21,7 @@ import (
 	"strings"
 	"testing"
 
-	"ocliv/internal/protocol"
+	"github.com/B-A-M-N/ocliv/internal/protocol"
 )
 
 // TestAttachDenialClassification pins the class of every close code the

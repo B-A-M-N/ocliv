@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/lease"
-	"ocliv/internal/metrics"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/metrics"
 )
 
 // allocateOrResume creates a new lease or resumes a valid one (F04, F05).

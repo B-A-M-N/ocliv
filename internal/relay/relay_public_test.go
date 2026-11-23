@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/B-A-M-N/ocliv/internal/protocol"
 	"github.com/hashicorp/yamux"
-	"ocliv/internal/protocol"
 )
 
 // TestAdmittedSessionCurrent pins the P1-5 dispatch fence: liveness

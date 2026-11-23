@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"ocliv/internal/config"
-	"ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/identity"
 )
 
 // ServiceLayers reports the independent, evidence-backed health of each

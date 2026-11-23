@@ -19,7 +19,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/hashicorp/yamux"
 
-	"ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
 )
 
 // ReadLimit bounds a single websocket message used for the NetConn bridge.

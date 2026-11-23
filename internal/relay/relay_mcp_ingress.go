@@ -20,9 +20,9 @@ import (
 	"strings"
 	"time"
 
-	"ocliv/internal/lease"
-	"ocliv/internal/metrics"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/metrics"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 // Access modes binding a lease to MCP ingress policy (P0-B). They are

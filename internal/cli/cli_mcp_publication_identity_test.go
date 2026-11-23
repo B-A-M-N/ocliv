@@ -29,7 +29,7 @@ import (
 	"strings"
 	"testing"
 
-	"ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/lease"
 )
 
 // TestDefaultPublicationNameIsStable pins the core property: the same

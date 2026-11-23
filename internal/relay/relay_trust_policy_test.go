@@ -13,10 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/agent"
-	"ocliv/internal/authz"
-	"ocliv/internal/identity"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/agent"
+	"github.com/B-A-M-N/ocliv/internal/authz"
+	"github.com/B-A-M-N/ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 func signMgmtReq(t *testing.T, k *identity.KeyPair, method, path string, body []byte) *http.Request {

@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/lease"
 )
 
 // Chaos C3: concurrent duplicate route creations must converge on one

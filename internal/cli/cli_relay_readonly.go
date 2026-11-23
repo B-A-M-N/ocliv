@@ -6,7 +6,7 @@ import (
 	"net/url"
 	"path/filepath"
 
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 // openRelayDBReadOnly opens an existing relay database without invoking the

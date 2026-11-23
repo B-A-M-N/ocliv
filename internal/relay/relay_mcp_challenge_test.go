@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/authz"
+	"github.com/B-A-M-N/ocliv/internal/authz"
 )
 
 // doManagedTool drives one request to the route's tool path through the

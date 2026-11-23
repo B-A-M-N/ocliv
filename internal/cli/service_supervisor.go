@@ -13,10 +13,10 @@ import (
 	"syscall"
 	"time"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/config"
-	"ocliv/internal/protocol"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/protocol"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 const userPublisherUnitTemplate = `# User-level Ocliv service publisher (%i).

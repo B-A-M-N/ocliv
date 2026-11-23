@@ -21,9 +21,9 @@ import (
 	"strings"
 	"time"
 
-	"ocliv/internal/access"
-	"ocliv/internal/lease"
-	"ocliv/internal/metrics"
+	"github.com/B-A-M-N/ocliv/internal/access"
+	"github.com/B-A-M-N/ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/metrics"
 )
 
 // visitorAccess owns the relay's visitor-credential secret: the HMAC key

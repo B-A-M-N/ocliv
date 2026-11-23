@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/authz"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/authz"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 // cmdAuthz handles the operator authorization workflow for managed MCP

@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/agent"
-	"ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/agent"
+	"github.com/B-A-M-N/ocliv/internal/config"
 )
 
 func b64sig(b []byte) string { return base64.StdEncoding.EncodeToString(b) }

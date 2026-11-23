@@ -24,9 +24,9 @@ import (
 	"strings"
 	"time"
 
-	"ocliv/internal/authz"
-	"ocliv/internal/identity"
-	"ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/authz"
+	"github.com/B-A-M-N/ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/lease"
 )
 
 // mcpBaseURL is the single minting point for public route URLs. The

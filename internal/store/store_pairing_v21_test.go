@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
 )
 
 func TestPairingV21MigrationAndCorruptTimestamp(t *testing.T) {

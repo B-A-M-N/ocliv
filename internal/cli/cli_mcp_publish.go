@@ -38,11 +38,11 @@ import (
 	"syscall"
 	"time"
 
-	"ocliv/internal/agent"
-	"ocliv/internal/apperr"
-	"ocliv/internal/config"
-	"ocliv/internal/identity"
-	"ocliv/internal/mcp"
+	"github.com/B-A-M-N/ocliv/internal/agent"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/mcp"
 )
 
 // mcpAuthProfiles maps the operator-facing --auth values to the signed

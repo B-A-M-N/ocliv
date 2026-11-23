@@ -22,10 +22,10 @@ import (
 	"github.com/coder/websocket"
 	"github.com/hashicorp/yamux"
 
-	"ocliv/internal/config"
-	"ocliv/internal/identity"
-	"ocliv/internal/protocol"
-	"ocliv/internal/transport"
+	"github.com/B-A-M-N/ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/protocol"
+	"github.com/B-A-M-N/ocliv/internal/transport"
 )
 
 // TestStreamReaderSurfacesAbortAsError: transport failures, aborts, and

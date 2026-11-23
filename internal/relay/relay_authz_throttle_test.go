@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/lease"
-	"ocliv/internal/limits"
+	"github.com/B-A-M-N/ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/limits"
 )
 
 func registerOn(t *testing.T, s *Server, routeID string) int {

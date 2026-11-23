@@ -23,11 +23,11 @@ import (
 
 	"github.com/hashicorp/yamux"
 
-	"ocliv/internal/access"
-	"ocliv/internal/apperr"
-	"ocliv/internal/installer"
-	"ocliv/internal/limits"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/access"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/installer"
+	"github.com/B-A-M-N/ocliv/internal/limits"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 // Options configures the relay.

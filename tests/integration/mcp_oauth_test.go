@@ -26,7 +26,7 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/config"
 )
 
 // oauthUpstream is a minimal MCP resource server: it serves the

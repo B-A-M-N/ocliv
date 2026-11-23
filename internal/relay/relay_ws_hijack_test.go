@@ -19,7 +19,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"ocliv/internal/protocol"
+	"github.com/B-A-M-N/ocliv/internal/protocol"
 )
 
 func TestDrainHijackedBytesForwardsBuffered(t *testing.T) {

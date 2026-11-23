@@ -18,8 +18,8 @@ import (
 
 	"github.com/hashicorp/yamux"
 
-	"ocliv/internal/lease"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 // postMCPRoute POSTs a signed route-create through the full handler

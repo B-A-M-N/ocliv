@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/identity"
 )
 
 func TestManagementCallReturnsTransportError(t *testing.T) {

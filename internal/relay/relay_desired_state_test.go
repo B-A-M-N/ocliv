@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/lease"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 func TestDesiredEnabledDisableEnableAndStalePublisher(t *testing.T) {

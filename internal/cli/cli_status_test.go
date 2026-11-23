@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"ocliv/internal/protocol"
+	"github.com/B-A-M-N/ocliv/internal/protocol"
 )
 
 func TestRenderStatusShowsProbeContract(t *testing.T) {

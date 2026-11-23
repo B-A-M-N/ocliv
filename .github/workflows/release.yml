@@ -25,13 +25,19 @@ jobs:
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
           go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.8.0
-      - name: Build Clean Detached-Worktree Release Bundle
+      - name: Build Clean Detached-Worktree Unsigned CI Bundle
+        # Official signed production releases are built offline with
+        # OCLIV_RELEASE_SIGNING_KEY_FILE and published via
+        # scripts/release/publish-github-release.sh so the permanent Ed25519
+        # signing key never leaves the operator's trusted machine.
+        env:
+          OCLIV_UNSIGNED_DEV: "true"
         run: |
           TARGET_SHA="${{ github.event.inputs.sha }}"
           if [ -z "$TARGET_SHA" ]; then
             TARGET_SHA="${{ github.sha }}"
           fi
-          ./scripts/release/build-release.sh "$TARGET_SHA"
+          ./scripts/release/build-release.sh --allow-missing-tools "$TARGET_SHA"
       - name: Upload Release Artifacts
         uses: actions/upload-artifact@v4
         with:

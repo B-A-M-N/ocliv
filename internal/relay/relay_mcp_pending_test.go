@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/lease"
 )
 
 // postMCPActivate POSTs a signed route activation through the full

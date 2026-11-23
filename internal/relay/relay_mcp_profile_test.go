@@ -10,7 +10,7 @@ import (
 	"net/http"
 	"testing"
 
-	"ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/lease"
 )
 
 func TestMCPModeBindingMatrix(t *testing.T) {

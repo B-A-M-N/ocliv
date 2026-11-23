@@ -10,7 +10,10 @@ import argparse, json, pathlib, re, sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 TRUST_JSON = ROOT / "internal" / "installer" / "release-trust.json"
-SHELL_SCRIPT = ROOT / "packaging" / "install" / "install-client.sh"
+SHELL_SCRIPTS = [
+    ROOT / "packaging" / "install" / "install-client.sh",
+    ROOT / "packaging" / "install" / "install-relay.sh",
+]
 
 BEGIN_MARK = "# BEGIN GENERATED TRUST ROOT (from internal/installer/release-trust.json)"
 END_MARK = "# END GENERATED TRUST ROOT"
@@ -41,21 +44,21 @@ def main() -> int:
     args = parser.parse_args()
 
     want_block = render_block(TRUST_JSON)
-    content = SHELL_SCRIPT.read_text(encoding="utf-8")
     pattern = re.compile(re.escape(BEGIN_MARK) + r".*?" + re.escape(END_MARK), re.DOTALL)
-    if not pattern.search(content):
-        print(f"error: missing generated trust markers in {SHELL_SCRIPT}", file=sys.stderr)
-        return 1
-    updated = pattern.sub(want_block, content, count=1)
-    if args.check:
-        if updated != content:
-            print("error: packaging/install/install-client.sh trust root is out of sync with internal/installer/release-trust.json", file=sys.stderr)
-            print("       run: python3 scripts/release/render-shell-trust.py", file=sys.stderr)
+    for script in SHELL_SCRIPTS:
+        content = script.read_text(encoding="utf-8")
+        if not pattern.search(content):
+            print(f"error: missing generated trust markers in {script}", file=sys.stderr)
             return 1
-        return 0
-    if updated != content:
-        SHELL_SCRIPT.write_text(updated, encoding="utf-8")
-        print(f"updated {SHELL_SCRIPT} from {TRUST_JSON}")
+        updated = pattern.sub(want_block, content, count=1)
+        if args.check:
+            if updated != content:
+                print(f"error: {script} trust root is out of sync with internal/installer/release-trust.json", file=sys.stderr)
+                print("       run: python3 scripts/release/render-shell-trust.py", file=sys.stderr)
+                return 1
+        elif updated != content:
+            script.write_text(updated, encoding="utf-8")
+            print(f"updated {script} from {TRUST_JSON}")
     return 0
 
 

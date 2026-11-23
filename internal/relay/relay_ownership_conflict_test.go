@@ -20,8 +20,8 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/protocol"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/protocol"
 )
 
 // TestOwnershipConflictHasDistinctCode pins the code split: the ownership

@@ -9,10 +9,10 @@ import (
 	"strings"
 	"testing"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/authz"
-	"ocliv/internal/config"
-	"ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/authz"
+	"github.com/B-A-M-N/ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/identity"
 )
 
 func setupTestProfileWithService(t *testing.T, svcName, routeID string) (string, *identity.KeyPair, string) {

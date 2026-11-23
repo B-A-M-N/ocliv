@@ -22,8 +22,8 @@ import (
 	"strings"
 	"time"
 
-	"ocliv/internal/access"
-	"ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/access"
+	"github.com/B-A-M-N/ocliv/internal/identity"
 )
 
 const maxMgmtBodyBytes = 64 * 1024

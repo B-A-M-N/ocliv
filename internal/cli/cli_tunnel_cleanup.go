@@ -8,9 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"ocliv/internal/agent"
-	"ocliv/internal/apperr"
-	"ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/agent"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/config"
 )
 
 // CleanupResult records remote revocation outcomes independently: local

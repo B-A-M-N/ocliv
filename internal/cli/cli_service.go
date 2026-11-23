@@ -18,11 +18,11 @@ import (
 	"syscall"
 	"time"
 
-	"ocliv/internal/agent"
-	"ocliv/internal/apperr"
-	"ocliv/internal/config"
-	"ocliv/internal/identity"
-	"ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/agent"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/lease"
 )
 
 // Authoritative service lifecycle states (Section 6).

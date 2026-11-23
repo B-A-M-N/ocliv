@@ -18,8 +18,8 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/identity"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 func TestP0ExpiredPersistentLeaseNeverResurrectsOldVisitorAuthority(t *testing.T) {

@@ -11,12 +11,12 @@ import (
 	"strings"
 	"time"
 
-	"ocliv/internal/access"
-	"ocliv/internal/lease"
-	"ocliv/internal/metrics"
-	"ocliv/internal/protocol"
-	"ocliv/internal/proxy"
-	"ocliv/internal/transport"
+	"github.com/B-A-M-N/ocliv/internal/access"
+	"github.com/B-A-M-N/ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/metrics"
+	"github.com/B-A-M-N/ocliv/internal/protocol"
+	"github.com/B-A-M-N/ocliv/internal/proxy"
+	"github.com/B-A-M-N/ocliv/internal/transport"
 )
 
 // routeTarget is the authoritative routing decision for one request (D01).

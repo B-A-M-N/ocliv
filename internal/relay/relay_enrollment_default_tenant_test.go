@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 // TestResolveEnrollmentTenant covers the multi-tenant selection rules:

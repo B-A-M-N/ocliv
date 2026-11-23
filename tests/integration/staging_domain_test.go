@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"testing"
 
-	"ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/config"
 )
 
 // The staging deployment is a normal relay under a staging namespace, not

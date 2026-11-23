@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/authz"
+	"github.com/B-A-M-N/ocliv/internal/authz"
 )
 
 // The atomic delete must roll BOTH halves when the retirement fails: the

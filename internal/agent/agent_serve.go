@@ -18,9 +18,9 @@ import (
 
 	"github.com/hashicorp/yamux"
 
-	"ocliv/internal/config"
-	"ocliv/internal/limits"
-	"ocliv/internal/protocol"
+	"github.com/B-A-M-N/ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/limits"
+	"github.com/B-A-M-N/ocliv/internal/protocol"
 )
 
 func rand01() float64 { return rand.Float64() }

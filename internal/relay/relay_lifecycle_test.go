@@ -18,10 +18,10 @@ import (
 
 	"github.com/coder/websocket"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/lease"
-	"ocliv/internal/limits"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/limits"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 func newLifecycleServer(t *testing.T) (*Server, *store.DB) {

@@ -11,10 +11,10 @@ import (
 
 	"github.com/coder/websocket"
 
-	"ocliv/internal/agent"
-	"ocliv/internal/config"
-	"ocliv/internal/limits"
-	"ocliv/internal/relay"
+	"github.com/B-A-M-N/ocliv/internal/agent"
+	"github.com/B-A-M-N/ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/limits"
+	"github.com/B-A-M-N/ocliv/internal/relay"
 )
 
 // TestResumeModeChangeAllocatesFresh: resuming with a different access

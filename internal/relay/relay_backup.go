@@ -36,9 +36,9 @@ import (
 	"strings"
 	"time"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/lease"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/store"
 
 	_ "modernc.org/sqlite"
 )

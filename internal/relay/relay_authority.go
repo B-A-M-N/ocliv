@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"strings"
 
-	"ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/lease"
 )
 
 // authorizeHost polices the two dangerous cross-authority cases: agent

@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/config"
-	"ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/identity"
 )
 
 func TestP0ManagedBackendStartupOrdering(t *testing.T) {

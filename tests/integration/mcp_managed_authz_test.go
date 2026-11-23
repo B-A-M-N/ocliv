@@ -32,10 +32,10 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/agent"
-	"ocliv/internal/authz"
-	"ocliv/internal/config"
-	"ocliv/internal/mcp"
+	"github.com/B-A-M-N/ocliv/internal/agent"
+	"github.com/B-A-M-N/ocliv/internal/authz"
+	"github.com/B-A-M-N/ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/mcp"
 )
 
 // managedUpstream is a plain local MCP server with no OAuth of its own. It

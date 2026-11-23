@@ -18,7 +18,7 @@ import (
 
 	"github.com/coder/websocket"
 
-	"ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/lease"
 )
 
 // getKeyPublications GETs /v1/agent/mcp-routes through the full handler

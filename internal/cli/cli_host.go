@@ -4,12 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/authz"
-	"ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/authz"
+	"github.com/B-A-M-N/ocliv/internal/config"
 )
 
 // HostTransactionResult is the machine-readable verdict for `ocliv host --json`.
@@ -80,6 +81,12 @@ func hasJSONFlag(argv []string) bool {
 // both success and failure, and all human diagnostics go to stderr.
 func cmdHost(argv []string) int {
 	return cmdHostWithOps(argv, defaultServiceOps())
+}
+
+// persistentSupervisorSupported reports whether this OS has native persistent
+// hosting supervisor support (currently Linux with systemd).
+func persistentSupervisorSupported() bool {
+	return runtime.GOOS == "linux"
 }
 
 func cmdHostWithOps(argv []string, ops serviceOps) int {
@@ -169,6 +176,9 @@ func cmdHostWithOps(argv []string, ops serviceOps) int {
 		default:
 			return failValidation(fmt.Sprintf("unknown flag %q", a))
 		}
+	}
+	if !persistentSupervisorSupported() {
+		return failValidation("persistent hosting currently requires Linux with systemd; native persistence for " + runtime.GOOS + " is not yet supported")
 	}
 	if os.Geteuid() == 0 && !allowRoot {
 		return failValidation("refusing to run user-level `ocliv host` as root (run as your normal user, or pass --allow-root)")

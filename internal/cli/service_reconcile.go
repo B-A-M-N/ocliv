@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"ocliv/internal/config"
-	"ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/identity"
 )
 
 type relayInventoryItem struct {

@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/config"
-	"ocliv/internal/limits"
+	"github.com/B-A-M-N/ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/limits"
 )
 
 func shrinkHeadTimeout(t *testing.T, d time.Duration) {

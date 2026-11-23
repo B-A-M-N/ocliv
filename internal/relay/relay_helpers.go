@@ -9,8 +9,8 @@ import (
 	"net/http"
 	"strings"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/metrics"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/metrics"
 )
 
 // withTx runs fn in a serializable transaction.

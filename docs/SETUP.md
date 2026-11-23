@@ -8,9 +8,11 @@ Each stage is independently verified and checkpointed so interrupted runs
 resume cleanly.
 
 **Role separation:** Relay setup NEVER enrolls a publisher identity or writes
-publisher config on the relay host. After the relay is running, pair each
-publisher machine via `ocliv pair https://<relay-host>` and approve on the
-relay with `ocliv relay approve <CODE> --tenant <TENANT>`.
+publisher config on the relay host. After the relay is running, enroll each
+publisher machine from the relay host over SSH via
+`ocliv device add user@publisher --install` (or `--local-user USER` for a
+same-host unprivileged user). If SSH is unavailable, fall back to interactive
+pairing (`ocliv pair https://<relay-host>` + `ocliv relay approve <CODE> --tenant default`).
 
 ## Prerequisites (the only unavoidable manual steps)
 
@@ -49,10 +51,14 @@ sudo ocliv relay setup --auto --hostname lab.dynv6.net \
 # 4. From another network (no -k): expect relay 4xx, not TLS errors.
 curl -v https://relay.example.net/v1/agent/challenge
 
-# 5. On each publisher machine, pair and publish:
-ocliv pair https://relay.example.net
-#    (approve on the relay: ocliv relay approve <CODE> --tenant default)
-ocliv host 8765 --name personal-tools
+# 5. Enroll a publisher machine from the relay host (preferred over SSH):
+ocliv device add user@publisher --install
+
+#    (Fallback when SSH is unavailable: run `ocliv pair https://relay.example.net`
+#     on the publisher, then `ocliv relay approve <CODE> --tenant default` on the relay.)
+
+# 6. On the publisher machine, host your local MCP server with ChatGPT trusted:
+ocliv host mcp 8765 --name tools --trust chatgpt
 ```
 
 ## Certificate strategy (read before operating)
@@ -91,9 +97,10 @@ For the tunnel and wildcard edges, a fresh `*.t.<domain>` probe hostname
 must resolve here too; the single-host edge needs only the apex and is
 not blocked on a wildcard record it never uses.
 
-Still manual by design: creating the dynv6 account/token, the router
-port forward, installing Caddy itself when missing, and revocation/
-recovery decisions (below).
+Still manual by design: creating the DNS provider account/token, the router
+port forward (if behind NAT), and revocation/recovery decisions (below).
+Caddy itself is installed automatically (pinned with the selected DNS-01
+module when using `--edge wildcard`) when `ocliv setup --auto` runs as root.
 
 A later step's failure rolls the whole install back to the previous
 state (files restored, the first-candidate binary restored, a data dir

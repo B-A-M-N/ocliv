@@ -13,9 +13,9 @@ import (
 	"database/sql"
 	"time"
 
-	"ocliv/internal/access"
-	"ocliv/internal/apperr"
-	"ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/access"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/lease"
 )
 
 // revokeVisitorCredentials revokes all visitor access tokens and browser

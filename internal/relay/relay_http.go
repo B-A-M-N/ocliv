@@ -28,10 +28,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"ocliv/internal/limits"
-	"ocliv/internal/metrics"
-	"ocliv/internal/protocol"
-	"ocliv/internal/proxy"
+	"github.com/B-A-M-N/ocliv/internal/limits"
+	"github.com/B-A-M-N/ocliv/internal/metrics"
+	"github.com/B-A-M-N/ocliv/internal/protocol"
+	"github.com/B-A-M-N/ocliv/internal/proxy"
 )
 
 // errUploadStopped tells the upload worker to exit without a terminal

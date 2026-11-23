@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/control"
-	"ocliv/internal/relay"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/control"
+	"github.com/B-A-M-N/ocliv/internal/relay"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 // cmdDevice is the operator-facing device enrollment and management command:

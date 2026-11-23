@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/lease"
 )
 
 func renewalFixture(t *testing.T) (*Server, ed25519.PrivateKey, string) {

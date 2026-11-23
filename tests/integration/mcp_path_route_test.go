@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/config"
-	"ocliv/internal/identity"
-	"ocliv/internal/limits"
+	"github.com/B-A-M-N/ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/limits"
 )
 
 // routeReq issues a visitor request against the harness relay with an

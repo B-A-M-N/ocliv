@@ -14,10 +14,10 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/config"
-	"ocliv/internal/lease"
-	"ocliv/internal/relay"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/relay"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 // An offline publisher's route must deny without forwarding: after the

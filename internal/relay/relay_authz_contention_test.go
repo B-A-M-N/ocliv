@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/limits"
+	"github.com/B-A-M-N/ocliv/internal/limits"
 )
 
 // TestAuthzRateLimitDoesNotCrossRoutes proves the limiter's key is

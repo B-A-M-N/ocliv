@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/authz"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/authz"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 func TestAuthzRegisterDirectAndGrantRouteCLI(t *testing.T) {

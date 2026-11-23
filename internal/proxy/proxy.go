@@ -9,8 +9,8 @@ import (
 	"net/textproto"
 	"strings"
 
-	"ocliv/internal/access"
-	"ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/access"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
 )
 
 // HopByHop lists headers that must never cross the tunnel.

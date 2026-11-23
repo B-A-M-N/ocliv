@@ -13,8 +13,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/B-A-M-N/ocliv/internal/apperr"
 	_ "modernc.org/sqlite"
-	"ocliv/internal/apperr"
 )
 
 // Schema versions; migrations are explicit and rollback-aware (H07).

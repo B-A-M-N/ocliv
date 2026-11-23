@@ -12,10 +12,10 @@ import (
 	"strings"
 	"time"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/config"
-	"ocliv/internal/control"
-	"ocliv/internal/installer"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/control"
+	"github.com/B-A-M-N/ocliv/internal/installer"
 )
 
 // cmdUpdate is the simplified client update command:

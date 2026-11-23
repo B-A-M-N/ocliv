@@ -1,4 +1,4 @@
-module ocliv
+module github.com/B-A-M-N/ocliv
 
 go 1.26.0
 

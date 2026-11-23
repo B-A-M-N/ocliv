@@ -12,7 +12,7 @@ import (
 
 	"github.com/coder/websocket"
 
-	"ocliv/internal/transport"
+	"github.com/B-A-M-N/ocliv/internal/transport"
 )
 
 // connectWithIntent performs a raw agent handshake with a caller-built

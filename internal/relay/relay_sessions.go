@@ -15,8 +15,8 @@ import (
 	"github.com/coder/websocket"
 	"github.com/hashicorp/yamux"
 
-	"ocliv/internal/lease"
-	"ocliv/internal/metrics"
+	"github.com/B-A-M-N/ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/metrics"
 )
 
 // registerSession bridges to yamux, publishes the live route (F06), and

@@ -14,10 +14,10 @@ import (
 	"strings"
 	"testing"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/relay"
-	"ocliv/internal/setup"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/relay"
+	"github.com/B-A-M-N/ocliv/internal/setup"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 func TestSetupCheckReportsEchoVerdict(t *testing.T) {

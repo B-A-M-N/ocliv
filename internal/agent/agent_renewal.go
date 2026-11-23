@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/config"
 )
 
 const (

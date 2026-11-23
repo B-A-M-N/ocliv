@@ -21,7 +21,7 @@ import (
 	"strings"
 	"time"
 
-	"ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
 )
 
 // mcpProbeOutcome is the staged doctor verdict. Verified means a usable

@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 // The managed authorization mode must map to a real relay access mode and a

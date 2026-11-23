@@ -19,7 +19,7 @@ import (
 	"syscall"
 	"time"
 
-	"ocliv/internal/limits"
+	"github.com/B-A-M-N/ocliv/internal/limits"
 )
 
 // Finding is one diagnostic line.

@@ -3,7 +3,7 @@ package integration
 import (
 	"testing"
 
-	"ocliv/internal/cli"
+	"github.com/B-A-M-N/ocliv/internal/cli"
 )
 
 // TestIssueEnrollDoesNotDisturbLiveLease: the operator enrollment path

@@ -13,7 +13,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/config"
 )
 
 func TestMCPRouteDiscoveryURL(t *testing.T) {

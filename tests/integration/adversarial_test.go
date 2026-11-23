@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/config"
 )
 
 func TestTenantIsolation(t *testing.T) {

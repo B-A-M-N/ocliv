@@ -19,12 +19,12 @@ import (
 	"syscall"
 	"time"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/doctor"
-	"ocliv/internal/limits"
-	"ocliv/internal/relay"
-	"ocliv/internal/server"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/doctor"
+	"github.com/B-A-M-N/ocliv/internal/limits"
+	"github.com/B-A-M-N/ocliv/internal/relay"
+	"github.com/B-A-M-N/ocliv/internal/server"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 // restrictFileCreation limits files created by the relay process to

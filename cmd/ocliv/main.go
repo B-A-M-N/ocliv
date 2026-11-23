@@ -4,7 +4,7 @@ package main
 import (
 	"os"
 
-	"ocliv/internal/cli"
+	"github.com/B-A-M-N/ocliv/internal/cli"
 )
 
 func main() {

@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
 )
 
 // Chaos D1: DNS hijack (or stale record) pointing the relay hostname at

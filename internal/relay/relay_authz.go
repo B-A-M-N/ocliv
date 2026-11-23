@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"ocliv/internal/authz"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/authz"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 // authzManager owns the relay's managed-authorization state: the issuer key

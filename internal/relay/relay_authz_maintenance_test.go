@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/authz"
+	"github.com/B-A-M-N/ocliv/internal/authz"
 )
 
 func TestAuthzMaintenanceRunsPeriodically(t *testing.T) {

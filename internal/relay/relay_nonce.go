@@ -4,8 +4,8 @@ import (
 	"sync"
 	"time"
 
-	"ocliv/internal/limits"
-	"ocliv/internal/metrics"
+	"github.com/B-A-M-N/ocliv/internal/limits"
+	"github.com/B-A-M-N/ocliv/internal/metrics"
 )
 
 // nonceCache owns the challenge/handshake replay cache: nonce -> expiry.

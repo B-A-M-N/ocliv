@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"time"
 
-	"ocliv/internal/mcp"
+	"github.com/B-A-M-N/ocliv/internal/mcp"
 )
 
 func main() {

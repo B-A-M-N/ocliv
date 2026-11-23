@@ -9,9 +9,9 @@ import (
 	"runtime/debug"
 	"strings"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/protocol"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/protocol"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 // BuildCommit, BuildTime, and BuildDirty can be overridden at link time via -ldflags.

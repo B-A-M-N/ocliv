@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 func backupTestDB(t *testing.T, dir string) *store.DB {

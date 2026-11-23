@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"strings"
 
-	"ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/lease"
 )
 
 // askPath is the on-demand TLS authorization endpoint Caddy queries

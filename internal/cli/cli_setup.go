@@ -18,13 +18,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/setup"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/setup"
 )
 
 // setupManagedDestinations are the system files bootstrap may
@@ -522,6 +523,10 @@ func cmdSetup(argv []string) int {
 				outDir = prev.OutDir
 			}
 		}
+	}
+	if auto && !check && !refreshDNS && !persistentSupervisorSupported() {
+		fmt.Fprintf(os.Stderr, "error: `ocliv setup --auto` requires systemd-based Linux; native relay provisioning on %s is not yet supported\n", runtime.GOOS)
+		return apperr.ExitCLIValidation
 	}
 	if edge != "auto" && edge != "tunnel" && edge != "single-host" && edge != "wildcard" {
 		fmt.Fprintln(os.Stderr, "error: --edge must be auto, single-host, wildcard, or tunnel")

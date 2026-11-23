@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/lease"
 )
 
 // TestManagedPublicationStableAcrossLeases: the managed profile keeps ONE

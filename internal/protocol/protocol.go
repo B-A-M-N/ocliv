@@ -15,7 +15,7 @@ import (
 	"strconv"
 	"strings"
 
-	"ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
 )
 
 // Version negotiation.

@@ -15,7 +15,7 @@ cd "$ROOT"
 FAIL=0
 
 # 1. Tracked root-level entries allowlist.
-ALLOWED_ROOT_RE='^(AGENTS\.md|README\.md|go\.mod|go\.sum|\.gitignore|\.github|cmd|docs|integrations|internal|packaging|scripts|skills|tests)$'
+ALLOWED_ROOT_RE='^(AGENTS\.md|CONTRIBUTING\.md|LICENSE|LICENSING\.md|README\.md|TRADEMARKS\.md|go\.mod|go\.sum|\.gitignore|\.github|cmd|docs|integrations|internal|packaging|scripts|skills|tests)$'
 while IFS= read -r top; do
   [ -z "$top" ] && continue
   if ! [[ "$top" =~ $ALLOWED_ROOT_RE ]]; then

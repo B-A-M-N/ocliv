@@ -7,10 +7,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/authz"
-	"ocliv/internal/identity"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/authz"
+	"github.com/B-A-M-N/ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 func TestConnectGoogleWorkflowIdempotencyAndRevocationFence(t *testing.T) {

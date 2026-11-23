@@ -16,10 +16,10 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/config"
-	"ocliv/internal/identity"
-	"ocliv/internal/protocol"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/protocol"
 )
 
 func writeTestServerCA(t *testing.T, srv *httptest.Server) string {

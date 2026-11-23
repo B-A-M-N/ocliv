@@ -15,11 +15,11 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/config"
-	"ocliv/internal/identity"
-	"ocliv/internal/protocol"
-	"ocliv/internal/setup"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/config"
+	"github.com/B-A-M-N/ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/protocol"
+	"github.com/B-A-M-N/ocliv/internal/setup"
 )
 
 func TestEnrollmentRejectsMismatchedOrMalformedKeyIDs(t *testing.T) {

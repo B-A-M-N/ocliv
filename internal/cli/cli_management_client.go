@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"time"
 
-	"ocliv/internal/control"
-	"ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/control"
+	"github.com/B-A-M-N/ocliv/internal/identity"
 )
 
 func mgmtHTTPClient(timeout time.Duration) (*http.Client, error) {

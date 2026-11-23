@@ -16,9 +16,9 @@ import (
 	"strings"
 	"time"
 
-	"ocliv/internal/limits"
-	"ocliv/internal/metrics"
-	"ocliv/internal/protocol"
+	"github.com/B-A-M-N/ocliv/internal/limits"
+	"github.com/B-A-M-N/ocliv/internal/metrics"
+	"github.com/B-A-M-N/ocliv/internal/protocol"
 )
 
 // WSMaxLifetime bounds an upgraded connection. Read/write idle deadlines

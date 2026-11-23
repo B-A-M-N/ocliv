@@ -18,9 +18,9 @@ import (
 	"testing"
 	"time"
 
-	"ocliv/internal/lease"
-	"ocliv/internal/metrics"
-	"ocliv/internal/store"
+	"github.com/B-A-M-N/ocliv/internal/lease"
+	"github.com/B-A-M-N/ocliv/internal/metrics"
+	"github.com/B-A-M-N/ocliv/internal/store"
 )
 
 // publishRoute POSTs a route create and returns the minted route ID.

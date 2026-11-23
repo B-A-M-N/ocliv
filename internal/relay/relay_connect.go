@@ -19,10 +19,10 @@ import (
 
 	"github.com/coder/websocket"
 
-	"ocliv/internal/apperr"
-	"ocliv/internal/identity"
-	"ocliv/internal/protocol"
-	"ocliv/internal/transport"
+	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/identity"
+	"github.com/B-A-M-N/ocliv/internal/protocol"
+	"github.com/B-A-M-N/ocliv/internal/transport"
 )
 
 // challengeReq asks for a one-time nonce for a key id.
