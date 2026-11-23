@@ -331,10 +331,11 @@ type revocationSet struct {
 	// managed grant (authz_grants.status != 'active'), or a revoked
 	// managed token jti (authz_revocations). Restoring an older database
 	// would otherwise reactivate managed OAuth clients/grants/tokens.
-	authzClients    map[string]bool        // authz_clients with revoked_at set
-	authzGrants     map[authzGrantKey]bool // authz_grants with status != 'active' (keyed by tenant/route/client tuple)
-	authzJTIs       map[string]bool        // authz_revocations jti
-	authzTablesLive bool                   // live DB has the managed tables
+	authzClients       map[string]bool        // authz_clients with revoked_at set
+	authzGrants        map[authzGrantKey]bool // authz_grants with status != 'active' (keyed by tenant/route/client tuple)
+	authzJTIs          map[string]bool        // authz_revocations jti
+	authzTrustPolicies map[string]bool        // authz_trust_policies with revoked_at set or enabled=0
+	authzTablesLive    bool                   // live DB has the managed tables
 	// pubIDs is every publication route_id present. A backup row
 	// (active or tombstoned) absent from live means the publication
 	// was explicitly deleted after the snapshot — restoring would
@@ -446,6 +447,7 @@ func readRevocations(q *sql.DB) (*revocationSet, error) {
 	s.authzClients = map[string]bool{}
 	s.authzGrants = map[authzGrantKey]bool{}
 	s.authzJTIs = map[string]bool{}
+	s.authzTrustPolicies = map[string]bool{}
 	var authzTable string
 	if err := q.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='authz_clients'`).Scan(&authzTable); err == nil && authzTable != "" {
 		s.authzTablesLive = true
@@ -473,6 +475,12 @@ func readRevocations(q *sql.DB) (*revocationSet, error) {
 	if err := q.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='authz_revocations'`).Scan(&authzRevTable); err == nil && authzRevTable != "" {
 		if s.authzJTIs, err = collectStrings(q, `SELECT jti FROM authz_revocations`); err != nil {
 			return nil, apperr.E(apperr.CodeStoreFault, "reading managed token revocations", err)
+		}
+	}
+	var trustPolTable string
+	if err := q.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='authz_trust_policies'`).Scan(&trustPolTable); err == nil && trustPolTable != "" {
+		if s.authzTrustPolicies, err = collectStrings(q, `SELECT id FROM authz_trust_policies WHERE revoked_at IS NOT NULL OR enabled=0`); err != nil {
+			return nil, apperr.E(apperr.CodeStoreFault, "reading trust policy revocations", err)
 		}
 	}
 	var pubTable string
@@ -585,6 +593,11 @@ func rollbackDiff(live, backup *revocationSet) []string {
 		for jti := range live.authzJTIs {
 			if !backup.authzJTIs[jti] {
 				missing = append(missing, "authz-token:"+jti)
+			}
+		}
+		for id := range live.authzTrustPolicies {
+			if !backup.authzTrustPolicies[id] {
+				missing = append(missing, "authz-trust-policy:"+id)
 			}
 		}
 	}
@@ -939,6 +952,12 @@ func resetRestoredAuthority(candidatePath string) error {
 		}
 		if _, err := tx.Exec(`UPDATE authz_consent SET consumed_at=? WHERE consumed_at IS NULL`, now); err != nil {
 			return err
+		}
+		var trustPolTable string
+		if err := tx.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='authz_trust_policies'`).Scan(&trustPolTable); err == nil && trustPolTable != "" {
+			if _, err := tx.Exec(`UPDATE authz_trust_policies SET enabled=0, revoked_at=? WHERE revoked_at IS NULL OR enabled<>0`, now); err != nil {
+				return err
+			}
 		}
 		if _, err := tx.Exec(`DELETE FROM authz_issuer_key`); err != nil {
 			return err

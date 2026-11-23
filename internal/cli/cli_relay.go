@@ -431,6 +431,7 @@ func cmdRelayServe(argv []string) int {
 	rawAutoApprove := os.Getenv("OCLIV_AUTO_APPROVE_REDIRECT_HOSTS")
 	if v, seen := explicitRelayFlag(argv, "--auto-approve-redirect-hosts"); seen {
 		rawAutoApprove = v
+		fmt.Fprintln(os.Stderr, "note: --auto-approve-redirect-hosts is deprecated; use route-scoped `ocliv trust <service> chatgpt` instead")
 	}
 	autoApproveHosts, err := parseAutoApproveRedirectHosts(rawAutoApprove)
 	if err != nil {

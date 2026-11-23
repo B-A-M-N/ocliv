@@ -187,7 +187,7 @@ func cmdStatus(argv []string) int {
 					fmt.Println(string(b))
 					return apperr.ExitOK
 				}
-				return cmdServiceList(nil, defaultServiceOps())
+				return renderServiceControlPanel(svcs, defaultServiceOps())
 			}
 		}
 		fmt.Println("no active tunnel")
@@ -239,12 +239,118 @@ func cmdStatus(argv []string) int {
 		}
 		if svcStore, serr := openServices(); serr == nil {
 			if svcs, lerr := svcStore.List(); lerr == nil && len(svcs) > 0 {
-				fmt.Println("\nHosted services:")
-				_ = cmdServiceList(nil, defaultServiceOps())
+				fmt.Println()
+				_ = renderServiceControlPanel(svcs, defaultServiceOps())
 			}
 		}
 	}
 	return code
+}
+
+// renderServiceControlPanel renders the operator-friendly control panel view
+// for `ocliv status`: relay & device identity, hosted services with trusted
+// clients, and any pending OAuth clients with exact actionable commands.
+func renderServiceControlPanel(svcs []config.ServiceRecord, ops serviceOps) int {
+	profile := config.ActiveProfile()
+	relayURL := agentRelayURLForProfile(profile)
+	k, keyID, kerr := loadKeyForProfile(profile)
+	host, _ := os.Hostname()
+	if relayURL != "" {
+		fmt.Printf("Relay:   %s\n", relayURL)
+	}
+	if kerr == nil {
+		if host != "" {
+			fmt.Printf("Device:  %s (%s)\n", host, keyID)
+		} else {
+			fmt.Printf("Device:  %s\n", keyID)
+		}
+	} else {
+		fmt.Printf("Device:  not enrolled (profile %s)\n", profile)
+	}
+
+	// Best-effort fetch of trusted clients per route from the signed publications endpoint.
+	trustedByRoute := map[string][]string{}
+	if kerr == nil && relayURL != "" {
+		if st, body, err := ops.mgmtCall(relayURL, k, keyID, http.MethodGet, "/v1/agent/mcp-routes"); err == nil && st == http.StatusOK {
+			var pubs []struct {
+				RouteID        string   `json:"route_id"`
+				TrustedClients []string `json:"trusted_clients"`
+			}
+			if json.Unmarshal(body, &pubs) == nil {
+				for _, p := range pubs {
+					if len(p.TrustedClients) > 0 {
+						trustedByRoute[p.RouteID] = p.TrustedClients
+					}
+				}
+			}
+		}
+	}
+
+	type pendingEntry struct {
+		service  string
+		clientID string
+		name     string
+	}
+	var pending []pendingEntry
+
+	fmt.Println("\nServices:")
+	for _, rec := range svcs {
+		rk, rKeyID := k, keyID
+		if rec.Profile != "" && rec.Profile != profile {
+			rk, rKeyID, _ = loadKeyForProfile(rec.Profile)
+		}
+		rep := inspectServiceStatus(rec, rk, rKeyID, ops)
+		urlStr := rep.PublicURL
+		if urlStr == "" {
+			urlStr = "-"
+		}
+		trustedStr := ""
+		if tcs := trustedByRoute[rec.PublicationID]; len(tcs) > 0 {
+			trustedStr = "  trusted=" + strings.Join(tcs, ",")
+		}
+		fmt.Printf("  %-14s  %-4s  %-10s  %s%s\n", rec.Name, rec.Type, rep.State, urlStr, trustedStr)
+
+		// Collect pending OAuth clients for managed-OAuth MCP services.
+		if rec.Type == "mcp" && rec.PublicationID != "" && rk != nil {
+			rURL := rec.RelayURL
+			if rURL == "" {
+				rURL = relayURL
+			}
+			if rURL != "" {
+				if st, body, err := ops.mgmtCall(rURL, rk, rKeyID, http.MethodGet, "/v1/agent/mcp-routes/"+rec.PublicationID+"/authz/pending"); err == nil && st == http.StatusOK {
+					var pResp struct {
+						Pending []struct {
+							ClientID string `json:"client_id"`
+							Name     string `json:"name"`
+						} `json:"pending"`
+					}
+					if json.Unmarshal(body, &pResp) == nil {
+						for _, pc := range pResp.Pending {
+							pending = append(pending, pendingEntry{
+								service:  rec.Name,
+								clientID: pc.ClientID,
+								name:     pc.Name,
+							})
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if len(pending) > 0 {
+		fmt.Println("\nPending OAuth clients:")
+		for _, p := range pending {
+			label := p.name
+			if label == "" {
+				label = "unnamed"
+			}
+			fmt.Printf("  %s (%s) on %s\n", p.clientID, label, p.service)
+			fmt.Printf("    approve: ocliv trust %s --client %s\n", p.service, p.clientID)
+			fmt.Printf("    revoke:  ocliv revoke client %s --service %s\n", p.clientID, p.service)
+		}
+	}
+	return apperr.ExitOK
 }
 
 // cmdDoctor runs agent-side diagnostics, or hosted-service diagnostics when

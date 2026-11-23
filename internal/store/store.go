@@ -346,6 +346,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_pairing_requests_one_pending_per_key
   ON pairing_requests(key_id) WHERE status = 'pending';
 `
 
+// schemaV23 adds route-scoped OAuth client trust policies. A policy pins an
+// exact set of HTTPS redirect URIs for a single (tenant_id, route_id); a
+// dynamically registered public client whose complete redirect_uris set
+// exactly matches an active policy receives a direct grant (skip_pairing=1)
+// at registration time without weakening PKCE or route/tenant isolation.
+const schemaV23 = `
+CREATE TABLE IF NOT EXISTS authz_trust_policies (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  route_id TEXT NOT NULL,
+  owner_key_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  redirect_uris_json TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_authz_trust_policies_route
+  ON authz_trust_policies(tenant_id, route_id, enabled, revoked_at);
+`
+
 // applyMigration runs one versioned migration body and its version
 // stamp in a single transaction: a failure anywhere rolls back the
 // body, so a version is never recorded for half-applied work (P1-2).
@@ -370,7 +391,7 @@ func applyMigration(sqldb *sql.DB, version int, body string) error {
 }
 
 // currentSchema is the newest version Open must reach.
-const currentSchema = 22
+const currentSchema = 23
 
 // SchemaVersion is the exported current schema version for tools that must
 // refuse unknown/newer databases without opening (and thereby migrating)
@@ -571,6 +592,7 @@ func Open(path string) (*DB, error) {
 		{20, schemaV20},
 		{21, schemaV21},
 		{22, schemaV22},
+		{23, schemaV23},
 	}
 	for _, m := range migrations {
 		var v int

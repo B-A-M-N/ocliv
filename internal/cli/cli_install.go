@@ -13,9 +13,75 @@ import (
 	"time"
 
 	"ocliv/internal/apperr"
+	"ocliv/internal/config"
 	"ocliv/internal/control"
 	"ocliv/internal/installer"
 )
+
+// cmdUpdate is the simplified client update command:
+//
+//	ocliv update [--check] [--yes] [--relay URL] [--dir DIR] [--profile NAME]
+//
+// It reads the persisted relay URL for the active profile and delegates to
+// the verified signed release installer (`cmdInstall`).
+func cmdUpdate(argv []string) int {
+	var relayURL, dir, profileFlag string
+	var checkOnly, yes bool
+
+	for i := 0; i < len(argv); i++ {
+		a := argv[i]
+		switch {
+		case a == "--help" || a == "-h":
+			fmt.Fprintln(os.Stderr, "usage: ocliv update [--check] [--yes] [--relay URL] [--dir DIR] [--profile NAME]")
+			return apperr.ExitOK
+		case a == "--check":
+			checkOnly = true
+		case a == "--yes" || a == "-y":
+			yes = true
+		case a == "--relay" || strings.HasPrefix(a, "--relay="):
+			v, ok := mcpFlagValue(argv, &i, "relay")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			relayURL = v
+		case a == "--dir" || strings.HasPrefix(a, "--dir="):
+			v, ok := mcpFlagValue(argv, &i, "dir")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			dir = v
+		case a == "--profile" || strings.HasPrefix(a, "--profile="):
+			v, ok := mcpFlagValue(argv, &i, "profile")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			profileFlag = v
+		default:
+			fmt.Fprintf(os.Stderr, "update: unknown flag %q\n", a)
+			return apperr.ExitCLIValidation
+		}
+	}
+	if profileFlag == "" {
+		profileFlag = config.ActiveProfile()
+	}
+	if relayURL == "" {
+		relayURL = agentRelayURLForProfile(profileFlag)
+	}
+	if relayURL == "" {
+		fmt.Fprintln(os.Stderr, "update: no relay URL configured; pass --relay URL or enroll first")
+		return apperr.ExitCLIValidation
+	}
+	installArgs := []string{"--relay", relayURL}
+	if dir != "" {
+		installArgs = append(installArgs, "--dir", dir)
+	}
+	if checkOnly {
+		installArgs = append(installArgs, "--dry-run", "--yes")
+	} else if yes {
+		installArgs = append(installArgs, "--yes")
+	}
+	return cmdInstall(installArgs)
+}
 
 func cmdInstall(argv []string) int {
 	var relayURL, manifestURL, artifactURL, dir string

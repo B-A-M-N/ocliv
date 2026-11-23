@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"ocliv/internal/apperr"
+	"ocliv/internal/authz"
 	"ocliv/internal/config"
 )
 
@@ -24,6 +25,7 @@ type HostTransactionResult struct {
 	Public                string                  `json:"public,omitempty"`
 	PublicationID         string                  `json:"publication_id,omitempty"`
 	Authentication        string                  `json:"authentication"`
+	TrustedClients        []string                `json:"trusted_clients,omitempty"`
 	Configured            bool                    `json:"configured"`
 	RunningNow            bool                    `json:"running_now"`
 	PersistenceConfigured bool                    `json:"persistence_configured"`
@@ -102,6 +104,7 @@ func cmdHostWithOps(argv []string, ops serviceOps) int {
 	var port int
 	var stdio, allowRoot bool
 	var name, svcType, auth, profileFlag string
+	var trustPresets []string
 	var cmd []string
 
 	i := 0
@@ -154,6 +157,15 @@ func cmdHostWithOps(argv []string, ops serviceOps) int {
 				return failValidation("missing value for --auth")
 			}
 			auth = v
+		case a == "--trust" || strings.HasPrefix(a, "--trust="):
+			v, ok := mcpFlagValue(argv, &i, "trust")
+			if !ok {
+				return failValidation("missing value for --trust")
+			}
+			if _, ok := authz.LookupTrustPreset(v); !ok {
+				return failValidation(fmt.Sprintf("unknown --trust preset %q (available: chatgpt)", v))
+			}
+			trustPresets = append(trustPresets, strings.ToLower(strings.TrimSpace(v)))
 		default:
 			return failValidation(fmt.Sprintf("unknown flag %q", a))
 		}
@@ -216,6 +228,9 @@ func cmdHostWithOps(argv []string, ops serviceOps) int {
 	}
 	auth = addReq.Auth
 	svcType = addReq.Type
+	if len(trustPresets) > 0 && (svcType != "mcp" || auth != "ocliv-managed") {
+		return failValidation("--trust is only supported for managed-OAuth MCP services (`ocliv host mcp PORT --trust chatgpt`)")
+	}
 
 	profile := config.ActiveProfile()
 	k, keyID, err := loadKeyForProfile(profile)
@@ -228,11 +243,11 @@ func cmdHostWithOps(argv []string, ops serviceOps) int {
 				State:          ServiceStateUnknown,
 				Health:         HealthBlocked,
 				Error:          fmt.Sprintf("not enrolled in profile %q", profile),
-				RecoveryAction: "run `ocliv login --relay https://YOUR_RELAY --code-file PATH` on this machine first",
+				RecoveryAction: "run `ocliv device add user@this-host` on your relay, or `ocliv pair https://YOUR_RELAY` here",
 			})
 		} else {
 			fmt.Fprintf(os.Stderr, "not enrolled in profile %q.\n", profile)
-			fmt.Fprintln(os.Stderr, "Run `ocliv login --relay https://YOUR_RELAY --code-file PATH` on this machine first.")
+			fmt.Fprintln(os.Stderr, "Run `ocliv device add user@this-host` on your relay, or `ocliv pair https://YOUR_RELAY` on this machine first.")
 		}
 		return apperr.ExitAuth
 	}
@@ -407,6 +422,27 @@ func cmdHostWithOps(argv []string, ops serviceOps) int {
 		return apperr.ExitInternal
 	}
 
+	// Step 4: Apply any requested route-scoped client trust policies (e.g. --trust chatgpt).
+	if len(trustPresets) > 0 && res.PublicationID != "" {
+		relayURL := ""
+		if ok && rec.RelayURL != "" {
+			relayURL = rec.RelayURL
+		}
+		if relayURL == "" {
+			relayURL = agentRelayURLForProfile(profile)
+		}
+		for _, preset := range trustPresets {
+			pol, _, pcode, perr := applyTrustPolicyToRoute(relayURL, k, keyID, res.PublicationID, preset, nil, ops)
+			if perr != nil {
+				res.Error = fmt.Sprintf("service is serving, but applying --trust %s failed: %v", preset, perr)
+				res.RecoveryAction = fmt.Sprintf("run `ocliv trust %s %s` to retry", name, preset)
+				emitHostResult(res, jsonOut)
+				return pcode
+			}
+			res.TrustedClients = append(res.TrustedClients, pol.DisplayLabel())
+		}
+	}
+
 	emitHostResult(res, jsonOut)
 	if !jsonOut && svcType == "mcp" && res.Public != "" {
 		snippet, _ := json.MarshalIndent(map[string]any{
@@ -464,6 +500,9 @@ func emitHostResult(res HostTransactionResult, jsonOut bool) {
 	fmt.Printf("Connection:      %s\n", connStr)
 	fmt.Printf("Route:           %s\n", routeStr)
 	fmt.Printf("Authentication:  %s\n", humanAuthLabel(res.Type, res.Authentication))
+	if len(res.TrustedClients) > 0 {
+		fmt.Printf("Trusted clients: %s\n", strings.Join(res.TrustedClients, ", "))
+	}
 	if res.VerificationLevel != "" {
 		fmt.Printf("Verification:    %s (publicly_verified=%v)\n", res.VerificationLevel, res.PubliclyVerified)
 	}

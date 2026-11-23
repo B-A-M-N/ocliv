@@ -165,17 +165,29 @@ func Run(argv []string) int {
 	case "relay":
 		return cmdRelay(argv[1:])
 	case "setup":
-		jsonFlag := false
-		for _, a := range argv[1:] {
-			if a == "--json" {
-				jsonFlag = true
-				break
-			}
-		}
-		if !jsonFlag {
-			fmt.Fprintln(os.Stderr, "note: `ocliv setup` is a compatibility alias for `ocliv relay setup`")
-		}
 		return cmdSetup(argv[1:])
+	case "device":
+		return cmdDevice(argv[1:])
+	case "trust":
+		if err := requireUserContext("trust", false); err != nil {
+			fmt.Fprintln(os.Stderr, "error: "+err.Error())
+			return apperr.ExitCLIValidation
+		}
+		return cmdTrust(argv[1:])
+	case "untrust":
+		if err := requireUserContext("untrust", false); err != nil {
+			fmt.Fprintln(os.Stderr, "error: "+err.Error())
+			return apperr.ExitCLIValidation
+		}
+		return cmdUntrust(argv[1:])
+	case "revoke":
+		if err := requireUserContext("revoke", false); err != nil {
+			fmt.Fprintln(os.Stderr, "error: "+err.Error())
+			return apperr.ExitCLIValidation
+		}
+		return cmdRevoke(argv[1:])
+	case "update":
+		return cmdUpdate(argv[1:])
 	case "access":
 		return cmdAccess(argv[1:])
 	case "mcp":
@@ -196,6 +208,12 @@ func Run(argv []string) int {
 		return cmdInstall(argv[1:])
 	case "host":
 		return cmdHost(argv[1:])
+	case "start":
+		if err := requireUserContext("start", false); err != nil {
+			fmt.Fprintln(os.Stderr, "error: "+err.Error())
+			return apperr.ExitCLIValidation
+		}
+		return cmdServiceStart(argv[1:], defaultServiceOps())
 	case "restart":
 		if err := requireUserContext("restart", false); err != nil {
 			fmt.Fprintln(os.Stderr, "error: "+err.Error())
@@ -228,38 +246,44 @@ func Run(argv []string) int {
 }
 
 func usage(code int) int {
-	fmt.Print(`Ocliv — secure instant HTTPS hosting.
+	fmt.Print(`Ocliv — secure instant HTTPS & MCP hosting.
 
-Everyday (Publisher):
-  ocliv pair RELAY_URL [--no-wait]   pair this publisher with a relay (primary flow)
-  ocliv pair resume                  complete a pending pairing request
-  ocliv host [http|mcp] PORT [--name N]  persistently host HTTP (default) or MCP (systemd + reboot-safe)
-  ocliv status [NAME] [--json]       show hosted service or tunnel health and recovery state
-  ocliv restart NAME                 non-destructive restart/rebind (preserves URL & sessions)
-  ocliv stop NAME [--json]           immediately disable public access, retain identity
-  ocliv remove NAME --confirm NAME   permanently retire a hosted publication
-  ocliv PORT                  share localhost:PORT over protected HTTPS (ephemeral)
-  ocliv doctor                diagnose key, relay, local service, and DNS/TLS
-  ocliv login --relay URL --code-file PATH   enroll via one-time code (headless/automated)
-  ocliv install --relay URL [--dir DIR] [--yes]   download and verify signed release from relay
-  ocliv profile create NAME | use NAME|default | list   separate enrollments
+Getting Started:
+  sudo ocliv setup [--edge wildcard|single-host|tunnel]   set up this relay host (TLS + systemd)
+  ocliv device add USER@HOST [--install]                  enroll a publisher machine over SSH
+  ocliv host mcp PORT --name NAME --trust chatgpt         host an MCP server with ChatGPT trusted
 
-Relay Operator:
-  ocliv relay setup --auto [--edge wildcard|single-host|tunnel] [--dns-provider NAME] [--hostname HOST] [--acme-email ADDR] [--token-file PATH] [--dry-run] [--json]
-  ocliv relay setup --check   diagnose relay host reachability (changes nothing)
-  ocliv relay approve CODE --tenant TENANT [--data DIR]   approve a publisher pairing request
-  ocliv relay init --domain DOMAIN | relay serve --domain DOMAIN [--edge-mode wildcard|single-host|tunnel] | relay doctor | relay issue-enroll | relay revoke-key
+Everyday Commands:
+  ocliv host [http|mcp] PORT [--name N] [--trust PRESET]   persistently host HTTP or MCP (systemd + reboot-safe)
+  ocliv status [NAME] [--json]                             show relay, services, trusted clients, and pending approvals
+  ocliv start NAME                                         start a stopped hosted service
+  ocliv stop NAME [--json]                                 immediately disable public access, retain identity
+  ocliv restart NAME                                       non-destructive restart/rebind (preserves URL & sessions)
+  ocliv trust NAME PRESET|--redirect-uri URI|--client ID   manage route-scoped trusted OAuth clients
+  ocliv untrust NAME PRESET_OR_ID                          revoke a route trust policy
+  ocliv revoke client CLIENT_ID [--service NAME]           revoke an OAuth client's access
+  ocliv remove NAME [--yes]                                permanently retire a hosted service
+  ocliv update [--check] [--yes]                           check for or install signed client updates from relay
+  ocliv doctor [NAME|--all]                                diagnose key, relay, local service, and DNS/TLS
+  ocliv PORT                                               share localhost:PORT over protected HTTPS (ephemeral)
 
-Advanced:
-  ocliv PORT [--public] [--ipv6] [--name NAME] [--ttl 2h] [--upstream-host H] [--json] [--no-share-link] [--share-link-file PATH]
-  ocliv logout
-  ocliv access share|rotate|revoke [LEASE]
-  ocliv mcp expose -- COMMAND [ARGS...]
-  ocliv mcp manage
-  ocliv mcp publish (--local URL | --stdio -- CMD [ARGS...]) --auth upstream-oauth|ocliv-managed [--relay URL] [--name N] [--ttl D] ...
-  ocliv mcp serve --local URL --auth upstream-oauth|fixture-anonymous [--relay URL] ...
-  ocliv mcp doctor [--lease ID] [--name LABEL]
-  ocliv mcp list|unpublish ...
+Device Management (on relay host):
+  ocliv device add USER@HOST [--tenant default] [--install]   enroll a remote machine over SSH
+  ocliv device add --local-user USER [--tenant default]       enroll a local unprivileged user on the relay host
+  ocliv device list [--data DIR]                              list enrolled devices/keys
+  ocliv device revoke KEY_ID [--data DIR]                     revoke an enrolled device key
+
+Advanced / Plumbing:
+  ocliv pair RELAY_URL | pair resume                          manual pairing fallback when SSH is unavailable
+  ocliv login --relay URL --code-file PATH | logout           headless code enrollment / sign-out
+  ocliv service ...                                           low-level service management
+  ocliv authz ...                                             low-level relay OAuth administration
+  ocliv relay ...                                             low-level relay serve/init/backup/restore/approve
+  ocliv install --relay URL [--dir DIR] [--yes]               explicit signed release installer
+  ocliv profile create|use|list                               separate enrollment profiles
+  ocliv access share|rotate|revoke [LEASE]                    ephemeral share-link credentials
+  ocliv mcp expose|manage|publish|serve                       low-level MCP publisher commands
+  ocliv connect ... | google ...                              legacy client/connector helpers
   ocliv version
 `)
 	return code

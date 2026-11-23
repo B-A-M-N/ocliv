@@ -62,13 +62,14 @@ type serviceStopResult struct {
 // serviceOps isolates external interactions (systemd --user, relay mgmt, probes)
 // so both production and hermetic unit/integration tests use the same logic.
 type serviceOps struct {
-	systemctl func(args ...string) (string, error)
-	loginctl  func(args ...string) (string, error)
-	mgmtCall  func(relayURL string, k *identity.KeyPair, keyID, method, path string) (int, []byte, error)
-	probeLoc  func(target string, timeout time.Duration) error
-	probePub  func(publicURL string, timeout time.Duration) (int, error)
-	probeEdge func(publicURL string, timeout time.Duration) (int, error)
-	provision func(rec config.ServiceRecord, ops serviceOps) error
+	systemctl    func(args ...string) (string, error)
+	loginctl     func(args ...string) (string, error)
+	mgmtCall     func(relayURL string, k *identity.KeyPair, keyID, method, path string) (int, []byte, error)
+	mgmtCallBody func(relayURL string, k *identity.KeyPair, keyID, method, path string, reqBody []byte) (int, []byte, error)
+	probeLoc     func(target string, timeout time.Duration) error
+	probePub     func(publicURL string, timeout time.Duration) (int, error)
+	probeEdge    func(publicURL string, timeout time.Duration) (int, error)
+	provision    func(rec config.ServiceRecord, ops serviceOps) error
 }
 
 func defaultServiceOps() serviceOps {
@@ -82,9 +83,10 @@ func defaultServiceOps() serviceOps {
 			out, err := exec.Command("loginctl", args...).CombinedOutput()
 			return strings.TrimSpace(string(out)), err
 		},
-		mgmtCall:  mgmtCall,
-		probeLoc:  agent.ProbeLocal,
-		provision: provisionUserSupervisor,
+		mgmtCall:     mgmtCall,
+		mgmtCallBody: mgmtCallBody,
+		probeLoc:     agent.ProbeLocal,
+		provision:    provisionUserSupervisor,
 		probeEdge: func(publicURL string, timeout time.Duration) (int, error) {
 			c, err := mgmtHTTPClient(timeout)
 			if err != nil {
@@ -1952,12 +1954,12 @@ func cmdServiceList(argv []string, ops serviceOps) int {
 
 func cmdServiceRemove(argv []string, ops serviceOps) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ocliv service remove NAME --confirm NAME [--forget-local]")
+		fmt.Fprintln(os.Stderr, "usage: ocliv remove NAME [--yes | --confirm NAME] [--forget-local]")
 		return apperr.ExitCLIValidation
 	}
 	name := argv[0]
 	var confirm string
-	var forgetLocal bool
+	var forgetLocal, yes bool
 	for i := 1; i < len(argv); i++ {
 		if argv[i] == "--confirm" || strings.HasPrefix(argv[i], "--confirm=") {
 			v, ok := mcpFlagValue(argv, &i, "confirm")
@@ -1965,6 +1967,8 @@ func cmdServiceRemove(argv []string, ops serviceOps) int {
 				return apperr.ExitCLIValidation
 			}
 			confirm = v
+		} else if argv[i] == "--yes" || argv[i] == "-y" {
+			yes = true
 		} else if argv[i] == "--forget-local" {
 			forgetLocal = true
 		} else {
@@ -1972,9 +1976,20 @@ func cmdServiceRemove(argv []string, ops serviceOps) int {
 			return apperr.ExitCLIValidation
 		}
 	}
-	if confirm != name {
-		fmt.Fprintf(os.Stderr, "permanent removal requires `--confirm %s`\n", name)
-		return apperr.ExitCLIValidation
+	if !yes && confirm != name {
+		if fi, err := os.Stdin.Stat(); err == nil && (fi.Mode()&os.ModeCharDevice) != 0 {
+			fmt.Fprintf(os.Stderr, "Permanently remove service %q and revoke its public route? [y/N] ", name)
+			var answer string
+			_, _ = fmt.Fscanln(os.Stdin, &answer)
+			answer = strings.ToLower(strings.TrimSpace(answer))
+			if answer != "y" && answer != "yes" {
+				fmt.Fprintln(os.Stderr, "aborted")
+				return apperr.ExitCLIValidation
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "permanent removal requires `--yes` or `--confirm %s`\n", name)
+			return apperr.ExitCLIValidation
+		}
 	}
 	store, err := openServices()
 	if err != nil {

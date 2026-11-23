@@ -262,6 +262,197 @@ func (s *SQLStore) TryRegisterClientWithPendingGrant(c Client, tenant, route str
 	return nil
 }
 
+// TryRegisterClientWithDirectGrant atomically enforces the per-route quota,
+// inserts the client, AND seeds an ACTIVE direct grant (skip_pairing=1) in one
+// transaction. Called only when an active route-scoped trust policy matches.
+func (s *SQLStore) TryRegisterClientWithDirectGrant(c Client, tenant, route string) error {
+	if c.ID == "" {
+		return fmt.Errorf("authz: client id is required")
+	}
+	if tenant == "" || route == "" {
+		return fmt.Errorf("authz: tenant and route are required for direct grant")
+	}
+	uris, err := json.Marshal(c.RedirectURIs)
+	if err != nil {
+		return fmt.Errorf("authz: redirect uris: %w", err)
+	}
+	createdAt := c.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	nowStr := createdAt.UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("authz: register tx: %w", err)
+	}
+	defer tx.Rollback()
+	var n int
+	if err := tx.QueryRow(
+		`SELECT COUNT(1) FROM authz_clients WHERE tenant_id=? AND route_id=?`,
+		c.Tenant, c.Route).Scan(&n); err != nil {
+		return fmt.Errorf("authz: count clients: %w", err)
+	}
+	if n >= MaxClientsPerRoute {
+		var victimID string
+		err := tx.QueryRow(
+			`SELECT c.id FROM authz_clients c
+			 WHERE c.tenant_id=? AND c.route_id=? AND c.revoked_at IS NULL
+			   AND NOT EXISTS (
+			     SELECT 1 FROM authz_grants g
+			     WHERE g.client_id=c.id AND g.tenant_id=c.tenant_id AND g.route_id=c.route_id
+			       AND g.status IN ('active', 'revoked')
+			   )
+			 ORDER BY c.created_at ASC, c.id ASC LIMIT 1`,
+			c.Tenant, c.Route).Scan(&victimID)
+		if err == sql.ErrNoRows {
+			return ErrClientQuota
+		}
+		if err != nil {
+			return fmt.Errorf("authz: select oldest unused client: %w", err)
+		}
+		if _, err := tx.Exec(
+			`DELETE FROM authz_grants WHERE client_id=? AND tenant_id=? AND route_id=? AND status='pending'`,
+			victimID, c.Tenant, c.Route); err != nil {
+			return fmt.Errorf("authz: delete pending grant for evicted client: %w", err)
+		}
+		res, err := tx.Exec(
+			`DELETE FROM authz_clients
+			 WHERE id=? AND tenant_id=? AND route_id=? AND revoked_at IS NULL
+			   AND NOT EXISTS (
+			     SELECT 1 FROM authz_grants g
+			     WHERE g.client_id=authz_clients.id
+			       AND g.tenant_id=authz_clients.tenant_id
+			       AND g.route_id=authz_clients.route_id
+			       AND g.status IN ('active', 'revoked')
+			   )`,
+			victimID, c.Tenant, c.Route)
+		if err != nil {
+			return fmt.Errorf("authz: evict oldest unused client: %w", err)
+		}
+		deleted, _ := res.RowsAffected()
+		if deleted != 1 {
+			return ErrClientQuota
+		}
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO authz_clients(id, name, redirect_uris, created_at, tenant_id, route_id, client_secret_hash, client_mode, refresh_policy) VALUES(?,?,?,?,?,?,?,?,?)`,
+		c.ID, c.Name, string(uris), nowStr, c.Tenant, c.Route, c.ClientSecretHash, defaultClientMode(c.ClientMode), c.RefreshPolicy); err != nil {
+		return fmt.Errorf("authz: register client: %w", err)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO authz_grants(client_id, tenant_id, route_id, status, skip_pairing, created_at, updated_at) VALUES(?,?,?,?,1,?,?)`,
+		c.ID, tenant, route, string(GrantActive), nowStr, nowStr); err != nil {
+		return fmt.Errorf("authz: seed direct grant: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("authz: register commit: %w", err)
+	}
+	return nil
+}
+
+// CreateTrustPolicy inserts a durable route-scoped exact-redirect trust policy.
+func (s *SQLStore) CreateTrustPolicy(p ClientTrustPolicy) error {
+	if p.ID == "" || p.TenantID == "" || p.RouteID == "" {
+		return fmt.Errorf("authz: trust policy requires id, tenant_id, and route_id")
+	}
+	uris, err := ValidateTrustRedirectURIs(p.RedirectURIs)
+	if err != nil {
+		return err
+	}
+	urisJSON, err := json.Marshal(uris)
+	if err != nil {
+		return fmt.Errorf("authz: marshal trust policy redirect_uris: %w", err)
+	}
+	createdAt := p.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	enabled := 0
+	if p.Enabled {
+		enabled = 1
+	}
+	_, err = s.db.Exec(
+		`INSERT INTO authz_trust_policies(id, tenant_id, route_id, owner_key_id, kind, redirect_uris_json, enabled, created_at)
+		 VALUES(?,?,?,?,?,?,?,?)`,
+		p.ID, p.TenantID, p.RouteID, p.OwnerKeyID, p.Kind, string(urisJSON), enabled, createdAt.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("authz: create trust policy: %w", err)
+	}
+	return nil
+}
+
+// ListTrustPolicies returns all active, unrevoked trust policies for (tenant, route).
+func (s *SQLStore) ListTrustPolicies(tenant, route string) ([]ClientTrustPolicy, error) {
+	rows, err := s.db.Query(
+		`SELECT id, tenant_id, route_id, owner_key_id, kind, redirect_uris_json, enabled, created_at
+		 FROM authz_trust_policies
+		 WHERE tenant_id=? AND route_id=? AND enabled=1 AND revoked_at IS NULL
+		 ORDER BY created_at ASC, id ASC`,
+		tenant, route,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("authz: list trust policies: %w", err)
+	}
+	defer rows.Close()
+	out := make([]ClientTrustPolicy, 0)
+	for rows.Next() {
+		var (
+			p         ClientTrustPolicy
+			urisJSON  string
+			enabled   int
+			createdAt string
+		)
+		if err := rows.Scan(&p.ID, &p.TenantID, &p.RouteID, &p.OwnerKeyID, &p.Kind, &urisJSON, &enabled, &createdAt); err != nil {
+			return nil, fmt.Errorf("authz: scan trust policy: %w", err)
+		}
+		p.Enabled = enabled != 0
+		_ = json.Unmarshal([]byte(urisJSON), &p.RedirectURIs)
+		if t, err := time.Parse(time.RFC3339Nano, createdAt); err == nil {
+			p.CreatedAt = t
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// RevokeTrustPolicy revokes active trust policies on (tenant, route) matching
+// either exact policy ID or policy kind (e.g. "chatgpt").
+func (s *SQLStore) RevokeTrustPolicy(tenant, route, idOrKind string) (int, error) {
+	if idOrKind == "" {
+		return 0, fmt.Errorf("authz: policy id or kind is required")
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	res, err := s.db.Exec(
+		`UPDATE authz_trust_policies
+		 SET enabled=0, revoked_at=?
+		 WHERE tenant_id=? AND route_id=? AND revoked_at IS NULL AND (id=? OR kind=?)`,
+		now, tenant, route, idOrKind, idOrKind,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("authz: revoke trust policy: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+// MatchTrustPolicy returns the first active trust policy on (tenant, route)
+// whose RedirectURIs set exactly equals redirectURIs.
+func (s *SQLStore) MatchTrustPolicy(tenant, route string, redirectURIs []string) (*ClientTrustPolicy, error) {
+	policies, err := s.ListTrustPolicies(tenant, route)
+	if err != nil {
+		return nil, err
+	}
+	for i := range policies {
+		if ExactRedirectURISetEqual(policies[i].RedirectURIs, redirectURIs) {
+			cp := policies[i]
+			cp.RedirectURIs = append([]string(nil), policies[i].RedirectURIs...)
+			return &cp, nil
+		}
+	}
+	return nil, nil
+}
+
 // CreateOpaqueRefresh persists a hashed opaque refresh token for a confidential client.
 func (s *SQLStore) CreateOpaqueRefresh(r OpaqueRefresh) error {
 	_, err := s.db.Exec(

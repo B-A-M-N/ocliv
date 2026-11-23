@@ -187,6 +187,17 @@ type Store interface {
 	// TryRegisterClientWithPendingGrant atomically registers a client and
 	// creates its initial GrantPending row in one transaction.
 	TryRegisterClientWithPendingGrant(c Client, tenant, route string) error
+	// TryRegisterClientWithDirectGrant atomically registers a client and
+	// creates an ACTIVE Grant with SkipPairing=true in one transaction.
+	// Used only when an active route-scoped ClientTrustPolicy matches the
+	// client's exact redirect_uris set.
+	TryRegisterClientWithDirectGrant(c Client, tenant, route string) error
+
+	// Trust policy management (route-scoped exact-redirect policies).
+	CreateTrustPolicy(p ClientTrustPolicy) error
+	ListTrustPolicies(tenant, route string) ([]ClientTrustPolicy, error)
+	RevokeTrustPolicy(tenant, route, idOrKind string) (int, error)
+	MatchTrustPolicy(tenant, route string, redirectURIs []string) (*ClientTrustPolicy, error)
 	CreateOpaqueRefresh(r OpaqueRefresh) error
 	RotateOpaqueRefresh(oldHash, newHash, clientID, tenant, route string, now time.Time, extendBy time.Duration) (*OpaqueRefresh, error)
 	ExtendOpaqueRefresh(tokenHash, clientID, tenant, route string, now time.Time, extendBy time.Duration) (*OpaqueRefresh, error)
@@ -290,6 +301,7 @@ type MemStore struct {
 	consent       map[string]*Consent
 	audit         []AuthzAudit
 	opaqueRefresh map[string]*OpaqueRefresh
+	trustPolicies map[string]*ClientTrustPolicy
 }
 
 // NewMemStore returns an empty in-memory store.
@@ -1056,4 +1068,118 @@ func (m *MemStore) RevokeOpaqueRefreshForClient(clientID string) error {
 		}
 	}
 	return nil
+}
+
+// TryRegisterClientWithDirectGrant atomically registers a client and creates
+// its ACTIVE direct grant (SkipPairing=true).
+func (m *MemStore) TryRegisterClientWithDirectGrant(c Client, tenant, route string) error {
+	if c.ID == "" {
+		return fmt.Errorf("authz: client id is required")
+	}
+	if tenant == "" || route == "" {
+		return fmt.Errorf("authz: tenant and route are required for direct grant")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.tryRegisterClientLocked(c); err != nil {
+		return err
+	}
+	now := c.CreatedAt
+	if now.IsZero() {
+		now = time.Now()
+	}
+	m.grants[grantKey(c.ID, tenant, route)] = &Grant{
+		ClientID:    c.ID,
+		Tenant:      tenant,
+		Route:       route,
+		Status:      GrantActive,
+		SkipPairing: true,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	return nil
+}
+
+// CreateTrustPolicy stores a route-scoped exact-redirect trust policy.
+func (m *MemStore) CreateTrustPolicy(p ClientTrustPolicy) error {
+	if p.ID == "" || p.TenantID == "" || p.RouteID == "" {
+		return fmt.Errorf("authz: trust policy requires id, tenant_id, and route_id")
+	}
+	uris, err := ValidateTrustRedirectURIs(p.RedirectURIs)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.trustPolicies == nil {
+		m.trustPolicies = map[string]*ClientTrustPolicy{}
+	}
+	if _, exists := m.trustPolicies[p.ID]; exists {
+		return fmt.Errorf("authz: trust policy %q already exists", p.ID)
+	}
+	cp := p
+	cp.RedirectURIs = uris
+	if cp.CreatedAt.IsZero() {
+		cp.CreatedAt = time.Now().UTC()
+	}
+	m.trustPolicies[p.ID] = &cp
+	return nil
+}
+
+// ListTrustPolicies returns active, unrevoked trust policies for a route.
+func (m *MemStore) ListTrustPolicies(tenant, route string) ([]ClientTrustPolicy, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]ClientTrustPolicy, 0)
+	for _, p := range m.trustPolicies {
+		if p.TenantID == tenant && p.RouteID == route && p.Enabled && p.RevokedAt == nil {
+			cp := *p
+			cp.RedirectURIs = append([]string(nil), p.RedirectURIs...)
+			out = append(out, cp)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+// RevokeTrustPolicy revokes matching active trust policies by ID or kind.
+func (m *MemStore) RevokeTrustPolicy(tenant, route, idOrKind string) (int, error) {
+	if idOrKind == "" {
+		return 0, fmt.Errorf("authz: policy id or kind is required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now().UTC()
+	n := 0
+	for _, p := range m.trustPolicies {
+		if p.TenantID == tenant && p.RouteID == route && p.RevokedAt == nil && (p.ID == idOrKind || p.Kind == idOrKind) {
+			t := now
+			p.Enabled = false
+			p.RevokedAt = &t
+			n++
+		}
+	}
+	return n, nil
+}
+
+// MatchTrustPolicy returns the first active policy on (tenant, route) whose
+// RedirectURIs set exactly equals redirectURIs.
+func (m *MemStore) MatchTrustPolicy(tenant, route string, redirectURIs []string) (*ClientTrustPolicy, error) {
+	policies, err := m.ListTrustPolicies(tenant, route)
+	if err != nil {
+		return nil, err
+	}
+	for i := range policies {
+		if ExactRedirectURISetEqual(policies[i].RedirectURIs, redirectURIs) {
+			cp := policies[i]
+			cp.RedirectURIs = append([]string(nil), policies[i].RedirectURIs...)
+			return &cp, nil
+		}
+	}
+	return nil, nil
 }

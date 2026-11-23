@@ -47,8 +47,9 @@ type Options struct {
 	MCPExternalPort int
 	ServerKey       []byte // HMAC key for visitor sessions; random per relay
 	Logger          Logger
-	// AutoApproveRedirectHosts lists trusted redirect hostnames that may
-	// auto-approve managed OAuth clients with skip_pairing=true.
+	// AutoApproveRedirectHosts is DEPRECATED: use route-scoped trust policies
+	// (`ocliv trust <service> chatgpt` or `--redirect-uri`) instead. Retained
+	// for backward compatibility; it does not auto-approve pending DCR clients.
 	AutoApproveRedirectHosts []string
 	// GoogleVerificationJSON is the operator-configured JSON payload served at
 	// GET /.well-known/google-connected-apps on MCPExternalHost (HTTP 200, no redirect).

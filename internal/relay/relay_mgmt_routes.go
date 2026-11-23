@@ -128,6 +128,12 @@ func (s *Server) deletePublicationAtomically(tenant, keyID, routeID string) (boo
 			return err
 		}
 		retired, _ = ures.RowsAffected()
+		if _, err := tx.Exec(
+			`UPDATE authz_trust_policies SET enabled=0, revoked_at=?
+			 WHERE tenant_id=? AND route_id=? AND (revoked_at IS NULL OR enabled<>0)`,
+			now, tenant, routeID); err != nil {
+			return err
+		}
 		return nil
 	})
 	if err != nil {
@@ -169,8 +175,26 @@ func (s *Server) handleAgentPublications(w http.ResponseWriter, r *http.Request)
 			s.serveKeyPublicationAuthzPending(w, tenant, keyID, routeID)
 			return
 		}
+		if routeID, ok := strings.CutSuffix(rest, "/trust"); ok && validRouteID(routeID) {
+			s.serveKeyPublicationTrustList(w, tenant, keyID, routeID)
+			return
+		}
+	}
+	if r.Method == http.MethodDelete {
+		if idx := strings.Index(rest, "/trust/"); idx > 0 {
+			routeID := rest[:idx]
+			idOrKind := rest[idx+len("/trust/"):]
+			if validRouteID(routeID) && idOrKind != "" && !strings.Contains(idOrKind, "/") {
+				s.serveKeyPublicationTrustRevoke(w, tenant, keyID, routeID, idOrKind)
+				return
+			}
+		}
 	}
 	if r.Method == http.MethodPost {
+		if routeID, ok := strings.CutSuffix(rest, "/trust"); ok && validRouteID(routeID) {
+			s.serveKeyPublicationTrustAdd(w, r, tenant, keyID, routeID)
+			return
+		}
 		if routeID, ok := strings.CutSuffix(rest, "/disable"); ok && validRouteID(routeID) {
 			s.serveKeyPublicationDesiredState(w, tenant, keyID, routeID, false)
 			return
@@ -257,23 +281,24 @@ func (s *Server) handleAgentPublications(w http.ResponseWriter, r *http.Request)
 }
 
 type agentPublicationView struct {
-	RouteID          string  `json:"route_id"`
-	Host             string  `json:"external_host,omitempty"`
-	URL              *string `json:"url"`
-	Profile          string  `json:"profile,omitempty"`
-	Name             string  `json:"pub_name,omitempty"`
-	LeaseID          *string `json:"lease_id"`
-	CreatedAt        string  `json:"created_at,omitempty"`
-	RevokedAt        *string `json:"revoked_at"`
-	VerifiedAt       *string `json:"verified_at"`
-	PublicationState string  `json:"publication_state"`
-	DesiredEnabled   bool    `json:"desired_enabled"`
-	StateGeneration  int64   `json:"state_generation"`
-	LeaseState       *string `json:"lease_state"`
-	SessionLive      bool    `json:"session_live"`
-	HostBinding      string  `json:"host_binding"`
-	Admission        string  `json:"admission"`
-	AdmissionReason  string  `json:"admission_reason"`
+	RouteID          string   `json:"route_id"`
+	Host             string   `json:"external_host,omitempty"`
+	URL              *string  `json:"url"`
+	Profile          string   `json:"profile,omitempty"`
+	Name             string   `json:"pub_name,omitempty"`
+	LeaseID          *string  `json:"lease_id"`
+	CreatedAt        string   `json:"created_at,omitempty"`
+	RevokedAt        *string  `json:"revoked_at"`
+	VerifiedAt       *string  `json:"verified_at"`
+	PublicationState string   `json:"publication_state"`
+	DesiredEnabled   bool     `json:"desired_enabled"`
+	StateGeneration  int64    `json:"state_generation"`
+	LeaseState       *string  `json:"lease_state"`
+	SessionLive      bool     `json:"session_live"`
+	HostBinding      string   `json:"host_binding"`
+	Admission        string   `json:"admission"`
+	AdmissionReason  string   `json:"admission_reason"`
+	TrustedClients   []string `json:"trusted_clients,omitempty"`
 }
 
 // enrichAgentPublication reports current route admission without invoking
@@ -372,6 +397,20 @@ func (s *Server) enrichAgentPublication(tenant, keyID string, p *agentPublicatio
 		p.Admission = "READY"
 	} else {
 		p.Admission = "BLOCKED"
+	}
+	if s.authz != nil {
+		if policies, err := s.authz.Store().ListTrustPolicies(tenant, p.RouteID); err == nil && len(policies) > 0 {
+			labels := make([]string, 0, len(policies))
+			seen := make(map[string]struct{}, len(policies))
+			for _, pol := range policies {
+				lbl := pol.DisplayLabel()
+				if _, dup := seen[lbl]; !dup {
+					seen[lbl] = struct{}{}
+					labels = append(labels, lbl)
+				}
+			}
+			p.TrustedClients = labels
+		}
 	}
 	return nil
 }
@@ -737,6 +776,148 @@ func (s *Server) serveKeyPublicationAuthzRegister(w http.ResponseWriter, r *http
 		"client_secret":  secret,
 		"refresh_policy": req.RefreshPolicy,
 		"status":         status,
+	})
+}
+
+func (s *Server) serveKeyPublicationTrustList(w http.ResponseWriter, tenant, keyID, routeID string) {
+	var exists int
+	if err := s.db.SQL().QueryRow(
+		`SELECT 1 FROM mcp_publications WHERE route_id=? AND tenant_id=? AND owner_key_id=? AND revoked_at IS NULL`,
+		routeID, tenant, keyID,
+	).Scan(&exists); err != nil {
+		http.Error(w, "unknown route", http.StatusNotFound)
+		return
+	}
+	policies := []authz.ClientTrustPolicy{}
+	if s.authz != nil {
+		list, err := s.authz.Store().ListTrustPolicies(tenant, routeID)
+		if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		policies = list
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"route_id":  routeID,
+		"tenant_id": tenant,
+		"policies":  policies,
+	})
+}
+
+func (s *Server) serveKeyPublicationTrustAdd(w http.ResponseWriter, r *http.Request, tenant, keyID, routeID string) {
+	if s.authz == nil {
+		http.Error(w, "managed authz unavailable", http.StatusConflict)
+		return
+	}
+	var exists int
+	if err := s.db.SQL().QueryRow(
+		`SELECT 1 FROM mcp_publications WHERE route_id=? AND tenant_id=? AND owner_key_id=? AND revoked_at IS NULL`,
+		routeID, tenant, keyID,
+	).Scan(&exists); err != nil {
+		http.Error(w, "unknown route", http.StatusNotFound)
+		return
+	}
+	var req struct {
+		Kind         string   `json:"kind"`
+		RedirectURIs []string `json:"redirect_uris"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 32*1024)).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	kind := strings.ToLower(strings.TrimSpace(req.Kind))
+	uris := req.RedirectURIs
+	if len(uris) == 0 {
+		if kind == "" {
+			http.Error(w, "kind or redirect_uris required", http.StatusBadRequest)
+			return
+		}
+		preset, ok := authz.LookupTrustPreset(kind)
+		if !ok {
+			http.Error(w, "unknown trust preset: "+kind, http.StatusBadRequest)
+			return
+		}
+		kind = preset.Kind
+		uris = preset.RedirectURIs
+	} else {
+		if kind == "" {
+			kind = "custom"
+		}
+	}
+	cleanURIs, err := authz.ValidateTrustRedirectURIs(uris)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// Idempotent: if an active policy on this route already pins the exact same
+	// URI set, return it without duplicating rows.
+	if existing, err := s.authz.Store().MatchTrustPolicy(tenant, routeID, cleanURIs); err == nil && existing != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"route_id":  routeID,
+			"tenant_id": tenant,
+			"policy":    existing,
+			"status":    "existing",
+		})
+		return
+	}
+	polID, err := authz.MintTrustPolicyID()
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	pol := authz.ClientTrustPolicy{
+		ID:           polID,
+		TenantID:     tenant,
+		RouteID:      routeID,
+		OwnerKeyID:   keyID,
+		Kind:         kind,
+		RedirectURIs: cleanURIs,
+		Enabled:      true,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := s.authz.Store().CreateTrustPolicy(pol); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.db.AuditKey("agent", tenant, keyID, "", "authz-trust-add", "ok",
+		"policy "+pol.ID+" kind "+pol.Kind+" route "+routeID)
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"route_id":  routeID,
+		"tenant_id": tenant,
+		"policy":    pol,
+		"status":    "created",
+	})
+}
+
+func (s *Server) serveKeyPublicationTrustRevoke(w http.ResponseWriter, tenant, keyID, routeID, idOrKind string) {
+	if s.authz == nil {
+		http.Error(w, "managed authz unavailable", http.StatusConflict)
+		return
+	}
+	var exists int
+	if err := s.db.SQL().QueryRow(
+		`SELECT 1 FROM mcp_publications WHERE route_id=? AND tenant_id=? AND owner_key_id=? AND revoked_at IS NULL`,
+		routeID, tenant, keyID,
+	).Scan(&exists); err != nil {
+		http.Error(w, "unknown route", http.StatusNotFound)
+		return
+	}
+	n, err := s.authz.Store().RevokeTrustPolicy(tenant, routeID, strings.TrimSpace(idOrKind))
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if n == 0 {
+		http.Error(w, "unknown trust policy", http.StatusNotFound)
+		return
+	}
+	s.db.AuditKey("agent", tenant, keyID, "", "authz-trust-revoke", "ok",
+		"target "+idOrKind+" route "+routeID+" revoked="+itoa(uint64(n)))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"route_id":  routeID,
+		"tenant_id": tenant,
+		"revoked":   n,
+		"status":    "revoked",
 	})
 }
 

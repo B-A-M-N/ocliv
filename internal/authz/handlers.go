@@ -65,9 +65,10 @@ type Server struct {
 	// ConsentTTL bounds a pending consent challenge. Zero selects
 	// DefaultConsentTTL.
 	ConsentTTL time.Duration
-	// AutoApproveRedirectHosts lists normalized lowercase hostnames whose
-	// registered redirect URIs (all of them) are trusted for direct
-	// zero-click authorization without an interactive pairing_secret form.
+	// AutoApproveRedirectHosts is DEPRECATED: use route-scoped ClientTrustPolicy
+	// via `ocliv trust <service> chatgpt` (or `--redirect-uri`) instead.
+	// Retained for backward compatibility; it does not auto-approve pending DCR
+	// clients on its own.
 	AutoApproveRedirectHosts []string
 }
 
@@ -330,7 +331,18 @@ func (s *Server) ServeRegister(w http.ResponseWriter, r *http.Request) {
 		Tenant:       s.tenant(),
 		Route:        s.RouteID,
 	}
-	if err := s.Store.TryRegisterClientWithPendingGrant(client, s.tenant(), s.RouteID); err != nil {
+	matchedPolicy, merr := s.Store.MatchTrustPolicy(s.tenant(), s.RouteID, client.RedirectURIs)
+	if merr != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	registerFn := func() error {
+		if matchedPolicy != nil {
+			return s.Store.TryRegisterClientWithDirectGrant(client, s.tenant(), s.RouteID)
+		}
+		return s.Store.TryRegisterClientWithPendingGrant(client, s.tenant(), s.RouteID)
+	}
+	if err := registerFn(); err != nil {
 		if err != ErrClientQuota {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_client_metadata", "error_description": err.Error()})
 			return
@@ -339,13 +351,17 @@ func (s *Server) ServeRegister(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
-		if err := s.Store.TryRegisterClientWithPendingGrant(client, s.tenant(), s.RouteID); err != nil {
+		if err := registerFn(); err != nil {
 			writeJSON(w, http.StatusTooManyRequests, map[string]string{
 				"error":             "invalid_client_metadata",
 				"error_description": "registration quota for this route is exhausted",
 			})
 			return
 		}
+	}
+	if matchedPolicy != nil {
+		_ = s.Store.AuditAuthz("publisher", s.tenant(), s.RouteID, id, "authz-auto-approve", "ok",
+			"policy="+matchedPolicy.Kind+" id="+matchedPolicy.ID)
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"client_id":                  id,
