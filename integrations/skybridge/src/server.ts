@@ -178,7 +178,7 @@ export const app = new Skybridge({
 // forwards route discovery to (upstream
 // `/.well-known/oauth-protected-resource/mcp`). Without this, the relay's
 // strict discovery probe 404s and publication can never verify.
-app.use('/.well-known/oauth-protected-resource/mcp', (_req, res) => {
+app.use('/.well-known/oauth-protected-resource/mcp', (_req: unknown, res: { json: (body: unknown) => void }) => {
   res.json(buildPrMetadata({resource: publicResourceUrl as string, issuer: issuer as string, scopes: writeEnabled ? ['ocliv:read','ocliv:write'] : ['ocliv:read']}));
 });
 export type AppType = typeof app;
