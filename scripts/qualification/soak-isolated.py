@@ -275,8 +275,11 @@ def start_mcp_pub():
 
 
 def start_http_pub():
+    # Ad-hoc `ocliv PORT --public` leases do not auto-renew (unlike `mcp publish`),
+    # so set TTL > soak duration to avoid planned expiry blips during multi-hour soaks.
+    http_ttl_min = max(30, math.ceil((args.duration + 3600) / 60))
     return subprocess.Popen(
-        [args.bin, str(uport), "--public", "--name", "soak-http", "--ttl", "30m", "--relay", base_url],
+        [args.bin, str(uport), "--public", "--name", "soak-http", "--ttl", f"{http_ttl_min}m", "--relay", base_url],
         stdout=pub_http_log, stderr=subprocess.STDOUT, env=pub_env,
     )
 
