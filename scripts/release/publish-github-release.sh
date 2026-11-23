@@ -140,5 +140,5 @@ if [ -f "$BUNDLE/THIRD_PARTY_LICENSES" ]; then
 fi
 
 echo "==> Publishing GitHub Release $TAG"
-gh release create "$TAG" "${ASSETS[@]}" --verify-tag --title "Ocliv $TAG" --generate-notes
+gh release create "$TAG" "${ASSETS[@]}" --title "Ocliv $TAG" --generate-notes
 echo "OK: published Ocliv $TAG ($SHA)"
