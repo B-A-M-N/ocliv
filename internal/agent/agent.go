@@ -44,14 +44,15 @@ type Runner struct {
 	// ProbePath/ProbeStatus declare the local readiness contract for apps
 	// that don't answer usefully at / (Domain A). Empty path means /;
 	// status 0 means any HTTP response counts.
-	ProbePath   string
-	ProbeStatus int
-	Upstream    string // Host to present locally (D09)
-	OnAttach    func(a Attached)
-	OnState     func(state string) // CONNECTED / RECONNECTING
-	OnRenewal   func(status LeaseRenewalStatus)
-	HTTP        *http.Client // test hook: local upstream client
-	WSURL       string       // test hook: ws base for upgrades (unused, raw TCP used)
+	ProbePath     string
+	ProbeStatus   int
+	Upstream      string // Host to present locally (D09)
+	IngressSecret []byte // Optional 0600 shared secret for signing ocliv-ingress-v2 assertions to local management MCPs
+	OnAttach      func(a Attached)
+	OnState       func(state string) // CONNECTED / RECONNECTING
+	OnRenewal     func(status LeaseRenewalStatus)
+	HTTP          *http.Client // test hook: local upstream client
+	WSURL         string       // test hook: ws base for upgrades (unused, raw TCP used)
 	// HandshakeTransport overrides the agent handshake transport
 	// (challenge POST + WSS dial). Test hook only: lets a harness
 	// present the public relay authority while dialing loopback.

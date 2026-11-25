@@ -1,6 +1,6 @@
 ---
 name: ocliv-setup-and-ops
-description: Portable guide for discovering a user's environment and setting up, publishing, troubleshooting, and upgrading Ocliv relays, MCP publishers, and OAuth connectors (such as ChatGPT). Use when a user wants to install, configure, expose local MCP/HTTP services, connect an OAuth client, or troubleshoot Ocliv on any machine.
+description: Portable guide for discovering a user's environment and setting up, publishing, troubleshooting, and upgrading Ocliv relays, MCP publishers, Control Center UI, and OAuth connectors (such as ChatGPT and Gemini). Use when a user wants to install, configure, expose local MCP/HTTP services, connect an OAuth client, or troubleshoot Ocliv on any machine.
 ---
 
 # Ocliv Setup, Publishing & Troubleshooting Guide
@@ -17,12 +17,12 @@ Determine three facts from the user or read-only inspection:
    - **Publisher host** (workstation/server running local MCP or HTTP services)
    - **Both**
 2. **Edge / DNS topology:**
-   - **`wildcard` (default):** Wildcard DNS (`*.t.<domain>`) + DNS-01 wildcard cert — supports both arbitrary HTTP/WS leases (`https://<name>.t.<domain>`) and MCP path routes.
-   - **`single-host`:** One public hostname (`https://<host>`) without wildcard DNS — serves agent control + path-based MCP routes (`https://<host>/r/<route-id>/mcp`) via normal ACME TLS (HTTP-01 or TLS-ALPN-01).
+   - **`wildcard` (default):** Wildcard DNS (`*.t.<domain>`) + DNS-01 wildcard cert — supports both arbitrary HTTP/WS leases and MCP path routes.
+   - **`single-host`:** One public hostname (`https://<host>`) without wildcard DNS — serves agent control + path-based MCP routes (`https://<host>/r/<route-id>/mcp`) via standard ACME TLS.
    - **`tunnel`:** Explicit non-canonical lab/compatibility mode only.
 3. **Existing state (read-only checks):**
-   - Relay host: `systemctl status ocliv-relay`, `systemctl cat ocliv-relay`, Caddyfile location, DB path (typically `/var/lib/ocliv/ocliv.db`).
-   - Publisher host: `which ocliv`, `~/.config/ocliv/config.toml`, `systemctl --user list-units '*ocliv*'`, local listening services (`ss -ltnp`).
+   - Relay host: `systemctl status ocliv-relay`, Caddy status, DB path (typically `/var/lib/ocliv/ocliv.db`).
+   - Publisher host: `which ocliv`, `ocliv status`, `ocliv service list`, `systemctl --user list-units '*ocliv*'`.
 
 **Safety rule:** Never mutate, migrate, or restart a live production `ocliv-relay` or its database without explicit user approval and a WAL-safe backup (`ocliv relay backup`) first.
 
@@ -30,79 +30,77 @@ Determine three facts from the user or read-only inspection:
 
 ## 2. Core Workflows
 
-### A. Initial Relay Setup (Relay Host)
-- Use the canonical guided setup: `sudo ocliv relay setup`
-- Ensure the relay binds loopback only (e.g., `127.0.0.1:8080`) behind the TLS edge (Caddy), which must overwrite `X-Forwarded-For` / `X-Forwarded-Proto` and strip `X-Forwarded-Host`.
-- If port 80 is occupied (e.g., by Pi-hole or another web server), move Caddy's HTTP listener off 80 and use TLS-ALPN-01 on 443 (single-host) or DNS-01 (wildcard).
+### A. Operator Control Center (Recommended for Everyday Use)
+- Launch the local loopback-only graphical interface:
+  ```bash
+  ocliv ui
+  ```
+- Install a desktop application menu shortcut:
+  ```bash
+  ocliv ui --install-shortcut
+  ```
+- From Control Center, operators can add/enable/disable/repair services, copy canonical MCP URLs, approve/deny live ChatGPT OAuth login requests, revoke clients, and edit per-agent MCP permissions with checkboxes.
 
-### B. Enrolling a New Publisher Machine
-1. Install `ocliv` via the relay's signed bootstrap installer (`install-client.sh`) or verified release binary.
-2. Pair the publisher:
-   - **Publisher:** `ocliv pair https://<relay-host>` (or `--no-wait` + `ocliv pair resume`)
-   - **Relay operator:** `ocliv relay approve <DISPLAY_CODE> --tenant <TENANT> --data <DATA_DIR>`
-3. Verify enrollment: `OCLIV_RELAY_URL=https://<relay-host> ocliv mcp list`
+### B. Initial Relay Setup & Publisher Enrollment
+1. Relay host:
+   ```bash
+   sudo ocliv setup --auto --edge-mode single-host --hostname <YOUR_HOST> --acme-email <EMAIL>
+   ```
+2. Enroll a publisher machine over SSH (no code copying):
+   ```bash
+   ocliv device add user@publisher-host --install
+   # Or on the same host:
+   ocliv device add --local
+   ```
 
-### C. Publishing a Local MCP Server (Managed OAuth)
-1. Confirm the local MCP server responds on localhost **before** debugging Ocliv (see Section 3).
-2. Publish:
-   ```bash
-   ocliv mcp publish --local http://127.0.0.1:<PORT>/mcp --auth ocliv-managed --name <NAME> --relay https://<relay-host>
-   ```
-3. Note the printed public URL: `https://<mcp-host>/r/<route-id>/mcp`.
+### C. Publishing a Local MCP Server (Service-Name-First)
+```bash
+ocliv host mcp <PORT> --name <NAME> --trust chatgpt
+ocliv status <NAME>
+ocliv mcp url <NAME>
+ocliv mcp check <NAME>
+```
 
-### D. Connecting an OAuth MCP Client (e.g., ChatGPT)
-1. Add `https://<mcp-host>/r/<route-id>/mcp` in the client with **OAuth** authentication.
-2. When the client registers and lands on the Ocliv consent page asking for a **pairing credential**, run on the relay host:
+### D. Connecting ChatGPT (Native Transaction-Bound OAuth — No Pairing Secrets)
+1. Paste the URL from `ocliv mcp url <NAME>` into ChatGPT (**Settings → Connectors / Apps → Add MCP Server**, Authentication: **OAuth**).
+2. When ChatGPT opens the Ocliv authorization page, approve the exact live transaction in **Ocliv Control Center** (**Access & Connections**) or via CLI:
    ```bash
-   sudo ocliv authz pending --data <DATA_DIR>
-   sudo ocliv authz approve --data <DATA_DIR> --client <CLIENT_ID> --tenant <TENANT_ID> --route <ROUTE_ID>
+   ocliv service pending <NAME>
+   ocliv service approve <NAME> --challenge <CHALLENGE_ID>
    ```
-3. Paste the printed pairing secret into the consent page, then verify `tools/list` and `tools/call`.
-4. To revoke access later:
+3. To revoke a client later:
    ```bash
-   sudo ocliv authz revoke --data <DATA_DIR> --client <CLIENT_ID> --tenant <TENANT_ID> --route <ROUTE_ID>
+   ocliv revoke client <CLIENT_ID> --service <NAME>
    ```
+
+### E. Connecting Gemini / Google
+```bash
+ocliv connect google <NAME> --type gemini --approve --secret-out ~/gemini-secret.txt
+```
+(For Google Connected Apps with domain verification, run `ocliv google verify-domain` first and use `--type connected-app`.)
 
 ---
 
-## 3. Systematic Troubleshooting (Eliminate Guesswork)
+## 3. Systematic Troubleshooting
 
 Always isolate the failing layer in order: **External TLS → Relay Auth → Publisher Tunnel → Local Upstream**.
 
-1. **External TLS / Reachability:**
-   - Test from an external network (e.g., cellular, no VPN/LAN) against `https://<relay-host>/v1/agent/capabilities` (expect `200 OK` with normal system-trusted TLS, no `-k`).
-   - Note: `/_ocliv/healthz` is an edge/loopback health route; hitting it externally returns `421 misdirected visitor requires tunnel auth` (which still proves TLS + relay reachability, while `/v1/agent/capabilities` returns `200`).
-2. **Stale Publisher Relay URL:**
-   - If `ocliv mcp list` tries to dial `127.0.0.1:<port>`, `~/.config/ocliv/config.toml` has a stale test URL. Override with `OCLIV_RELAY_URL=https://<relay-host>` or fix `config.toml`.
-3. **OAuth Succeeds but Client Reports "No Tools Exposed":**
-   - Test the local MCP upstream directly on localhost with a two-step MCP handshake (`initialize` → capture `mcp-session-id` → `tools/list`):
-     ```bash
-     HDR=$(mktemp)
-     curl -sS -D "$HDR" -o /tmp/mcp-init.out -X POST \
-       -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
-       -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"1.0"}}}' \
-       http://127.0.0.1:<PORT>/mcp
-     head -n 1 "$HDR"
-     SID=$(grep -i '^mcp-session-id:' "$HDR" | awk '{print $2}' | tr -d '\r')
-     curl -sS -X POST -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
-       -H "mcp-session-id: $SID" -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-       http://127.0.0.1:<PORT>/mcp | head -c 500
-     rm -f "$HDR" /tmp/mcp-init.out
-     ```
-   - If `initialize` returns `500` on localhost (common with MCP aggregators/gateways when one downstream target port died or moved), inspect the backend logs and `ss -ltnp` rather than debugging Ocliv.
-4. **Public HTTP/WS Lease Denied (`tunnel credential rejected`):**
-   - Tenant policy defaults to `allow_public=false`. Enable only when intentionally exposing a public lease:
-     `ocliv relay tenants policy set <TENANT> --allow-public=true --data <DATA_DIR>`
+1. **Stale service binding or `HOST_MISMATCH`:**
+   - Run `ocliv service reconcile <NAME> --json` (or click **Repair** in Control Center) to atomically repair the local binding without interrupting healthy live tunnels.
+2. **External TLS / Reachability:**
+   - Run `ocliv mcp check <NAME>` (or test `https://<relay-host>/v1/agent/capabilities` off-LAN expecting `200 OK`).
+   - Apex `/` returning `421` is by design on single-host edges.
+3. **OAuth succeeds but client reports no tools:**
+   - Run `ocliv doctor <NAME>` and verify the local MCP server responds to `initialize` + `tools/list` on `127.0.0.1:<PORT>/mcp`.
 
 ---
 
-## 4. Safe Upgrades & Rollback
+## 4. Safe Upgrades & Forward-Only Recovery
 
-- Schema upgrades are **forward-only**: an older binary refuses a newer database schema.
-- Always take a WAL-safe backup BEFORE replacing the relay binary:
+- Schema upgrades are **forward-only** (Schema V24): an older binary refuses a newer database schema.
+- Always take and validate a WAL-safe backup BEFORE replacing the relay binary:
   ```bash
   sudo ocliv relay backup --data <DATA_DIR> --out <BACKUP_PATH>
   sudo ocliv relay validate-backup --in <BACKUP_PATH>
   ```
-- When serving a signed release bundle from a relay (`--release-manifest`, `--release-manifest-sig`, `--release-artifacts`), every artifact declared in `release-manifest.json` (e.g., both `amd64` and `arm64`) must exist in the artifact directory with matching SHA-256s.
-- Rollback must restore **both** the previous binary and the guarded backup (`ocliv relay restore --relay-stopped`); never raw-copy SQLite files over a live database.
+- Recovery is **roll-forward** using the guarded restore (`ocliv relay restore --relay-stopped`) with the current/candidate binary — never raw-copy SQLite files and never reinstall an older binary against a migrated schema.

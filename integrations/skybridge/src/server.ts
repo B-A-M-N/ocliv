@@ -125,6 +125,9 @@ export const app = new Skybridge({
       const remoteAddress = req?.socket?.remoteAddress ?? extra?.http?.remoteAddress ?? '';
       const verified = verifyIngressIdentity({
         headers,
+        method: req?.method ?? 'POST',
+        path: req?.url ?? '/mcp',
+        host: req?.headers?.host ?? '',
         remoteAddress,
         ingressSecret,
         allowedSubjects: subjects,

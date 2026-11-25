@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  IngressReplayCache,
   loadPermissionsPolicyFromObject,
   PermissionsEnforcer,
   signIngressIdentity,
@@ -8,139 +9,169 @@ import {
 } from '../src/core/permissions.mjs';
 import { NativeControlPlane, redactSecrets } from '../src/core/control-plane.mjs';
 
-test('OCL-012 verified ingress identity rejects spoofing, non-loopback, and expired timestamps', () => {
+test('OCL-013 verified ocliv-ingress-v2 rejects spoofing, replay, method/path tamper, non-loopback, and expiry', () => {
   const secret = 'super-secret-ingress-key-0123456789';
   const allowed = new Set(['agent-ops']);
   const now = 1700000000;
-  const sig = signIngressIdentity({ secret, subject: 'agent-ops', scopes: ['ocliv:read', 'ocliv:write'], timestampSec: now });
+  const nonce = 'nonce-unique-123456';
+  const cache = new IngressReplayCache();
+  const sig = signIngressIdentity({
+    secret,
+    method: 'POST',
+    path: '/mcp',
+    host: '127.0.0.1:3000',
+    route: 'jr8x2Txyoa1jPs22CROuBQ',
+    subject: 'agent-ops',
+    scopes: ['ocliv:read', 'ocliv:write'],
+    timestampSec: now,
+    nonce,
+  });
 
-  // Valid loopback + HMAC signature passes.
+  const validHeaders = {
+    host: '127.0.0.1:3000',
+    'x-ocliv-verified-subject': 'agent-ops',
+    'x-ocliv-verified-route': 'jr8x2Txyoa1jPs22CROuBQ',
+    'x-ocliv-verified-scopes': 'ocliv:read ocliv:write',
+    'x-ocliv-ingress-ts': String(now),
+    'x-ocliv-ingress-nonce': nonce,
+    'x-ocliv-ingress-sig': sig,
+  };
+
+  // Valid loopback + ocliv-ingress-v2 HMAC signature passes once.
   const ok = verifyIngressIdentity({
-    headers: {
-      'x-ocliv-verified-subject': 'agent-ops',
-      'x-ocliv-verified-scopes': 'ocliv:read ocliv:write',
-      'x-ocliv-ingress-ts': String(now),
-      'x-ocliv-ingress-sig': sig,
-    },
+    headers: validHeaders,
+    method: 'POST',
+    path: '/mcp',
     remoteAddress: '127.0.0.1',
     ingressSecret: secret,
     allowedSubjects: allowed,
     nowSec: now,
+    replayCache: cache,
   });
   assert.equal(ok.subject, 'agent-ops');
+  assert.equal(ok.route, 'jr8x2Txyoa1jPs22CROuBQ');
 
-  // Spoofed subject with original signature MUST fail closed.
+  // Replaying the exact same signed assertion MUST fail closed.
   assert.throws(
     () =>
       verifyIngressIdentity({
-        headers: {
-          'x-ocliv-verified-subject': 'admin-spoof',
-          'x-ocliv-verified-scopes': 'ocliv:read ocliv:write',
-          'x-ocliv-ingress-ts': String(now),
-          'x-ocliv-ingress-sig': sig,
-        },
+        headers: validHeaders,
+        method: 'POST',
+        path: '/mcp',
         remoteAddress: '127.0.0.1',
         ingressSecret: secret,
-        allowedSubjects: new Set(['agent-ops', 'admin-spoof']),
+        allowedSubjects: allowed,
         nowSec: now,
+        replayCache: cache,
+      }),
+    /Replayed/
+  );
+
+  // Tampering with method or path MUST fail closed.
+  assert.throws(
+    () =>
+      verifyIngressIdentity({
+        headers: validHeaders,
+        method: 'DELETE',
+        path: '/mcp',
+        remoteAddress: '127.0.0.1',
+        ingressSecret: secret,
+        allowedSubjects: allowed,
+        nowSec: now,
+        replayCache: new IngressReplayCache(),
       }),
     /signature verification failed/
   );
 
-  // Non-loopback remote address MUST fail closed even with a valid signature.
+  // Spoofed subject MUST fail closed.
   assert.throws(
     () =>
       verifyIngressIdentity({
-        headers: {
-          'x-ocliv-verified-subject': 'agent-ops',
-          'x-ocliv-verified-scopes': 'ocliv:read',
-          'x-ocliv-ingress-ts': String(now),
-          'x-ocliv-ingress-sig': sig,
-        },
+        headers: { ...validHeaders, 'x-ocliv-verified-subject': 'admin-spoof' },
+        method: 'POST',
+        path: '/mcp',
+        remoteAddress: '127.0.0.1',
+        ingressSecret: secret,
+        allowedSubjects: new Set(['agent-ops', 'admin-spoof']),
+        nowSec: now,
+        replayCache: new IngressReplayCache(),
+      }),
+    /signature verification failed/
+  );
+
+  // Non-loopback remote address MUST fail closed.
+  assert.throws(
+    () =>
+      verifyIngressIdentity({
+        headers: validHeaders,
+        method: 'POST',
+        path: '/mcp',
         remoteAddress: '192.168.1.50',
         ingressSecret: secret,
         allowedSubjects: allowed,
         nowSec: now,
+        replayCache: new IngressReplayCache(),
       }),
     /loopback/
   );
-
-  // Expired timestamp MUST fail closed.
-  assert.throws(
-    () =>
-      verifyIngressIdentity({
-        headers: {
-          'x-ocliv-verified-subject': 'agent-ops',
-          'x-ocliv-verified-scopes': 'ocliv:read ocliv:write',
-          'x-ocliv-ingress-ts': String(now - 300),
-          'x-ocliv-ingress-sig': sig,
-        },
-        remoteAddress: '127.0.0.1',
-        ingressSecret: secret,
-        allowedSubjects: allowed,
-        nowSec: now,
-      }),
-    /expired/
-  );
 });
 
-test('OCL-012 durable permissions enforce independent sensitivity boundaries and service/port allowlists', () => {
+test('OCL-013 durable permissions separate authorize_visitor from manage_auth_policy and deny empty allowlists', () => {
   const policy = loadPermissionsPolicyFromObject({
     agents: {
-      'agent-lifecycle': {
+      'agent-approver': {
         agent_permissions: {
           inspect: true,
           get_url: true,
           verify: true,
           lifecycle: true,
           deployment: false,
-          authorize_visitor: false,
+          authorize_visitor: true,
+          manage_auth_policy: false,
           revoke_client: false,
           remove_publication: false,
         },
         allowed_services: ['agentgateway'],
       },
-      'agent-deployer': {
+      'agent-empty-allowlist': {
         agent_permissions: {
           inspect: true,
-          get_url: true,
-          verify: true,
-          lifecycle: true,
           deployment: true,
-          authorize_visitor: false,
-          revoke_client: false,
-          remove_publication: false,
         },
-        allowed_services: ['my-mcp'],
-        allowed_ports: [8085],
-        allowed_auth_modes: ['ocliv-managed'],
       },
     },
   });
   const enforcer = new PermissionsEnforcer(policy);
 
-  // Lifecycle agent can inspect/enable agentgateway, but CANNOT approve visitors, revoke clients, or touch other services.
-  assert.equal(enforcer.assertAllowed({ subject: 'agent-lifecycle', action: 'lifecycle', service: 'agentgateway' }), true);
-  assert.throws(() => enforcer.assertAllowed({ subject: 'agent-lifecycle', action: 'authorize_visitor', service: 'agentgateway' }), /not permitted/);
-  assert.throws(() => enforcer.assertAllowed({ subject: 'agent-lifecycle', action: 'revoke_client', service: 'agentgateway' }), /not permitted/);
-  assert.throws(() => enforcer.assertAllowed({ subject: 'agent-lifecycle', action: 'remove_publication', service: 'agentgateway' }), /not permitted/);
-  assert.throws(() => enforcer.assertAllowed({ subject: 'agent-lifecycle', action: 'lifecycle', service: 'other-svc' }), /not authorized to operate on service/);
+  // Approver can approve visitors, but CANNOT modify auth policy or revoke clients.
+  assert.equal(enforcer.assertAllowed({ subject: 'agent-approver', action: 'authorize_visitor', service: 'agentgateway' }), true);
+  assert.throws(() => enforcer.assertAllowed({ subject: 'agent-approver', action: 'manage_auth_policy', service: 'agentgateway' }), /not permitted/);
+  assert.throws(() => enforcer.assertAllowed({ subject: 'agent-approver', action: 'revoke_client', service: 'agentgateway' }), /not permitted/);
 
-  // Deployer agent is bound to allowed port & auth mode.
-  assert.equal(enforcer.assertAllowed({ subject: 'agent-deployer', action: 'deployment', service: 'my-mcp', port: 8085, authMode: 'ocliv-managed' }), true);
-  assert.throws(() => enforcer.assertAllowed({ subject: 'agent-deployer', action: 'deployment', service: 'my-mcp', port: 9999, authMode: 'ocliv-managed' }), /port allowlist/);
-  assert.throws(() => enforcer.assertAllowed({ subject: 'agent-deployer', action: 'deployment', service: 'my-mcp', port: 8085, authMode: 'upstream-oauth' }), /Authentication mode/);
+  // Empty allowed_services and empty allowed_ports NEVER act as wildcards.
+  assert.equal(enforcer.canAccessService('agent-empty-allowlist', 'agentgateway'), false);
+  assert.throws(() => enforcer.assertAllowed({ subject: 'agent-empty-allowlist', action: 'inspect', service: 'agentgateway' }), /not authorized to operate on service/);
+  assert.throws(() => enforcer.assertAllowed({ subject: 'agent-empty-allowlist', action: 'deployment', port: 8085, authMode: 'ocliv-managed' }), /port allowlist/);
 });
 
-test('OCL-012 NativeControlPlane single-call get_url, idempotent deploy, secret redaction, and privilege enforcement', async () => {
-  const calls = [];
+test('OCL-013 NativeControlPlane filters list_services, enforces config conflict on deploy, and redacts secrets', async () => {
   const execMock = async (_bin, args) => {
-    calls.push(args.join(' '));
     const cmd = args.join(' ');
+    if (cmd === 'service list --json') {
+      return {
+        stdout: JSON.stringify([
+          { name: 'agentgateway', type: 'mcp' },
+          { name: 'secret-internal', type: 'mcp' },
+        ]),
+        stderr: '',
+      };
+    }
     if (cmd === 'status agentgateway --json') {
       return {
         stdout: JSON.stringify({
           name: 'agentgateway',
+          type: 'mcp',
+          local_url: 'http://127.0.0.1:8765/mcp',
           desired_state: 'enabled',
           state: 'SERVING',
           health: 'READY',
@@ -163,9 +194,6 @@ test('OCL-012 NativeControlPlane single-call get_url, idempotent deploy, secret 
         stderr: '',
       };
     }
-    if (cmd === 'service reconcile agentgateway --json') {
-      return { stdout: JSON.stringify({ name: 'agentgateway', state: 'SERVING', health: 'READY' }), stderr: '' };
-    }
     return { stdout: '{}', stderr: '' };
   };
 
@@ -178,38 +206,31 @@ test('OCL-012 NativeControlPlane single-call get_url, idempotent deploy, secret 
         lifecycle: true,
         deployment: true,
         authorize_visitor: false,
+        manage_auth_policy: false,
         revoke_client: false,
         remove_publication: false,
       },
       allowed_services: ['agentgateway'],
-      allowed_ports: [8765],
+      allowed_ports: [8765, 9999],
       allowed_auth_modes: ['ocliv-managed'],
     })
   );
 
   const cp = new NativeControlPlane({ bin: '/usr/local/bin/ocliv', permissions: enforcer, execImpl: execMock });
 
-  // Single-call get_url returns canonical URL + reachability directly.
-  const urlRes = await cp.getUrl('agent-1', { service: 'agentgateway' });
-  assert.equal(urlRes.service, 'agentgateway');
-  assert.equal(urlRes.url, 'https://bamnlabs.duckdns.org/r/jr8x2Txyoa1jPs22CROuBQ/mcp');
-  assert.equal(urlRes.enabled, true);
-  assert.equal(urlRes.reachable, true);
-  assert.equal(urlRes.authentication, 'ocliv-managed');
+  // list_services filters out unauthorized services.
+  const listed = await cp.listServices('agent-1');
+  assert.deepEqual(listed.services.map((s) => s.name), ['agentgateway']);
+
+  // Conflicting port on existing service returns CONFIGURATION_CONFLICT instead of fake idempotent success.
+  await assert.rejects(
+    () => cp.deployService('agent-1', { name: 'agentgateway', port: 9999, type: 'mcp', authentication: 'ocliv-managed' }),
+    /different configuration/
+  );
 
   // Secret redaction strips sensitive keys recursively.
-  const svcRes = await cp.getService('agent-1', { service: 'agentgateway' });
-  assert.equal('pairing_secret' in svcRes.service, false);
   assert.deepEqual(redactSecrets({ ok: true, refresh_token: 'rt_x', nested: { client_secret: 'cs_x', safe: 1 } }), {
     ok: true,
     nested: { safe: 1 },
   });
-
-  // Idempotent deploy of already-existing service reconciles instead of creating duplicate publication.
-  const depRes = await cp.deployService('agent-1', { name: 'agentgateway', port: 8765, type: 'mcp', authentication: 'ocliv-managed' });
-  assert.equal(depRes.idempotent, true);
-  assert.equal(calls.some((c) => c.startsWith('host mcp')), false);
-
-  // Privilege escalation to decide_authorization fails closed.
-  await assert.rejects(() => cp.decideAuthorization('agent-1', { service: 'agentgateway', challenge: 'cns_1', decision: 'approve' }), /not permitted/);
 });

@@ -329,6 +329,13 @@ func (rn *Runner) serveLocalHTTP(ctx context.Context, stream net.Conn, head prot
 	if head.BodyKnown && head.BodyLen >= 0 {
 		req.ContentLength = head.BodyLen
 	}
+	ingressSecret := rn.IngressSecret
+	if len(ingressSecret) == 0 {
+		if envSec, err := LoadIngressSecretFromEnv(); err == nil && len(envSec) >= 16 {
+			ingressSecret = envSec
+		}
+	}
+	AttachVerifiedIngressHeaders(req, ingressSecret, head.Headers["X-Ocliv-Route"], head.Headers["X-Ocliv-Upstream-Sub"], "", time.Now())
 	resp, err := rn.localClient().Do(req)
 	if err != nil {
 		_ = sendAgentAbort(stream, "upstream_dial", "local service unreachable")

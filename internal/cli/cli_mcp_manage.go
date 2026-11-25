@@ -4,17 +4,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
+	"regexp"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/B-A-M-N/ocliv/internal/config"
 	"github.com/B-A-M-N/ocliv/internal/identity"
 )
 
-// OCL-012 Agent-Facing MCP Control Plane tool catalog (closed set by construction:
+// OCL-012/013 Agent-Facing MCP Control Plane tool catalog (closed set by construction:
 // no shell, exec, or arbitrary command tool exists and none can be added by callers).
 type mcpManageToolSpec struct {
 	Name        string
@@ -22,6 +20,11 @@ type mcpManageToolSpec struct {
 	Properties  map[string]any
 	Required    []string
 }
+
+var (
+	mcpServiceNameRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9._-]{0,63}$`)
+	mcpSafeIDRe      = regexp.MustCompile(`^[A-Za-z0-9._:-]{3,128}$`)
+)
 
 var ocl012ManageToolSpecs = []mcpManageToolSpec{
 	// Discovery & URL retrieval
@@ -32,7 +35,7 @@ var ocl012ManageToolSpecs = []mcpManageToolSpec{
 	},
 	{
 		Name:        "list_services",
-		Description: "List all configured local services, including disabled and unpublished services.",
+		Description: "List configured local services permitted for this agent principal, including disabled and unpublished services.",
 		Properties:  map[string]any{},
 	},
 	{
@@ -50,7 +53,7 @@ var ocl012ManageToolSpecs = []mcpManageToolSpec{
 	// Deployment & lifecycle
 	{
 		Name:        "deploy_service",
-		Description: "Idempotently create or attach a protected publication for an operator-permitted local service.",
+		Description: "Idempotently create and activate a protected publication for an operator-permitted local service. Returns CONFIGURATION_CONFLICT if an existing service differs.",
 		Properties: map[string]any{
 			"name":           map[string]any{"type": "string"},
 			"port":           map[string]any{"type": "integer"},
@@ -69,7 +72,7 @@ var ocl012ManageToolSpecs = []mcpManageToolSpec{
 	},
 	{
 		Name:        "disable_service",
-		Description: "Disable public exposure while preserving canonical URL and OAuth grants.",
+		Description: "Disable public exposure while preserving canonical URL and OAuth grants. Reports UNCONFIRMED if relay denial cannot be confirmed.",
 		Properties:  map[string]any{"service": map[string]any{"type": "string"}},
 		Required:    []string{"service"},
 	},
@@ -81,20 +84,20 @@ var ocl012ManageToolSpecs = []mcpManageToolSpec{
 	},
 	{
 		Name:        "reconcile_service",
-		Description: "Atomically repair stale publication bindings and resolve configuration drift.",
+		Description: "Atomically repair stale publication bindings and confirm healthy convergence.",
 		Properties:  map[string]any{"service": map[string]any{"type": "string"}},
 		Required:    []string{"service"},
 	},
 	{
 		Name:        "remove_service",
-		Description: "Permanently retire a hosted service and its publication.",
+		Description: "Permanently retire a hosted service and its publication. Preserves local record if remote revocation fails.",
 		Properties:  map[string]any{"service": map[string]any{"type": "string"}},
 		Required:    []string{"service"},
 	},
 	// Authentication & access management
 	{
 		Name:        "get_auth_status",
-		Description: "Inspect authentication mode, enforcement, trust policies, and pending authorizations.",
+		Description: "Inspect authentication mode, enforcement, and pending authorization counts.",
 		Properties:  map[string]any{"service": map[string]any{"type": "string"}},
 		Required:    []string{"service"},
 	},
@@ -116,13 +119,13 @@ var ocl012ManageToolSpecs = []mcpManageToolSpec{
 	},
 	{
 		Name:        "list_authorized_clients",
-		Description: "Inspect route-scoped trust policies and provider client bindings.",
+		Description: "Retrieve the authoritative OAuth client grant inventory for a service from the relay.",
 		Properties:  map[string]any{"service": map[string]any{"type": "string"}},
 		Required:    []string{"service"},
 	},
 	{
 		Name:        "revoke_client",
-		Description: "Immediately revoke OAuth access for one specific client ID on a service.",
+		Description: "Immediately revoke OAuth access for one specific client ID on a service (requires independent revoke_client permission).",
 		Properties: map[string]any{
 			"service":  map[string]any{"type": "string"},
 			"clientId": map[string]any{"type": "string"},
@@ -137,7 +140,7 @@ var ocl012ManageToolSpecs = []mcpManageToolSpec{
 	},
 	{
 		Name:        "set_auth_policy",
-		Description: "Configure route-scoped OAuth trust preset (chatgpt) or exact HTTPS redirect URI.",
+		Description: "Configure route-scoped OAuth trust preset (chatgpt) or exact HTTPS redirect URI (requires independent manage_auth_policy permission).",
 		Properties: map[string]any{
 			"service":     map[string]any{"type": "string"},
 			"preset":      map[string]any{"type": "string", "enum": []string{"chatgpt"}},
@@ -148,7 +151,7 @@ var ocl012ManageToolSpecs = []mcpManageToolSpec{
 	// Diagnostics & verification
 	{
 		Name:        "verify_service",
-		Description: "Run canonical native transport, OAuth discovery, and MCP verification checks.",
+		Description: "Run canonical native transport, OAuth discovery, and MCP verification checks with explicit per-stage results.",
 		Properties:  map[string]any{"service": map[string]any{"type": "string"}},
 		Required:    []string{"service"},
 	},
@@ -160,148 +163,10 @@ var ocl012ManageToolSpecs = []mcpManageToolSpec{
 	},
 	{
 		Name:        "verify_events",
-		Description: "Verify MCP Events discovery and capability readiness.",
+		Description: "Report canonical MCP Events verification stages honestly (unexercised stages remain UNKNOWN).",
 		Properties:  map[string]any{"service": map[string]any{"type": "string"}},
 		Required:    []string{"service"},
 	},
-}
-
-// agentPermissionsPolicy models the operator-controlled 0600 permissions file
-// (`~/.config/ocliv/agent-permissions.json`). No MCP tool can modify this file.
-type agentPermissionsFlags struct {
-	Inspect           bool `json:"inspect"`
-	GetURL            bool `json:"get_url"`
-	Verify            bool `json:"verify"`
-	Lifecycle         bool `json:"lifecycle"`
-	Deployment        bool `json:"deployment"`
-	AuthorizeVisitor  bool `json:"authorize_visitor"`
-	RevokeClient      bool `json:"revoke_client"`
-	RemovePublication bool `json:"remove_publication"`
-}
-
-type agentPermissionsPolicy struct {
-	AgentPermissions agentPermissionsFlags `json:"agent_permissions"`
-	AllowedServices  []string              `json:"allowed_services,omitempty"`
-	AllowedPorts     []int                 `json:"allowed_ports,omitempty"`
-	AllowedAuthModes []string              `json:"allowed_auth_modes,omitempty"`
-}
-
-func defaultLocalAgentPermissions() agentPermissionsPolicy {
-	// Safe fail-closed default when no operator policy file exists:
-	// read-only discovery/URL/verification allowed for local stdio; ALL mutating
-	// and sensitive capabilities denied until explicitly granted by the operator.
-	return agentPermissionsPolicy{
-		AgentPermissions: agentPermissionsFlags{
-			Inspect: true,
-			GetURL:  true,
-			Verify:  true,
-		},
-		AllowedServices:  []string{"*"},
-		AllowedAuthModes: []string{"ocliv-managed"},
-	}
-}
-
-func loadAgentPermissionsPolicy() (agentPermissionsPolicy, error) {
-	path := strings.TrimSpace(os.Getenv("OCLIV_PERMISSIONS_FILE"))
-	if path == "" {
-		dir, _, _, err := agentFiles()
-		if err != nil {
-			return defaultLocalAgentPermissions(), nil
-		}
-		path = filepath.Join(dir, "agent-permissions.json")
-	}
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return defaultLocalAgentPermissions(), nil
-		}
-		return agentPermissionsPolicy{}, fmt.Errorf("open agent-permissions.json: %w", err)
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return agentPermissionsPolicy{}, err
-	}
-	if !fi.Mode().IsRegular() || (fi.Mode().Perm()&0o077) != 0 {
-		return agentPermissionsPolicy{}, fmt.Errorf("agent-permissions.json must be a regular 0600 file")
-	}
-	var pol agentPermissionsPolicy
-	if err := json.NewDecoder(f).Decode(&pol); err != nil {
-		return agentPermissionsPolicy{}, fmt.Errorf("invalid agent-permissions.json: %w", err)
-	}
-	if len(pol.AllowedServices) == 0 {
-		pol.AllowedServices = []string{"*"}
-	}
-	if len(pol.AllowedAuthModes) == 0 {
-		pol.AllowedAuthModes = []string{"ocliv-managed"}
-	}
-	return pol, nil
-}
-
-func (p agentPermissionsPolicy) check(action, service string, port int, authMode string) error {
-	var ok bool
-	switch action {
-	case "inspect":
-		ok = p.AgentPermissions.Inspect
-	case "get_url":
-		ok = p.AgentPermissions.GetURL
-	case "verify":
-		ok = p.AgentPermissions.Verify
-	case "lifecycle":
-		ok = p.AgentPermissions.Lifecycle
-	case "deployment":
-		ok = p.AgentPermissions.Deployment
-	case "authorize_visitor":
-		ok = p.AgentPermissions.AuthorizeVisitor
-	case "revoke_client":
-		ok = p.AgentPermissions.RevokeClient
-	case "remove_publication":
-		ok = p.AgentPermissions.RemovePublication
-	default:
-		return fmt.Errorf("unknown permission action %q", action)
-	}
-	if !ok {
-		return fmt.Errorf("permission denied: operator has not granted %q in agent-permissions.json", action)
-	}
-	if service != "" {
-		allowed := false
-		for _, s := range p.AllowedServices {
-			if s == "*" || s == service {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			return fmt.Errorf("permission denied: service %q is outside operator allowed_services", service)
-		}
-	}
-	if action == "deployment" {
-		if port > 0 && len(p.AllowedPorts) > 0 {
-			portOK := false
-			for _, ap := range p.AllowedPorts {
-				if ap == port {
-					portOK = true
-					break
-				}
-			}
-			if !portOK {
-				return fmt.Errorf("permission denied: port %d is outside operator allowed_ports", port)
-			}
-		}
-		if authMode != "" {
-			modeOK := false
-			for _, am := range p.AllowedAuthModes {
-				if am == authMode {
-					modeOK = true
-					break
-				}
-			}
-			if !modeOK {
-				return fmt.Errorf("permission denied: auth mode %q is outside operator allowed_auth_modes", authMode)
-			}
-		}
-	}
-	return nil
 }
 
 func mcpToolStringArg(args map[string]any, key string) string {
@@ -313,19 +178,62 @@ func mcpToolStringArg(args map[string]any, key string) string {
 	return strings.TrimSpace(s)
 }
 
-func mcpToolIntArg(args map[string]any, key string) int {
+func mcpToolIntArg(args map[string]any, key string) (int, bool) {
 	v, ok := args[key]
 	if !ok || v == nil {
-		return 0
+		return 0, false
 	}
 	switch n := v.(type) {
 	case float64:
-		return int(n)
+		if n != float64(int(n)) {
+			return 0, false
+		}
+		return int(n), true
 	case int:
-		return n
+		return n, true
 	default:
-		return 0
+		return 0, false
 	}
+}
+
+func mcpToolBoolArg(args map[string]any, key string, defaultVal bool) (bool, bool) {
+	v, ok := args[key]
+	if !ok || v == nil {
+		return defaultVal, true
+	}
+	b, ok := v.(bool)
+	return b, ok
+}
+
+func validateMCPServiceName(name string) error {
+	if !mcpServiceNameRe.MatchString(name) {
+		return fmt.Errorf("invalid service name %q", name)
+	}
+	return nil
+}
+
+func validateMCPSafeID(id, label string) error {
+	if !mcpSafeIDRe.MatchString(id) {
+		return fmt.Errorf("invalid %s", label)
+	}
+	return nil
+}
+
+func sanitizeMCPError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.TrimSpace(err.Error())
+	// Strip potential bearer tokens or query credentials from error strings.
+	for _, kw := range []string{"Bearer ", "pairing_secret", "client_secret", "refresh_token", "access_token", "private_key"} {
+		if idx := strings.Index(msg, kw); idx >= 0 {
+			msg = msg[:idx] + "[redacted]"
+		}
+	}
+	if len(msg) > 240 {
+		msg = msg[:240] + "…"
+	}
+	return msg
 }
 
 func mcpToolResult(v any) map[string]any {
@@ -336,97 +244,189 @@ func mcpToolResult(v any) map[string]any {
 	}
 }
 
-// handleMCPManageTool dispatches all 20 OCL-012 agent-facing MCP control-plane
-// tools directly against Ocliv's canonical native Go service/reconcile/authz/check
-// operations while enforcing operator-controlled durable permissions.
-func handleMCPManageTool(name string, args map[string]any, relayURL string, k *identity.KeyPair, keyID string, ops serviceOps) (any, error) {
+func safeServiceSummary(rec config.ServiceRecord) map[string]any {
+	svcID := ""
+	if rec.Identity != nil {
+		svcID = rec.Identity.ServiceID
+	}
+	return map[string]any{
+		"name":           rec.Name,
+		"service_id":     svcID,
+		"type":           rec.Type,
+		"profile":        rec.Profile,
+		"local_url":      rec.LocalURL,
+		"publication_id": rec.PublicationID,
+		"public_url":     rec.PublicURL,
+		"desired_state":  rec.DesiredState,
+		"authentication": rec.Auth,
+	}
+}
+
+func safeStatusReport(rep ServiceStatusReport) map[string]any {
+	return map[string]any{
+		"name":               rep.Name,
+		"service_id":         rep.ServiceID,
+		"type":               rep.Type,
+		"profile":            rep.Profile,
+		"desired_state":      rep.DesiredState,
+		"observed_state":     rep.State,
+		"health":             rep.Health,
+		"running_now":        rep.RunningNow,
+		"process_state":      rep.ProcessState,
+		"relay_state":        rep.RelayState,
+		"publication_id":     rep.PublicationID,
+		"public_url":         rep.PublicURL,
+		"authentication":     rep.AuthProfile,
+		"backend_available":  rep.BackendAvailable,
+		"public_transport":   rep.PublicTransport,
+		"public_verified":    rep.PublicVerified,
+		"verification_level": rep.VerificationLevel,
+		"layers":             rep.Layers,
+		"last_failure":       rep.LastFailure,
+	}
+}
+
+// handleMCPManageTool dispatches ONLY the 20 advertised OCL-012/013 tools
+// against Ocliv's canonical native Go service/lifecycle/authz/verification
+// operations while enforcing per-principal durable operator permissions.
+func handleMCPManageTool(principal, name string, args map[string]any, relayURL string, k *identity.KeyPair, keyID string, ops serviceOps) (any, error) {
+	if args == nil {
+		args = map[string]any{}
+	}
 	pol, perr := loadAgentPermissionsPolicy()
 	if perr != nil {
-		return nil, perr
+		return nil, fmt.Errorf("permissions policy unavailable: %s", sanitizeMCPError(perr))
 	}
 	store, serr := openServices()
 	if serr != nil {
-		return nil, serr
+		return nil, fmt.Errorf("service store unavailable: %s", sanitizeMCPError(serr))
 	}
 
-	resolveSvc := func(svcName string) (config.ServiceRecord, string, error) {
-		if svcName == "" {
-			return config.ServiceRecord{}, "", fmt.Errorf("service name is required")
+	// authorizeAction checks durable permissions first, then single-use operator
+	// approvals; if denied, records a durable pending approval request and
+	// returns an actionable OPERATOR_AUTHORIZATION_REQUIRED structured payload.
+	authorizeAction := func(action, serviceName, serviceID string, port int, authMode string) (map[string]any, bool) {
+		if ok, _, _ := pol.check(principal, action, serviceName, serviceID, port, authMode); ok {
+			return nil, true
+		}
+		if consumeSingleUseApproval(principal, action, serviceName, port) {
+			return nil, true
+		}
+		req, _ := createOperatorApprovalRequest(principal, name, action, serviceName, serviceID, port, authMode)
+		return map[string]any{
+			"ok":                    false,
+			"status":                "OPERATOR_AUTHORIZATION_REQUIRED",
+			"request_id":            req.RequestID,
+			"principal":             principal,
+			"action":                name,
+			"service":               serviceName,
+			"requested_permissions": []string{action},
+			"message":               "Review this request in Ocliv Control Center.",
+		}, false
+	}
+
+	resolveSvc := func(svcName string) (config.ServiceRecord, string, string, *identity.KeyPair, string, error) {
+		if err := validateMCPServiceName(svcName); err != nil {
+			return config.ServiceRecord{}, "", "", nil, "", err
 		}
 		rec, ok, err := store.Get(svcName)
 		if err != nil || !ok {
-			return config.ServiceRecord{}, "", fmt.Errorf("unknown service %q", svcName)
+			return config.ServiceRecord{}, "", "", nil, "", fmt.Errorf("unknown service %q", svcName)
+		}
+		svcID := ""
+		if rec.Identity != nil {
+			svcID = rec.Identity.ServiceID
+		}
+		rk, rKeyID := k, keyID
+		if rec.Profile != "" && rec.Profile != config.ActiveProfile() {
+			if pk, pkID, kerr := loadKeyForProfile(rec.Profile); kerr == nil {
+				rk, rKeyID = pk, pkID
+			}
 		}
 		rURL := rec.RelayURL
 		if rURL == "" {
-			rURL = relayURL
+			if rec.Profile != "" {
+				rURL = agentRelayURLForProfile(rec.Profile)
+			} else {
+				rURL = relayURL
+			}
 		}
-		return rec, rURL, nil
+		return rec, svcID, rURL, rk, rKeyID, nil
 	}
 
 	switch name {
 	case "get_status":
-		if err := pol.check("inspect", "", 0, ""); err != nil {
-			return nil, err
+		if denied, ok := authorizeAction("inspect", "", "", 0, ""); !ok {
+			return denied, nil
 		}
 		svcs, _ := store.List()
+		visibleCount := 0
+		for _, rec := range svcs {
+			svcID := ""
+			if rec.Identity != nil {
+				svcID = rec.Identity.ServiceID
+			}
+			if pol.canAccessService(principal, rec.Name, svcID) {
+				visibleCount++
+			}
+		}
 		pubs, _, pubErr := fetchRelayPublications(relayURL, k, keyID, ops)
 		return map[string]any{
 			"ok":               true,
+			"principal":        principal,
 			"relay_url":        relayURL,
 			"key_id":           keyID,
 			"relay_reachable":  pubErr == nil,
 			"publications":     len(pubs),
-			"services_count":   len(svcs),
+			"services_count":   visibleCount,
 			"version":          buildVersionInfo(),
 			"permissions_mode": "operator-controlled",
 		}, nil
 
 	case "list_services":
-		if err := pol.check("inspect", "", 0, ""); err != nil {
-			return nil, err
+		if denied, ok := authorizeAction("inspect", "", "", 0, ""); !ok {
+			return denied, nil
 		}
 		svcs, err := store.List()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("list services failed")
 		}
 		items := make([]map[string]any, 0, len(svcs))
 		for _, rec := range svcs {
-			items = append(items, map[string]any{
-				"name":           rec.Name,
-				"type":           rec.Type,
-				"profile":        rec.Profile,
-				"local_url":      rec.LocalURL,
-				"publication_id": rec.PublicationID,
-				"public_url":     rec.PublicURL,
-				"desired_state":  rec.DesiredState,
-				"authentication": rec.Auth,
-			})
+			svcID := ""
+			if rec.Identity != nil {
+				svcID = rec.Identity.ServiceID
+			}
+			// Filter discovery strictly by principal service allowlist.
+			if !pol.canAccessService(principal, rec.Name, svcID) {
+				continue
+			}
+			items = append(items, safeServiceSummary(rec))
 		}
 		return map[string]any{"ok": true, "services": items}, nil
 
 	case "get_service":
 		svcName := mcpToolStringArg(args, "service")
-		if err := pol.check("inspect", svcName, 0, ""); err != nil {
-			return nil, err
-		}
-		rec, _, err := resolveSvc(svcName)
+		rec, svcID, _, rk, rKeyID, err := resolveSvc(svcName)
 		if err != nil {
 			return nil, err
 		}
-		rep := inspectServiceStatus(rec, k, keyID, ops)
-		return map[string]any{"ok": true, "service": rep}, nil
+		if denied, ok := authorizeAction("inspect", rec.Name, svcID, 0, ""); !ok {
+			return denied, nil
+		}
+		rep := inspectServiceStatus(rec, rk, rKeyID, ops)
+		return map[string]any{"ok": true, "service": safeStatusReport(rep)}, nil
 
 	case "get_url":
 		svcName := mcpToolStringArg(args, "service")
-		if err := pol.check("get_url", svcName, 0, ""); err != nil {
-			return nil, err
-		}
-		rec, _, err := resolveSvc(svcName)
+		rec, svcID, _, rk, rKeyID, err := resolveSvc(svcName)
 		if err != nil {
 			return nil, err
 		}
-		rep := inspectServiceStatus(rec, k, keyID, ops)
+		if denied, ok := authorizeAction("get_url", rec.Name, svcID, 0, ""); !ok {
+			return denied, nil
+		}
+		rep := inspectServiceStatus(rec, rk, rKeyID, ops)
 		entry, _ := resolveCatalogEntry(svcName, rec.Profile, ops)
 		pubURL := rep.PublicURL
 		if pubURL == "" {
@@ -445,6 +445,7 @@ func handleMCPManageTool(name string, args map[string]any, relayURL string, k *i
 		}
 		return map[string]any{
 			"service":        svcName,
+			"service_id":     svcID,
 			"publication_id": pubID,
 			"url":            pubURL,
 			"enabled":        rec.DesiredState == config.DesiredEnabled,
@@ -455,393 +456,691 @@ func handleMCPManageTool(name string, args map[string]any, relayURL string, k *i
 
 	case "deploy_service":
 		svcName := mcpToolStringArg(args, "name")
-		port := mcpToolIntArg(args, "port")
+		if err := validateMCPServiceName(svcName); err != nil {
+			return nil, err
+		}
+		port, portOK := mcpToolIntArg(args, "port")
+		if !portOK || port < 1 || port > 65535 {
+			return nil, fmt.Errorf("port must be an integer between 1 and 65535")
+		}
 		svcType := mcpToolStringArg(args, "type")
 		if svcType == "" {
 			svcType = "mcp"
+		}
+		if svcType != "mcp" && svcType != "http" {
+			return nil, fmt.Errorf("type must be mcp or http")
 		}
 		authMode := mcpToolStringArg(args, "authentication")
 		if authMode == "" {
 			authMode = "ocliv-managed"
 		}
-		if svcName == "" || port < 1 || port > 65535 {
-			return nil, fmt.Errorf("valid name and port (1-65535) are required")
-		}
-		if err := pol.check("deployment", svcName, port, authMode); err != nil {
-			return nil, err
-		}
-		// Idempotent: if service already exists, reconcile/enable rather than duplicating.
-		if rec, exists, gerr := store.Get(svcName); gerr == nil && exists {
-			rep, rerr := reconcileServiceOnce(store, rec.Name, k, keyID, ops, time.Now())
-			if rerr != nil {
-				return nil, rerr
-			}
-			return map[string]any{"ok": true, "idempotent": true, "service": rep}, nil
+		if authMode != "ocliv-managed" && authMode != "upstream-oauth" {
+			return nil, fmt.Errorf("authentication must be ocliv-managed or upstream-oauth")
 		}
 		localPath := mcpToolStringArg(args, "path")
 		if localPath == "" {
-			localPath = "/mcp"
+			if svcType == "mcp" {
+				localPath = "/mcp"
+			} else {
+				localPath = "/"
+			}
 		}
-		if err := store.Put(config.ServiceRecord{
-			Name:         svcName,
-			Type:         svcType,
-			LocalURL:     fmt.Sprintf("http://127.0.0.1:%d%s", port, localPath),
-			Auth:         authMode,
-			Profile:      config.ActiveProfile(),
-			RelayURL:     relayURL,
-			DesiredState: config.DesiredConfigured,
-		}); err != nil {
-			return nil, err
+		if !strings.HasPrefix(localPath, "/") || strings.Contains(localPath, "..") || strings.ContainsAny(localPath, " \t\r\n") {
+			return nil, fmt.Errorf("path must be a clean absolute path")
 		}
-		rec, _, _ := store.Get(svcName)
-		rep := inspectServiceStatus(rec, k, keyID, ops)
-		return map[string]any{"ok": true, "idempotent": false, "service": rep}, nil
+		persistent, persistOK := mcpToolBoolArg(args, "persistent", true)
+		if !persistOK {
+			return nil, fmt.Errorf("persistent must be a boolean")
+		}
+		wantLocalURL := fmt.Sprintf("http://127.0.0.1:%d%s", port, localPath)
+
+		existing, exists, _ := store.Get(svcName)
+		existingSvcID := ""
+		if exists && existing.Identity != nil {
+			existingSvcID = existing.Identity.ServiceID
+		}
+		if denied, ok := authorizeAction("deployment", svcName, existingSvcID, port, authMode); !ok {
+			return denied, nil
+		}
+
+		// Exact-match idempotency check: reject differing configurations fail-closed.
+		if exists {
+			if existing.LocalURL != wantLocalURL || existing.Type != svcType || existing.Auth != authMode {
+				return map[string]any{
+					"ok":        false,
+					"status":    "CONFIGURATION_CONFLICT",
+					"operation": "deploy_service",
+					"service":   svcName,
+					"existing": map[string]any{
+						"local_url":      existing.LocalURL,
+						"type":           existing.Type,
+						"authentication": existing.Auth,
+					},
+					"requested": map[string]any{
+						"local_url":      wantLocalURL,
+						"type":           svcType,
+						"authentication": authMode,
+					},
+					"message": "Existing service configuration differs; refusing silent replacement.",
+				}, nil
+			}
+			rep, rerr := reconcileServiceOnce(store, existing.Name, k, keyID, ops, time.Now())
+			confirmed := rerr == nil && rep.State == ServiceStateServing && rep.Health == HealthReady
+			return map[string]any{
+				"ok":             confirmed,
+				"operation":      "deploy_service",
+				"idempotent":     true,
+				"confirmed":      confirmed,
+				"service":        svcName,
+				"desired_state":  existing.DesiredState,
+				"observed_state": rep.State,
+				"publication_id": rep.PublicationID,
+				"public_url":     rep.PublicURL,
+				"detail":         sanitizeMCPError(rerr),
+			}, nil
+		}
+
+		// Canonical registration + activation through shared native hosted-service workflows.
+		rec, _, _, regErr := registerHostedService(serviceAddRequest{
+			Name:        svcName,
+			Type:        svcType,
+			LocalURL:    wantLocalURL,
+			Auth:        authMode,
+			Profile:     config.ActiveProfile(),
+			BackendMode: config.BackendAttached,
+		}, ops)
+		if regErr != nil {
+			return map[string]any{
+				"ok":        false,
+				"operation": "deploy_service",
+				"service":   svcName,
+				"confirmed": false,
+				"status":    "UNCONFIRMED",
+				"detail":    sanitizeMCPError(regErr),
+			}, nil
+		}
+		if !persistent {
+			rep := inspectServiceStatus(rec, k, keyID, ops)
+			return map[string]any{
+				"ok":             true,
+				"operation":      "deploy_service",
+				"idempotent":     false,
+				"confirmed":      true,
+				"service":        svcName,
+				"desired_state":  rec.DesiredState,
+				"observed_state": rep.State,
+				"public_url":     rep.PublicURL,
+			}, nil
+		}
+		startOut, _, startErr := startHostedService(serviceStartRequest{Name: svcName}, ops)
+		confirmed := startErr == nil && startOut.Status.State == ServiceStateServing && startOut.Status.Health == HealthReady
+		status := "CONFIRMED"
+		if !confirmed {
+			status = "UNCONFIRMED"
+		}
+		return map[string]any{
+			"ok":             confirmed,
+			"status":         status,
+			"operation":      "deploy_service",
+			"idempotent":     false,
+			"confirmed":      confirmed,
+			"service":        svcName,
+			"desired_state":  config.DesiredEnabled,
+			"observed_state": startOut.Status.State,
+			"publication_id": startOut.Status.PublicationID,
+			"public_url":     startOut.Status.PublicURL,
+			"detail":         sanitizeMCPError(startErr),
+		}, nil
 
 	case "enable_service":
 		svcName := mcpToolStringArg(args, "service")
-		if err := pol.check("lifecycle", svcName, 0, ""); err != nil {
-			return nil, err
-		}
-		rec, rURL, err := resolveSvc(svcName)
+		rec, svcID, _, _, _, err := resolveSvc(svcName)
 		if err != nil {
 			return nil, err
 		}
-		pubID, _, found, rerr := resolveRelayPublication(rURL, k, keyID, rec, ops)
-		if rerr == nil && found && pubID != "" {
-			_, _, _ = ops.mgmtCall(rURL, k, keyID, http.MethodPost, "/v1/agent/mcp-routes/"+pubID+"/enable")
+		if denied, ok := authorizeAction("lifecycle", rec.Name, svcID, 0, ""); !ok {
+			return denied, nil
 		}
-		if rec.SystemdUnit != "" && ops.systemctl != nil {
-			_, _ = ops.systemctl("start", rec.SystemdUnit)
+		out, _, startErr := startHostedService(serviceStartRequest{Name: rec.Name}, ops)
+		confirmed := startErr == nil && out.Status.State == ServiceStateServing && out.Status.Health == HealthReady
+		status := "CONFIRMED"
+		if !confirmed {
+			status = "UNCONFIRMED"
 		}
-		_, _ = store.UpdateCAS(rec.Name, rec.Revision, func(r *config.ServiceRecord) error {
-			r.DesiredState = config.DesiredEnabled
-			return nil
-		})
-		rep, rerr := reconcileServiceOnce(store, rec.Name, k, keyID, ops, time.Now())
-		return map[string]any{"ok": rerr == nil, "service": rep}, rerr
+		return map[string]any{
+			"ok":             confirmed,
+			"status":         status,
+			"operation":      "enable_service",
+			"service":        rec.Name,
+			"desired_state":  config.DesiredEnabled,
+			"observed_state": out.Status.State,
+			"publication_id": out.Status.PublicationID,
+			"public_url":     out.Status.PublicURL,
+			"confirmed":      confirmed,
+			"detail":         sanitizeMCPError(startErr),
+		}, nil
 
 	case "disable_service":
 		svcName := mcpToolStringArg(args, "service")
-		if err := pol.check("lifecycle", svcName, 0, ""); err != nil {
-			return nil, err
-		}
-		rec, rURL, err := resolveSvc(svcName)
+		rec, svcID, _, rk, rKeyID, err := resolveSvc(svcName)
 		if err != nil {
 			return nil, err
 		}
-		pubID, _, found, rerr := resolveRelayPublication(rURL, k, keyID, rec, ops)
-		if rerr == nil && found && pubID != "" {
-			_, _, _ = ops.mgmtCall(rURL, k, keyID, http.MethodPost, "/v1/agent/mcp-routes/"+pubID+"/disable")
+		if denied, ok := authorizeAction("lifecycle", rec.Name, svcID, 0, ""); !ok {
+			return denied, nil
 		}
-		if rec.SystemdUnit != "" && ops.systemctl != nil {
-			_, _ = ops.systemctl("stop", rec.SystemdUnit)
+		res := stopServiceAuthoritatively(store, rec, rk, rKeyID, ops)
+		confirmed := res.Stopped && res.RemoteDisabled
+		status := "CONFIRMED"
+		if !confirmed {
+			status = "UNCONFIRMED"
 		}
-		updated, uerr := store.UpdateCAS(rec.Name, rec.Revision, func(r *config.ServiceRecord) error {
-			r.DesiredState = config.DesiredDisabled
-			return nil
-		})
-		if uerr != nil {
-			return nil, uerr
-		}
-		rep := inspectServiceStatus(updated, k, keyID, ops)
-		return map[string]any{"ok": true, "service": rep}, nil
+		return map[string]any{
+			"ok":                    confirmed,
+			"status":                status,
+			"operation":             "disable_service",
+			"service":               rec.Name,
+			"desired_state":         config.DesiredDisabled,
+			"observed_state":        res.State,
+			"public_access_blocked": res.RemoteDisabled,
+			"url_retained":          res.RetainedURL != "",
+			"retained_url":          res.RetainedURL,
+			"confirmed":             confirmed,
+			"detail":                res.Detail,
+		}, nil
 
 	case "restart_service":
 		svcName := mcpToolStringArg(args, "service")
-		if err := pol.check("lifecycle", svcName, 0, ""); err != nil {
-			return nil, err
-		}
-		rec, _, err := resolveSvc(svcName)
+		rec, svcID, _, _, _, err := resolveSvc(svcName)
 		if err != nil {
 			return nil, err
 		}
-		if rec.SystemdUnit != "" && ops.systemctl != nil {
-			if out, serr := ops.systemctl("restart", rec.SystemdUnit); serr != nil {
-				return nil, fmt.Errorf("restart failed: %v (%s)", serr, strings.TrimSpace(out))
-			}
+		if denied, ok := authorizeAction("lifecycle", rec.Name, svcID, 0, ""); !ok {
+			return denied, nil
 		}
-		rep, rerr := reconcileServiceOnce(store, rec.Name, k, keyID, ops, time.Now())
-		return map[string]any{"ok": rerr == nil, "service": rep}, rerr
+		out, _, restErr := restartHostedServiceInProfile(rec.Profile, rec.Name, ops)
+		confirmed := restErr == nil && out.Status.State == ServiceStateServing && out.Status.Health == HealthReady
+		status := "CONFIRMED"
+		if !confirmed {
+			status = "UNCONFIRMED"
+		}
+		return map[string]any{
+			"ok":             confirmed,
+			"status":         status,
+			"operation":      "restart_service",
+			"service":        rec.Name,
+			"desired_state":  rec.DesiredState,
+			"observed_state": out.Status.State,
+			"publication_id": out.Status.PublicationID,
+			"public_url":     out.Status.PublicURL,
+			"confirmed":      confirmed,
+			"detail":         sanitizeMCPError(restErr),
+		}, nil
 
 	case "reconcile_service":
 		svcName := mcpToolStringArg(args, "service")
-		if err := pol.check("lifecycle", svcName, 0, ""); err != nil {
+		rec, svcID, _, rk, rKeyID, err := resolveSvc(svcName)
+		if err != nil {
 			return nil, err
 		}
-		if _, _, err := resolveSvc(svcName); err != nil {
-			return nil, err
+		if denied, ok := authorizeAction("lifecycle", rec.Name, svcID, 0, ""); !ok {
+			return denied, nil
 		}
-		rep, rerr := reconcileServiceOnce(store, svcName, k, keyID, ops, time.Now())
-		return map[string]any{"ok": rerr == nil, "service": rep}, rerr
+		rep, rerr := reconcileServiceOnce(store, rec.Name, rk, rKeyID, ops, time.Now())
+		healthy := rerr == nil && rep.Health == HealthReady && (rec.DesiredState != config.DesiredEnabled || rep.State == ServiceStateServing)
+		status := "CONFIRMED"
+		if !healthy {
+			status = "UNCONFIRMED"
+		}
+		return map[string]any{
+			"ok":             healthy,
+			"status":         status,
+			"operation":      "reconcile_service",
+			"service":        rec.Name,
+			"desired_state":  rec.DesiredState,
+			"observed_state": rep.State,
+			"health":         rep.Health,
+			"publication_id": rep.PublicationID,
+			"public_url":     rep.PublicURL,
+			"confirmed":      healthy,
+			"detail":         sanitizeMCPError(rerr),
+		}, nil
 
 	case "remove_service":
 		svcName := mcpToolStringArg(args, "service")
-		if err := pol.check("remove_publication", svcName, 0, ""); err != nil {
-			return nil, err
-		}
-		rec, rURL, err := resolveSvc(svcName)
+		rec, svcID, _, rk, rKeyID, err := resolveSvc(svcName)
 		if err != nil {
 			return nil, err
 		}
-		pubID, _, found, rerr := resolveRelayPublication(rURL, k, keyID, rec, ops)
-		if rerr == nil && found && pubID != "" {
-			_, _, _ = ops.mgmtCall(rURL, k, keyID, http.MethodDelete, "/v1/agent/mcp-routes/"+pubID)
+		if denied, ok := authorizeAction("remove_publication", rec.Name, svcID, 0, ""); !ok {
+			return denied, nil
 		}
-		if rec.SystemdUnit != "" && ops.systemctl != nil {
-			_, _ = ops.systemctl("stop", rec.SystemdUnit)
+		// Authoritative removal preserves the local record if remote revocation cannot be confirmed.
+		pubID, remErr := removeServiceAuthoritatively(store, rec, rk, rKeyID, ops)
+		if remErr != nil {
+			return map[string]any{
+				"ok":             false,
+				"status":         "UNCONFIRMED",
+				"operation":      "remove_service",
+				"service":        rec.Name,
+				"confirmed":      false,
+				"record_kept":    true,
+				"publication_id": rec.PublicationID,
+				"detail":         sanitizeMCPError(remErr),
+			}, nil
 		}
-		_, _ = store.Delete(rec.Name)
-		return map[string]any{"ok": true, "service": svcName, "removed": true}, nil
+		return map[string]any{
+			"ok":             true,
+			"status":         "CONFIRMED",
+			"operation":      "remove_service",
+			"service":        rec.Name,
+			"publication_id": pubID,
+			"removed":        true,
+			"confirmed":      true,
+		}, nil
 
 	case "get_auth_status":
 		svcName := mcpToolStringArg(args, "service")
-		if err := pol.check("inspect", svcName, 0, ""); err != nil {
-			return nil, err
-		}
-		rec, rURL, err := resolveSvc(svcName)
+		rec, svcID, rURL, rk, rKeyID, err := resolveSvc(svcName)
 		if err != nil {
 			return nil, err
 		}
-		rep := inspectServiceStatus(rec, k, keyID, ops)
-		pubID, _, found, rerr := resolveRelayPublication(rURL, k, keyID, rec, ops)
-		var pendingDoc any
+		if denied, ok := authorizeAction("inspect", rec.Name, svcID, 0, ""); !ok {
+			return denied, nil
+		}
+		rep := inspectServiceStatus(rec, rk, rKeyID, ops)
+		pubID, _, found, rerr := resolveRelayPublication(rURL, rk, rKeyID, rec, ops)
+		pendingCount := 0
+		pendingTxCount := 0
 		if rerr == nil && found && pubID != "" {
-			if st, body, cerr := ops.mgmtCall(rURL, k, keyID, http.MethodGet, "/v1/agent/mcp-routes/"+pubID+"/authz/pending"); cerr == nil && st == http.StatusOK {
-				_ = json.Unmarshal(body, &pendingDoc)
+			if st, body, cerr := ops.mgmtCall(rURL, rk, rKeyID, http.MethodGet, "/v1/agent/mcp-routes/"+pubID+"/authz/pending"); cerr == nil && st == http.StatusOK {
+				var p struct {
+					Pending             []any `json:"pending"`
+					PendingTransactions []any `json:"pending_transactions"`
+				}
+				if json.Unmarshal(body, &p) == nil {
+					pendingCount = len(p.Pending)
+					pendingTxCount = len(p.PendingTransactions)
+				}
 			}
 		}
 		return map[string]any{
-			"ok":                  true,
-			"service":             svcName,
-			"publication_id":      pubID,
-			"authentication":      rep.AuthProfile,
-			"authorization_layer": rep.Layers.Authorization,
-			"pending":             pendingDoc,
+			"ok":                         true,
+			"service":                    svcName,
+			"publication_id":             pubID,
+			"authentication":             rep.AuthProfile,
+			"authorization_layer":        rep.Layers.Authorization,
+			"pending_clients_count":      pendingCount,
+			"pending_transactions_count": pendingTxCount,
 		}, nil
 
 	case "list_pending_authorizations":
 		svcName := mcpToolStringArg(args, "service")
-		if err := pol.check("inspect", svcName, 0, ""); err != nil {
-			return nil, err
-		}
-		rec, rURL, err := resolveSvc(svcName)
+		rec, svcID, rURL, rk, rKeyID, err := resolveSvc(svcName)
 		if err != nil {
 			return nil, err
 		}
-		pubID, _, found, rerr := resolveRelayPublication(rURL, k, keyID, rec, ops)
+		if denied, ok := authorizeAction("inspect", rec.Name, svcID, 0, ""); !ok {
+			return denied, nil
+		}
+		pubID, _, found, rerr := resolveRelayPublication(rURL, rk, rKeyID, rec, ops)
 		if rerr != nil {
-			return nil, rerr
+			return nil, fmt.Errorf("cannot resolve publication: %s", sanitizeMCPError(rerr))
 		}
 		if !found {
 			return nil, fmt.Errorf("no publication found for service %q", svcName)
 		}
-		st, body, cerr := ops.mgmtCall(rURL, k, keyID, http.MethodGet, "/v1/agent/mcp-routes/"+pubID+"/authz/pending")
+		st, body, cerr := ops.mgmtCall(rURL, rk, rKeyID, http.MethodGet, "/v1/agent/mcp-routes/"+pubID+"/authz/pending")
 		if cerr != nil || st != http.StatusOK {
-			return nil, fmt.Errorf("relay returned %d (%v)", st, cerr)
+			return nil, fmt.Errorf("relay pending query failed (HTTP %d)", st)
 		}
-		var doc map[string]any
-		_ = json.Unmarshal(body, &doc)
-		return map[string]any{"ok": true, "service": svcName, "publication_id": pubID, "pending": doc["pending"], "pending_transactions": doc["pending_transactions"]}, nil
+		var out struct {
+			Pending []struct {
+				ClientID     string `json:"client_id"`
+				Name         string `json:"name"`
+				RedirectURIs string `json:"redirect_uris"`
+				Status       string `json:"status"`
+				CreatedAt    string `json:"created_at"`
+			} `json:"pending"`
+			PendingTransactions []struct {
+				Challenge   string `json:"challenge"`
+				ClientID    string `json:"client_id"`
+				ClientName  string `json:"client_name"`
+				RedirectURI string `json:"redirect_uri"`
+				Scope       string `json:"scope"`
+				ExpiresAt   string `json:"expires_at"`
+			} `json:"pending_transactions"`
+		}
+		if err := json.Unmarshal(body, &out); err != nil {
+			return nil, fmt.Errorf("unparseable relay pending response")
+		}
+		return map[string]any{
+			"ok":                   true,
+			"service":              svcName,
+			"publication_id":       pubID,
+			"pending_clients":      out.Pending,
+			"pending_transactions": out.PendingTransactions,
+		}, nil
 
 	case "decide_authorization":
 		svcName := mcpToolStringArg(args, "service")
 		challenge := mcpToolStringArg(args, "challenge")
 		decision := mcpToolStringArg(args, "decision")
-		if challenge == "" || (decision != "approve" && decision != "deny") {
-			return nil, fmt.Errorf("challenge and decision (approve|deny) are required")
-		}
-		if err := pol.check("authorize_visitor", svcName, 0, ""); err != nil {
+		if err := validateMCPSafeID(challenge, "challenge"); err != nil {
 			return nil, err
 		}
-		rec, rURL, err := resolveSvc(svcName)
+		if decision != "approve" && decision != "deny" {
+			return nil, fmt.Errorf("decision must be approve or deny")
+		}
+		rec, svcID, rURL, rk, rKeyID, err := resolveSvc(svcName)
 		if err != nil {
 			return nil, err
 		}
-		pubID, _, found, rerr := resolveRelayPublication(rURL, k, keyID, rec, ops)
-		if rerr != nil {
-			return nil, rerr
+		if denied, ok := authorizeAction("authorize_visitor", rec.Name, svcID, 0, ""); !ok {
+			return denied, nil
 		}
-		if !found {
+		pubID, _, found, rerr := resolveRelayPublication(rURL, rk, rKeyID, rec, ops)
+		if rerr != nil || !found {
 			return nil, fmt.Errorf("no publication found for service %q", svcName)
 		}
 		path := "/v1/agent/mcp-routes/" + pubID + "/authz/consents/" + challenge + "/" + decision
-		st, body, cerr := ops.mgmtCall(rURL, k, keyID, http.MethodPost, path)
+		st, body, cerr := ops.mgmtCall(rURL, rk, rKeyID, http.MethodPost, path)
 		if cerr != nil || (st != http.StatusOK && st != http.StatusCreated) {
-			return nil, fmt.Errorf("relay returned %d: %s", st, strings.TrimSpace(string(body)))
+			return nil, fmt.Errorf("authorization decision failed (HTTP %d)", st)
 		}
-		var doc map[string]any
-		_ = json.Unmarshal(body, &doc)
-		delete(doc, "pairing_secret")
-		return map[string]any{"ok": true, "service": svcName, "decision": decision, "result": doc}, nil
+		var resp struct {
+			Challenge string `json:"challenge"`
+			ClientID  string `json:"client_id"`
+			Decision  string `json:"decision"`
+		}
+		_ = json.Unmarshal(body, &resp)
+		return map[string]any{
+			"ok":             true,
+			"service":        svcName,
+			"publication_id": pubID,
+			"challenge":      resp.Challenge,
+			"client_id":      resp.ClientID,
+			"decision":       decision,
+			"confirmed":      true,
+		}, nil
 
 	case "list_authorized_clients":
 		svcName := mcpToolStringArg(args, "service")
-		if err := pol.check("inspect", svcName, 0, ""); err != nil {
-			return nil, err
-		}
-		rec, rURL, err := resolveSvc(svcName)
+		rec, svcID, rURL, rk, rKeyID, err := resolveSvc(svcName)
 		if err != nil {
 			return nil, err
 		}
-		pubID, _, found, rerr := resolveRelayPublication(rURL, k, keyID, rec, ops)
-		var trustDoc any
-		if rerr == nil && found && pubID != "" {
-			if st, body, cerr := ops.mgmtCall(rURL, k, keyID, http.MethodGet, "/v1/agent/mcp-routes/"+pubID+"/trust"); cerr == nil && st == http.StatusOK {
-				_ = json.Unmarshal(body, &trustDoc)
-			}
+		if denied, ok := authorizeAction("inspect", rec.Name, svcID, 0, ""); !ok {
+			return denied, nil
+		}
+		pubID, _, found, rerr := resolveRelayPublication(rURL, rk, rKeyID, rec, ops)
+		if rerr != nil || !found {
+			return nil, fmt.Errorf("no publication found for service %q", svcName)
+		}
+		st, body, cerr := ops.mgmtCall(rURL, rk, rKeyID, http.MethodGet, "/v1/agent/mcp-routes/"+pubID+"/authz/clients")
+		if cerr != nil || st != http.StatusOK {
+			return map[string]any{
+				"ok":             false,
+				"status":         "AUTHORITATIVE_CLIENTS_UNAVAILABLE",
+				"service":        svcName,
+				"publication_id": pubID,
+				"clients":        []any{},
+				"detail":         fmt.Sprintf("relay returned HTTP %d for /authz/clients (upgrade relay to inspect authoritative client grants)", st),
+			}, nil
+		}
+		var out struct {
+			Clients []struct {
+				ClientID      string   `json:"client_id"`
+				ClientName    string   `json:"client_name"`
+				AuthMethod    string   `json:"auth_method"`
+				Status        string   `json:"status"`
+				PublicationID string   `json:"publication_id"`
+				RedirectURIs  []string `json:"redirect_uris"`
+				AuthorizedAt  string   `json:"authorized_at"`
+				UpdatedAt     string   `json:"updated_at"`
+				RevokedAt     *string  `json:"revoked_at,omitempty"`
+				TrustPolicyID string   `json:"trust_policy_id,omitempty"`
+			} `json:"clients"`
+		}
+		if err := json.Unmarshal(body, &out); err != nil {
+			return nil, fmt.Errorf("unparseable relay client inventory")
 		}
 		return map[string]any{
-			"ok":                true,
-			"service":           svcName,
-			"publication_id":    pubID,
-			"trust_policies":    trustDoc,
-			"provider_bindings": rec.ProviderBindings,
+			"ok":             true,
+			"service":        svcName,
+			"publication_id": pubID,
+			"clients":        out.Clients,
 		}, nil
 
 	case "revoke_client":
 		svcName := mcpToolStringArg(args, "service")
 		clientID := mcpToolStringArg(args, "clientId")
-		if clientID == "" {
-			return nil, fmt.Errorf("clientId is required")
-		}
-		if err := pol.check("revoke_client", svcName, 0, ""); err != nil {
+		if err := validateMCPSafeID(clientID, "clientId"); err != nil {
 			return nil, err
 		}
-		rec, rURL, err := resolveSvc(svcName)
+		rec, svcID, rURL, rk, rKeyID, err := resolveSvc(svcName)
 		if err != nil {
 			return nil, err
 		}
-		pubID, _, found, rerr := resolveRelayPublication(rURL, k, keyID, rec, ops)
-		if rerr != nil {
-			return nil, rerr
+		if denied, ok := authorizeAction("revoke_client", rec.Name, svcID, 0, ""); !ok {
+			return denied, nil
 		}
-		if !found {
+		pubID, _, found, rerr := resolveRelayPublication(rURL, rk, rKeyID, rec, ops)
+		if rerr != nil || !found {
 			return nil, fmt.Errorf("no publication found for service %q", svcName)
 		}
-		st, body, cerr := ops.mgmtCall(rURL, k, keyID, http.MethodPost, "/v1/agent/mcp-routes/"+pubID+"/authz/revoke/"+clientID)
+		st, _, cerr := ops.mgmtCall(rURL, rk, rKeyID, http.MethodPost, "/v1/agent/mcp-routes/"+pubID+"/authz/revoke/"+clientID)
 		if cerr != nil || st != http.StatusOK {
-			return nil, fmt.Errorf("relay returned %d: %s", st, strings.TrimSpace(string(body)))
+			return map[string]any{
+				"ok":        false,
+				"status":    "UNCONFIRMED",
+				"service":   svcName,
+				"client_id": clientID,
+				"confirmed": false,
+				"detail":    fmt.Sprintf("relay revoke failed (HTTP %d)", st),
+			}, nil
 		}
-		return map[string]any{"ok": true, "service": svcName, "client_id": clientID, "revoked": true}, nil
+		return map[string]any{
+			"ok":             true,
+			"status":         "CONFIRMED",
+			"service":        svcName,
+			"publication_id": pubID,
+			"client_id":      clientID,
+			"revoked":        true,
+			"confirmed":      true,
+		}, nil
 
 	case "get_auth_policy":
 		svcName := mcpToolStringArg(args, "service")
-		if err := pol.check("inspect", svcName, 0, ""); err != nil {
-			return nil, err
-		}
-		rec, rURL, err := resolveSvc(svcName)
+		rec, svcID, rURL, rk, rKeyID, err := resolveSvc(svcName)
 		if err != nil {
 			return nil, err
 		}
-		pubID, _, found, rerr := resolveRelayPublication(rURL, k, keyID, rec, ops)
-		if rerr != nil {
-			return nil, rerr
+		if denied, ok := authorizeAction("inspect", rec.Name, svcID, 0, ""); !ok {
+			return denied, nil
 		}
-		var trustDoc, visitorDoc any
-		if found && pubID != "" {
-			if st, body, cerr := ops.mgmtCall(rURL, k, keyID, http.MethodGet, "/v1/agent/mcp-routes/"+pubID+"/trust"); cerr == nil && st == http.StatusOK {
-				_ = json.Unmarshal(body, &trustDoc)
+		pubID, _, found, rerr := resolveRelayPublication(rURL, rk, rKeyID, rec, ops)
+		if rerr != nil || !found {
+			return nil, fmt.Errorf("no publication found for service %q", svcName)
+		}
+		var trustPolicies []map[string]any
+		if st, body, cerr := ops.mgmtCall(rURL, rk, rKeyID, http.MethodGet, "/v1/agent/mcp-routes/"+pubID+"/trust"); cerr == nil && st == http.StatusOK {
+			var tResp struct {
+				Policies []struct {
+					ID           string   `json:"id"`
+					Kind         string   `json:"kind"`
+					RedirectURIs []string `json:"redirect_uris"`
+					Enabled      bool     `json:"enabled"`
+				} `json:"policies"`
 			}
-			if st, body, cerr := ops.mgmtCall(rURL, k, keyID, http.MethodGet, "/v1/agent/mcp-routes/"+pubID+"/visitor-auth"); cerr == nil && st == http.StatusOK {
-				_ = json.Unmarshal(body, &visitorDoc)
+			if json.Unmarshal(body, &tResp) == nil {
+				for _, p := range tResp.Policies {
+					trustPolicies = append(trustPolicies, map[string]any{
+						"id":            p.ID,
+						"kind":          p.Kind,
+						"redirect_uris": p.RedirectURIs,
+						"enabled":       p.Enabled,
+					})
+				}
 			}
 		}
-		return map[string]any{"ok": true, "service": svcName, "publication_id": pubID, "trust_policies": trustDoc, "visitor_auth": visitorDoc}, nil
+		visitorMode := "native"
+		if st, body, cerr := ops.mgmtCall(rURL, rk, rKeyID, http.MethodGet, "/v1/agent/mcp-routes/"+pubID+"/visitor-auth"); cerr == nil && st == http.StatusOK {
+			var vResp struct {
+				Policy struct {
+					Mode string `json:"mode"`
+				} `json:"policy"`
+			}
+			if json.Unmarshal(body, &vResp) == nil && vResp.Policy.Mode != "" {
+				visitorMode = vResp.Policy.Mode
+			}
+		}
+		return map[string]any{
+			"ok":             true,
+			"service":        svcName,
+			"publication_id": pubID,
+			"visitor_mode":   visitorMode,
+			"trust_policies": trustPolicies,
+		}, nil
 
 	case "set_auth_policy":
 		svcName := mcpToolStringArg(args, "service")
 		preset := mcpToolStringArg(args, "preset")
 		redirectURI := mcpToolStringArg(args, "redirectUri")
-		if err := pol.check("authorize_visitor", svcName, 0, ""); err != nil {
-			return nil, err
-		}
-		rec, rURL, err := resolveSvc(svcName)
+		rec, svcID, rURL, rk, rKeyID, err := resolveSvc(svcName)
 		if err != nil {
 			return nil, err
 		}
-		pubID, _, found, rerr := resolveRelayPublication(rURL, k, keyID, rec, ops)
-		if rerr != nil {
-			return nil, rerr
+		// Strictly independent permission from authorize_visitor.
+		if denied, ok := authorizeAction("manage_auth_policy", rec.Name, svcID, 0, ""); !ok {
+			return denied, nil
 		}
-		if !found {
+		pubID, _, found, rerr := resolveRelayPublication(rURL, rk, rKeyID, rec, ops)
+		if rerr != nil || !found {
 			return nil, fmt.Errorf("no publication found for service %q", svcName)
 		}
 		var redirects []string
+		if preset != "" && preset != "chatgpt" {
+			return nil, fmt.Errorf("unsupported preset %q", preset)
+		}
 		if redirectURI != "" {
 			if !strings.HasPrefix(redirectURI, "https://") {
 				return nil, fmt.Errorf("redirectUri must be an exact https:// URI")
 			}
 			redirects = []string{redirectURI}
 		}
-		polRes, status, _, perr := applyTrustPolicyToRoute(rURL, k, keyID, pubID, preset, redirects, ops)
-		if perr != nil {
-			return nil, perr
+		if preset == "" && len(redirects) == 0 {
+			return nil, fmt.Errorf("preset or redirectUri is required")
 		}
-		return map[string]any{"ok": true, "service": svcName, "status": status, "policy": polRes}, nil
+		polRes, status, _, perr := applyTrustPolicyToRoute(rURL, rk, rKeyID, pubID, preset, redirects, ops)
+		if perr != nil {
+			return nil, fmt.Errorf("set_auth_policy failed: %s", sanitizeMCPError(perr))
+		}
+		return map[string]any{
+			"ok":             true,
+			"service":        svcName,
+			"publication_id": pubID,
+			"status":         status,
+			"policy_id":      polRes.ID,
+			"kind":           polRes.Kind,
+			"confirmed":      true,
+		}, nil
 
 	case "verify_service":
 		svcName := mcpToolStringArg(args, "service")
-		if err := pol.check("verify", svcName, 0, ""); err != nil {
-			return nil, err
-		}
-		rec, _, err := resolveSvc(svcName)
+		rec, svcID, _, rk, rKeyID, err := resolveSvc(svcName)
 		if err != nil {
 			return nil, err
 		}
-		rep := inspectServiceStatus(rec, k, keyID, ops)
+		if denied, ok := authorizeAction("verify", rec.Name, svcID, 0, ""); !ok {
+			return denied, nil
+		}
+		rep := inspectServiceStatus(rec, rk, rKeyID, ops)
 		entry, _ := resolveCatalogEntry(svcName, rec.Profile, ops)
-		var disc *discoveryCheckResult
+		endpointStage := "FAIL"
+		oauthStage := "UNKNOWN"
 		if entry.URL != "" {
 			d := runReadOnlyDiscoveryCheck(&http.Client{Timeout: 8 * time.Second}, entry.URL)
-			disc = &d
+			endpointStage = d.Transport
+			oauthStage = d.Discovery
+		}
+		authMCPStage := "UNKNOWN"
+		externalStage := "UNKNOWN"
+		if rep.PublicVerified {
+			authMCPStage = "PASS"
+		}
+		if rep.VerificationEvidence != nil && rep.VerificationEvidence.Stage == "EXTERNAL_CLIENT_VERIFIED" {
+			externalStage = "PASS"
 		}
 		return map[string]any{
-			"ok":        rep.Health == HealthReady && (disc == nil || (disc.Transport == "PASS" && disc.Discovery == "PASS")),
-			"service":   svcName,
-			"status":    rep,
-			"discovery": disc,
+			"ok":             endpointStage == "PASS" && oauthStage == "PASS" && rep.Health == HealthReady,
+			"service":        svcName,
+			"publication_id": rep.PublicationID,
+			"url":            entry.URL,
+			"stages": map[string]string{
+				"public_endpoint_reachable":    endpointStage,
+				"oauth_discovery_compatible":   oauthStage,
+				"authenticated_mcp_handshake":  authMCPStage,
+				"events_advertised":            "UNKNOWN",
+				"events_subscription_verified": "UNKNOWN",
+				"callback_delivery_verified":   "UNKNOWN",
+				"external_client_acceptance":   externalStage,
+			},
+			"status": safeStatusReport(rep),
 		}, nil
 
 	case "diagnose_service":
 		svcName := mcpToolStringArg(args, "service")
-		if err := pol.check("inspect", svcName, 0, ""); err != nil {
-			return nil, err
-		}
-		rec, _, err := resolveSvc(svcName)
+		rec, svcID, _, rk, rKeyID, err := resolveSvc(svcName)
 		if err != nil {
 			return nil, err
 		}
-		rep := inspectServiceStatus(rec, k, keyID, ops)
+		if denied, ok := authorizeAction("inspect", rec.Name, svcID, 0, ""); !ok {
+			return denied, nil
+		}
+		rep := inspectServiceStatus(rec, rk, rKeyID, ops)
 		layer, classification, errCode := classifyFailureLayer(rep)
 		return map[string]any{
 			"ok":             true,
 			"service":        svcName,
-			"status":         rep,
 			"failing_layer":  layer,
 			"classification": classification,
 			"error_code":     errCode,
+			"status":         safeStatusReport(rep),
 		}, nil
 
 	case "verify_events":
 		svcName := mcpToolStringArg(args, "service")
-		if err := pol.check("verify", svcName, 0, ""); err != nil {
-			return nil, err
-		}
-		rec, _, err := resolveSvc(svcName)
+		rec, svcID, _, rk, rKeyID, err := resolveSvc(svcName)
 		if err != nil {
 			return nil, err
 		}
+		if denied, ok := authorizeAction("verify", rec.Name, svcID, 0, ""); !ok {
+			return denied, nil
+		}
+		rep := inspectServiceStatus(rec, rk, rKeyID, ops)
 		entry, _ := resolveCatalogEntry(svcName, rec.Profile, ops)
 		if entry.URL == "" {
 			return nil, fmt.Errorf("no canonical URL available for service %q", svcName)
 		}
-		disc := runReadOnlyDiscoveryCheck(&http.Client{Timeout: 8 * time.Second}, entry.URL)
+		d := runReadOnlyDiscoveryCheck(&http.Client{Timeout: 8 * time.Second}, entry.URL)
+		// Never misrepresent OAuth metadata discovery as authenticated Events verification.
 		return map[string]any{
-			"ok":        disc.Transport == "PASS" && disc.Discovery == "PASS",
-			"service":   svcName,
-			"url":       entry.URL,
-			"discovery": disc,
-			"note":      "Events subscription delivery requires an explicit visitor token via CLI `ocliv mcp check NAME --capability events --token-file PATH`",
+			"ok":             false,
+			"verified":       false,
+			"service":        svcName,
+			"publication_id": rep.PublicationID,
+			"url":            entry.URL,
+			"stages": map[string]string{
+				"public_endpoint_reachable":    d.Transport,
+				"oauth_discovery_compatible":   d.Discovery,
+				"authenticated_mcp_handshake":  "UNKNOWN",
+				"events_advertised":            "UNKNOWN",
+				"events_subscription_verified": "UNKNOWN",
+				"callback_delivery_verified":   "UNKNOWN",
+				"external_client_acceptance":   "UNKNOWN",
+			},
+			"detail": "Authenticated Events qualification requires an operator-supplied visitor token via `ocliv mcp check NAME --capability events --token-file PATH` or Ocliv Control Center.",
 		}, nil
 	}
 	return nil, fmt.Errorf("unknown tool %q", name)

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Ocliv Control Center
+GenericName=Local MCP & Tunnel Operator Interface
+Comment=Manage Ocliv services, approve AI connections, and configure agent permissions
+Exec=ocliv ui
+Terminal=false
+Categories=Network;Utility;Development;
+StartupNotify=true

@@ -236,6 +236,12 @@ func Run(argv []string) int {
 			return apperr.ExitCLIValidation
 		}
 		return cmdServiceRemove(argv[1:], defaultServiceOps())
+	case "ui", "control-center":
+		if err := requireUserContext("ui", false); err != nil {
+			fmt.Fprintln(os.Stderr, "error: "+err.Error())
+			return apperr.ExitCLIValidation
+		}
+		return cmdUI(argv[1:])
 	case "logs":
 		return cmdServiceLogs(argv[1:])
 	case "share":
@@ -258,6 +264,7 @@ Getting Started:
   ocliv host mcp PORT --name NAME --trust chatgpt         host an MCP server with ChatGPT trusted
 
 Everyday Commands:
+  ocliv ui [--install-shortcut]                            launch the local Ocliv Control Center graphical interface
   ocliv host [http|mcp] PORT [--name N] [--trust PRESET]   persistently host HTTP or MCP (systemd + reboot-safe)
   ocliv status [NAME] [--json]                             show relay, services, trusted clients, and pending approvals
   ocliv start|enable NAME                                  enable/start a hosted service (preserves URL & identity)

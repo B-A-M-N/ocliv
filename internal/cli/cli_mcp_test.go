@@ -159,7 +159,7 @@ func TestManageNotificationSilent(t *testing.T) {
 // TestManageStatusRequiresEnrollment: without a local key the management
 // loop reports not-enrolled instead of touching the relay.
 func TestManageStatusRequiresEnrollment(t *testing.T) {
-	resps := manageCall(t, `{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"ocliv_status","arguments":{}}}`+"\n")
+	resps := manageCall(t, `{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_status","arguments":{}}}`+"\n")
 	if len(resps) != 1 {
 		t.Fatalf("got %d responses, want 1", len(resps))
 	}
@@ -169,6 +169,31 @@ func TestManageStatusRequiresEnrollment(t *testing.T) {
 	}
 	if code, _ := errObj["code"].(float64); code != -32000 {
 		t.Fatalf("error code=%v, want -32000", errObj["code"])
+	}
+}
+
+// TestManageRejectsUnadvertisedLegacyTools proves that calling unadvertised
+// legacy tools (ocliv_share, ocliv_revoke, ocliv_status) cannot bypass the
+// closed 20-tool catalog or permission layer.
+func TestManageRejectsUnadvertisedLegacyTools(t *testing.T) {
+	_ = enrollHome(t)
+	for _, legacy := range []string{"ocliv_share", "ocliv_revoke", "ocliv_status", "shell_exec"} {
+		var out strings.Builder
+		req := `{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"` + legacy + `","arguments":{}}}` + "\n"
+		if code := runMCPManage(strings.NewReader(req), &out); code != 0 {
+			t.Fatalf("%s: runMCPManage exit=%d", legacy, code)
+		}
+		var resp map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimSpace(out.String())), &resp); err != nil {
+			t.Fatalf("%s: bad JSON %q: %v", legacy, out.String(), err)
+		}
+		errObj, ok := resp["error"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s: unadvertised tool unexpectedly succeeded: %v", legacy, resp)
+		}
+		if code, _ := errObj["code"].(float64); code != -32601 {
+			t.Fatalf("%s: error code=%v, want -32601 (msg=%v)", legacy, errObj["code"], errObj["message"])
+		}
 	}
 }
 

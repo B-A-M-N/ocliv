@@ -225,7 +225,10 @@ func runMCPManage(in io.Reader, out io.Writer) int {
 	k, keyID, err := loadKey()
 	enrolled := err == nil
 	relayURL := agentRelayURL()
-	dir, _, _, _ := agentFiles()
+	principal := strings.TrimSpace(os.Getenv("OCLIV_MCP_PRINCIPAL"))
+	if principal == "" {
+		principal = "local-stdio"
+	}
 
 	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
@@ -279,42 +282,18 @@ func runMCPManage(in io.Reader, out io.Writer) int {
 				rpcError(out, req.ID, -32000, "not enrolled: run `ocliv login` first")
 				continue
 			}
-			leaseID := lastLeaseID(dir)
-			switch p.Name {
-			case "ocliv_status":
-				st := map[string]any{"lease_id": leaseID, "relay_url": relayURL}
-				if leaseID == "" {
-					st["route"] = "no active lease"
+			// Closed tool surface: ONLY the 20 advertised OCL-012 tools are dispatchable.
+			// Legacy unadvertised ocliv_status / ocliv_share / ocliv_revoke bypasses are removed.
+			res, herr := handleMCPManageTool(principal, p.Name, p.Arguments, relayURL, k, keyID, defaultServiceOps())
+			if herr != nil {
+				if strings.HasPrefix(herr.Error(), "unknown tool") {
+					rpcError(out, req.ID, -32601, herr.Error())
+				} else {
+					rpcError(out, req.ID, -32000, herr.Error())
 				}
-				rpcResult(out, req.ID, map[string]any{"content": []any{map[string]any{"type": "text", "text": fmt.Sprintf("%v", st)}}})
-			case "ocliv_share", "ocliv_revoke":
-				if leaseID == "" {
-					rpcError(out, req.ID, -32000, "no active lease; start a tunnel first")
-					continue
-				}
-				action := strings.TrimPrefix(p.Name, "ocliv_")
-				code, body, err := mgmtCall(relayURL, k, keyID, "POST", "/v1/agent/lease/"+leaseID+"/"+action)
-				if err != nil {
-					rpcError(out, req.ID, -32000, fmt.Sprintf("%s relay transport failed: %v", action, err))
-					continue
-				}
-				if code != 200 {
-					rpcError(out, req.ID, -32000, fmt.Sprintf("%s failed (relay status %d)", action, code))
-					continue
-				}
-				rpcResult(out, req.ID, map[string]any{"content": []any{map[string]any{"type": "text", "text": string(body)}}})
-			default:
-				res, herr := handleMCPManageTool(p.Name, p.Arguments, relayURL, k, keyID, defaultServiceOps())
-				if herr != nil {
-					if strings.HasPrefix(herr.Error(), "unknown tool") {
-						rpcError(out, req.ID, -32601, herr.Error())
-					} else {
-						rpcError(out, req.ID, -32000, herr.Error())
-					}
-					continue
-				}
-				rpcResult(out, req.ID, mcpToolResult(res))
+				continue
 			}
+			rpcResult(out, req.ID, mcpToolResult(res))
 		default:
 			rpcError(out, req.ID, -32601, fmt.Sprintf("unknown method %q", req.Method))
 		}

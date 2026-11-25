@@ -151,8 +151,11 @@ export class NativeControlPlane {
   async listServices(subject) {
     this.permissions.assertAllowed({ subject, action: 'inspect' });
     const res = await this.runCli(['service', 'list', '--json']);
-    const list = Array.isArray(res.json) ? res.json : (res.json?.services ?? []);
-    return redactSecrets({ ok: true, services: list });
+    const rawList = Array.isArray(res.json) ? res.json : (res.json?.services ?? []);
+    const filtered = rawList.filter((svc) =>
+      this.permissions.canAccessService(subject, svc?.name ?? '', svc?.identity?.service_id ?? svc?.service_id ?? '')
+    );
+    return redactSecrets({ ok: true, services: filtered });
   }
 
   async getService(subject, { service }) {
@@ -208,9 +211,23 @@ export class NativeControlPlane {
       authMode: authentication,
     });
 
-    // Idempotency check: if service already exists with matching target, reconcile/enable instead of duplicating.
+    // Idempotency check: require exact configuration match before returning idempotent: true.
     const existing = await this.runCli(['status', svcName, '--json'], { allowNonZero: true });
     if (existing.json && existing.json.name === svcName) {
+      const wantLocal = `http://127.0.0.1:${port}${path}`;
+      const existingLocal = existing.json.local_url || '';
+      const existingType = existing.json.type || 'mcp';
+      const existingAuth = existing.json.auth_profile || 'ocliv-managed';
+      if (
+        (existingLocal && existingLocal !== wantLocal) ||
+        existingType !== type ||
+        existingAuth !== authentication
+      ) {
+        throw new ControlPlaneError('CONFIGURATION_CONFLICT', `Service "${svcName}" already exists with a different configuration`, {
+          existing: { local_url: existingLocal, type: existingType, authentication: existingAuth },
+          requested: { local_url: wantLocal, type, authentication },
+        });
+      }
       if (existing.json.desired_state !== 'enabled') {
         await this.runCli(['service', 'start', svcName], { allowNonZero: true });
       }
@@ -343,7 +360,7 @@ export class NativeControlPlane {
 
   async setAuthPolicy(subject, { service, preset = '', redirectUri = '' }) {
     const name = assertServiceName(service);
-    this.permissions.assertAllowed({ subject, action: 'authorize_visitor', service: name });
+    this.permissions.assertAllowed({ subject, action: 'manage_auth_policy', service: name });
     const args = ['trust', name];
     if (preset) {
       if (preset !== 'chatgpt') {

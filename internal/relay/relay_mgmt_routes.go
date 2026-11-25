@@ -182,6 +182,10 @@ func (s *Server) handleAgentPublications(w http.ResponseWriter, r *http.Request)
 			s.serveKeyPublicationAuthzPending(w, tenant, keyID, routeID)
 			return
 		}
+		if routeID, ok := strings.CutSuffix(rest, "/authz/clients"); ok && validRouteID(routeID) {
+			s.serveKeyPublicationAuthzClients(w, tenant, keyID, routeID)
+			return
+		}
 		if routeID, ok := strings.CutSuffix(rest, "/trust"); ok && validRouteID(routeID) {
 			s.serveKeyPublicationTrustList(w, tenant, keyID, routeID)
 			return
@@ -649,6 +653,84 @@ func (s *Server) serveKeyPublicationDesiredState(w http.ResponseWriter, tenant, 
 		"desired_enabled":  enabled,
 		"state_generation": stateGen,
 		"session_live":     sessionLive,
+	})
+}
+
+func (s *Server) serveKeyPublicationAuthzClients(w http.ResponseWriter, tenant, keyID, routeID string) {
+	var exists int
+	if err := s.db.SQL().QueryRow(
+		`SELECT 1 FROM mcp_publications WHERE route_id=? AND tenant_id=? AND owner_key_id=?`,
+		routeID, tenant, keyID,
+	).Scan(&exists); err != nil {
+		http.Error(w, "unknown route", http.StatusNotFound)
+		return
+	}
+	type authorizedClientView struct {
+		ClientID      string   `json:"client_id"`
+		ClientName    string   `json:"client_name"`
+		AuthMethod    string   `json:"auth_method"`
+		Status        string   `json:"status"`
+		PublicationID string   `json:"publication_id"`
+		RedirectURIs  []string `json:"redirect_uris"`
+		AuthorizedAt  string   `json:"authorized_at"`
+		UpdatedAt     string   `json:"updated_at"`
+		RevokedAt     *string  `json:"revoked_at,omitempty"`
+		TrustPolicyID string   `json:"trust_policy_id,omitempty"`
+		OwnerIssuer   string   `json:"owner_issuer,omitempty"`
+		OwnerSubject  string   `json:"owner_subject,omitempty"`
+	}
+	clients := []authorizedClientView{}
+	if s.authz != nil {
+		rows, err := s.db.SQL().Query(
+			`SELECT c.id, COALESCE(c.name, ''), COALESCE(c.redirect_uris, '[]'),
+			        COALESCE(g.status, 'pending'), COALESCE(g.auth_method, ''),
+			        COALESCE(g.created_at, c.created_at), COALESCE(g.updated_at, c.created_at),
+			        c.revoked_at, COALESCE(g.trust_policy_id, ''),
+			        COALESCE(g.owner_issuer, ''), COALESCE(g.owner_subject, '')
+			 FROM authz_clients c
+			 LEFT JOIN authz_grants g ON g.client_id=c.id AND g.tenant_id=c.tenant_id AND g.route_id=c.route_id
+			 WHERE c.tenant_id=? AND c.route_id=?
+			 ORDER BY COALESCE(g.updated_at, c.created_at) DESC`,
+			tenant, routeID,
+		)
+		if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var v authorizedClientView
+			var redirectsJSON string
+			var revokedAt sql.NullString
+			if err := rows.Scan(
+				&v.ClientID, &v.ClientName, &redirectsJSON,
+				&v.Status, &v.AuthMethod,
+				&v.AuthorizedAt, &v.UpdatedAt,
+				&revokedAt, &v.TrustPolicyID,
+				&v.OwnerIssuer, &v.OwnerSubject,
+			); err != nil {
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+			v.PublicationID = routeID
+			if revokedAt.Valid {
+				s := revokedAt.String
+				v.RevokedAt = &s
+				v.Status = "revoked"
+			}
+			if v.AuthMethod == "" {
+				v.AuthMethod = "native"
+			}
+			_ = json.Unmarshal([]byte(redirectsJSON), &v.RedirectURIs)
+			if v.RedirectURIs == nil {
+				v.RedirectURIs = []string{}
+			}
+			clients = append(clients, v)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"publication_id": routeID,
+		"clients":        clients,
 	})
 }
 

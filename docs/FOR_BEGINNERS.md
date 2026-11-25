@@ -141,159 +141,112 @@ AI is a **co-pilot**, not a pilot — and MCP gives that co-pilot access to swit
 
 ---
 
-# 🚀 Part 2: Step-by-Step Setup Guide (Beginner Friendly)
+# 🚀 Part 2: Step-by-Step Setup Guide (Graphical-First, Beginner Friendly)
 
-Take your time. Do not rush. Follow each step in order.
+You do **not** have to live in a terminal to use Ocliv. Once Ocliv is installed, the **Ocliv Control Center** gives you a clean local web interface in your browser with buttons, status badges, and checkboxes.
 
 First, let's clear up the only **three words** you need to know:
 
 | Word | What it means in plain English |
 | :--- | :--- |
 | **MCP Server** | The small tool program running on your computer (for example, a notes tool, a search tool, or AgentGateway). |
-| **Publisher** | Your computer running `ocliv` to safely share that local MCP server over an encrypted outbound tunnel. |
-| **Relay** | A small always-on Linux box with a public web address (like a Raspberry Pi or a cheap VPS) that answers HTTPS requests from ChatGPT or Gemini and forwards them through the tunnel to your computer. |
-
-You can run both on the same Linux machine, or put the Relay on a small server/Raspberry Pi and the Publisher on your main Linux workstation.
+| **Ocliv Control Center** | Your local dashboard (`ocliv ui` or the **Ocliv Control Center** app in your desktop menu). Only you can open it on your own computer — it is never exposed to the public Internet. |
+| **Relay** | A small always-on Linux box with a public web address (like a Raspberry Pi or a cheap VPS) that answers HTTPS requests from ChatGPT or Gemini and forwards them safely through an outbound tunnel to your computer. |
 
 ---
 
-## Step 0: Before You Start
+## Step 1: Open Ocliv Control Center
 
-Make sure you have:
-1. A **Linux computer** (Ubuntu, Pop!_OS, Debian, Raspberry Pi OS, etc.) with `systemd`. *(Ocliv `v0.1` is built for Linux.)*
-2. A **public domain name** pointing to your Relay machine (for example, a free DuckDNS name like `myname.duckdns.org` or a domain on Cloudflare) with port **443** (standard HTTPS) reachable on the Relay.
-3. A **local MCP server** you want to connect (running on your computer on a local port like `http://127.0.0.1:8765/mcp`, or as a command-line `stdio` tool).
-4. A **ChatGPT** or **Gemini** account that supports custom MCP connectors.
-
----
-
-## Step 1: Install Ocliv on Your Relay
-
-Open a terminal on your **Relay** machine and run:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/B-A-M-N/ocliv/master/packaging/install/install-relay.sh | sudo sh
-```
-
-Check that it worked:
-```sh
-ocliv version
-```
-✅ **Check:** You should see an Ocliv version number printed on screen.
-
-Now set up the Relay and automatic HTTPS certificates:
-* If you have a **single hostname** (like `myname.duckdns.org` — easiest for beginners):
-  ```sh
-  sudo ocliv setup --auto --edge-mode single-host --hostname myname.duckdns.org --acme-email you@example.com
-  ```
-* If you have a **domain with wildcard DNS** (like Cloudflare):
-  ```sh
-  sudo ocliv setup --auto --hostname example.net --dns-provider cloudflare --acme-email you@example.com
-  ```
-
-Wait for it to finish. It sets up the Relay service and Caddy (which automatically gets a real HTTPS padlock certificate for you).
+1. If you installed the desktop shortcut (`ocliv ui --install-shortcut`), open **Ocliv Control Center** from your computer's application menu.
+   *(Or run `ocliv ui` once in a terminal — it opens your browser automatically and shows your **Services**, **Access & Connections**, **Agents & Permissions**, and **Setup & Diagnostics** tabs.)*
+2. Check the top-left badge: it should say **`Relay connected`** in green.
+   *(If you haven't set up a Relay yet, see the **First-Time Relay Setup** section in the Advanced CLI Reference below or [docs/SETUP.md](SETUP.md).)*
 
 ---
 
-## Step 2: Enroll Your Computer (The Publisher)
+## Step 2: Add Your Local MCP Server
 
-Your computer needs a cryptographic identity so the Relay knows it is really you.
-
-From your **Relay** machine, run one command (replace `user@my-computer` with your username and computer address):
-
-```sh
-ocliv device add user@my-computer --install
-```
-
-*(If your Relay and Publisher are the exact same machine, just run `ocliv device add --local` instead.)*
-
-✅ **Check:** On your computer, run:
-```sh
-ocliv status
-```
-You should see your Relay address and your computer's Device ID. No secret codes to copy by hand!
+1. In the **Services** tab, click **`+ Add service`**.
+2. Fill in the simple form:
+   * **Service name:** a friendly name like `mytools`
+   * **Local port:** the port your MCP server listens on (for example, `8765`)
+   * **Type:** `MCP Server`
+   * **Authentication:** `Ocliv Managed OAuth (Recommended)`
+3. Click **`Add & Publish`**.
+4. Wait a few seconds until the card shows **`Online`** in green and displays your permanent HTTPS address (like `https://myname.duckdns.org/r/abc123.../mcp`).
 
 ---
 
-## Step 3: Publish Your Local MCP Server
+## Step 3A: Connect to ChatGPT
 
-Suppose your local MCP server is running on port `8765` on your computer, and you want to call it `mytools`.
-
-Run this on your computer:
-
-```sh
-ocliv host mcp 8765 --name mytools --trust chatgpt
-```
-
-*(If your MCP server is a command-line `stdio` program instead of a port, use `--stdio -- <command>`, for example: `ocliv host mcp --stdio --name mytools --trust chatgpt -- /path/to/my-mcp-server`.)*
-
-Now check its status and get its public web address:
-
-```sh
-ocliv status mytools
-ocliv mcp url mytools
-ocliv mcp check mytools
-```
-
-✅ **Check:**
-* `ocliv status mytools` says **`SERVING`** and **`READY`**.
-* `ocliv mcp url mytools` prints a clean HTTPS address like `https://myname.duckdns.org/r/abc123.../mcp`.
-* `ocliv mcp check mytools` passes its transport and OAuth discovery checks.
-
-**Copy that HTTPS URL** — that is the address you will give to ChatGPT or Gemini.
+1. On your service card, click **`Connect / Access`**.
+2. Click **`Trust ChatGPT Redirect`** (one click), then click **`Copy MCP URL`**.
+3. Open **ChatGPT** → **Settings → Apps / Connectors** → **Create / Add MCP Server**:
+   * **Name:** `mytools`
+   * **MCP Server URL:** paste the URL you just copied
+   * **Authentication:** select **OAuth**
+4. Click **Create / Connect**. ChatGPT will open an Ocliv authorization tab in your browser.
+5. Switch back to **Ocliv Control Center** → **Access & Connections** → **Pending Visitor Approvals**, verify it is your ChatGPT connection, and click **`Approve`**.
+6. ChatGPT completes sign-in automatically — **no pairing codes to copy**, and it stays connected automatically.
 
 ---
 
-## Step 4A: Connect to ChatGPT
+## Step 3B: Connect to Gemini (Google)
 
-1. Open **ChatGPT** in your browser.
-2. Go to **Settings → Apps / Connectors** (or **Developer Mode → Connectors**, depending on your ChatGPT plan) and click **Create** / **Add MCP Server**.
-3. Fill in:
-   * **Name:** `mytools` (or any label you like)
-   * **MCP Server URL:** paste the HTTPS URL from `ocliv mcp url mytools`
-   * **Authentication:** select **OAuth** (do **not** choose "No Authentication")
-4. Click **Create / Connect**. ChatGPT will open a browser tab showing an **Ocliv Authorization** page waiting for your approval.
-5. **Approve it from your own terminal** (no copying pairing secrets!):
-   ```sh
-   ocliv service pending mytools
-   ```
-   You will see one pending request with a Challenge ID (like `cns_...`). Check that the client name and redirect URL belong to ChatGPT, then approve it:
-   ```sh
-   ocliv service approve mytools --challenge <CHALLENGE_ID>
-   ```
-6. Look back at the browser tab — it will complete automatically and return you to ChatGPT!
+Gemini / Google Connected Apps requires a confidential OAuth Client ID and Client Secret bound to your route. Because confidential secrets should never pass through an AI agent's chat, run the operator command once on your computer (see [docs/CONNECTING-CHATGPT-AND-GEMINI.md](CONNECTING-CHATGPT-AND-GEMINI.md)):
 
-✅ **Check:** ChatGPT now lists your `mytools` connector as connected and shows its available tools. You will **not** have to repeat this every hour — Ocliv refreshes tokens automatically.
+```sh
+ocliv connect google mytools --type gemini --approve --secret-out ~/mytools-google-secret.txt
+```
+
+Paste the **MCP URL**, **Client ID**, and **Client Secret** into Gemini, then delete the temporary secret file (`rm ~/mytools-google-secret.txt`).
 
 ---
 
-## Step 4B: Connect to Gemini (Google)
+## Step 4: Control What AI Agents Can Do (Checkboxes, No JSON!)
 
-Gemini / Google Connected Apps uses a confidential OAuth client registered specifically for your route. Ocliv has a single command to set this up safely for you.
-
-1. Run this on your computer (replace `mytools` with your service name):
-   ```sh
-   ocliv connect google mytools --type gemini --approve --secret-out ~/mytools-google-secret.txt
-   ```
-   *(If you are connecting a Google Connected App that requires domain verification, run `ocliv google verify-domain` first and use `--type connected-app` instead of `--type gemini`. See [docs/CONNECTING-CHATGPT-AND-GEMINI.md](CONNECTING-CHATGPT-AND-GEMINI.md) for full details.)*
-2. Ocliv prints your **MCP URL**, **Client ID**, and writes the one-time **Client Secret** safely to `~/mytools-google-secret.txt` (readable only by you).
-3. In your **Gemini / Google** MCP connector settings, enter:
-   * **MCP Server URL:** from `ocliv mcp url mytools`
-   * **Client ID:** printed by `ocliv connect google`
-   * **Client Secret:** contents of `~/mytools-google-secret.txt`
-4. Complete the sign-in / connection flow in Gemini, then delete the temporary secret file once saved (`rm ~/mytools-google-secret.txt`).
+If you connect an AI agent to Ocliv's own management MCP:
+1. Open the **Agents & Permissions** tab in **Ocliv Control Center**.
+2. Select an agent principal and check **only** the boxes you want it to have (for example: *Inspect service status* and *Retrieve service URLs*, while leaving *Approve visitor connections* and *Permanently remove services* unchecked).
+3. If an agent ever asks to do something outside its permissions, a request appears under **Pending Agent Permission Requests** where you can click **Allow Once**, **Allow Persistently**, or **Deny**.
+4. **Important security note:** Permissions protect remote or sandboxed agents. If a local AI agent has unrestricted terminal/shell access under your exact same Linux user account, it can already run any command you can run — use a separate OS user or container whenever you need a hard boundary.
 
 ---
 
 ## Step 5: Test the Connection (The Handshake)
 
-Before asking your AI to do real work, test that the bridge works safely:
-
 1. Start a new chat in ChatGPT or Gemini with your `mytools` connector enabled.
 2. Type:
    > *"Can you list the tools available from mytools? Do not run any tool that changes anything yet — just list what you can see."*
 3. **Success:** The AI lists the tools from your local MCP server!
-4. **Failure:** Check `ocliv status mytools` and `ocliv mcp check mytools` on your computer.
+
+---
+
+## Advanced CLI Reference (Optional)
+
+Everything in the Control Center is also available from the terminal for developers and automation:
+
+```sh
+# Install Ocliv on a Relay host (Linux x86_64 / ARM64):
+curl -fsSL https://raw.githubusercontent.com/B-A-M-N/ocliv/master/packaging/install/install-relay.sh | sudo sh
+
+# Set up Relay + automatic HTTPS (single-host easiest for beginners):
+sudo ocliv setup --auto --edge-mode single-host --hostname myname.duckdns.org --acme-email you@example.com
+
+# Enroll your publisher computer over SSH (or `--local` on the same machine):
+ocliv device add user@my-computer --install
+
+# Publish, check, approve, pause, resume, or repair from the CLI:
+ocliv host mcp 8765 --name mytools --trust chatgpt
+ocliv status mytools
+ocliv mcp url mytools
+ocliv mcp check mytools
+ocliv service pending mytools
+ocliv service approve mytools --challenge <CHALLENGE_ID>
+ocliv stop mytools
+ocliv start mytools
+ocliv service reconcile mytools
+```
 
 ---
 
