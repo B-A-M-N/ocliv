@@ -208,8 +208,8 @@ func Run(argv []string) int {
 		return cmdInstall(argv[1:])
 	case "host":
 		return cmdHost(argv[1:])
-	case "start":
-		if err := requireUserContext("start", false); err != nil {
+	case "start", "enable":
+		if err := requireUserContext(argv[0], false); err != nil {
 			fmt.Fprintln(os.Stderr, "error: "+err.Error())
 			return apperr.ExitCLIValidation
 		}
@@ -220,8 +220,8 @@ func Run(argv []string) int {
 			return apperr.ExitCLIValidation
 		}
 		return cmdServiceRestart(argv[1:], defaultServiceOps())
-	case "stop":
-		if err := requireUserContext("stop", false); err != nil {
+	case "stop", "disable":
+		if err := requireUserContext(argv[0], false); err != nil {
 			fmt.Fprintln(os.Stderr, "error: "+err.Error())
 			return apperr.ExitCLIValidation
 		}
@@ -256,19 +256,21 @@ Getting Started:
 Everyday Commands:
   ocliv host [http|mcp] PORT [--name N] [--trust PRESET]   persistently host HTTP or MCP (systemd + reboot-safe)
   ocliv status [NAME] [--json]                             show relay, services, trusted clients, and pending approvals
-  ocliv start NAME                                         start a stopped hosted service
-  ocliv stop NAME [--json]                                 immediately disable public access, retain identity
+  ocliv start|enable NAME                                  enable/start a hosted service (preserves URL & identity)
+  ocliv stop|disable NAME [--json]                         immediately disable public access, retain identity
   ocliv restart NAME                                       non-destructive restart/rebind (preserves URL & sessions)
-  ocliv trust NAME PRESET|--redirect-uri URI|--client ID   manage route-scoped trusted OAuth clients
-  ocliv untrust NAME PRESET_OR_ID                          revoke a route trust policy
+  ocliv trust NAME PRESET|--redirect-uri URI|--client ID   manage route-scoped client policies & federated OIDC auth
+  ocliv untrust NAME PRESET_OR_ID|--visitor-auth           revoke a route trust or federated visitor auth policy
   ocliv revoke client CLIENT_ID [--service NAME]           revoke an OAuth client's access
   ocliv remove NAME [--yes]                                permanently retire a hosted service
   ocliv update [--check] [--yes]                           check for or install signed client updates from relay
   ocliv doctor [NAME|--all]                                diagnose key, relay, local service, and DNS/TLS
+  ocliv mcp url|check NAME [--capability events]           inspect canonical MCP URL, OAuth discovery & Events
   ocliv PORT                                               share localhost:PORT over protected HTTPS (ephemeral)
 
 Device Management (on relay host):
-  ocliv device add USER@HOST [--tenant default] [--install]   enroll a remote machine over SSH
+  ocliv device add USER@HOST [--tenant default] [--install]   enroll a remote machine over SSH (default)
+  ocliv device add --local [--tenant default]                 enroll current non-root user on the relay host
   ocliv device add --local-user USER [--tenant default]       enroll a local unprivileged user on the relay host
   ocliv device list [--data DIR]                              list enrolled devices/keys
   ocliv device revoke KEY_ID [--data DIR]                     revoke an enrolled device key

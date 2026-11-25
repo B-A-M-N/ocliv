@@ -3,8 +3,10 @@ package cli
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -817,6 +819,60 @@ func TestRenderStatusNamedStates(t *testing.T) {
 	jout, _ := renderStatus(local, nil, &statusProblem{state: "RELAY DISCONNECTED", advice: "x"}, true)
 	if !strings.Contains(jout, "RELAY DISCONNECTED") {
 		t.Fatalf("json omits classified state: %q", jout)
+	}
+}
+
+// OCL-002: Relay connectivity failures must classify typed errors accurately
+// (DNS, TLS, timeout/unreachable) and never present observer reachability
+// failure as confirmed tunnel disconnection.
+func TestClassifyRelayMgmtErrorsAndLastKnownSeparation(t *testing.T) {
+	dnsProb := classifyRelayMgmtError(&net.DNSError{Err: "no such host", Name: "relay.example", IsNotFound: true})
+	if dnsProb == nil || dnsProb.state != "RELAY_DNS_UNREACHABLE" {
+		t.Fatalf("DNS error classified as %+v, want RELAY_DNS_UNREACHABLE", dnsProb)
+	}
+	tlsProb := classifyRelayMgmtError(x509.UnknownAuthorityError{})
+	if tlsProb == nil || tlsProb.state != "RELAY_TLS_ERROR" {
+		t.Fatalf("TLS error classified as %+v, want RELAY_TLS_ERROR", tlsProb)
+	}
+	timeoutProb := classifyRelayMgmtError(context.DeadlineExceeded)
+	if timeoutProb == nil || timeoutProb.state != "RELAY_UNREACHABLE" {
+		t.Fatalf("timeout error classified as %+v, want RELAY_UNREACHABLE", timeoutProb)
+	}
+	unknownProb := classifyRelayMgmtError(errors.New("unexpected proxy reset"))
+	if unknownProb == nil || unknownProb.state != "TUNNEL_STATE_UNKNOWN" {
+		t.Fatalf("generic error classified as %+v, want TUNNEL_STATE_UNKNOWN", unknownProb)
+	}
+
+	// Render with DNS error and stale last-known state: must report
+	// TUNNEL_STATE_UNKNOWN and keep last-known clearly non-authoritative.
+	local := map[string]any{
+		"lease_id": "l1", "url": "https://h/", "access_mode": "mcp_managed_oauth", "port": float64(18777),
+		"last_known_status": "ACTIVE", "last_known_route": "TUNNEL_ONLINE", "last_observed_at": "2026-11-24T22:00:00Z",
+	}
+	out, _ := renderStatus(local, nil, dnsProb, false)
+	if !strings.Contains(out, "RELAY_DNS_UNREACHABLE") || !strings.Contains(out, "TUNNEL_STATE_UNKNOWN") || !strings.Contains(out, "non-authoritative") {
+		t.Fatalf("DNS status output misclassified: %q", out)
+	}
+	if strings.Contains(out, "RELAY DISCONNECTED") {
+		t.Fatalf("DNS error must never render as RELAY DISCONNECTED: %q", out)
+	}
+	jout, _ := renderStatus(local, nil, dnsProb, true)
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(jout), &parsed); err != nil {
+		t.Fatalf("unmarshal json status: %v", err)
+	}
+	if parsed["status"] != "RELAY_DNS_UNREACHABLE" || parsed["tunnel_state"] != "TUNNEL_STATE_UNKNOWN" || parsed["authoritative"] != false || parsed["last_observed_at"] != "2026-11-24T22:00:00Z" {
+		t.Fatalf("unexpected json status: %+v", parsed)
+	}
+
+	// Authoritative live relay response -> TUNNEL_ONLINE; offline -> TUNNEL_OFFLINE.
+	liveOut, _ := renderStatus(local, map[string]any{"status": "ACTIVE", "route_live": true}, nil, true)
+	if !strings.Contains(liveOut, `"tunnel_state":"TUNNEL_ONLINE"`) {
+		t.Fatalf("expected TUNNEL_ONLINE, got %s", liveOut)
+	}
+	offOut, _ := renderStatus(local, map[string]any{"status": "ACTIVE", "route_live": false}, nil, true)
+	if !strings.Contains(offOut, `"tunnel_state":"TUNNEL_OFFLINE"`) {
+		t.Fatalf("expected TUNNEL_OFFLINE, got %s", offOut)
 	}
 }
 

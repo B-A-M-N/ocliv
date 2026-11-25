@@ -59,7 +59,7 @@ var (
 // cmdLogin performs one-time enrollment: generate a keypair, exchange the
 // operator-issued code for registration.
 func cmdLogin(argv []string) int {
-	var relayURL, codeFile, cacert string
+	var relayURL, codeFile, cacert, profile string
 	for i := 0; i < len(argv); i++ {
 		switch {
 		case argv[i] == "--relay" && i+1 < len(argv):
@@ -77,16 +77,36 @@ func cmdLogin(argv []string) int {
 			cacert = argv[i]
 		case strings.HasPrefix(argv[i], "--cacert="):
 			cacert = strings.TrimPrefix(argv[i], "--cacert=")
+		case argv[i] == "--profile" && i+1 < len(argv):
+			i++
+			profile = argv[i]
+		case strings.HasPrefix(argv[i], "--profile="):
+			profile = strings.TrimPrefix(argv[i], "--profile=")
 		default:
 			fmt.Fprintf(os.Stderr, "unknown login flag %q\n", argv[i])
 			return apperr.ExitCLIValidation
 		}
 	}
+	if profile != "" {
+		if !validProfileName(profile) {
+			fmt.Fprintln(os.Stderr, "error: invalid --profile (must match ^[A-Za-z0-9._-]+$ without leading '-')")
+			return apperr.ExitCLIValidation
+		}
+		prevProfile, hadPrev := os.LookupEnv("OCLIV_PROFILE")
+		_ = os.Setenv("OCLIV_PROFILE", profile)
+		defer func() {
+			if hadPrev {
+				_ = os.Setenv("OCLIV_PROFILE", prevProfile)
+			} else {
+				_ = os.Unsetenv("OCLIV_PROFILE")
+			}
+		}()
+	}
 	if cacert == "" {
 		cacert = config.CACertPath()
 	}
 	if relayURL == "" || codeFile == "" {
-		fmt.Fprintln(os.Stderr, "usage: ocliv login --relay https://relay.example.com --code-file PATH")
+		fmt.Fprintln(os.Stderr, "usage: ocliv login --relay https://relay.example.com --code-file PATH [--profile NAME]")
 		fmt.Fprintln(os.Stderr, "note: enrollment codes never pass through argv; use a file or - for stdin (A07)")
 		return apperr.ExitCLIValidation
 	}

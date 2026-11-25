@@ -65,10 +65,14 @@ type Server struct {
 	// ConsentTTL bounds a pending consent challenge. Zero selects
 	// DefaultConsentTTL.
 	ConsentTTL time.Duration
+	// OIDCTxTTL bounds an in-flight federated OIDC authorization round-trip.
+	// Zero selects DefaultOIDCTxTTL.
+	OIDCTxTTL time.Duration
+	// OIDCClient performs discovery, token exchange, and JWKS validation for
+	// federated visitor authentication (OCL-005). Nil uses a strict HTTPS client.
+	OIDCClient *OIDCClient
 	// AutoApproveRedirectHosts is DEPRECATED: use route-scoped ClientTrustPolicy
-	// via `ocliv trust <service> chatgpt` (or `--redirect-uri`) instead.
-	// Retained for backward compatibility; it does not auto-approve pending DCR
-	// clients on its own.
+	// paired with federated VisitorAuthPolicy instead.
 	AutoApproveRedirectHosts []string
 }
 
@@ -332,24 +336,11 @@ func (s *Server) ServeRegister(w http.ResponseWriter, r *http.Request) {
 		Tenant:       s.tenant(),
 		Route:        s.RouteID,
 	}
-	matchedPolicy, merr := s.Store.MatchTrustPolicy(s.tenant(), s.RouteID, client.RedirectURIs)
-	if merr != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	registerFn := func() error {
-		if matchedPolicy != nil {
-			err := s.Store.TryRegisterClientWithTrustPolicy(client, s.tenant(), s.RouteID, matchedPolicy.ID)
-			if err == ErrTrustPolicyInactive {
-				// Policy was revoked or changed concurrently; fall back cleanly to pending.
-				matchedPolicy = nil
-				return s.Store.TryRegisterClientWithPendingGrant(client, s.tenant(), s.RouteID)
-			}
-			return err
-		}
-		return s.Store.TryRegisterClientWithPendingGrant(client, s.tenant(), s.RouteID)
-	}
-	if err := registerFn(); err != nil {
+	// OCL-005 & OCL-007: Dynamic client registration NEVER creates an active
+	// grant. Unauthenticated registrations remain pending until resource-owner
+	// authentication (federated OIDC or explicit operator approval) succeeds,
+	// so registration floods are bounded and cleanly evictable by LRU/pruning.
+	if err := s.Store.TryRegisterClientWithPendingGrant(client, s.tenant(), s.RouteID); err != nil {
 		if err != ErrClientQuota {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_client_metadata", "error_description": err.Error()})
 			return
@@ -358,7 +349,7 @@ func (s *Server) ServeRegister(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
-		if err := registerFn(); err != nil {
+		if err := s.Store.TryRegisterClientWithPendingGrant(client, s.tenant(), s.RouteID); err != nil {
 			writeJSON(w, http.StatusTooManyRequests, map[string]string{
 				"error":             "invalid_client_metadata",
 				"error_description": "registration quota for this route is exhausted",
@@ -366,10 +357,18 @@ func (s *Server) ServeRegister(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if matchedPolicy != nil {
-		_ = s.Store.AuditAuthz("publisher", s.tenant(), s.RouteID, id, "authz-auto-approve", "ok",
-			"policy="+matchedPolicy.Kind+" id="+matchedPolicy.ID)
-	}
+	isSynth := IsSyntheticProbeRequest(r)
+	_ = s.Store.RecordHostObservation(HostObservation{
+		TenantID:       s.tenant(),
+		RouteID:        s.RouteID,
+		CanonicalURL:   s.RouteURL,
+		ClientID:       id,
+		ClientKind:     ClassifyClientKind(client.RedirectURIs, isSynth),
+		Stage:          StageClientRegistered,
+		ResultCategory: "ok",
+		IsSynthetic:    isSynth,
+		ObservedAt:     time.Now().UTC(),
+	})
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"client_id":                  id,
 		"client_name":                req.ClientName,
@@ -405,13 +404,19 @@ func (s *Server) scopedClient(id string) (*Client, error) {
 }
 
 // exactOperatorApprovedBinding returns true only when an explicit, active,
-// non-revoked operator grant exists for this exact (client, tenant, route)
-// with SkipPairing enabled and the requested redirectURI is bound to client.
+// non-revoked per-client operator direct grant exists for this exact
+// (client, tenant, route) with SkipPairing enabled and the requested
+// redirectURI is bound to client. Redirect-URI-only trust policy grants are
+// explicitly excluded (OCL-005): a matching redirect URI alone must never
+// authorize a private route without human/resource-owner authentication.
 func exactOperatorApprovedBinding(grant *Grant, client *Client, tenant, routeID, redirectURI string) bool {
 	if grant == nil || client == nil || client.RevokedAt != nil {
 		return false
 	}
 	if grant.Status != GrantActive || !grant.SkipPairing {
+		return false
+	}
+	if grant.Provenance.Method == GrantMethodTrustPolicy {
 		return false
 	}
 	if grant.Tenant != tenant || grant.Route != routeID || client.Tenant != tenant {
@@ -423,6 +428,41 @@ func exactOperatorApprovedBinding(grant *Grant, client *Client, tenant, routeID,
 		}
 	}
 	return false
+}
+
+// validateGrantPolicyLive re-checks live grant status AND provenance policy
+// invariants (active trust policy and active federated visitor policy/subject)
+// on every request, code redemption, and refresh rotation (OCL-005, OCL-006).
+func validateGrantPolicyLive(store Store, grant *Grant, tenant, routeID string) error {
+	if grant == nil || grant.Status != GrantActive {
+		return fmt.Errorf("authz: client is not approved for this route")
+	}
+	if grant.Provenance.TrustPolicyID != "" {
+		policies, err := store.ListTrustPolicies(tenant, routeID)
+		if err != nil {
+			return fmt.Errorf("authz: verify trust policy: %w", err)
+		}
+		found := false
+		for _, p := range policies {
+			if p.ID == grant.Provenance.TrustPolicyID && p.Enabled && p.RevokedAt == nil {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("authz: trust policy %q has been revoked", grant.Provenance.TrustPolicyID)
+		}
+	}
+	if grant.Provenance.Method == GrantMethodFederatedOIDC {
+		vp, err := store.GetVisitorAuthPolicy(tenant, routeID)
+		if err != nil {
+			return fmt.Errorf("authz: verify visitor auth policy: %w", err)
+		}
+		if !vp.AllowsSubject(grant.Provenance.OwnerIssuer, grant.Provenance.OwnerSubject) {
+			return fmt.Errorf("authz: federated resource-owner subject is no longer authorized for this route")
+		}
+	}
+	return nil
 }
 
 // canAutoApproveClient returns true when the relay operator has configured
@@ -565,6 +605,11 @@ func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 		s.issueCode(w, r, clientID, redirectURI, challenge, "S256", state, grantedScope)
 		return
 	}
+	// OCL-005: Federated resource-owner authentication via OIDC.
+	if vp, vperr := s.Store.GetVisitorAuthPolicy(s.tenant(), s.RouteID); vperr == nil && vp != nil && vp.Mode == VisitorAuthModeFederated && vp.Enabled && vp.RevokedAt == nil {
+		s.startFederatedOIDC(w, r, vp, client, redirectURI, challenge, state, resource[0], grantedScope)
+		return
+	}
 	// Approved AND consented: the ordinary OAuth authorization-code + PKCE
 	// flow, with no Ocliv-specific authorization parameter. The consent is
 	// the client's proof of possession of the pairing credential, recorded
@@ -647,6 +692,214 @@ func (s *Server) consentTTL() time.Duration {
 		return s.ConsentTTL
 	}
 	return DefaultConsentTTL
+}
+
+func (s *Server) oidcTxTTL() time.Duration {
+	if s.OIDCTxTTL > 0 {
+		return s.OIDCTxTTL
+	}
+	return DefaultOIDCTxTTL
+}
+
+func (s *Server) oidcClient() *OIDCClient {
+	if s.OIDCClient != nil {
+		return s.OIDCClient
+	}
+	return &OIDCClient{}
+}
+
+func (s *Server) oidcCallbackURL() string {
+	return s.IssuerURL + "/callback"
+}
+
+// startFederatedOIDC enforces client policy eligibility (exact redirect URI
+// match against an active ClientTrustPolicy when configured), creates a
+// single-use transaction-bound OIDC state+nonce+PKCE record, and redirects the
+// resource owner to the configured OIDC provider (OCL-005).
+func (s *Server) startFederatedOIDC(w http.ResponseWriter, r *http.Request, vp *VisitorAuthPolicy, client *Client, redirectURI, codeChallenge, clientState, resource, scope string) {
+	var trustPolicyID string
+	matchedPolicy, merr := s.Store.MatchTrustPolicy(s.tenant(), s.RouteID, client.RedirectURIs)
+	if merr != nil {
+		redirectAuthorizationError(w, r, redirectURI, clientState, "server_error", "trust policy check failed", s.IssuerURL)
+		return
+	}
+	if vp.ClientPolicy != "" {
+		if matchedPolicy == nil {
+			_ = s.Store.AuditAuthz("visitor", s.tenant(), s.RouteID, client.ID, "federated-authorize", "denied", "client redirect does not match required client_policy "+vp.ClientPolicy)
+			redirectAuthorizationError(w, r, redirectURI, clientState, "access_denied", "client does not satisfy route client_policy", s.IssuerURL)
+			return
+		}
+		if vp.ClientPolicy != "custom" && matchedPolicy.Kind != vp.ClientPolicy {
+			_ = s.Store.AuditAuthz("visitor", s.tenant(), s.RouteID, client.ID, "federated-authorize", "denied", "client_policy kind mismatch")
+			redirectAuthorizationError(w, r, redirectURI, clientState, "access_denied", "client does not satisfy route client_policy", s.IssuerURL)
+			return
+		}
+		trustPolicyID = matchedPolicy.ID
+	} else if matchedPolicy != nil {
+		trustPolicyID = matchedPolicy.ID
+	}
+
+	if n, err := s.Store.CountPendingOIDCTransactions(s.tenant(), s.RouteID); err != nil {
+		redirectAuthorizationError(w, r, redirectURI, clientState, "server_error", "internal error", s.IssuerURL)
+		return
+	} else if n >= MaxPendingOIDCTxPerRoute {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{
+			"error":             "invalid_request",
+			"error_description": "too many pending federated login transactions for this route",
+		})
+		return
+	}
+
+	disc, err := s.oidcClient().Discover(r.Context(), vp.Issuer)
+	if err != nil {
+		_ = s.Store.AuditAuthz("visitor", s.tenant(), s.RouteID, client.ID, "federated-authorize", "error", "oidc discovery failed")
+		redirectAuthorizationError(w, r, redirectURI, clientState, "server_error", "identity provider unavailable", s.IssuerURL)
+		return
+	}
+	oidcState, err := mintRandomToken("ost_", 24)
+	if err != nil {
+		redirectAuthorizationError(w, r, redirectURI, clientState, "server_error", "internal error", s.IssuerURL)
+		return
+	}
+	oidcNonce, err := mintRandomToken("onc_", 24)
+	if err != nil {
+		redirectAuthorizationError(w, r, redirectURI, clientState, "server_error", "internal error", s.IssuerURL)
+		return
+	}
+	pkceVerifier, err := mintRandomToken("opk_", 36)
+	if err != nil {
+		redirectAuthorizationError(w, r, redirectURI, clientState, "server_error", "internal error", s.IssuerURL)
+		return
+	}
+	if err := s.Store.CreateOIDCTransaction(OIDCTransaction{
+		State:         oidcState,
+		Nonce:         oidcNonce,
+		PKCEVerifier:  pkceVerifier,
+		ClientID:      client.ID,
+		Tenant:        s.tenant(),
+		Route:         s.RouteID,
+		RedirectURI:   redirectURI,
+		CodeChallenge: codeChallenge,
+		ClientState:   clientState,
+		Resource:      resource,
+		Scope:         scope,
+		TrustPolicyID: trustPolicyID,
+		ExpiresAt:     time.Now().UTC().Add(s.oidcTxTTL()),
+	}); err != nil {
+		redirectAuthorizationError(w, r, redirectURI, clientState, "server_error", "internal error", s.IssuerURL)
+		return
+	}
+	idpAuthURL, err := url.Parse(disc.AuthorizationEndpoint)
+	if err != nil {
+		redirectAuthorizationError(w, r, redirectURI, clientState, "server_error", "invalid identity provider endpoint", s.IssuerURL)
+		return
+	}
+	qp := idpAuthURL.Query()
+	qp.Set("response_type", "code")
+	qp.Set("client_id", vp.ClientID)
+	qp.Set("redirect_uri", s.oidcCallbackURL())
+	qp.Set("scope", "openid")
+	qp.Set("state", oidcState)
+	qp.Set("nonce", oidcNonce)
+	qp.Set("code_challenge", CodeChallengeS256(pkceVerifier))
+	qp.Set("code_challenge_method", "S256")
+	idpAuthURL.RawQuery = qp.Encode()
+	w.Header().Set("Cache-Control", "no-store")
+	http.Redirect(w, r, idpAuthURL.String(), http.StatusFound)
+}
+
+// ServeOIDCCallback completes federated resource-owner authentication after
+// the upstream OIDC provider redirects back to /r/<route-id>/oauth/callback
+// (OCL-005). It validates state, exchanges the code with PKCE, verifies the
+// id_token signature/issuer/audience/nonce/expiry via JWKS, enforces the
+// route's allowed_subjects allowlist, atomically establishes a durable grant
+// with full provenance, and mints the standard Ocliv authorization code.
+func (s *Server) ServeOIDCCallback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	q := r.URL.Query()
+	oidcState := strings.TrimSpace(q.Get("state"))
+	idpCode := strings.TrimSpace(q.Get("code"))
+	idpErr := strings.TrimSpace(q.Get("error"))
+	if oidcState == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "missing state"})
+		return
+	}
+	tx, err := s.Store.ConsumeOIDCTransaction(oidcState, s.tenant(), s.RouteID)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "invalid or expired federated transaction"})
+		return
+	}
+	if idpErr != "" {
+		_ = s.Store.AuditAuthz("visitor", s.tenant(), s.RouteID, tx.ClientID, "federated-callback", "denied", "idp error "+idpErr)
+		redirectAuthorizationError(w, r, tx.RedirectURI, tx.ClientState, "access_denied", "identity provider denied authentication", s.IssuerURL)
+		return
+	}
+	if idpCode == "" {
+		redirectAuthorizationError(w, r, tx.RedirectURI, tx.ClientState, "access_denied", "missing identity provider authorization code", s.IssuerURL)
+		return
+	}
+	client, cerr := s.scopedClient(tx.ClientID)
+	if cerr != nil || client.RevokedAt != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_client", "error_description": "client revoked"})
+		return
+	}
+	if existingGrant, gerr := s.Store.GetGrant(tx.ClientID, s.tenant(), s.RouteID); gerr == nil && existingGrant != nil && existingGrant.Status == GrantRevoked {
+		redirectAuthorizationError(w, r, tx.RedirectURI, tx.ClientState, "access_denied", "client grant revoked", s.IssuerURL)
+		return
+	}
+	vp, vperr := s.Store.GetVisitorAuthPolicy(s.tenant(), s.RouteID)
+	if vperr != nil || vp == nil || vp.Mode != VisitorAuthModeFederated || !vp.Enabled || vp.RevokedAt != nil {
+		redirectAuthorizationError(w, r, tx.RedirectURI, tx.ClientState, "access_denied", "federated visitor auth policy inactive", s.IssuerURL)
+		return
+	}
+	// Re-verify trust policy atomically before granting (TOCTOU protection).
+	if tx.TrustPolicyID != "" {
+		matched, merr := s.Store.MatchTrustPolicy(s.tenant(), s.RouteID, client.RedirectURIs)
+		if merr != nil || matched == nil || matched.ID != tx.TrustPolicyID {
+			_ = s.Store.AuditAuthz("visitor", s.tenant(), s.RouteID, tx.ClientID, "federated-callback", "denied", "trust policy revoked during login")
+			redirectAuthorizationError(w, r, tx.RedirectURI, tx.ClientState, "access_denied", "client trust policy is no longer active", s.IssuerURL)
+			return
+		}
+	}
+	disc, derr := s.oidcClient().Discover(r.Context(), vp.Issuer)
+	if derr != nil {
+		redirectAuthorizationError(w, r, tx.RedirectURI, tx.ClientState, "server_error", "identity provider discovery failed", s.IssuerURL)
+		return
+	}
+	rawIDToken, exErr := s.oidcClient().ExchangeCode(r.Context(), disc.TokenEndpoint, vp.ClientID, vp.ClientSecret, idpCode, s.oidcCallbackURL(), tx.PKCEVerifier)
+	if exErr != nil {
+		_ = s.Store.AuditAuthz("visitor", s.tenant(), s.RouteID, tx.ClientID, "federated-callback", "denied", "oidc code exchange failed")
+		redirectAuthorizationError(w, r, tx.RedirectURI, tx.ClientState, "access_denied", "identity provider authentication failed", s.IssuerURL)
+		return
+	}
+	subject, verErr := s.oidcClient().VerifyIDToken(r.Context(), disc.JWKSURI, vp.Issuer, vp.ClientID, tx.Nonce, rawIDToken)
+	if verErr != nil {
+		_ = s.Store.AuditAuthz("visitor", s.tenant(), s.RouteID, tx.ClientID, "federated-callback", "denied", "oidc id_token verification failed")
+		redirectAuthorizationError(w, r, tx.RedirectURI, tx.ClientState, "access_denied", "identity token validation failed", s.IssuerURL)
+		return
+	}
+	if !vp.AllowsSubject(vp.Issuer, subject) {
+		_ = s.Store.AuditAuthz("visitor", s.tenant(), s.RouteID, tx.ClientID, "federated-callback", "denied", "subject not allowed")
+		redirectAuthorizationError(w, r, tx.RedirectURI, tx.ClientState, "access_denied", "authenticated account is not authorized for this route", s.IssuerURL)
+		return
+	}
+	prov := GrantProvenance{
+		Method:        GrantMethodFederatedOIDC,
+		TrustPolicyID: tx.TrustPolicyID,
+		OwnerIssuer:   vp.Issuer,
+		OwnerSubject:  subject,
+	}
+	if err := s.Store.ApproveGrantWithProvenance(tx.ClientID, s.tenant(), s.RouteID, false, prov); err != nil {
+		_ = s.Store.AuditAuthz("visitor", s.tenant(), s.RouteID, tx.ClientID, "federated-callback", "denied", "grant activation failed")
+		redirectAuthorizationError(w, r, tx.RedirectURI, tx.ClientState, "access_denied", "grant authorization failed", s.IssuerURL)
+		return
+	}
+	_ = s.Store.AuditAuthz("visitor", s.tenant(), s.RouteID, tx.ClientID, "authz-federated-authorize", "ok",
+		"iss="+vp.Issuer+" sub="+subject+" policy="+tx.TrustPolicyID)
+	s.issueCode(w, r, tx.ClientID, tx.RedirectURI, tx.CodeChallenge, "S256", tx.ClientState, tx.Scope)
 }
 
 // issueCode mints and returns an authorization code via the redirect URI.
@@ -919,7 +1172,7 @@ func (s *Server) serveCodeGrant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	grant, err := s.Store.GetGrant(clientID, s.tenant(), s.RouteID)
-	if err != nil || grant.Status != GrantActive {
+	if err != nil || validateGrantPolicyLive(s.Store, grant, s.tenant(), s.RouteID) != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant", "error_description": "client is not approved for this route"})
 		return
 	}
@@ -1002,6 +1255,18 @@ func (s *Server) serveCodeGrant(w http.ResponseWriter, r *http.Request) {
 	if refresh != "" {
 		resp["refresh_token"] = refresh
 	}
+	isSynth := IsSyntheticProbeRequest(r)
+	_ = s.Store.RecordHostObservation(HostObservation{
+		TenantID:       s.tenant(),
+		RouteID:        s.RouteID,
+		CanonicalURL:   s.RouteURL,
+		ClientID:       clientID,
+		ClientKind:     ClassifyClientKind(client.RedirectURIs, isSynth),
+		Stage:          StageClientAuthorized,
+		ResultCategory: "ok",
+		IsSynthetic:    isSynth,
+		ObservedAt:     time.Now().UTC(),
+	})
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -1043,7 +1308,7 @@ func (s *Server) serveRefreshGrant(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		grant, err := s.Store.GetGrant(clientID, s.tenant(), s.RouteID)
-		if err != nil || grant.Status != GrantActive {
+		if err != nil || validateGrantPolicyLive(s.Store, grant, s.tenant(), s.RouteID) != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant",
 				"error_description": "client is not approved for this route"})
 			return
@@ -1177,7 +1442,7 @@ func (s *Server) serveRefreshGrant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	grant, err := s.Store.GetGrant(clientID, s.tenant(), s.RouteID)
-	if err != nil || grant.Status != GrantActive {
+	if err != nil || validateGrantPolicyLive(s.Store, grant, s.tenant(), s.RouteID) != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant",
 			"error_description": "client is not approved for this route"})
 		return

@@ -103,6 +103,8 @@ func cmdTrustWithOps(argv []string, ops serviceOps) int {
 		fmt.Fprintln(os.Stderr, "usage: ocliv trust NAME PRESET                     (e.g. ocliv trust tools chatgpt)")
 		fmt.Fprintln(os.Stderr, "       ocliv trust NAME --redirect-uri HTTPS_URI   (pin exact HTTPS callback)")
 		fmt.Fprintln(os.Stderr, "       ocliv trust NAME --client CLIENT_ID         (approve a pending client directly)")
+		fmt.Fprintln(os.Stderr, "       ocliv trust NAME --issuer URL --oidc-client-id ID --allow-subject SUB [--oidc-client-secret-file PATH] [--client-policy PRESET]")
+		fmt.Fprintln(os.Stderr, "       ocliv trust NAME --show-visitor-auth [--json]")
 		fmt.Fprintln(os.Stderr, "       ocliv trust NAME --list [--json]            (list active trust policies)")
 		if len(argv) == 0 {
 			return apperr.ExitCLIValidation
@@ -111,14 +113,18 @@ func cmdTrustWithOps(argv []string, ops serviceOps) int {
 	}
 	target := argv[0]
 	var preset, clientID, profileFlag string
+	var oidcIssuer, oidcClientID, oidcSecretFile, clientPolicy string
+	var allowedSubjects []string
 	var redirectURIs []string
-	var listOnly, jsonOut bool
+	var listOnly, showVisitorAuth, jsonOut bool
 
 	for i := 1; i < len(argv); i++ {
 		a := argv[i]
 		switch {
 		case a == "--list":
 			listOnly = true
+		case a == "--show-visitor-auth":
+			showVisitorAuth = true
 		case a == "--json":
 			jsonOut = true
 		case a == "--client" || strings.HasPrefix(a, "--client="):
@@ -133,6 +139,36 @@ func cmdTrustWithOps(argv []string, ops serviceOps) int {
 				return apperr.ExitCLIValidation
 			}
 			redirectURIs = append(redirectURIs, v)
+		case a == "--issuer" || strings.HasPrefix(a, "--issuer="):
+			v, ok := mcpFlagValue(argv, &i, "issuer")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			oidcIssuer = v
+		case a == "--oidc-client-id" || strings.HasPrefix(a, "--oidc-client-id="):
+			v, ok := mcpFlagValue(argv, &i, "oidc-client-id")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			oidcClientID = v
+		case a == "--oidc-client-secret-file" || strings.HasPrefix(a, "--oidc-client-secret-file="):
+			v, ok := mcpFlagValue(argv, &i, "oidc-client-secret-file")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			oidcSecretFile = v
+		case a == "--allow-subject" || strings.HasPrefix(a, "--allow-subject="):
+			v, ok := mcpFlagValue(argv, &i, "allow-subject")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			allowedSubjects = append(allowedSubjects, v)
+		case a == "--client-policy" || strings.HasPrefix(a, "--client-policy="):
+			v, ok := mcpFlagValue(argv, &i, "client-policy")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			clientPolicy = strings.ToLower(v)
 		case a == "--profile" || strings.HasPrefix(a, "--profile="):
 			v, ok := mcpFlagValue(argv, &i, "profile")
 			if !ok {
@@ -151,6 +187,86 @@ func cmdTrustWithOps(argv []string, ops serviceOps) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "trust: "+err.Error())
 		return code
+	}
+
+	if showVisitorAuth {
+		st, body, callErr := ops.mgmtCall(relayURL, k, keyID, http.MethodGet, "/v1/agent/mcp-routes/"+routeID+"/visitor-auth")
+		if callErr != nil {
+			fmt.Fprintf(os.Stderr, "trust: %v\n", callErr)
+			return apperr.ExitRelayTLS
+		}
+		if st != http.StatusOK {
+			fmt.Fprintf(os.Stderr, "trust: relay returned %d: %s\n", st, strings.TrimSpace(string(body)))
+			return apperr.ExitAuth
+		}
+		if jsonOut {
+			fmt.Println(string(body))
+			return apperr.ExitOK
+		}
+		var out struct {
+			Policy *authz.VisitorAuthPolicy `json:"policy"`
+		}
+		if err := json.Unmarshal(body, &out); err != nil {
+			fmt.Fprintln(os.Stderr, "trust: invalid relay response")
+			return apperr.ExitInternal
+		}
+		if out.Policy == nil {
+			fmt.Printf("no federated visitor auth policy configured for %s (mode=pairing)\n", displayName)
+			return apperr.ExitOK
+		}
+		fmt.Printf("visitor_auth (%s): mode=%s issuer=%s client_id=%s client_policy=%s subjects=%s\n",
+			displayName, out.Policy.Mode, out.Policy.Issuer, out.Policy.ClientID, out.Policy.ClientPolicy, strings.Join(out.Policy.AllowedSubjects, ","))
+		return apperr.ExitOK
+	}
+
+	if oidcIssuer != "" || oidcClientID != "" || len(allowedSubjects) > 0 {
+		var secret string
+		if oidcSecretFile != "" {
+			s, serr := readTokenFileSafe(oidcSecretFile)
+			if serr != nil {
+				fmt.Fprintf(os.Stderr, "trust: --oidc-client-secret-file: %v\n", serr)
+				return apperr.ExitCLIValidation
+			}
+			secret = s
+		}
+		pol := authz.VisitorAuthPolicy{
+			TenantID:        "preview",
+			RouteID:         routeID,
+			Mode:            authz.VisitorAuthModeFederated,
+			Issuer:          oidcIssuer,
+			ClientID:        oidcClientID,
+			ClientSecret:    secret,
+			AllowedSubjects: allowedSubjects,
+			ClientPolicy:    clientPolicy,
+			Enabled:         true,
+		}
+		if _, verr := authz.ValidateVisitorAuthPolicy(pol); verr != nil {
+			fmt.Fprintf(os.Stderr, "trust: %v\n", verr)
+			return apperr.ExitCLIValidation
+		}
+		reqBody, _ := json.Marshal(map[string]any{
+			"mode":             pol.Mode,
+			"issuer":           pol.Issuer,
+			"client_id":        pol.ClientID,
+			"client_secret":    pol.ClientSecret,
+			"allowed_subjects": pol.AllowedSubjects,
+			"client_policy":    pol.ClientPolicy,
+		})
+		st, body, callErr := ops.callMgmtBody(relayURL, k, keyID, http.MethodPut, "/v1/agent/mcp-routes/"+routeID+"/visitor-auth", reqBody)
+		if callErr != nil {
+			fmt.Fprintf(os.Stderr, "trust: %v\n", callErr)
+			return apperr.ExitRelayTLS
+		}
+		if st != http.StatusOK && st != http.StatusCreated {
+			fmt.Fprintf(os.Stderr, "trust: relay returned %d: %s\n", st, strings.TrimSpace(string(body)))
+			return apperr.ExitAuth
+		}
+		if jsonOut {
+			fmt.Println(string(body))
+			return apperr.ExitOK
+		}
+		fmt.Printf("✓ %s configured for federated visitor OIDC auth (issuer=%s, subjects=%d)\n", displayName, pol.Issuer, len(pol.AllowedSubjects))
+		return apperr.ExitOK
 	}
 
 	if listOnly {
@@ -251,21 +367,27 @@ func cmdUntrust(argv []string) int {
 func cmdUntrustWithOps(argv []string, ops serviceOps) int {
 	if len(argv) < 2 || argv[0] == "--help" || argv[0] == "-h" {
 		fmt.Fprintln(os.Stderr, "usage: ocliv untrust NAME PRESET_OR_POLICY_ID [--profile NAME]")
+		fmt.Fprintln(os.Stderr, "       ocliv untrust NAME --visitor-auth [--profile NAME]")
 		if len(argv) > 0 && (argv[0] == "--help" || argv[0] == "-h") {
 			return apperr.ExitOK
 		}
 		return apperr.ExitCLIValidation
 	}
 	target := argv[0]
-	policyTarget := argv[1]
+	policyTarget := ""
+	revokeVisitorAuth := false
 	var profileFlag string
-	for i := 2; i < len(argv); i++ {
-		if argv[i] == "--profile" || strings.HasPrefix(argv[i], "--profile=") {
+	for i := 1; i < len(argv); i++ {
+		if argv[i] == "--visitor-auth" {
+			revokeVisitorAuth = true
+		} else if argv[i] == "--profile" || strings.HasPrefix(argv[i], "--profile=") {
 			v, ok := mcpFlagValue(argv, &i, "profile")
 			if !ok {
 				return apperr.ExitCLIValidation
 			}
 			profileFlag = v
+		} else if !strings.HasPrefix(argv[i], "-") && policyTarget == "" {
+			policyTarget = argv[i]
 		} else {
 			fmt.Fprintf(os.Stderr, "untrust: unknown flag %q\n", argv[i])
 			return apperr.ExitCLIValidation
@@ -276,6 +398,23 @@ func cmdUntrustWithOps(argv []string, ops serviceOps) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "untrust: "+err.Error())
 		return code
+	}
+	if revokeVisitorAuth {
+		st, body, callErr := ops.mgmtCall(relayURL, k, keyID, http.MethodDelete, "/v1/agent/mcp-routes/"+routeID+"/visitor-auth")
+		if callErr != nil {
+			fmt.Fprintf(os.Stderr, "untrust: %v\n", callErr)
+			return apperr.ExitRelayTLS
+		}
+		if st != http.StatusOK {
+			fmt.Fprintf(os.Stderr, "untrust: relay returned %d: %s\n", st, strings.TrimSpace(string(body)))
+			return apperr.ExitAuth
+		}
+		fmt.Printf("✓ revoked federated visitor auth policy and dependent grants from %s\n", displayName)
+		return apperr.ExitOK
+	}
+	if policyTarget == "" {
+		fmt.Fprintln(os.Stderr, "untrust: specify PRESET_OR_POLICY_ID or --visitor-auth")
+		return apperr.ExitCLIValidation
 	}
 	st, body, callErr := ops.mgmtCall(relayURL, k, keyID, http.MethodDelete, "/v1/agent/mcp-routes/"+routeID+"/trust/"+policyTarget)
 	if callErr != nil {

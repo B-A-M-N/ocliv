@@ -24,17 +24,39 @@ import (
 	"github.com/B-A-M-N/ocliv/internal/apperr"
 )
 
+// MCPAuthEvidence separates configured authentication mode from observed
+// enforcement across local and public surfaces (OCL-001).
+type MCPAuthEvidence struct {
+	Mode                   string `json:"mode"`
+	LocalAccess            string `json:"local_access"`
+	PublicMetadata         string `json:"public_metadata,omitempty"`
+	PublicEnforcement      string `json:"public_enforcement"`
+	AuthenticatedPublicMCP string `json:"authenticated_public_mcp"`
+}
+
+// MCPProbeConfig specifies a canonical MCP endpoint and transport options
+// for probing either a local loopback server or a public HTTPS publication
+// without rewriting scheme, host, port, or resource path (OCL-003).
+type MCPProbeConfig struct {
+	Endpoint    *url.URL
+	AuthMode    string
+	BearerToken string
+	Client      *http.Client
+	IsPublic    bool
+}
+
 // mcpProbeOutcome is the staged doctor verdict. Verified means a usable
-// local MCP connection was proven; every other facet is reported
-// independently so success in one stage can never masquerade as success
-// in another.
+// MCP connection was proven; every other facet is reported independently
+// so success in one stage can never masquerade as success in another.
 type mcpProbeOutcome struct {
-	Summary        string // one-line human verdict (back-compat with probeMCPProtocol)
-	Verified       bool   // usable local connection proven
-	Auth           string // AUTH_NONE | AUTH_REQUIRED | AUTH_UNVERIFIED | NOT_APPLICABLE
-	AuthEnforced   bool   // upstream rejected both missing and invalid bearer credentials
-	UnboundHandoff bool   // exact resource-file server signal before URL handoff
-	Protocol       string // negotiated protocolVersion, "" when none proven
+	Summary            string          // one-line human verdict (back-compat with probeMCPProtocol)
+	Verified           bool            // usable MCP connection proven
+	Auth               string          // AUTH_NONE | AUTH_REQUIRED | AUTH_UNVERIFIED | RELAY_MANAGED_OAUTH | NOT_APPLICABLE
+	AuthEvidence       MCPAuthEvidence // structured auth mode vs observed enforcement (OCL-001)
+	AuthEnforced       bool            // upstream rejected both missing and invalid bearer credentials
+	UnboundHandoff     bool            // exact resource-file server signal before URL handoff
+	Protocol           string          // negotiated protocolVersion, "" when none proven
+	ServerCapabilities map[string]any  // raw server capabilities when reported
 }
 
 // probeMCPProtocol verifies a usable MCP session against the local
@@ -45,21 +67,109 @@ func probeMCPProtocol(target, mode string) (string, bool) {
 	return out.Summary, out.Verified
 }
 
+// classifyMCPAuth classifies authentication mode separately from observed
+// enforcement for both modern (2026-07-28) and legacy (2024-11-05) MCP probe
+// paths (OCL-001).
+func classifyMCPAuth(mode string, bearerProvided, isPublic bool) (auth, note string, ev MCPAuthEvidence) {
+	switch mode {
+	case "mcp_anonymous_fixture":
+		ev = MCPAuthEvidence{
+			Mode:                   "ANONYMOUS_FIXTURE",
+			LocalAccess:            "VERIFIED",
+			PublicEnforcement:      "NOT_APPLICABLE",
+			AuthenticatedPublicMCP: "NOT_APPLICABLE",
+		}
+		if isPublic {
+			ev.LocalAccess = "NOT_TESTED"
+		}
+		return "AUTH_NONE", "", ev
+	case "mcp_managed_oauth":
+		ev = MCPAuthEvidence{
+			Mode:                   "RELAY_MANAGED_OAUTH",
+			LocalAccess:            "VERIFIED",
+			PublicEnforcement:      "NOT_TESTED",
+			AuthenticatedPublicMCP: "NOT_TESTED",
+		}
+		if isPublic {
+			ev.LocalAccess = "NOT_TESTED"
+			if bearerProvided {
+				ev.AuthenticatedPublicMCP = "VERIFIED"
+				return "RELAY_MANAGED_OAUTH", "; authenticated public MCP verified with bearer", ev
+			}
+			return "RELAY_MANAGED_OAUTH", "; visitor OAuth is enforced by the relay-managed route", ev
+		}
+		return "RELAY_MANAGED_OAUTH", "; visitor OAuth is enforced by the relay-managed route", ev
+	default: // mcp_upstream_oauth
+		ev = MCPAuthEvidence{
+			Mode:                   "UPSTREAM_OAUTH",
+			LocalAccess:            "VERIFIED",
+			PublicEnforcement:      "UNVERIFIED",
+			AuthenticatedPublicMCP: "NOT_TESTED",
+		}
+		if isPublic {
+			ev.LocalAccess = "NOT_TESTED"
+		}
+		if bearerProvided {
+			if isPublic {
+				ev.AuthenticatedPublicMCP = "VERIFIED"
+			}
+			ev.PublicEnforcement = "NOT_TESTED"
+			return "AUTH_REQUIRED", "; protocol verified with the operator-supplied upstream bearer", ev
+		}
+		return "AUTH_UNVERIFIED", "; auth unverified (answered without bearer — upstream OAuth enforcement NOT proven)", ev
+	}
+}
+
 // modernAuthFacet renders the authentication facet for a verified modern
-// endpoint. The probe holds no bearer, so usability is proven but upstream
-// enforcement never is — except for the anonymous fixture, which is
-// anonymous by profile.
+// endpoint via the unified classifier (OCL-001).
 func modernAuthFacet(anon, managed, upstreamBearer bool) (auth, note string) {
+	mode := "mcp_upstream_oauth"
 	if anon {
-		return "AUTH_NONE", ""
+		mode = "mcp_anonymous_fixture"
+	} else if managed {
+		mode = "mcp_managed_oauth"
 	}
-	if managed {
-		return "AUTH_REQUIRED", "; visitor OAuth is enforced by the relay-managed route"
+	auth, note, _ = classifyMCPAuth(mode, upstreamBearer, false)
+	return auth, note
+}
+
+// localMCPEndpoint builds a canonical endpoint URL from either a full HTTP(S)
+// URL (preserving exact scheme, host, port, and resource path) or a local
+// host:port target (constructing http://<target>/mcp).
+func localMCPEndpoint(target string) (*url.URL, error) {
+	raw := strings.TrimSpace(target)
+	if raw == "" {
+		return nil, fmt.Errorf("empty MCP probe target")
 	}
-	if upstreamBearer {
-		return "AUTH_REQUIRED", "; protocol verified with the operator-supplied upstream bearer"
+	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid MCP endpoint URL: %w", err)
+		}
+		if u.Host == "" {
+			return nil, fmt.Errorf("MCP endpoint URL missing host")
+		}
+		if u.User != nil {
+			return nil, fmt.Errorf("userinfo in MCP endpoint URL is forbidden")
+		}
+		if u.Path == "" {
+			u.Path = "/mcp"
+		}
+		return u, nil
 	}
-	return "AUTH_UNVERIFIED", "; auth unverified (answered without bearer — upstream OAuth enforcement NOT proven)"
+	u, err := url.Parse("http://" + raw + "/mcp")
+	if err != nil || u.Host == "" {
+		return nil, fmt.Errorf("invalid local MCP target %q", target)
+	}
+	return u, nil
+}
+
+// redactSecret scrubs bearer tokens or credential fragments from diagnostic text.
+func redactSecret(msg, secret string) string {
+	if secret == "" || msg == "" {
+		return msg
+	}
+	return strings.ReplaceAll(msg, secret, "[REDACTED]")
 }
 
 // unboundHandoffSignal is the exact body a resource-file-bound MCP
@@ -87,13 +197,70 @@ const unboundHandoffSignal = "resource not configured"
 // The body is required for the 503 case: a bare 503 is ambiguous, and
 // treating every 503 as presence would wave a genuinely broken upstream
 // through the publish gate.
-func presenceVerdict(status int, body []byte, anon bool) (mcpProbeOutcome, bool) {
+func presenceVerdict(status int, body []byte, mode string, isPublic, bearerProvided bool) (mcpProbeOutcome, bool) {
+	anon := mode == "mcp_anonymous_fixture"
+	managed := mode == "mcp_managed_oauth"
 	switch status {
 	case http.StatusUnauthorized, http.StatusForbidden:
 		if anon {
-			return mcpProbeOutcome{Summary: "protocol: broken (fixture server demands auth it cannot supply)", Auth: "AUTH_REQUIRED"}, true
+			return mcpProbeOutcome{
+				Summary: "protocol: broken (fixture server demands auth it cannot supply)",
+				Auth:    "AUTH_REQUIRED",
+				AuthEvidence: MCPAuthEvidence{
+					Mode:                   "ANONYMOUS_FIXTURE",
+					LocalAccess:            "AUTH_CHALLENGED",
+					PublicEnforcement:      "NOT_APPLICABLE",
+					AuthenticatedPublicMCP: "NOT_APPLICABLE",
+				},
+			}, true
 		}
-		return mcpProbeOutcome{Summary: "auth: required (server demands bearer; configure the upstream OAuth client)", Auth: "AUTH_REQUIRED"}, true
+		if managed {
+			ev := MCPAuthEvidence{
+				Mode:                   "RELAY_MANAGED_OAUTH",
+				LocalAccess:            "AUTH_CHALLENGED",
+				PublicEnforcement:      "NOT_TESTED",
+				AuthenticatedPublicMCP: "NOT_TESTED",
+			}
+			if isPublic {
+				ev.LocalAccess = "NOT_TESTED"
+				if bearerProvided {
+					ev.AuthenticatedPublicMCP = "REJECTED"
+					return mcpProbeOutcome{
+						Summary:      fmt.Sprintf("auth: rejected (HTTP %d; presented bearer was not accepted by the relay-managed route)", status),
+						Auth:         "RELAY_MANAGED_OAUTH",
+						AuthEvidence: ev,
+					}, true
+				}
+				ev.PublicEnforcement = "ENFORCED"
+				return mcpProbeOutcome{
+					Summary:      fmt.Sprintf("auth: enforced (HTTP %d; relay-managed route rejected anonymous request)", status),
+					Auth:         "RELAY_MANAGED_OAUTH",
+					AuthEvidence: ev,
+				}, true
+			}
+			return mcpProbeOutcome{
+				Summary:      fmt.Sprintf("auth: local backend returned HTTP %d behind a relay-managed OAuth route", status),
+				Auth:         "AUTH_REQUIRED",
+				AuthEvidence: ev,
+			}, true
+		}
+		ev := MCPAuthEvidence{
+			Mode:                   "UPSTREAM_OAUTH",
+			LocalAccess:            "AUTH_CHALLENGED",
+			PublicEnforcement:      "ENFORCED",
+			AuthenticatedPublicMCP: "NOT_TESTED",
+		}
+		if isPublic {
+			ev.LocalAccess = "NOT_TESTED"
+			if bearerProvided {
+				ev.AuthenticatedPublicMCP = "REJECTED"
+			}
+		}
+		return mcpProbeOutcome{
+			Summary:      "auth: required (server demands bearer; configure the upstream OAuth client)",
+			Auth:         "AUTH_REQUIRED",
+			AuthEvidence: ev,
+		}, true
 	case http.StatusServiceUnavailable:
 		if anon {
 			return mcpProbeOutcome{}, false
@@ -101,7 +268,17 @@ func presenceVerdict(status int, body []byte, anon bool) (mcpProbeOutcome, bool)
 		if !strings.Contains(strings.ToLower(string(body)), unboundHandoffSignal) {
 			return mcpProbeOutcome{}, false
 		}
-		return mcpProbeOutcome{Summary: "auth: required (server reports resource not configured; it binds after publish writes the --resource-file handoff)", Auth: "AUTH_REQUIRED", UnboundHandoff: true}, true
+		return mcpProbeOutcome{
+			Summary:        "auth: required (server reports resource not configured; it binds after publish writes the --resource-file handoff)",
+			Auth:           "AUTH_REQUIRED",
+			UnboundHandoff: true,
+			AuthEvidence: MCPAuthEvidence{
+				Mode:                   "UPSTREAM_OAUTH",
+				LocalAccess:            "UNBOUND_HANDOFF",
+				PublicEnforcement:      "NOT_TESTED",
+				AuthenticatedPublicMCP: "NOT_TESTED",
+			},
+		}, true
 	}
 	return mcpProbeOutcome{}, false
 }
@@ -119,23 +296,60 @@ func runMCPProbeWithBearer(target, mode, bearer string) mcpProbeOutcome {
 }
 
 func runMCPProbeWithClient(target, mode, bearer string, client *http.Client) mcpProbeOutcome {
-	if mode != "mcp_upstream_oauth" && mode != "mcp_anonymous_fixture" && mode != "mcp_managed_oauth" {
-		return mcpProbeOutcome{Summary: "not-applicable (not an MCP lease)", Verified: true, Auth: "NOT_APPLICABLE"}
+	ep, err := localMCPEndpoint(target)
+	if err != nil {
+		return mcpProbeOutcome{Summary: "invalid MCP target (" + err.Error() + ")", Auth: "AUTH_UNVERIFIED"}
 	}
-	anon := mode == "mcp_anonymous_fixture"
-	managed := mode == "mcp_managed_oauth"
+	isPublic := strings.EqualFold(ep.Scheme, "https")
+	return runMCPProbeWithConfig(MCPProbeConfig{
+		Endpoint:    ep,
+		AuthMode:    mode,
+		BearerToken: bearer,
+		Client:      client,
+		IsPublic:    isPublic,
+	})
+}
+
+// runMCPProbeWithConfig executes the staged MCP probe against a canonical
+// endpoint URL, preserving scheme, host, port, and exact resource path (OCL-003).
+func runMCPProbeWithConfig(cfg MCPProbeConfig) mcpProbeOutcome {
+	mode := cfg.AuthMode
+	if mode != "mcp_upstream_oauth" && mode != "mcp_anonymous_fixture" && mode != "mcp_managed_oauth" {
+		return mcpProbeOutcome{
+			Summary:  "not-applicable (not an MCP lease)",
+			Verified: true,
+			Auth:     "NOT_APPLICABLE",
+			AuthEvidence: MCPAuthEvidence{
+				Mode:                   "NOT_APPLICABLE",
+				LocalAccess:            "NOT_APPLICABLE",
+				PublicEnforcement:      "NOT_APPLICABLE",
+				AuthenticatedPublicMCP: "NOT_APPLICABLE",
+			},
+		}
+	}
+	if cfg.Endpoint == nil || cfg.Endpoint.Host == "" {
+		return mcpProbeOutcome{Summary: "invalid MCP endpoint (missing URL)", Auth: "AUTH_UNVERIFIED"}
+	}
+	if cfg.Endpoint.User != nil {
+		return mcpProbeOutcome{Summary: "invalid MCP endpoint (userinfo forbidden)", Auth: "AUTH_UNVERIFIED"}
+	}
+	endpointURL := cfg.Endpoint.String()
+	bearer := cfg.BearerToken
+	isPublic := cfg.IsPublic || strings.EqualFold(cfg.Endpoint.Scheme, "https")
+	client := cfg.Client
 	if client == nil {
 		client = &http.Client{Timeout: 5 * time.Second}
 	}
 	var sessionID string
 	var sessionVersion string
 	post := func(body, version string) (*http.Response, []byte, error) {
-		req, err := http.NewRequest(http.MethodPost, "http://"+target+"/mcp", strings.NewReader(body))
+		req, err := http.NewRequest(http.MethodPost, endpointURL, strings.NewReader(body))
 		if err != nil {
 			return nil, nil, err
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json, text/event-stream")
+		req.Header.Set("User-Agent", "ocliv-probe/"+BinaryVersion)
 		if bearer != "" {
 			req.Header.Set("Authorization", "Bearer "+bearer)
 		}
@@ -174,11 +388,15 @@ func runMCPProbeWithClient(target, mode, bearer string, client *http.Client) mcp
 		if sessionID == "" {
 			return
 		}
-		req, err := http.NewRequest(http.MethodDelete, "http://"+target+"/mcp", nil)
+		req, err := http.NewRequest(http.MethodDelete, endpointURL, nil)
 		if err != nil {
 			return
 		}
 		req.Header.Set("Mcp-Session-Id", sessionID)
+		req.Header.Set("User-Agent", "ocliv-probe/"+BinaryVersion)
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
 		if sessionVersion != "" {
 			req.Header.Set("Mcp-Protocol-Version", sessionVersion)
 		}
@@ -188,7 +406,7 @@ func runMCPProbeWithClient(target, mode, bearer string, client *http.Client) mcp
 		}
 	}()
 	unreachable := func(step string, err error) mcpProbeOutcome {
-		return mcpProbeOutcome{Summary: step + " unreachable (" + err.Error() + ")", Auth: "AUTH_UNVERIFIED"}
+		return mcpProbeOutcome{Summary: step + " unreachable (" + redactSecret(err.Error(), bearer) + ")", Auth: "AUTH_UNVERIFIED"}
 	}
 
 	// Stage 0 — modern path (MCP 2026-07-28, stateless): try tools/list
@@ -201,19 +419,20 @@ func runMCPProbeWithClient(target, mode, bearer string, client *http.Client) mcp
 	const modernVersion = "2026-07-28"
 	mresp, mraw, merr := post(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`, modernVersion)
 	if merr == nil {
-		if v, ok := presenceVerdict(mresp.StatusCode, mraw, anon); ok {
+		if v, ok := presenceVerdict(mresp.StatusCode, mraw, mode, isPublic, bearer != ""); ok {
 			return v
 		}
 		if list, err := decodeJSONRPC(mresp, mraw); err == nil {
 			if _, err := validateEnvelope(list, 1); err == nil {
 				res, _ := list["result"].(map[string]any)
 				if tools, ok := res["tools"].([]any); ok {
-					auth, authNote := modernAuthFacet(anon, managed, bearer != "")
+					auth, authNote, ev := classifyMCPAuth(mode, bearer != "", isPublic)
 					return mcpProbeOutcome{
-						Summary:  "ok (protocol " + modernVersion + " stateless, tools/list answered; " + strconv.Itoa(len(tools)) + " tools)" + authNote,
-						Verified: true,
-						Auth:     auth,
-						Protocol: modernVersion,
+						Summary:      "ok (protocol " + modernVersion + " stateless, tools/list answered; " + strconv.Itoa(len(tools)) + " tools)" + authNote,
+						Verified:     true,
+						Auth:         auth,
+						AuthEvidence: ev,
+						Protocol:     modernVersion,
 					}
 				}
 			}
@@ -233,19 +452,25 @@ func runMCPProbeWithClient(target, mode, bearer string, client *http.Client) mcp
 		}
 		return unreachable("initialize", err)
 	}
-	if v, ok := presenceVerdict(resp.StatusCode, raw, anon); ok {
+	if v, ok := presenceVerdict(resp.StatusCode, raw, mode, isPublic, bearer != ""); ok {
 		return v
 	}
 	init, err := decodeJSONRPC(resp, raw)
 	if err != nil {
-		return mcpProbeOutcome{Summary: "initialize invalid (" + err.Error() + ")", Auth: "AUTH_UNVERIFIED"}
+		return mcpProbeOutcome{Summary: "initialize invalid (" + redactSecret(err.Error(), bearer) + ")", Auth: "AUTH_UNVERIFIED"}
 	}
 	version, err := validateEnvelope(init, 1)
 	if err != nil {
-		return mcpProbeOutcome{Summary: "initialize invalid (" + err.Error() + ")", Auth: "AUTH_UNVERIFIED"}
+		return mcpProbeOutcome{Summary: "initialize invalid (" + redactSecret(err.Error(), bearer) + ")", Auth: "AUTH_UNVERIFIED"}
 	}
 	if version == "" {
 		return mcpProbeOutcome{Summary: "initialize invalid (missing protocolVersion — client cannot bind a transport revision)", Auth: "AUTH_UNVERIFIED"}
+	}
+	var serverCaps map[string]any
+	if initRes, ok := init["result"].(map[string]any); ok {
+		if caps, ok := initRes["capabilities"].(map[string]any); ok {
+			serverCaps = caps
+		}
 	}
 
 	// Stage 2 — protocol: the initialized notification (no JSON-RPC
@@ -264,15 +489,15 @@ func runMCPProbeWithClient(target, mode, bearer string, client *http.Client) mcp
 	if err != nil {
 		return unreachable("tools/list", err)
 	}
-	if v, ok := presenceVerdict(lresp.StatusCode, lraw, anon); ok {
+	if v, ok := presenceVerdict(lresp.StatusCode, lraw, mode, isPublic, bearer != ""); ok {
 		return v
 	}
 	list, err := decodeJSONRPC(lresp, lraw)
 	if err != nil {
-		return mcpProbeOutcome{Summary: "tools/list invalid (" + err.Error() + ")", Auth: "AUTH_UNVERIFIED"}
+		return mcpProbeOutcome{Summary: "tools/list invalid (" + redactSecret(err.Error(), bearer) + ")", Auth: "AUTH_UNVERIFIED"}
 	}
 	if _, err := validateEnvelope(list, 2); err != nil {
-		return mcpProbeOutcome{Summary: "tools/list invalid (" + err.Error() + ")", Auth: "AUTH_UNVERIFIED"}
+		return mcpProbeOutcome{Summary: "tools/list invalid (" + redactSecret(err.Error(), bearer) + ")", Auth: "AUTH_UNVERIFIED"}
 	}
 	res, _ := list["result"].(map[string]any)
 	tools, ok := res["tools"].([]any)
@@ -280,28 +505,14 @@ func runMCPProbeWithClient(target, mode, bearer string, client *http.Client) mcp
 		return mcpProbeOutcome{Summary: "tools/list invalid (no tools array)", Auth: "AUTH_UNVERIFIED"}
 	}
 
-	// Stage 3 — authentication facet. The probe holds no bearer, so a
-	// 200-only exchange proves usability but never enforcement: an
-	// upstream-oauth server that answers anonymously has NOT proven its
-	// OAuth contract. Fixture servers are anonymous by profile.
-	auth := "AUTH_UNVERIFIED"
-	authNote := "; auth unverified (answered without bearer — upstream OAuth enforcement NOT proven, qualify against the real IdP)"
-	if anon {
-		auth = "AUTH_NONE"
-		authNote = ""
-	} else if managed || bearer != "" {
-		auth = "AUTH_REQUIRED"
-		if managed {
-			authNote = "; visitor OAuth is enforced by the relay-managed route"
-		} else {
-			authNote = "; protocol verified with the operator-supplied upstream bearer"
-		}
-	}
+	auth, authNote, ev := classifyMCPAuth(mode, bearer != "", isPublic)
 	return mcpProbeOutcome{
-		Summary:  "ok (protocol " + version + ", tools/list answered; " + strconv.Itoa(len(tools)) + " tools)" + authNote,
-		Verified: true,
-		Auth:     auth,
-		Protocol: version,
+		Summary:            "ok (protocol " + version + ", tools/list answered; " + strconv.Itoa(len(tools)) + " tools)" + authNote,
+		Verified:           true,
+		Auth:               auth,
+		AuthEvidence:       ev,
+		Protocol:           version,
+		ServerCapabilities: serverCaps,
 	}
 }
 
@@ -443,14 +654,19 @@ func (e *mcpStatusError) Error() string {
 }
 
 // doctorAuthLine renders the authentication facet for the doctor report.
-// AUTH_UNVERIFIED is the honest steady state for upstream-oauth: the
-// local probe holds no bearer, so a 200-only exchange proves usability
-// but never upstream OAuth enforcement.
+// Configured auth mode is kept separate from observed enforcement (OCL-001):
+// managed OAuth must never instruct operators to configure an upstream bearer
+// merely because visitor OAuth is enabled at the relay.
 func doctorAuthLine(mode, auth string) string {
 	switch auth {
+	case "RELAY_MANAGED_OAUTH":
+		return "RELAY_MANAGED_OAUTH (visitor OAuth enforced by relay-managed route; local backend requires no upstream bearer)"
 	case "AUTH_NONE":
 		return "AUTH_NONE (anonymous fixture profile)"
 	case "AUTH_REQUIRED":
+		if mode == "mcp_managed_oauth" {
+			return "AUTH_REQUIRED (local backend demanded a bearer behind a relay-managed OAuth route)"
+		}
 		return "AUTH_REQUIRED (server demands bearer; configure the upstream OAuth client)"
 	case "AUTH_UNVERIFIED":
 		if mode == "mcp_upstream_oauth" {
@@ -460,6 +676,35 @@ func doctorAuthLine(mode, auth string) string {
 	default:
 		return auth
 	}
+}
+
+// formatMCPAuthEvidence renders the separated authentication evidence lines
+// for `ocliv mcp doctor` (OCL-001).
+func formatMCPAuthEvidence(ev MCPAuthEvidence) string {
+	mode := ev.Mode
+	if mode == "" {
+		mode = "UNKNOWN"
+	}
+	localAccess := ev.LocalAccess
+	if localAccess == "" {
+		localAccess = "NOT_TESTED"
+	}
+	pubMeta := ev.PublicMetadata
+	if pubMeta == "" {
+		pubMeta = "NOT_TESTED"
+	}
+	pubEnf := ev.PublicEnforcement
+	if pubEnf == "" {
+		pubEnf = "NOT_TESTED"
+	}
+	authPub := ev.AuthenticatedPublicMCP
+	if authPub == "" {
+		authPub = "NOT_TESTED"
+	}
+	return fmt.Sprintf(
+		"Authentication mode: %s\nLocal MCP access: %s\nPublic OAuth metadata: %s\nAnonymous access rejection: %s\nAuthenticated public MCP: %s\n",
+		mode, localAccess, pubMeta, pubEnf, authPub,
+	)
 }
 
 // doctorProtocolExit maps the protocol probe to the process exit. A green

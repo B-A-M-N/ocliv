@@ -38,6 +38,10 @@ func applySchema(t *testing.T, db *sql.DB) {
 		   pairing_expires_at TEXT NOT NULL DEFAULT '',
 		   pairing_consumed_at TEXT, consented_at TEXT,
 		   skip_pairing INTEGER NOT NULL DEFAULT 0,
+		   auth_method TEXT NOT NULL DEFAULT 'legacy',
+		   trust_policy_id TEXT NOT NULL DEFAULT '',
+		   owner_issuer TEXT NOT NULL DEFAULT '',
+		   owner_subject TEXT NOT NULL DEFAULT '',
 		   PRIMARY KEY (client_id, tenant_id, route_id))`,
 		`CREATE TABLE authz_codes (code TEXT PRIMARY KEY, client_id TEXT NOT NULL,
 		   tenant_id TEXT NOT NULL, route_id TEXT NOT NULL, redirect_uri TEXT NOT NULL,
@@ -67,6 +71,25 @@ func applySchema(t *testing.T, db *sql.DB) {
 			   scope TEXT NOT NULL DEFAULT '',
 			   expires_at TEXT NOT NULL, absolute_expires_at TEXT NOT NULL,
 			   last_used_at TEXT NOT NULL, revoked_at TEXT)`,
+		`CREATE TABLE authz_visitor_policies (
+			   tenant_id TEXT NOT NULL, route_id TEXT NOT NULL, mode TEXT NOT NULL,
+			   issuer TEXT NOT NULL, client_id TEXT NOT NULL, client_secret TEXT NOT NULL DEFAULT '',
+			   allowed_subjects_json TEXT NOT NULL DEFAULT '[]', client_policy TEXT NOT NULL DEFAULT '',
+			   enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+			   revoked_at TEXT, PRIMARY KEY (tenant_id, route_id))`,
+		`CREATE TABLE authz_oidc_tx (
+			   state TEXT PRIMARY KEY, nonce TEXT NOT NULL, pkce_verifier TEXT NOT NULL,
+			   client_id TEXT NOT NULL, tenant_id TEXT NOT NULL, route_id TEXT NOT NULL,
+			   redirect_uri TEXT NOT NULL, code_challenge TEXT NOT NULL, client_state TEXT NOT NULL DEFAULT '',
+			   resource TEXT NOT NULL, scope TEXT NOT NULL, trust_policy_id TEXT NOT NULL DEFAULT '',
+			   expires_at TEXT NOT NULL, consumed_at TEXT)`,
+		`CREATE TABLE mcp_host_observations (
+			   id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, route_id TEXT NOT NULL,
+			   canonical_url TEXT NOT NULL, client_id TEXT NOT NULL DEFAULT '',
+			   client_kind TEXT NOT NULL DEFAULT 'generic', protocol_version TEXT NOT NULL DEFAULT '',
+			   publication_generation INTEGER NOT NULL DEFAULT 0, stage TEXT NOT NULL,
+			   result_category TEXT NOT NULL DEFAULT 'ok', is_synthetic INTEGER NOT NULL DEFAULT 0,
+			   observed_at TEXT NOT NULL)`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			t.Fatalf("schema: %v", err)

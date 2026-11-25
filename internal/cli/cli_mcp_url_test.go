@@ -170,3 +170,74 @@ func TestDiscoveryEgressHardeningBlocksSSRF(t *testing.T) {
 	}
 	_ = net.IPv4zero
 }
+
+// OCL-003: `ocliv mcp check NAME --token-file PATH` must hit the exact
+// canonical HTTPS path-routed URL and reject insecure token files (symlinks or
+// permissive modes).
+func TestMCPCheckAuthenticatedPublicProbeAndTokenFileHardening(t *testing.T) {
+	const goodTok = "tok-public-check-abc123"
+	var srvURL string
+	var sawAuthedPath string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/r/r1/mcp":
+			if r.Header.Get("Authorization") != "Bearer "+goodTok {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			sawAuthedPath = r.URL.Path
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2026-07-28","tools":[{"name":"echo"}]}}`))
+		case "/.well-known/oauth-protected-resource/r/r1/mcp":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"resource":"` + srvURL + `/r/r1/mcp","authorization_servers":["` + srvURL + `/r/r1/oauth"]}`))
+		case "/.well-known/oauth-authorization-server/r/r1/oauth":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"issuer":"` + srvURL + `/r/r1/oauth","authorization_endpoint":"` + srvURL + `/r/r1/oauth/authorize","token_endpoint":"` + srvURL + `/r/r1/oauth/token","registration_endpoint":"` + srvURL + `/r/r1/oauth/register","code_challenge_methods_supported":["S256"]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	srvURL = srv.URL
+
+	seedEnrolledProfileForTest(t, srvURL)
+	ops := serviceOps{
+		mgmtCall: func(_ string, _ *identity.KeyPair, _, _, _ string) (int, []byte, error) {
+			return 200, []byte(`{"publications":[{"route_id":"r1","pub_name":"kontrol","profile":"managed-oauth","url":"` + srvURL + `/r/r1/mcp","publication_state":"ACTIVE","desired_enabled":true,"state_generation":3}]}`), nil
+		},
+	}
+
+	tmpDir := t.TempDir()
+	tokPath := filepath.Join(tmpDir, "bearer.tok")
+	if err := os.WriteFile(tokPath, []byte(goodTok+"\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	if code := cmdMCPCheckWithOps([]string{"kontrol", "--client", "chatgpt", "--token-file", tokPath, "--json"}, ops, srv.Client()); code != apperr.ExitOK {
+		t.Fatalf("authenticated public mcp check exit=%d, want 0", code)
+	}
+	if sawAuthedPath != "/r/r1/mcp" {
+		t.Fatalf("expected authenticated probe at /r/r1/mcp, saw %q", sawAuthedPath)
+	}
+
+	// Permissive mode (0644) must be rejected.
+	badPermPath := filepath.Join(tmpDir, "world.tok")
+	if err := os.WriteFile(badPermPath, []byte(goodTok+"\n"), 0o600); err != nil {
+		t.Fatalf("write world token: %v", err)
+	}
+	if err := os.Chmod(badPermPath, 0o644); err != nil {
+		t.Fatalf("chmod world token: %v", err)
+	}
+	if code := cmdMCPCheckWithOps([]string{"kontrol", "--client", "chatgpt", "--token-file", badPermPath, "--json"}, ops, srv.Client()); code == apperr.ExitOK {
+		t.Fatal("expected nonzero exit for world-readable --token-file")
+	}
+
+	// Symlink token file must be rejected via O_NOFOLLOW.
+	linkPath := filepath.Join(tmpDir, "link.tok")
+	if err := os.Symlink(tokPath, linkPath); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if code := cmdMCPCheckWithOps([]string{"kontrol", "--client", "chatgpt", "--token-file", linkPath, "--json"}, ops, srv.Client()); code == apperr.ExitOK {
+		t.Fatal("expected nonzero exit for symlink --token-file")
+	}
+}

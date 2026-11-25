@@ -40,6 +40,7 @@ import (
 
 	"github.com/B-A-M-N/ocliv/internal/agent"
 	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/authz"
 	"github.com/B-A-M-N/ocliv/internal/config"
 	"github.com/B-A-M-N/ocliv/internal/identity"
 	"github.com/B-A-M-N/ocliv/internal/mcp"
@@ -1810,6 +1811,8 @@ func cmdMCPDoctor(argv []string) int {
 	out := runMCPProbe(target, st.AccessMode)
 	fmt.Printf("mcp protocol: %s\n", out.Summary)
 	fmt.Printf("mcp auth: %s\n", doctorAuthLine(st.AccessMode, out.Auth))
+	ev := out.AuthEvidence
+	ev.PublicMetadata = "NOT_TESTED"
 	publicOK := true
 	if routesOK {
 		for _, route := range rl.Routes {
@@ -1848,13 +1851,39 @@ func cmdMCPDoctor(argv []string) int {
 			}
 			if derr != nil {
 				fmt.Printf("public MCP route %s: not verified from this network (%v); if local Caddy works, check hairpin NAT and verify from off-LAN\n", route.RouteID, derr)
+				ev.PublicMetadata = "FAILED"
 				publicOK = false
 			} else {
 				fmt.Printf("public MCP route %s: verified_at present; lease ACTIVE/live; protected-resource metadata matches %s\n", route.RouteID, route.URL)
+				ev.PublicMetadata = "VERIFIED"
 			}
 		}
 	}
-	fmt.Println("chatgpt registration: EXTERNAL_UNVERIFIED (register the exact public URL in ChatGPT after external qualification)")
+	fmt.Print(formatMCPAuthEvidence(ev))
+	printedHostVerification := false
+	if routesOK && len(rl.Routes) > 0 {
+		for _, route := range rl.Routes {
+			if route.State != "active" {
+				continue
+			}
+			ocode, obody, oerr := mgmtCall(relayURL, k, keyID, http.MethodGet, "/v1/agent/mcp-routes/"+route.RouteID+"/observations")
+			if oerr == nil && ocode == http.StatusOK {
+				var obsResp struct {
+					Verification authz.HostVerificationSummary `json:"verification"`
+				}
+				if json.Unmarshal(obody, &obsResp) == nil {
+					v := obsResp.Verification
+					fmt.Printf("host verification (%s): stage=%s client_registration=%s client_authorization=%s mcp_observed=%s events_discovery=%s events_subscription=%s external_acceptance=%s\n",
+						route.RouteID, v.HighestStage, v.ClientRegistration, v.ClientAuthorization,
+						v.ClientMCPObserved, v.EventsDiscoveryObserved, v.EventsSubscriptionObserved, v.ExternalAcceptance)
+					printedHostVerification = true
+				}
+			}
+		}
+	}
+	if !printedHostVerification {
+		fmt.Println("host verification: EXTERNAL_ACCEPTANCE_UNVERIFIED (host-side registration and acceptance not established)")
+	}
 	if !publicOK {
 		return apperr.ExitRelayTLS
 	}

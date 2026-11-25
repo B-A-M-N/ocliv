@@ -19,7 +19,7 @@ func newTrustTestServer(t *testing.T, store Store, tenant, route string) *Server
 		t.Fatalf("NewIssuer: %v", err)
 	}
 	routeURL := "https://relay.example/r/" + route + "/mcp"
-	issuerURL := "https://relay.example/r/" + route
+	issuerURL := "https://relay.example/r/" + route + "/oauth"
 	return NewServer(issuer, store, tenant, route, routeURL, issuerURL)
 }
 
@@ -30,7 +30,7 @@ func postDCR(t *testing.T, srv *Server, name string, redirectURIs []string) (int
 		"redirect_uris":              redirectURIs,
 		"token_endpoint_auth_method": "none",
 	})
-	req := httptest.NewRequest(http.MethodPost, srv.IssuerURL+"/oauth/register", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, srv.IssuerURL+"/register", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	srv.ServeRegister(rec, req)
@@ -39,7 +39,10 @@ func postDCR(t *testing.T, srv *Server, name string, redirectURIs []string) (int
 	return rec.Code, out
 }
 
-func TestTrustPolicyExactMatchAutoApprovesAndMintsToken(t *testing.T) {
+// OCL-005 & OCL-007: Matching a redirect-URI trust policy alone MUST NOT create
+// an active grant at registration time or authorize a private route without
+// resource-owner authentication.
+func TestRedirectTrustPolicyAloneCannotAuthorizePrivateRoute(t *testing.T) {
 	store := NewMemStore()
 	srv := newTrustTestServer(t, store, "tenant-a", "route-1")
 
@@ -63,7 +66,7 @@ func TestTrustPolicyExactMatchAutoApprovesAndMintsToken(t *testing.T) {
 		t.Fatalf("CreateTrustPolicy: %v", err)
 	}
 
-	// 1. DCR with exact ChatGPT callback URI -> auto-approved direct grant.
+	// 1. DCR with exact ChatGPT callback URI -> remains PENDING (never auto-active).
 	code, reg := postDCR(t, srv, "ChatGPT", preset.RedirectURIs)
 	if code != http.StatusCreated {
 		t.Fatalf("DCR status=%d body=%v", code, reg)
@@ -77,27 +80,12 @@ func TestTrustPolicyExactMatchAutoApprovesAndMintsToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetGrant: %v", err)
 	}
-	if grant.Status != GrantActive || !grant.SkipPairing {
-		t.Fatalf("expected active direct grant, got status=%s skip_pairing=%v", grant.Status, grant.SkipPairing)
+	if grant.Status != GrantPending || grant.SkipPairing {
+		t.Fatalf("redirect-URI DCR must remain pending without resource-owner auth, got status=%s skip_pairing=%v", grant.Status, grant.SkipPairing)
 	}
 
-	// 2. Distinct audit event recorded for auto-approval.
-	audits, err := store.ListAuthzAudit(10)
-	if err != nil {
-		t.Fatalf("ListAuthzAudit: %v", err)
-	}
-	foundAudit := false
-	for _, a := range audits {
-		if a.Action == "authz-auto-approve" && a.Actor == "publisher" && a.ClientID == clientID && a.Result == "ok" && strings.Contains(a.Detail, "policy=chatgpt") {
-			foundAudit = true
-			break
-		}
-	}
-	if !foundAudit {
-		t.Fatalf("expected distinct authz-auto-approve audit event, got %+v", audits)
-	}
-
-	// 3. /oauth/authorize proceeds directly to code redirect with zero pairing screen.
+	// 2. /oauth/authorize without federated OIDC or explicit operator direct
+	// approval MUST NOT issue an authorization code; it renders the consent gate.
 	verifier := "test-pkce-verifier-0123456789abcdefghijklmnopqrstuvwxyz"
 	sum := sha256.Sum256([]byte(verifier))
 	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
@@ -112,46 +100,11 @@ func TestTrustPolicyExactMatchAutoApprovesAndMintsToken(t *testing.T) {
 		"resource":              {srv.RouteURL},
 		"scope":                 {"mcp:tools"},
 	}
-	authReq := httptest.NewRequest(http.MethodGet, srv.IssuerURL+"/oauth/authorize?"+q.Encode(), nil)
+	authReq := httptest.NewRequest(http.MethodGet, srv.IssuerURL+"/authorize?"+q.Encode(), nil)
 	authRec := httptest.NewRecorder()
 	srv.ServeAuthorize(authRec, authReq)
-	if authRec.Code != http.StatusFound {
-		t.Fatalf("expected 302 direct code redirect, got %d body=%s", authRec.Code, authRec.Body.String())
-	}
-	loc, err := url.Parse(authRec.Header().Get("Location"))
-	if err != nil {
-		t.Fatalf("parse Location: %v", err)
-	}
-	authCode := loc.Query().Get("code")
-	if authCode == "" {
-		t.Fatalf("expected code in redirect %q", loc.String())
-	}
-	if loc.Query().Get("state") != "st-123" {
-		t.Fatalf("expected state=st-123, got %q", loc.Query().Get("state"))
-	}
-
-	// 4. Token exchange with PKCE succeeds.
-	form := url.Values{
-		"grant_type":    {"authorization_code"},
-		"code":          {authCode},
-		"client_id":     {clientID},
-		"redirect_uri":  {preset.RedirectURIs[0]},
-		"code_verifier": {verifier},
-		"resource":      {srv.RouteURL},
-	}
-	tokReq := httptest.NewRequest(http.MethodPost, srv.IssuerURL+"/oauth/token", strings.NewReader(form.Encode()))
-	tokReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	tokRec := httptest.NewRecorder()
-	srv.ServeToken(tokRec, tokReq)
-	if tokRec.Code != http.StatusOK {
-		t.Fatalf("expected 200 token response, got %d body=%s", tokRec.Code, tokRec.Body.String())
-	}
-	var tokResp map[string]any
-	if err := json.Unmarshal(tokRec.Body.Bytes(), &tokResp); err != nil {
-		t.Fatalf("decode token response: %v", err)
-	}
-	if tokResp["access_token"] == "" {
-		t.Fatalf("expected access_token, got %v", tokResp)
+	if authRec.Code != http.StatusOK || authRec.Header().Get("Location") != "" {
+		t.Fatalf("matching redirect URI alone must not issue code redirect: status=%d loc=%q", authRec.Code, authRec.Header().Get("Location"))
 	}
 }
 
@@ -188,37 +141,27 @@ func TestTrustPolicyNegativeBoundaries(t *testing.T) {
 		t.Fatal("expected HTTP trust policy to be rejected")
 	}
 
-	// Negative 2: Extra redirect URI alongside ChatGPT URI must NOT auto-approve.
-	code, reg := postDCR(t, srvA1, "ChatGPT", []string{chatgptURI, "https://evil.example/cb"})
-	if code != http.StatusCreated {
-		t.Fatalf("DCR extra URI status=%d", code)
-	}
-	g, err := store.GetGrant(reg["client_id"].(string), "tenant-a", "route-1")
-	if err != nil || g.Status != GrantPending || g.SkipPairing {
-		t.Fatalf("extra redirect URI must stay pending, got grant=%+v err=%v", g, err)
+	// Negative 2: Extra redirect URI alongside ChatGPT URI must NOT match policy.
+	if matched, err := store.MatchTrustPolicy("tenant-a", "route-1", []string{chatgptURI, "https://evil.example/cb"}); err != nil || matched != nil {
+		t.Fatalf("extra redirect URI must not match policy, got %+v err=%v", matched, err)
 	}
 
-	// Negative 3: Wrong redirect URI on same host must NOT auto-approve.
-	code, reg = postDCR(t, srvA1, "ChatGPT", []string{"https://chatgpt.com/other_callback"})
-	if code != http.StatusCreated {
-		t.Fatalf("DCR wrong URI status=%d", code)
-	}
-	g, err = store.GetGrant(reg["client_id"].(string), "tenant-a", "route-1")
-	if err != nil || g.Status != GrantPending || g.SkipPairing {
-		t.Fatalf("wrong redirect URI must stay pending, got grant=%+v err=%v", g, err)
+	// Negative 3: Wrong redirect URI on same host must NOT match policy.
+	if matched, err := store.MatchTrustPolicy("tenant-a", "route-1", []string{"https://chatgpt.com/other_callback"}); err != nil || matched != nil {
+		t.Fatalf("wrong redirect URI must not match policy, got %+v err=%v", matched, err)
 	}
 
-	// Negative 4: Cross-route (same tenant, different route) must NOT auto-approve.
-	code, reg = postDCR(t, srvA2, "ChatGPT", []string{chatgptURI})
+	// Negative 4: Cross-route (same tenant, different route) must NOT match.
+	code, reg := postDCR(t, srvA2, "ChatGPT", []string{chatgptURI})
 	if code != http.StatusCreated {
 		t.Fatalf("DCR cross-route status=%d", code)
 	}
-	g, err = store.GetGrant(reg["client_id"].(string), "tenant-a", "route-2")
+	g, err := store.GetGrant(reg["client_id"].(string), "tenant-a", "route-2")
 	if err != nil || g.Status != GrantPending || g.SkipPairing {
 		t.Fatalf("cross-route DCR must stay pending, got grant=%+v err=%v", g, err)
 	}
 
-	// Negative 5: Cross-tenant (different tenant, same route ID) must NOT auto-approve.
+	// Negative 5: Cross-tenant (different tenant, same route ID) must NOT match.
 	code, reg = postDCR(t, srvB1, "ChatGPT", []string{chatgptURI})
 	if code != http.StatusCreated {
 		t.Fatalf("DCR cross-tenant status=%d", code)
@@ -246,23 +189,18 @@ func TestTrustPolicyNegativeBoundaries(t *testing.T) {
 		"resource":              {srvA1.RouteURL},
 	}
 	authRec := httptest.NewRecorder()
-	srvA1.ServeAuthorize(authRec, httptest.NewRequest(http.MethodGet, srvA1.IssuerURL+"/oauth/authorize?"+q.Encode(), nil))
+	srvA1.ServeAuthorize(authRec, httptest.NewRequest(http.MethodGet, srvA1.IssuerURL+"/authorize?"+q.Encode(), nil))
 	if authRec.Code == http.StatusFound {
 		t.Fatalf("revoked client must not receive authorization code")
 	}
 
-	// Negative 7: Revoked trust policy stops auto-approving new registrations.
+	// Negative 7: Revoked trust policy stops matching.
 	n, err := store.RevokeTrustPolicy("tenant-a", "route-1", "chatgpt")
 	if err != nil || n != 1 {
 		t.Fatalf("RevokeTrustPolicy: n=%d err=%v", n, err)
 	}
-	code, reg = postDCR(t, srvA1, "ChatGPT", []string{chatgptURI})
-	if code != http.StatusCreated {
-		t.Fatalf("DCR after policy revoke status=%d", code)
-	}
-	g, err = store.GetGrant(reg["client_id"].(string), "tenant-a", "route-1")
-	if err != nil || g.Status != GrantPending || g.SkipPairing {
-		t.Fatalf("revoked policy must not auto-approve new client, got grant=%+v err=%v", g, err)
+	if matched, err := store.MatchTrustPolicy("tenant-a", "route-1", []string{chatgptURI}); err != nil || matched != nil {
+		t.Fatalf("revoked policy must not match, got %+v err=%v", matched, err)
 	}
 }
 
@@ -279,24 +217,15 @@ func TestRFC9207IssuerMetadataAndAuthorizationResponses(t *testing.T) {
 	}
 
 	preset, _ := LookupTrustPreset("chatgpt")
-	polID, _ := MintTrustPolicyID()
-	if err := store.CreateTrustPolicy(ClientTrustPolicy{
-		ID:           polID,
-		TenantID:     "tenant-a",
-		RouteID:      "route-1",
-		OwnerKeyID:   "key-owner",
-		Kind:         preset.Kind,
-		RedirectURIs: preset.RedirectURIs,
-		Enabled:      true,
-	}); err != nil {
-		t.Fatalf("CreateTrustPolicy: %v", err)
-	}
-
 	code, reg := postDCR(t, srv, "ChatGPT", preset.RedirectURIs)
 	if code != http.StatusCreated {
 		t.Fatalf("DCR status=%d", code)
 	}
 	clientID := reg["client_id"].(string)
+	// Explicit per-client operator approval unlocks direct code redirect for RFC 9207 test.
+	if err := store.ApproveGrantDirect(clientID, "tenant-a", "route-1"); err != nil {
+		t.Fatalf("ApproveGrantDirect: %v", err)
+	}
 
 	// 2. Success redirect carries exact iss and state.
 	verifier := "rfc9207-pkce-verifier-0123456789abcdefghijklmnopqrstuvwxyz"
@@ -314,7 +243,7 @@ func TestRFC9207IssuerMetadataAndAuthorizationResponses(t *testing.T) {
 		"scope":                 {"mcp:tools"},
 	}
 	okRec := httptest.NewRecorder()
-	srv.ServeAuthorize(okRec, httptest.NewRequest(http.MethodGet, srv.IssuerURL+"/oauth/authorize?"+q.Encode(), nil))
+	srv.ServeAuthorize(okRec, httptest.NewRequest(http.MethodGet, srv.IssuerURL+"/authorize?"+q.Encode(), nil))
 	if okRec.Code != http.StatusFound {
 		t.Fatalf("expected 302 on success, got %d body=%s", okRec.Code, okRec.Body.String())
 	}
@@ -353,7 +282,7 @@ func TestRFC9207IssuerMetadataAndAuthorizationResponses(t *testing.T) {
 			eq.Set("state", "st-err")
 			tc.mutate(eq)
 			rec := httptest.NewRecorder()
-			srv.ServeAuthorize(rec, httptest.NewRequest(http.MethodGet, srv.IssuerURL+"/oauth/authorize?"+eq.Encode(), nil))
+			srv.ServeAuthorize(rec, httptest.NewRequest(http.MethodGet, srv.IssuerURL+"/authorize?"+eq.Encode(), nil))
 			if rec.Code != http.StatusFound {
 				t.Fatalf("%s: expected 302 error redirect, got %d body=%s", tc.name, rec.Code, rec.Body.String())
 			}
@@ -387,120 +316,8 @@ func TestRFC9207IssuerMetadataAndAuthorizationResponses(t *testing.T) {
 		"resource":              {srv.RouteURL},
 	}
 	evilRec := httptest.NewRecorder()
-	srv.ServeAuthorize(evilRec, httptest.NewRequest(http.MethodGet, srv.IssuerURL+"/oauth/authorize?"+evilQ.Encode(), nil))
+	srv.ServeAuthorize(evilRec, httptest.NewRequest(http.MethodGet, srv.IssuerURL+"/authorize?"+evilQ.Encode(), nil))
 	if evilRec.Code != http.StatusBadRequest || evilRec.Header().Get("Location") != "" {
 		t.Fatalf("untrusted redirect_uri must return 400 with no Location header, got %d loc=%q", evilRec.Code, evilRec.Header().Get("Location"))
-	}
-}
-
-// revokeOnMatchStore wraps SQLStore to deterministically simulate an operator
-// running `ocliv untrust` between MatchTrustPolicy() and TryRegisterClientWithTrustPolicy().
-type revokeOnMatchStore struct {
-	*SQLStore
-	revokedOnce bool
-}
-
-func (r *revokeOnMatchStore) MatchTrustPolicy(tenant, route string, redirectURIs []string) (*ClientTrustPolicy, error) {
-	pol, err := r.SQLStore.MatchTrustPolicy(tenant, route, redirectURIs)
-	if err == nil && pol != nil && !r.revokedOnce {
-		r.revokedOnce = true
-		_, _ = r.SQLStore.RevokeTrustPolicy(tenant, route, pol.ID)
-	}
-	return pol, err
-}
-
-func TestTrustPolicySQLStoreE2EAndRevokeInterleaving(t *testing.T) {
-	db := openTestDB(t)
-	applySchema(t, db)
-	sqlStore := NewSQLStore(db)
-	preset, _ := LookupTrustPreset("chatgpt")
-
-	// Part A: Full SQLStore E2E (DCR -> direct grant -> authorize with iss -> PKCE token -> audit).
-	srv := newTrustTestServer(t, sqlStore, "tenant-sql", "route-sql")
-	polID, _ := MintTrustPolicyID()
-	if err := sqlStore.CreateTrustPolicy(ClientTrustPolicy{
-		ID:           polID,
-		TenantID:     "tenant-sql",
-		RouteID:      "route-sql",
-		OwnerKeyID:   "key-sql",
-		Kind:         preset.Kind,
-		RedirectURIs: preset.RedirectURIs,
-		Enabled:      true,
-	}); err != nil {
-		t.Fatalf("CreateTrustPolicy: %v", err)
-	}
-
-	code, reg := postDCR(t, srv, "ChatGPT", preset.RedirectURIs)
-	if code != http.StatusCreated {
-		t.Fatalf("SQLStore DCR status=%d", code)
-	}
-	cid := reg["client_id"].(string)
-	g, err := sqlStore.GetGrant(cid, "tenant-sql", "route-sql")
-	if err != nil || g.Status != GrantActive || !g.SkipPairing {
-		t.Fatalf("expected active direct grant in SQLStore, got %+v err=%v", g, err)
-	}
-
-	verifier := "sqlstore-pkce-verifier-0123456789abcdefghijklmnopqrstuvwxyz"
-	sum := sha256.Sum256([]byte(verifier))
-	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
-	q := url.Values{
-		"response_type":         {"code"},
-		"client_id":             {cid},
-		"redirect_uri":          {preset.RedirectURIs[0]},
-		"code_challenge":        {challenge},
-		"code_challenge_method": {"S256"},
-		"state":                 {"sql-st"},
-		"resource":              {srv.RouteURL},
-		"scope":                 {"mcp:tools"},
-	}
-	authRec := httptest.NewRecorder()
-	srv.ServeAuthorize(authRec, httptest.NewRequest(http.MethodGet, srv.IssuerURL+"/oauth/authorize?"+q.Encode(), nil))
-	if authRec.Code != http.StatusFound {
-		t.Fatalf("SQLStore authorize status=%d body=%s", authRec.Code, authRec.Body.String())
-	}
-	loc, _ := url.Parse(authRec.Header().Get("Location"))
-	if loc.Query().Get("iss") != srv.IssuerURL {
-		t.Fatalf("SQLStore authorize redirect missing iss: %s", loc.String())
-	}
-	form := url.Values{
-		"grant_type":    {"authorization_code"},
-		"code":          {loc.Query().Get("code")},
-		"client_id":     {cid},
-		"redirect_uri":  {preset.RedirectURIs[0]},
-		"code_verifier": {verifier},
-		"resource":      {srv.RouteURL},
-	}
-	tokReq := httptest.NewRequest(http.MethodPost, srv.IssuerURL+"/oauth/token", strings.NewReader(form.Encode()))
-	tokReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	tokRec := httptest.NewRecorder()
-	srv.ServeToken(tokRec, tokReq)
-	if tokRec.Code != http.StatusOK {
-		t.Fatalf("SQLStore token exchange status=%d body=%s", tokRec.Code, tokRec.Body.String())
-	}
-
-	// Part B: Deterministic revoke-before-commit interleaving (TOCTOU regression).
-	interleaved := &revokeOnMatchStore{SQLStore: sqlStore}
-	srvRace := newTrustTestServer(t, interleaved, "tenant-sql", "route-sql")
-	code, reg2 := postDCR(t, srvRace, "ChatGPT-Race", preset.RedirectURIs)
-	if code != http.StatusCreated {
-		t.Fatalf("interleaved DCR status=%d, want 201 pending fallback", code)
-	}
-	cid2 := reg2["client_id"].(string)
-	g2, err := sqlStore.GetGrant(cid2, "tenant-sql", "route-sql")
-	if err != nil {
-		t.Fatalf("GetGrant interleaved: %v", err)
-	}
-	if g2.Status != GrantPending || g2.SkipPairing {
-		t.Fatalf("revoked policy during DCR must fall back to pending, got status=%s skip_pairing=%v", g2.Status, g2.SkipPairing)
-	}
-	// Verify no authz-auto-approve audit event was recorded for cid2.
-	audits, err := sqlStore.ListAuthzAudit(20)
-	if err != nil {
-		t.Fatalf("ListAuthzAudit: %v", err)
-	}
-	for _, a := range audits {
-		if a.ClientID == cid2 && a.Action == "authz-auto-approve" {
-			t.Fatalf("unexpected authz-auto-approve audit for revoked-policy client %s", cid2)
-		}
 	}
 }

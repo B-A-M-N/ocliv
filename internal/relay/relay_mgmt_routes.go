@@ -134,6 +134,12 @@ func (s *Server) deletePublicationAtomically(tenant, keyID, routeID string) (boo
 			now, tenant, routeID); err != nil {
 			return err
 		}
+		if _, err := tx.Exec(
+			`UPDATE authz_visitor_policies SET enabled=0, revoked_at=?, updated_at=?
+			 WHERE tenant_id=? AND route_id=? AND (revoked_at IS NULL OR enabled<>0)`,
+			now, now, tenant, routeID); err != nil {
+			return err
+		}
 		return nil
 	})
 	if err != nil {
@@ -179,8 +185,20 @@ func (s *Server) handleAgentPublications(w http.ResponseWriter, r *http.Request)
 			s.serveKeyPublicationTrustList(w, tenant, keyID, routeID)
 			return
 		}
+		if routeID, ok := strings.CutSuffix(rest, "/visitor-auth"); ok && validRouteID(routeID) {
+			s.serveKeyPublicationVisitorAuthGet(w, tenant, keyID, routeID)
+			return
+		}
+		if routeID, ok := strings.CutSuffix(rest, "/observations"); ok && validRouteID(routeID) {
+			s.serveKeyPublicationObservations(w, tenant, keyID, routeID)
+			return
+		}
 	}
 	if r.Method == http.MethodDelete {
+		if routeID, ok := strings.CutSuffix(rest, "/visitor-auth"); ok && validRouteID(routeID) {
+			s.serveKeyPublicationVisitorAuthRevoke(w, tenant, keyID, routeID)
+			return
+		}
 		if idx := strings.Index(rest, "/trust/"); idx > 0 {
 			routeID := rest[:idx]
 			idOrKind := rest[idx+len("/trust/"):]
@@ -188,6 +206,12 @@ func (s *Server) handleAgentPublications(w http.ResponseWriter, r *http.Request)
 				s.serveKeyPublicationTrustRevoke(w, tenant, keyID, routeID, idOrKind)
 				return
 			}
+		}
+	}
+	if r.Method == http.MethodPost || r.Method == http.MethodPut {
+		if routeID, ok := strings.CutSuffix(rest, "/visitor-auth"); ok && validRouteID(routeID) {
+			s.serveKeyPublicationVisitorAuthSet(w, r, tenant, keyID, routeID)
+			return
 		}
 	}
 	if r.Method == http.MethodPost {
@@ -281,24 +305,25 @@ func (s *Server) handleAgentPublications(w http.ResponseWriter, r *http.Request)
 }
 
 type agentPublicationView struct {
-	RouteID          string   `json:"route_id"`
-	Host             string   `json:"external_host,omitempty"`
-	URL              *string  `json:"url"`
-	Profile          string   `json:"profile,omitempty"`
-	Name             string   `json:"pub_name,omitempty"`
-	LeaseID          *string  `json:"lease_id"`
-	CreatedAt        string   `json:"created_at,omitempty"`
-	RevokedAt        *string  `json:"revoked_at"`
-	VerifiedAt       *string  `json:"verified_at"`
-	PublicationState string   `json:"publication_state"`
-	DesiredEnabled   bool     `json:"desired_enabled"`
-	StateGeneration  int64    `json:"state_generation"`
-	LeaseState       *string  `json:"lease_state"`
-	SessionLive      bool     `json:"session_live"`
-	HostBinding      string   `json:"host_binding"`
-	Admission        string   `json:"admission"`
-	AdmissionReason  string   `json:"admission_reason"`
-	TrustedClients   []string `json:"trusted_clients,omitempty"`
+	RouteID          string                         `json:"route_id"`
+	Host             string                         `json:"external_host,omitempty"`
+	URL              *string                        `json:"url"`
+	Profile          string                         `json:"profile,omitempty"`
+	Name             string                         `json:"pub_name,omitempty"`
+	LeaseID          *string                        `json:"lease_id"`
+	CreatedAt        string                         `json:"created_at,omitempty"`
+	RevokedAt        *string                        `json:"revoked_at"`
+	VerifiedAt       *string                        `json:"verified_at"`
+	PublicationState string                         `json:"publication_state"`
+	DesiredEnabled   bool                           `json:"desired_enabled"`
+	StateGeneration  int64                          `json:"state_generation"`
+	LeaseState       *string                        `json:"lease_state"`
+	SessionLive      bool                           `json:"session_live"`
+	HostBinding      string                         `json:"host_binding"`
+	Admission        string                         `json:"admission"`
+	AdmissionReason  string                         `json:"admission_reason"`
+	TrustedClients   []string                       `json:"trusted_clients,omitempty"`
+	HostVerification *authz.HostVerificationSummary `json:"host_verification,omitempty"`
 }
 
 // enrichAgentPublication reports current route admission without invoking
@@ -411,8 +436,37 @@ func (s *Server) enrichAgentPublication(tenant, keyID string, p *agentPublicatio
 			}
 			p.TrustedClients = labels
 		}
+		if obs, err := s.authz.Store().ListHostObservations(tenant, p.RouteID, 50); err == nil {
+			endpointReady := p.Admission == "READY"
+			oauthCompat := endpointReady && p.Profile == ingressProfileManaged
+			summary := authz.SummarizeHostObservations(endpointReady, oauthCompat, obs)
+			p.HostVerification = &summary
+		}
 	}
 	return nil
+}
+
+func (s *Server) serveKeyPublicationObservations(w http.ResponseWriter, tenant, keyID, routeID string) {
+	pub, err := s.readKeyPublication(tenant, keyID, routeID)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if pub.PublicationState == "MISSING" {
+		http.Error(w, "unknown route", http.StatusNotFound)
+		return
+	}
+	var summary authz.HostVerificationSummary
+	if pub.HostVerification != nil {
+		summary = *pub.HostVerification
+	} else {
+		summary = authz.SummarizeHostObservations(pub.Admission == "READY", pub.Admission == "READY" && pub.Profile == ingressProfileManaged, nil)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"route_id":     routeID,
+		"tenant_id":    tenant,
+		"verification": summary,
+	})
 }
 
 func (s *Server) readKeyPublication(tenant, keyID, routeID string) (*agentPublicationView, error) {
@@ -913,6 +967,127 @@ func (s *Server) serveKeyPublicationTrustRevoke(w http.ResponseWriter, tenant, k
 	}
 	s.db.AuditKey("agent", tenant, keyID, "", "authz-trust-revoke", "ok",
 		"target "+idOrKind+" route "+routeID+" revoked="+itoa(uint64(n)))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"route_id":  routeID,
+		"tenant_id": tenant,
+		"revoked":   n,
+		"status":    "revoked",
+	})
+}
+
+func (s *Server) serveKeyPublicationVisitorAuthGet(w http.ResponseWriter, tenant, keyID, routeID string) {
+	var exists int
+	if err := s.db.SQL().QueryRow(
+		`SELECT 1 FROM mcp_publications WHERE route_id=? AND tenant_id=? AND owner_key_id=? AND revoked_at IS NULL`,
+		routeID, tenant, keyID,
+	).Scan(&exists); err != nil {
+		http.Error(w, "unknown route", http.StatusNotFound)
+		return
+	}
+	if s.authz == nil {
+		http.Error(w, "managed authz unavailable", http.StatusConflict)
+		return
+	}
+	pol, err := s.authz.Store().GetVisitorAuthPolicy(tenant, routeID)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if pol == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"route_id":  routeID,
+			"tenant_id": tenant,
+			"policy":    nil,
+		})
+		return
+	}
+	redacted := pol.Redacted()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"route_id":  routeID,
+		"tenant_id": tenant,
+		"policy":    redacted,
+	})
+}
+
+func (s *Server) serveKeyPublicationVisitorAuthSet(w http.ResponseWriter, r *http.Request, tenant, keyID, routeID string) {
+	if s.authz == nil {
+		http.Error(w, "managed authz unavailable", http.StatusConflict)
+		return
+	}
+	var exists int
+	if err := s.db.SQL().QueryRow(
+		`SELECT 1 FROM mcp_publications WHERE route_id=? AND tenant_id=? AND owner_key_id=? AND revoked_at IS NULL`,
+		routeID, tenant, keyID,
+	).Scan(&exists); err != nil {
+		http.Error(w, "unknown route", http.StatusNotFound)
+		return
+	}
+	var req struct {
+		Mode            string   `json:"mode"`
+		Issuer          string   `json:"issuer"`
+		ClientID        string   `json:"client_id"`
+		ClientSecret    string   `json:"client_secret"`
+		AllowedSubjects []string `json:"allowed_subjects"`
+		ClientPolicy    string   `json:"client_policy"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 32*1024)).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	pol := authz.VisitorAuthPolicy{
+		TenantID:        tenant,
+		RouteID:         routeID,
+		Mode:            req.Mode,
+		Issuer:          req.Issuer,
+		ClientID:        req.ClientID,
+		ClientSecret:    req.ClientSecret,
+		AllowedSubjects: req.AllowedSubjects,
+		ClientPolicy:    req.ClientPolicy,
+		Enabled:         true,
+	}
+	if err := s.authz.Store().SetVisitorAuthPolicy(pol); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	saved, _ := s.authz.Store().GetVisitorAuthPolicy(tenant, routeID)
+	s.db.AuditKey("agent", tenant, keyID, "", "authz-visitor-policy-set", "ok",
+		"mode="+pol.Mode+" issuer="+pol.Issuer+" route="+routeID)
+	var outPol any
+	if saved != nil {
+		r := saved.Redacted()
+		outPol = r
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"route_id":  routeID,
+		"tenant_id": tenant,
+		"policy":    outPol,
+		"status":    "configured",
+	})
+}
+
+func (s *Server) serveKeyPublicationVisitorAuthRevoke(w http.ResponseWriter, tenant, keyID, routeID string) {
+	if s.authz == nil {
+		http.Error(w, "managed authz unavailable", http.StatusConflict)
+		return
+	}
+	var exists int
+	if err := s.db.SQL().QueryRow(
+		`SELECT 1 FROM mcp_publications WHERE route_id=? AND tenant_id=? AND owner_key_id=? AND revoked_at IS NULL`,
+		routeID, tenant, keyID,
+	).Scan(&exists); err != nil {
+		http.Error(w, "unknown route", http.StatusNotFound)
+		return
+	}
+	n, err := s.authz.Store().RevokeVisitorAuthPolicy(tenant, routeID)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if n == 0 {
+		http.Error(w, "no active visitor auth policy", http.StatusNotFound)
+		return
+	}
+	s.db.AuditKey("agent", tenant, keyID, "", "authz-visitor-policy-revoke", "ok", "route "+routeID)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"route_id":  routeID,
 		"tenant_id": tenant,

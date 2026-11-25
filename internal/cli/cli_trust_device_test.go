@@ -194,3 +194,72 @@ func TestSSHCommandQuotingPreservesLiteralArguments(t *testing.T) {
 		}
 	}
 }
+
+// OCL-005 & OCL-008: Federated visitor auth CLI configuration, secret file
+// hardening, and simplified publisher login --profile / device --local validation.
+func TestCLIFederatedVisitorAuthAndDeviceLocalFlags(t *testing.T) {
+	_, _, _ = setupTestProfileWithService(t, "tools", "AbCdEfGhIjKlMnOpQrStUv")
+
+	var lastMethod, lastPath string
+	var lastBody []byte
+	ops := serviceOps{
+		mgmtCall: func(relayURL string, k *identity.KeyPair, keyID, method, path string) (int, []byte, error) {
+			lastMethod, lastPath = method, path
+			switch {
+			case method == http.MethodGet && strings.HasSuffix(path, "/visitor-auth"):
+				return http.StatusOK, []byte(`{"policy":{"mode":"federated","issuer":"https://idp.example","client_id":"cid-1","allowed_subjects":["auth0|u1"],"client_policy":"chatgpt","enabled":true}}`), nil
+			case method == http.MethodDelete && strings.HasSuffix(path, "/visitor-auth"):
+				return http.StatusOK, []byte(`{"status":"revoked","revoked":1}`), nil
+			default:
+				return http.StatusNotFound, []byte("not found"), nil
+			}
+		},
+		mgmtCallBody: func(relayURL string, k *identity.KeyPair, keyID, method, path string, reqBody []byte) (int, []byte, error) {
+			lastMethod, lastPath, lastBody = method, path, reqBody
+			return http.StatusOK, []byte(`{"status":"configured","policy":{"mode":"federated","issuer":"https://idp.example","client_id":"cid-1","allowed_subjects":["auth0|u1"],"client_policy":"chatgpt","enabled":true}}`), nil
+		},
+	}
+
+	secPath := filepath.Join(t.TempDir(), "oidc.secret")
+	if err := os.WriteFile(secPath, []byte("oidc-client-secret-123\n"), 0o600); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+	if code := cmdTrustWithOps([]string{
+		"tools", "--issuer", "https://idp.example", "--oidc-client-id", "cid-1",
+		"--oidc-client-secret-file", secPath, "--allow-subject", "auth0|u1",
+		"--client-policy", "chatgpt",
+	}, ops); code != apperr.ExitOK {
+		t.Fatalf("cmdTrust federated exit=%d, want 0", code)
+	}
+	if lastMethod != http.MethodPut || lastPath != "/v1/agent/mcp-routes/AbCdEfGhIjKlMnOpQrStUv/visitor-auth" {
+		t.Fatalf("unexpected visitor-auth call: %s %s", lastMethod, lastPath)
+	}
+	if !strings.Contains(string(lastBody), `"auth0|u1"`) {
+		t.Fatalf("unexpected visitor-auth body: %s", string(lastBody))
+	}
+
+	if code := cmdTrustWithOps([]string{"tools", "--show-visitor-auth"}, ops); code != apperr.ExitOK {
+		t.Fatalf("cmdTrust --show-visitor-auth exit=%d, want 0", code)
+	}
+	if code := cmdUntrustWithOps([]string{"tools", "--visitor-auth"}, ops); code != apperr.ExitOK {
+		t.Fatalf("cmdUntrust --visitor-auth exit=%d, want 0", code)
+	}
+	if lastMethod != http.MethodDelete || lastPath != "/v1/agent/mcp-routes/AbCdEfGhIjKlMnOpQrStUv/visitor-auth" {
+		t.Fatalf("unexpected untrust visitor-auth call: %s %s", lastMethod, lastPath)
+	}
+
+	// Non-HTTPS issuer must fail validation locally.
+	if code := cmdTrustWithOps([]string{"tools", "--issuer", "http://idp.example", "--oidc-client-id", "cid-1", "--allow-subject", "auth0|u1"}, ops); code != apperr.ExitCLIValidation {
+		t.Fatalf("non-HTTPS issuer exit=%d, want ExitCLIValidation", code)
+	}
+
+	// OCL-008: device add --local cannot combine with USER@HOST.
+	if code := cmdDevice([]string{"add", "--local", "user@host", "--relay", "https://relay.example"}); code != apperr.ExitCLIValidation {
+		t.Fatalf("device add --local + target exit=%d, want ExitCLIValidation", code)
+	}
+
+	// OCL-008: login rejects bad --profile names cleanly.
+	if code := cmdLogin([]string{"--relay", "https://relay.example", "--code-file", "-", "--profile", "../evil"}); code != apperr.ExitCLIValidation {
+		t.Fatalf("login bad --profile exit=%d, want ExitCLIValidation", code)
+	}
+}

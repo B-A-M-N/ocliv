@@ -127,6 +127,10 @@ type Grant struct {
 	// with --direct, allowing /oauth/authorize to issue an authorization code
 	// without showing the interactive pairing_secret consent form.
 	SkipPairing bool
+	// Provenance tracks how this grant was authorized (OCL-006): legacy,
+	// pairing, direct_operator, trust_policy, or federated_oidc with bound
+	// policy/issuer/subject identifiers.
+	Provenance GrantProvenance
 	// ClientName and RedirectURIs are populated by ListGrants from
 	// authz_clients for operator display.
 	ClientName   string
@@ -204,6 +208,19 @@ type Store interface {
 	ListTrustPolicies(tenant, route string) ([]ClientTrustPolicy, error)
 	RevokeTrustPolicy(tenant, route, idOrKind string) (int, error)
 	MatchTrustPolicy(tenant, route string, redirectURIs []string) (*ClientTrustPolicy, error)
+
+	// Federated visitor authorization policies & single-use OIDC transactions (OCL-005).
+	SetVisitorAuthPolicy(p VisitorAuthPolicy) error
+	GetVisitorAuthPolicy(tenant, route string) (*VisitorAuthPolicy, error)
+	RevokeVisitorAuthPolicy(tenant, route string) (int, error)
+	CreateOIDCTransaction(tx OIDCTransaction) error
+	ConsumeOIDCTransaction(state, expectedTenant, expectedRoute string) (*OIDCTransaction, error)
+	CountPendingOIDCTransactions(tenant, route string) (int, error)
+
+	// ApproveGrantWithProvenance atomically activates a grant with explicit
+	// provenance (e.g. federated_oidc + trust_policy_id + issuer + subject).
+	// It refuses unknown/wrong-tenant clients and never resurrects a revoked grant.
+	ApproveGrantWithProvenance(clientID, tenant, route string, skipPairing bool, prov GrantProvenance) error
 	CreateOpaqueRefresh(r OpaqueRefresh) error
 	RotateOpaqueRefresh(oldHash, newHash, clientID, tenant, route string, now time.Time, extendBy time.Duration) (*OpaqueRefresh, error)
 	ExtendOpaqueRefresh(tokenHash, clientID, tenant, route string, now time.Time, extendBy time.Duration) (*OpaqueRefresh, error)
@@ -289,6 +306,12 @@ type Store interface {
 	// ListAuthzAudit returns the most recent audit records.
 	ListAuthzAudit(limit int) ([]AuthzAudit, error)
 
+	// RecordHostObservation records a privacy-safe external host OAuth/MCP
+	// lifecycle observation (OCL-009).
+	RecordHostObservation(obs HostObservation) error
+	// ListHostObservations returns recent host observations for a route, newest first.
+	ListHostObservations(tenant, route string, limit int) ([]HostObservation, error)
+
 	CreateCode(c Code) error
 	// ConsumeCode atomically marks a code consumed and returns it, scoped
 	// to the expected client + tenant + route. The scope check happens
@@ -299,15 +322,18 @@ type Store interface {
 
 // MemStore is an in-memory Store for tests and local evaluation.
 type MemStore struct {
-	mu            sync.Mutex
-	clients       map[string]*Client
-	grants        map[string]*Grant // key: clientID + "\x00" + tenant + "\x00" + route
-	codes         map[string]*Code
-	revocations   map[string]time.Time // key: jti\x00tenant\x00route -> revokedAt
-	consent       map[string]*Consent
-	audit         []AuthzAudit
-	opaqueRefresh map[string]*OpaqueRefresh
-	trustPolicies map[string]*ClientTrustPolicy
+	mu              sync.Mutex
+	clients         map[string]*Client
+	grants          map[string]*Grant // key: clientID + "\x00" + tenant + "\x00" + route
+	codes           map[string]*Code
+	revocations     map[string]time.Time // key: jti\x00tenant\x00route -> revokedAt
+	consent         map[string]*Consent
+	audit           []AuthzAudit
+	hostObs         []HostObservation
+	opaqueRefresh   map[string]*OpaqueRefresh
+	trustPolicies   map[string]*ClientTrustPolicy
+	visitorPolicies map[string]*VisitorAuthPolicy // key: tenant + "\x00" + route
+	oidcTx          map[string]*OIDCTransaction
 }
 
 // NewMemStore returns an empty in-memory store.
@@ -500,6 +526,7 @@ func (m *MemStore) ApproveGrantWithPairingSecret(clientID, tenant, route, secret
 	g.PairingIssuedAt = now
 	g.PairingExpiresAt = now.Add(ttl)
 	g.PairingConsumedAt = nil
+	g.Provenance = GrantProvenance{Method: GrantMethodPairing}
 	g.UpdatedAt = now
 	return nil
 }
@@ -538,6 +565,45 @@ func (m *MemStore) ApproveGrantDirect(clientID, tenant, route string) error {
 	}
 	g.Status = GrantActive
 	g.SkipPairing = true
+	g.Provenance = GrantProvenance{Method: GrantMethodDirectOperator}
+	g.UpdatedAt = now
+	return nil
+}
+
+// ApproveGrantWithProvenance atomically activates a grant with explicit
+// authorization provenance (OCL-005, OCL-006).
+func (m *MemStore) ApproveGrantWithProvenance(clientID, tenant, route string, skipPairing bool, prov GrantProvenance) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, cok := m.clients[clientID]
+	if !cok {
+		return fmt.Errorf("authz: approve grant for unknown client %q", clientID)
+	}
+	if c.Tenant == "" || c.Tenant != tenant {
+		return fmt.Errorf("authz: client %q is not registered for tenant %q", clientID, tenant)
+	}
+	if prov.Method == "" {
+		prov.Method = GrantMethodLegacy
+	}
+	k := grantKey(clientID, tenant, route)
+	now := time.Now()
+	g, ok := m.grants[k]
+	if !ok {
+		g = &Grant{
+			ClientID:  clientID,
+			Tenant:    tenant,
+			Route:     route,
+			Status:    GrantActive,
+			CreatedAt: now,
+		}
+		m.grants[k] = g
+	}
+	if g.Status == GrantRevoked {
+		return fmt.Errorf("authz: grant for client %q route %q is revoked; revocation is terminal", clientID, route)
+	}
+	g.Status = GrantActive
+	g.SkipPairing = skipPairing
+	g.Provenance = prov
 	g.UpdatedAt = now
 	return nil
 }
@@ -745,6 +811,11 @@ func (m *MemStore) PruneAuthzExpired(now time.Time) error {
 			delete(m.consent, ch)
 		}
 	}
+	for st, tx := range m.oidcTx {
+		if tx.ConsumedAt != nil || now.After(tx.ExpiresAt) {
+			delete(m.oidcTx, st)
+		}
+	}
 	cutoff := now.Add(-DefaultRevocationRetention)
 	for key, at := range m.revocations {
 		if at.Before(cutoff) {
@@ -860,6 +931,40 @@ func (m *MemStore) ListAuthzAudit(limit int) ([]AuthzAudit, error) {
 	sort.Slice(out, func(i, j int) bool { return out[i].Time.After(out[j].Time) })
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
+	}
+	return out, nil
+}
+
+// RecordHostObservation stores a non-secret host observation in memory.
+func (m *MemStore) RecordHostObservation(obs HostObservation) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if obs.ObservedAt.IsZero() {
+		obs.ObservedAt = time.Now().UTC()
+	}
+	if obs.ResultCategory == "" {
+		obs.ResultCategory = "ok"
+	}
+	m.hostObs = append(m.hostObs, obs)
+	return nil
+}
+
+// ListHostObservations returns recent observations for (tenant, route), newest first.
+func (m *MemStore) ListHostObservations(tenant, route string, limit int) ([]HostObservation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if limit <= 0 {
+		limit = 50
+	}
+	out := make([]HostObservation, 0)
+	for i := len(m.hostObs) - 1; i >= 0; i-- {
+		o := m.hostObs[i]
+		if o.TenantID == tenant && o.RouteID == route {
+			out = append(out, o)
+			if len(out) >= limit {
+				break
+			}
+		}
 	}
 	return out, nil
 }
@@ -1110,8 +1215,12 @@ func (m *MemStore) TryRegisterClientWithTrustPolicy(c Client, tenant, route, pol
 		Route:       route,
 		Status:      GrantActive,
 		SkipPairing: true,
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		Provenance: GrantProvenance{
+			Method:        GrantMethodTrustPolicy,
+			TrustPolicyID: policyID,
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
 	}
 	return nil
 }
@@ -1163,7 +1272,9 @@ func (m *MemStore) ListTrustPolicies(tenant, route string) ([]ClientTrustPolicy,
 	return out, nil
 }
 
-// RevokeTrustPolicy revokes matching active trust policies by ID or kind.
+// RevokeTrustPolicy revokes matching active trust policies by ID or kind, and
+// atomically revokes all grants and opaque refresh tokens derived from those
+// policies while leaving separately authorized grants intact (OCL-006).
 func (m *MemStore) RevokeTrustPolicy(tenant, route, idOrKind string) (int, error) {
 	if idOrKind == "" {
 		return 0, fmt.Errorf("authz: policy id or kind is required")
@@ -1171,12 +1282,147 @@ func (m *MemStore) RevokeTrustPolicy(tenant, route, idOrKind string) (int, error
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := time.Now().UTC()
+	revokedIDs := map[string]bool{}
 	n := 0
 	for _, p := range m.trustPolicies {
 		if p.TenantID == tenant && p.RouteID == route && p.RevokedAt == nil && (p.ID == idOrKind || p.Kind == idOrKind) {
 			t := now
 			p.Enabled = false
 			p.RevokedAt = &t
+			revokedIDs[p.ID] = true
+			n++
+		}
+	}
+	if len(revokedIDs) > 0 {
+		for _, g := range m.grants {
+			if g.Tenant == tenant && g.Route == route && g.Status != GrantRevoked && revokedIDs[g.Provenance.TrustPolicyID] {
+				g.Status = GrantRevoked
+				g.UpdatedAt = now
+				for _, r := range m.opaqueRefresh {
+					if r.ClientID == g.ClientID && r.Tenant == tenant && r.Route == route && r.RevokedAt == nil {
+						t := now
+						r.RevokedAt = &t
+					}
+				}
+			}
+		}
+	}
+	return n, nil
+}
+
+func visitorPolicyKey(tenant, route string) string {
+	return tenant + "\x00" + route
+}
+
+// SetVisitorAuthPolicy configures or updates the route's visitor auth policy.
+func (m *MemStore) SetVisitorAuthPolicy(p VisitorAuthPolicy) error {
+	clean, err := ValidateVisitorAuthPolicy(p)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.visitorPolicies == nil {
+		m.visitorPolicies = map[string]*VisitorAuthPolicy{}
+	}
+	now := time.Now().UTC()
+	if clean.CreatedAt.IsZero() {
+		clean.CreatedAt = now
+	}
+	clean.UpdatedAt = now
+	clean.RevokedAt = nil
+	cp := clean
+	m.visitorPolicies[visitorPolicyKey(clean.TenantID, clean.RouteID)] = &cp
+	return nil
+}
+
+// GetVisitorAuthPolicy returns the active, unrevoked visitor auth policy for (tenant, route).
+func (m *MemStore) GetVisitorAuthPolicy(tenant, route string) (*VisitorAuthPolicy, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.visitorPolicies[visitorPolicyKey(tenant, route)]
+	if !ok || !p.Enabled || p.RevokedAt != nil {
+		return nil, nil
+	}
+	cp := *p
+	cp.AllowedSubjects = append([]string(nil), p.AllowedSubjects...)
+	return &cp, nil
+}
+
+// RevokeVisitorAuthPolicy disables the route's visitor auth policy and
+// atomically revokes dependent federated grants and opaque refresh tokens.
+func (m *MemStore) RevokeVisitorAuthPolicy(tenant, route string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.visitorPolicies[visitorPolicyKey(tenant, route)]
+	if !ok || p.RevokedAt != nil {
+		return 0, nil
+	}
+	now := time.Now().UTC()
+	t := now
+	p.Enabled = false
+	p.RevokedAt = &t
+	p.UpdatedAt = now
+	for _, g := range m.grants {
+		if g.Tenant == tenant && g.Route == route && g.Status != GrantRevoked && g.Provenance.Method == GrantMethodFederatedOIDC {
+			g.Status = GrantRevoked
+			g.UpdatedAt = now
+			for _, r := range m.opaqueRefresh {
+				if r.ClientID == g.ClientID && r.Tenant == tenant && r.Route == route && r.RevokedAt == nil {
+					rt := now
+					r.RevokedAt = &rt
+				}
+			}
+		}
+	}
+	return 1, nil
+}
+
+func (m *MemStore) CreateOIDCTransaction(tx OIDCTransaction) error {
+	if tx.State == "" || tx.Nonce == "" {
+		return fmt.Errorf("authz: oidc transaction requires state and nonce")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.oidcTx == nil {
+		m.oidcTx = map[string]*OIDCTransaction{}
+	}
+	if _, dup := m.oidcTx[tx.State]; dup {
+		return fmt.Errorf("authz: oidc transaction state collision")
+	}
+	cp := tx
+	m.oidcTx[tx.State] = &cp
+	return nil
+}
+
+func (m *MemStore) ConsumeOIDCTransaction(state, expectedTenant, expectedRoute string) (*OIDCTransaction, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	tx, ok := m.oidcTx[state]
+	if !ok {
+		return nil, fmt.Errorf("authz: unknown oidc transaction state")
+	}
+	if tx.Tenant != expectedTenant || tx.Route != expectedRoute {
+		return nil, fmt.Errorf("authz: oidc transaction is not bound to this route")
+	}
+	if tx.ConsumedAt != nil {
+		return nil, fmt.Errorf("authz: oidc transaction already consumed")
+	}
+	if tx.Expired() {
+		return nil, fmt.Errorf("authz: oidc transaction expired")
+	}
+	now := time.Now().UTC()
+	tx.ConsumedAt = &now
+	cp := *tx
+	return &cp, nil
+}
+
+func (m *MemStore) CountPendingOIDCTransactions(tenant, route string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, tx := range m.oidcTx {
+		if tx.Tenant == tenant && tx.Route == route && tx.ConsumedAt == nil && !tx.Expired() {
 			n++
 		}
 	}

@@ -2,14 +2,19 @@
 package cli
 
 import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/B-A-M-N/ocliv/internal/agent"
 	"github.com/B-A-M-N/ocliv/internal/apperr"
@@ -20,13 +25,62 @@ import (
 // statusProblem is a classified failure to reach the authoritative
 // relay record. The state names the condition; advice names the next
 // corrective action. An unclassified error stays UNKNOWN, never a
-// stale cache echo (P1-F).
+// stale cache echo (P1-F, OCL-002).
 type statusProblem struct {
 	state  string
 	advice string
 }
 
 func (e *statusProblem) Error() string { return e.state + ": " + e.advice }
+
+// classifyRelayMgmtError maps typed transport failures onto accurate observer
+// diagnostics without conflating observer reachability failures with confirmed
+// tunnel disconnection (OCL-002).
+func classifyRelayMgmtError(err error) *statusProblem {
+	if err == nil {
+		return nil
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return &statusProblem{
+			state:  "RELAY_DNS_UNREACHABLE",
+			advice: "DNS lookup failed for relay (" + dnsErr.Error() + "); tunnel state is unknown, check DNS/network then run `ocliv doctor`",
+		}
+	}
+	var (
+		unkAuth   x509.UnknownAuthorityError
+		certInv   x509.CertificateInvalidError
+		hostErr   x509.HostnameError
+		sysRoots  x509.SystemRootsError
+		recHdrErr tls.RecordHeaderError
+		alertErr  tls.AlertError
+	)
+	if errors.As(err, &unkAuth) || errors.As(err, &certInv) || errors.As(err, &hostErr) ||
+		errors.As(err, &sysRoots) || errors.As(err, &recHdrErr) || errors.As(err, &alertErr) {
+		return &statusProblem{
+			state:  "RELAY_TLS_ERROR",
+			advice: "TLS validation failed while contacting relay (" + err.Error() + "); verify certificate/CA trust then run `ocliv doctor`",
+		}
+	}
+	var netErr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
+		return &statusProblem{
+			state:  "RELAY_UNREACHABLE",
+			advice: "timed out contacting relay (" + err.Error() + "); tunnel state is unknown, check network and relay URL then run `ocliv doctor`",
+		}
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return &statusProblem{
+			state:  "RELAY_UNREACHABLE",
+			advice: "could not reach relay (" + opErr.Error() + "); tunnel state is unknown, check network and relay URL then run `ocliv doctor`",
+		}
+	}
+	return &statusProblem{
+		state:  "TUNNEL_STATE_UNKNOWN",
+		advice: "observer could not query relay (" + err.Error() + "); tunnel state is unknown, run `ocliv doctor`",
+	}
+}
 
 // relayStateAdvice maps terminal/in-transit relay lease states to the
 // operator's next action. ACTIVE needs none.
@@ -75,6 +129,7 @@ func renderStatus(local, remote map[string]any, fetchErr error, showJSON bool) (
 	// anything else never implies reachability. External (public-internet)
 	// reachability is not claimed here; `ocliv doctor` probes it.
 	route := "unknown"
+	tunnelState := "TUNNEL_STATE_UNKNOWN"
 	if authoritative {
 		if u, ok := remote["url"].(string); ok && u != "" {
 			url = u
@@ -84,14 +139,21 @@ func renderStatus(local, remote map[string]any, fetchErr error, showJSON bool) (
 		}
 		if live, ok := remote["route_live"].(bool); ok {
 			route = "offline (no live session)"
+			tunnelState = "TUNNEL_OFFLINE"
 			if live {
 				route = "live"
+				tunnelState = "TUNNEL_ONLINE"
 				if g, ok := remote["live_generation"].(float64); ok && g >= 0 {
 					route = fmt.Sprintf("live (generation %d)", int64(g))
 				}
 			}
+		} else if state == "CLOSED" || state == "EXPIRED" || state == "REVOKED" || state == "RECONNECTING" {
+			tunnelState = "TUNNEL_OFFLINE"
 		}
 	}
+	lastKnownStatus, _ := local["last_known_status"].(string)
+	lastKnownRoute, _ := local["last_known_route"].(string)
+	lastObservedAt, _ := local["last_observed_at"].(string)
 	if showJSON {
 		if !authoritative {
 			var prob *statusProblem
@@ -99,12 +161,23 @@ func renderStatus(local, remote map[string]any, fetchErr error, showJSON bool) (
 				state = prob.state
 			}
 		}
-		raw, _ := json.Marshal(map[string]any{
+		payload := map[string]any{
 			"lease_id": local["lease_id"], "url": url, "access_mode": mode,
-			"port": local["port"], "status": state, "authoritative": authoritative,
-			"route": route, "probe_path": probePath,
+			"port": local["port"], "status": state, "tunnel_state": tunnelState,
+			"authoritative": authoritative,
+			"route":         route, "probe_path": probePath,
 			"probe_status": local["probe_status"],
-		})
+		}
+		if !authoritative && lastKnownStatus != "" {
+			payload["last_known_status"] = lastKnownStatus
+			if lastKnownRoute != "" {
+				payload["last_known_route"] = lastKnownRoute
+			}
+			if lastObservedAt != "" {
+				payload["last_observed_at"] = lastObservedAt
+			}
+		}
+		raw, _ := json.Marshal(payload)
 		return string(raw) + "\n", apperr.ExitOK
 	}
 	var sb strings.Builder
@@ -113,6 +186,7 @@ func renderStatus(local, remote map[string]any, fetchErr error, showJSON bool) (
 	fmt.Fprintf(&sb, "Probe:  %s (expect %s)\n", probePath, probeStatus)
 	if authoritative {
 		fmt.Fprintf(&sb, "Status: %s (relay)\n", state)
+		fmt.Fprintf(&sb, "Tunnel: %s\n", tunnelState)
 		fmt.Fprintf(&sb, "Route:  %s\n", route)
 		if adv := relayStateAdvice(state); adv != "" {
 			fmt.Fprintf(&sb, "Next:   %s\n", adv)
@@ -124,13 +198,30 @@ func renderStatus(local, remote map[string]any, fetchErr error, showJSON bool) (
 		var prob *statusProblem
 		if errors.As(fetchErr, &prob) {
 			fmt.Fprintf(&sb, "Status: %s\n", prob.state)
+			fmt.Fprintf(&sb, "Tunnel: %s\n", tunnelState)
+			if lastKnownStatus != "" {
+				ts := lastObservedAt
+				if ts == "" {
+					ts = "timestamp unavailable"
+				}
+				fmt.Fprintf(&sb, "Last known (non-authoritative, observed %s): status=%s route=%s\n", ts, lastKnownStatus, lastKnownRoute)
+			}
 			fmt.Fprintf(&sb, "Next:   %s\n", prob.advice)
 		} else {
 			fmt.Fprintf(&sb, "Status: UNKNOWN (%s)\n", fetchErr.Error())
+			fmt.Fprintf(&sb, "Tunnel: %s\n", tunnelState)
+			if lastKnownStatus != "" {
+				ts := lastObservedAt
+				if ts == "" {
+					ts = "timestamp unavailable"
+				}
+				fmt.Fprintf(&sb, "Last known (non-authoritative, observed %s): status=%s route=%s\n", ts, lastKnownStatus, lastKnownRoute)
+			}
 			fmt.Fprintf(&sb, "Next:   run `ocliv doctor` to isolate relay, network, and local service\n")
 		}
 	} else {
 		fmt.Fprintf(&sb, "Status: UNKNOWN\n")
+		fmt.Fprintf(&sb, "Tunnel: %s\n", tunnelState)
 	}
 	return sb.String(), apperr.ExitOK
 }
@@ -198,6 +289,8 @@ func cmdStatus(argv []string) int {
 		"lease_id": rec.LeaseID, "hostname": rec.Hostname, "url": rec.URL,
 		"port": rec.Port, "access_mode": rec.AccessMode, "generation": rec.Generation,
 		"probe_path": rec.ProbePath, "probe_status": rec.ProbeStatus,
+		"last_known_status": rec.LastKnownStatus, "last_known_route": rec.LastKnownRoute,
+		"last_observed_at": rec.LastObservedAt,
 	}
 	leaseID := rec.LeaseID
 	cfgVals, _ := config.LoadAgentFile(cfgPath)
@@ -213,19 +306,32 @@ func cmdStatus(argv []string) int {
 	if leaseID == "" {
 		fetchErr = fmt.Errorf("no recorded lease id")
 	} else if k, keyID, kerr := loadKey(); kerr != nil {
-		fetchErr = &statusProblem{state: "AUTHENTICATION REQUIRED", advice: "no usable agent key (" + kerr.Error() + "); run `ocliv login`"}
+		fetchErr = &statusProblem{state: "AUTHENTICATION_REQUIRED", advice: "no usable agent key (" + kerr.Error() + "); run `ocliv login`"}
 	} else {
 		code, body, mgmtErr := mgmtCall(relayURL, k, keyID, "GET", "/v1/agent/lease/"+leaseID+"/status")
 		if mgmtErr != nil {
-			fetchErr = &statusProblem{state: "RELAY DISCONNECTED", advice: "relay management transport failed: " + mgmtErr.Error() + "; check network and relay URL, then run `ocliv doctor`"}
+			fetchErr = classifyRelayMgmtError(mgmtErr)
 		} else if code != http.StatusOK {
 			if code == http.StatusUnauthorized || code == http.StatusForbidden {
-				fetchErr = &statusProblem{state: "AUTHENTICATION REQUIRED", advice: fmt.Sprintf("relay refused these credentials (HTTP %d); re-enroll with `ocliv login`", code)}
+				fetchErr = &statusProblem{state: "AUTHENTICATION_REQUIRED", advice: fmt.Sprintf("relay refused these credentials (HTTP %d); re-enroll with `ocliv login`", code)}
 			} else {
 				fetchErr = fmt.Errorf("relay status %d", code)
 			}
 		} else if uerr := json.Unmarshal(body, &remote); uerr != nil {
 			fetchErr = uerr
+		} else if store != nil {
+			if s, ok := remote["status"].(string); ok && s != "" {
+				rec.LastKnownStatus = s
+				if live, ok := remote["route_live"].(bool); ok {
+					if live {
+						rec.LastKnownRoute = "TUNNEL_ONLINE"
+					} else {
+						rec.LastKnownRoute = "TUNNEL_OFFLINE"
+					}
+				}
+				rec.LastObservedAt = time.Now().UTC().Format(time.RFC3339)
+				_ = store.Save(rec)
+			}
 		}
 	}
 	out, code := renderStatus(st, remote, fetchErr, showJSON)

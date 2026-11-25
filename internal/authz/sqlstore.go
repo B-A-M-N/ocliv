@@ -372,8 +372,8 @@ func (s *SQLStore) TryRegisterClientWithTrustPolicy(c Client, tenant, route, pol
 		return fmt.Errorf("authz: register client: %w", err)
 	}
 	if _, err := tx.Exec(
-		`INSERT INTO authz_grants(client_id, tenant_id, route_id, status, skip_pairing, created_at, updated_at) VALUES(?,?,?,?,1,?,?)`,
-		c.ID, tenant, route, string(GrantActive), nowStr, nowStr); err != nil {
+		`INSERT INTO authz_grants(client_id, tenant_id, route_id, status, skip_pairing, auth_method, trust_policy_id, created_at, updated_at) VALUES(?,?,?,?,1,?,?,?,?)`,
+		c.ID, tenant, route, string(GrantActive), GrantMethodTrustPolicy, policyID, nowStr, nowStr); err != nil {
 		return fmt.Errorf("authz: seed direct grant: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -449,13 +449,46 @@ func (s *SQLStore) ListTrustPolicies(tenant, route string) ([]ClientTrustPolicy,
 }
 
 // RevokeTrustPolicy revokes active trust policies on (tenant, route) matching
-// either exact policy ID or policy kind (e.g. "chatgpt").
+// either exact policy ID or policy kind (e.g. "chatgpt"), and atomically
+// revokes every grant and opaque refresh lineage derived from those policies
+// while leaving separately authorized grants intact (OCL-006).
 func (s *SQLStore) RevokeTrustPolicy(tenant, route, idOrKind string) (int, error) {
 	if idOrKind == "" {
 		return 0, fmt.Errorf("authz: policy id or kind is required")
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	res, err := s.db.Exec(
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("authz: revoke trust policy tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(
+		`SELECT id FROM authz_trust_policies
+		 WHERE tenant_id=? AND route_id=? AND revoked_at IS NULL AND (id=? OR kind=?)`,
+		tenant, route, idOrKind, idOrKind,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("authz: find trust policies: %w", err)
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("authz: scan trust policy id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("authz: read trust policies: %w", err)
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+
+	res, err := tx.Exec(
 		`UPDATE authz_trust_policies
 		 SET enabled=0, revoked_at=?
 		 WHERE tenant_id=? AND route_id=? AND revoked_at IS NULL AND (id=? OR kind=?)`,
@@ -465,7 +498,218 @@ func (s *SQLStore) RevokeTrustPolicy(tenant, route, idOrKind string) (int, error
 		return 0, fmt.Errorf("authz: revoke trust policy: %w", err)
 	}
 	n, _ := res.RowsAffected()
+
+	for _, polID := range ids {
+		if _, err := tx.Exec(
+			`UPDATE authz_opaque_refresh
+			 SET revoked_at=?
+			 WHERE tenant_id=? AND route_id=? AND revoked_at IS NULL
+			   AND client_id IN (
+			     SELECT client_id FROM authz_grants
+			     WHERE tenant_id=? AND route_id=? AND trust_policy_id=? AND status<>'revoked'
+			   )`,
+			now, tenant, route, tenant, route, polID,
+		); err != nil {
+			return 0, fmt.Errorf("authz: revoke dependent opaque refresh tokens: %w", err)
+		}
+		if _, err := tx.Exec(
+			`UPDATE authz_grants
+			 SET status='revoked', updated_at=?
+			 WHERE tenant_id=? AND route_id=? AND trust_policy_id=? AND status<>'revoked'`,
+			now, tenant, route, polID,
+		); err != nil {
+			return 0, fmt.Errorf("authz: revoke dependent grants: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("authz: commit revoke trust policy: %w", err)
+	}
 	return int(n), nil
+}
+
+// SetVisitorAuthPolicy persists or updates a route's visitor auth policy (OCL-005).
+func (s *SQLStore) SetVisitorAuthPolicy(p VisitorAuthPolicy) error {
+	clean, err := ValidateVisitorAuthPolicy(p)
+	if err != nil {
+		return err
+	}
+	subsJSON, err := json.Marshal(clean.AllowedSubjects)
+	if err != nil {
+		return fmt.Errorf("authz: marshal allowed_subjects: %w", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	enabled := 0
+	if clean.Enabled {
+		enabled = 1
+	}
+	_, err = s.db.Exec(
+		`INSERT INTO authz_visitor_policies(
+		   tenant_id, route_id, mode, issuer, client_id, client_secret,
+		   allowed_subjects_json, client_policy, enabled, created_at, updated_at, revoked_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL)
+		 ON CONFLICT(tenant_id, route_id)
+		 DO UPDATE SET mode=excluded.mode, issuer=excluded.issuer, client_id=excluded.client_id,
+		   client_secret=excluded.client_secret, allowed_subjects_json=excluded.allowed_subjects_json,
+		   client_policy=excluded.client_policy, enabled=excluded.enabled,
+		   updated_at=excluded.updated_at, revoked_at=NULL`,
+		clean.TenantID, clean.RouteID, clean.Mode, clean.Issuer, clean.ClientID, clean.ClientSecret,
+		string(subsJSON), clean.ClientPolicy, enabled, now, now,
+	)
+	if err != nil {
+		return fmt.Errorf("authz: set visitor auth policy: %w", err)
+	}
+	return nil
+}
+
+// GetVisitorAuthPolicy loads the active, unrevoked visitor auth policy for (tenant, route).
+func (s *SQLStore) GetVisitorAuthPolicy(tenant, route string) (*VisitorAuthPolicy, error) {
+	var (
+		p         VisitorAuthPolicy
+		subsJSON  string
+		enabled   int
+		createdAt string
+		updatedAt string
+	)
+	err := s.db.QueryRow(
+		`SELECT tenant_id, route_id, mode, issuer, client_id, client_secret,
+		        allowed_subjects_json, client_policy, enabled, created_at, updated_at
+		 FROM authz_visitor_policies
+		 WHERE tenant_id=? AND route_id=? AND enabled=1 AND revoked_at IS NULL`,
+		tenant, route,
+	).Scan(&p.TenantID, &p.RouteID, &p.Mode, &p.Issuer, &p.ClientID, &p.ClientSecret,
+		&subsJSON, &p.ClientPolicy, &enabled, &createdAt, &updatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("authz: get visitor auth policy: %w", err)
+	}
+	p.Enabled = enabled != 0
+	_ = json.Unmarshal([]byte(subsJSON), &p.AllowedSubjects)
+	p.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	p.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	return &p, nil
+}
+
+// RevokeVisitorAuthPolicy disables the route's visitor auth policy and
+// atomically revokes dependent federated grants and opaque refresh tokens.
+func (s *SQLStore) RevokeVisitorAuthPolicy(tenant, route string) (int, error) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("authz: revoke visitor policy tx: %w", err)
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(
+		`UPDATE authz_visitor_policies SET enabled=0, revoked_at=?, updated_at=?
+		 WHERE tenant_id=? AND route_id=? AND revoked_at IS NULL`,
+		now, now, tenant, route,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("authz: revoke visitor policy: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n > 0 {
+		if _, err := tx.Exec(
+			`UPDATE authz_opaque_refresh
+			 SET revoked_at=?
+			 WHERE tenant_id=? AND route_id=? AND revoked_at IS NULL
+			   AND client_id IN (
+			     SELECT client_id FROM authz_grants
+			     WHERE tenant_id=? AND route_id=? AND auth_method=? AND status<>'revoked'
+			   )`,
+			now, tenant, route, tenant, route, GrantMethodFederatedOIDC,
+		); err != nil {
+			return 0, fmt.Errorf("authz: revoke federated opaque refresh: %w", err)
+		}
+		if _, err := tx.Exec(
+			`UPDATE authz_grants SET status='revoked', updated_at=?
+			 WHERE tenant_id=? AND route_id=? AND auth_method=? AND status<>'revoked'`,
+			now, tenant, route, GrantMethodFederatedOIDC,
+		); err != nil {
+			return 0, fmt.Errorf("authz: revoke federated grants: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("authz: commit revoke visitor policy: %w", err)
+	}
+	return int(n), nil
+}
+
+func (s *SQLStore) CreateOIDCTransaction(t OIDCTransaction) error {
+	if t.State == "" || t.Nonce == "" {
+		return fmt.Errorf("authz: oidc transaction requires state and nonce")
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO authz_oidc_tx(
+		   state, nonce, pkce_verifier, client_id, tenant_id, route_id,
+		   redirect_uri, code_challenge, client_state, resource, scope,
+		   trust_policy_id, expires_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		t.State, t.Nonce, t.PKCEVerifier, t.ClientID, t.Tenant, t.Route,
+		t.RedirectURI, t.CodeChallenge, t.ClientState, t.Resource, t.Scope,
+		t.TrustPolicyID, t.ExpiresAt.UTC().Format(time.RFC3339Nano),
+	); err != nil {
+		return fmt.Errorf("authz: create oidc tx: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLStore) ConsumeOIDCTransaction(state, expectedTenant, expectedRoute string) (*OIDCTransaction, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("authz: consume oidc tx: %w", err)
+	}
+	defer tx.Rollback()
+	var (
+		t        OIDCTransaction
+		expires  string
+		consumed sql.NullString
+	)
+	err = tx.QueryRow(
+		`SELECT state, nonce, pkce_verifier, client_id, tenant_id, route_id,
+		        redirect_uri, code_challenge, client_state, resource, scope,
+		        trust_policy_id, expires_at, consumed_at
+		 FROM authz_oidc_tx WHERE state=?`,
+		state,
+	).Scan(&t.State, &t.Nonce, &t.PKCEVerifier, &t.ClientID, &t.Tenant, &t.Route,
+		&t.RedirectURI, &t.CodeChallenge, &t.ClientState, &t.Resource, &t.Scope,
+		&t.TrustPolicyID, &expires, &consumed)
+	if err != nil {
+		return nil, fmt.Errorf("authz: unknown oidc transaction state")
+	}
+	if t.Tenant != expectedTenant || t.Route != expectedRoute {
+		return nil, fmt.Errorf("authz: oidc transaction is not bound to this route")
+	}
+	if consumed.Valid {
+		return nil, fmt.Errorf("authz: oidc transaction already consumed")
+	}
+	t.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expires)
+	if t.ExpiresAt.IsZero() || time.Now().After(t.ExpiresAt) {
+		return nil, fmt.Errorf("authz: oidc transaction expired")
+	}
+	now := time.Now().UTC()
+	if _, err := tx.Exec(`UPDATE authz_oidc_tx SET consumed_at=? WHERE state=?`, now.Format(time.RFC3339Nano), state); err != nil {
+		return nil, fmt.Errorf("authz: consume oidc tx: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("authz: commit consume oidc tx: %w", err)
+	}
+	t.ConsumedAt = &now
+	return &t, nil
+}
+
+func (s *SQLStore) CountPendingOIDCTransactions(tenant, route string) (int, error) {
+	var n int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(1) FROM authz_oidc_tx
+		 WHERE tenant_id=? AND route_id=? AND consumed_at IS NULL AND expires_at > ?`,
+		tenant, route, time.Now().UTC().Format(time.RFC3339Nano),
+	).Scan(&n); err != nil {
+		return 0, fmt.Errorf("authz: count oidc tx: %w", err)
+	}
+	return n, nil
 }
 
 // MatchTrustPolicy returns the first active trust policy on (tenant, route)
@@ -750,11 +994,12 @@ func (s *SQLStore) GetGrant(clientID, tenant, route string) (*Grant, error) {
 	err := s.db.QueryRow(
 		`SELECT client_id, tenant_id, route_id, status, created_at, updated_at,
 		        pairing_hash, pairing_issued_at, pairing_expires_at, pairing_consumed_at,
-		        skip_pairing
+		        skip_pairing, auth_method, trust_policy_id, owner_issuer, owner_subject
 		 FROM authz_grants WHERE client_id=? AND tenant_id=? AND route_id=?`,
 		clientID, tenant, route).
 		Scan(&g.ClientID, &g.Tenant, &g.Route, &status, &createdAt, &updatedAt,
-			&pairingHash, &pairingIssued, &pairingExpires, &pairingUsed, &skipPairing)
+			&pairingHash, &pairingIssued, &pairingExpires, &pairingUsed, &skipPairing,
+			&g.Provenance.Method, &g.Provenance.TrustPolicyID, &g.Provenance.OwnerIssuer, &g.Provenance.OwnerSubject)
 	if err != nil {
 		return nil, fmt.Errorf("authz: get grant: %w", err)
 	}
@@ -956,6 +1201,10 @@ func (s *SQLStore) PruneAuthzExpired(now time.Time) error {
 		return fmt.Errorf("authz: prune consents: %w", err)
 	}
 	if _, err := s.db.Exec(
+		`DELETE FROM authz_oidc_tx WHERE consumed_at IS NOT NULL OR expires_at < ?`, nowStr); err != nil {
+		return fmt.Errorf("authz: prune oidc tx: %w", err)
+	}
+	if _, err := s.db.Exec(
 		`DELETE FROM authz_revocations WHERE revoked_at < ?`, revCutoff); err != nil {
 		return fmt.Errorf("authz: prune revocations: %w", err)
 	}
@@ -1041,7 +1290,73 @@ func (s *SQLStore) ListAuthzAudit(limit int) ([]AuthzAudit, error) {
 	return out, rows.Err()
 }
 
-// ApproveGrant sets a grant active, creating it if the client has not yet
+// RecordHostObservation persists a privacy-safe host observation (OCL-009).
+func (s *SQLStore) RecordHostObservation(obs HostObservation) error {
+	if obs.TenantID == "" || obs.RouteID == "" || obs.Stage == "" {
+		return nil
+	}
+	if obs.ObservedAt.IsZero() {
+		obs.ObservedAt = time.Now().UTC()
+	}
+	if obs.ResultCategory == "" {
+		obs.ResultCategory = "ok"
+	}
+	if obs.ClientKind == "" {
+		obs.ClientKind = "generic"
+	}
+	synth := 0
+	if obs.IsSynthetic {
+		synth = 1
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO mcp_host_observations(
+		   tenant_id, route_id, canonical_url, client_id, client_kind,
+		   protocol_version, publication_generation, stage, result_category,
+		   is_synthetic, observed_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+		obs.TenantID, obs.RouteID, obs.CanonicalURL, obs.ClientID, obs.ClientKind,
+		obs.ProtocolVersion, obs.PublicationGeneration, obs.Stage, obs.ResultCategory,
+		synth, obs.ObservedAt.UTC().Format(time.RFC3339Nano),
+	); err != nil {
+		return fmt.Errorf("authz: record host observation: %w", err)
+	}
+	return nil
+}
+
+// ListHostObservations returns recent host observations for (tenant, route), newest first.
+func (s *SQLStore) ListHostObservations(tenant, route string, limit int) ([]HostObservation, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.Query(
+		`SELECT tenant_id, route_id, canonical_url, client_id, client_kind,
+		        protocol_version, publication_generation, stage, result_category,
+		        is_synthetic, observed_at
+		 FROM mcp_host_observations
+		 WHERE tenant_id=? AND route_id=?
+		 ORDER BY id DESC LIMIT ?`,
+		tenant, route, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("authz: list host observations: %w", err)
+	}
+	defer rows.Close()
+	out := make([]HostObservation, 0)
+	for rows.Next() {
+		var o HostObservation
+		var synth int
+		var ts string
+		if err := rows.Scan(&o.TenantID, &o.RouteID, &o.CanonicalURL, &o.ClientID, &o.ClientKind,
+			&o.ProtocolVersion, &o.PublicationGeneration, &o.Stage, &o.ResultCategory, &synth, &ts); err != nil {
+			return nil, fmt.Errorf("authz: scan host observation: %w", err)
+		}
+		o.IsSynthetic = synth != 0
+		o.ObservedAt, _ = time.Parse(time.RFC3339Nano, ts)
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
 // initiated an authorize request. A revoked grant is never resurrected:
 // the conditional upsert leaves a revoked row untouched, and a
 // zero-row-count result is reported as a refusal.
@@ -1105,15 +1420,16 @@ func (s *SQLStore) ApproveGrantWithPairingSecret(clientID, tenant, route, secret
 	}
 	if _, err := tx.Exec(
 		`INSERT INTO authz_grants(client_id, tenant_id, route_id, status, created_at, updated_at,
-		   pairing_hash, pairing_issued_at, pairing_expires_at, pairing_consumed_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,NULL)
+		   pairing_hash, pairing_issued_at, pairing_expires_at, pairing_consumed_at, auth_method)
+		 VALUES(?,?,?,?,?,?,?,?,?,NULL,?)
 		 ON CONFLICT(client_id, tenant_id, route_id)
 		 DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at,
 		   pairing_hash=excluded.pairing_hash, pairing_issued_at=excluded.pairing_issued_at,
-		   pairing_expires_at=excluded.pairing_expires_at, pairing_consumed_at=NULL
+		   pairing_expires_at=excluded.pairing_expires_at, pairing_consumed_at=NULL,
+		   auth_method=excluded.auth_method
 		 WHERE authz_grants.status <> 'revoked'`,
 		clientID, tenant, route, string(GrantActive), nowStr, nowStr,
-		HashSecret(secret), nowStr, expires); err != nil {
+		HashSecret(secret), nowStr, expires, GrantMethodPairing); err != nil {
 		return fmt.Errorf("authz: approve grant: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -1153,16 +1469,71 @@ func (s *SQLStore) ApproveGrantDirect(clientID, tenant, route string) error {
 		return fmt.Errorf("authz: grant for client %q route %q is revoked; revocation is terminal", clientID, route)
 	}
 	if _, err := tx.Exec(
-		`INSERT INTO authz_grants(client_id, tenant_id, route_id, status, created_at, updated_at, skip_pairing)
-		 VALUES(?,?,?,?,?,?,1)
+		`INSERT INTO authz_grants(client_id, tenant_id, route_id, status, created_at, updated_at, skip_pairing, auth_method)
+		 VALUES(?,?,?,?,?,?,1,?)
 		 ON CONFLICT(client_id, tenant_id, route_id)
-		 DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at, skip_pairing=1
+		 DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at, skip_pairing=1, auth_method=excluded.auth_method
 		 WHERE authz_grants.status <> 'revoked'`,
-		clientID, tenant, route, string(GrantActive), nowStr, nowStr); err != nil {
+		clientID, tenant, route, string(GrantActive), nowStr, nowStr, GrantMethodDirectOperator); err != nil {
 		return fmt.Errorf("authz: approve direct grant: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("authz: approve direct commit: %w", err)
+	}
+	return nil
+}
+
+// ApproveGrantWithProvenance atomically activates a grant with explicit
+// authorization provenance (e.g. federated_oidc + trust_policy_id + issuer +
+// subject). It refuses revoked grants and cross-tenant clients (OCL-005, OCL-006).
+func (s *SQLStore) ApproveGrantWithProvenance(clientID, tenant, route string, skipPairing bool, prov GrantProvenance) error {
+	client, cerr := s.GetClient(clientID)
+	if cerr != nil {
+		return fmt.Errorf("authz: approve grant for unknown client %q: %w", clientID, cerr)
+	}
+	if client.Tenant == "" || client.Tenant != tenant {
+		return fmt.Errorf("authz: client %q is not registered for tenant %q", clientID, tenant)
+	}
+	if prov.Method == "" {
+		prov.Method = GrantMethodLegacy
+	}
+	skipInt := 0
+	if skipPairing {
+		skipInt = 1
+	}
+	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("authz: approve provenance tx: %w", err)
+	}
+	defer tx.Rollback()
+	var status string
+	err = tx.QueryRow(
+		`SELECT status FROM authz_grants WHERE client_id=? AND tenant_id=? AND route_id=?`,
+		clientID, tenant, route).Scan(&status)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("authz: check grant status: %w", err)
+	}
+	if err == nil && status == string(GrantRevoked) {
+		return fmt.Errorf("authz: grant for client %q route %q is revoked; revocation is terminal", clientID, route)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO authz_grants(
+		   client_id, tenant_id, route_id, status, created_at, updated_at,
+		   skip_pairing, auth_method, trust_policy_id, owner_issuer, owner_subject)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?)
+		 ON CONFLICT(client_id, tenant_id, route_id)
+		 DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at,
+		   skip_pairing=excluded.skip_pairing, auth_method=excluded.auth_method,
+		   trust_policy_id=excluded.trust_policy_id, owner_issuer=excluded.owner_issuer,
+		   owner_subject=excluded.owner_subject
+		 WHERE authz_grants.status <> 'revoked'`,
+		clientID, tenant, route, string(GrantActive), nowStr, nowStr,
+		skipInt, prov.Method, prov.TrustPolicyID, prov.OwnerIssuer, prov.OwnerSubject); err != nil {
+		return fmt.Errorf("authz: approve grant with provenance: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("authz: approve provenance commit: %w", err)
 	}
 	return nil
 }
@@ -1271,7 +1642,8 @@ func (s *SQLStore) ConsumeCode(code, expectedClient, expectedTenant, expectedRou
 func (s *SQLStore) ListGrants() ([]Grant, error) {
 	rows, err := s.db.Query(
 		`SELECT g.client_id, COALESCE(c.name, ''), COALESCE(c.redirect_uris, '[]'),
-		        g.tenant_id, g.route_id, g.status, g.created_at, g.updated_at, g.skip_pairing
+		        g.tenant_id, g.route_id, g.status, g.created_at, g.updated_at, g.skip_pairing,
+		        g.auth_method, g.trust_policy_id, g.owner_issuer, g.owner_subject
 		 FROM authz_grants g
 		 LEFT JOIN authz_clients c ON c.id = g.client_id
 		 ORDER BY g.created_at DESC`)
@@ -1285,7 +1657,8 @@ func (s *SQLStore) ListGrants() ([]Grant, error) {
 		var status, createdAt, updatedAt, redirectsJSON string
 		var skipPairing int
 		if err := rows.Scan(&g.ClientID, &g.ClientName, &redirectsJSON,
-			&g.Tenant, &g.Route, &status, &createdAt, &updatedAt, &skipPairing); err != nil {
+			&g.Tenant, &g.Route, &status, &createdAt, &updatedAt, &skipPairing,
+			&g.Provenance.Method, &g.Provenance.TrustPolicyID, &g.Provenance.OwnerIssuer, &g.Provenance.OwnerSubject); err != nil {
 			return nil, fmt.Errorf("authz: scan grant: %w", err)
 		}
 		g.Status = GrantStatus(status)

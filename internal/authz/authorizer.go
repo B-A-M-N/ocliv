@@ -59,13 +59,15 @@ func (a *Authorizer) AuthorizeClaims(r *http.Request, routeURL, issuerURL, tenan
 		return nil, fmt.Errorf("authz: route mismatch: got %q want %q", claims.Route, routeID)
 	}
 	// Publication-level boundary: the client must hold an ACTIVE grant for
-	// this tenant + route. Revocation is checked here, on every request.
+	// this tenant + route, and any bound trust policy or federated visitor
+	// auth policy/subject must remain active. Revocation is checked here on
+	// every request (OCL-005, OCL-006).
 	grant, err := a.store.GetGrant(claims.Subject, tenant, routeID)
 	if err != nil {
 		return nil, fmt.Errorf("authz: no grant for client %q: %w", claims.Subject, err)
 	}
-	if grant.Status != GrantActive {
-		return nil, fmt.Errorf("authz: client %q is not approved (status %q)", claims.Subject, grant.Status)
+	if err := validateGrantPolicyLive(a.store, grant, tenant, routeID); err != nil {
+		return nil, fmt.Errorf("authz: client %q denied: %w", claims.Subject, err)
 	}
 	// Client-level revocation: a revoked client's existing tokens stop at
 	// admission, not just at the next token exchange. The registration

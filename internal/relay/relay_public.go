@@ -3,15 +3,19 @@
 package relay
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/B-A-M-N/ocliv/internal/access"
+	"github.com/B-A-M-N/ocliv/internal/authz"
 	"github.com/B-A-M-N/ocliv/internal/lease"
 	"github.com/B-A-M-N/ocliv/internal/metrics"
 	"github.com/B-A-M-N/ocliv/internal/protocol"
@@ -332,12 +336,20 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request, t *routeTar
 			s.writeManagedBearerChallenge(w, r, t)
 			return
 		}
+		// Extract ONLY the lightweight JSON-RPC method name (never arguments,
+		// secrets, or payloads) and restore r.Body verbatim so forwarding stays
+		// 100% protocol-transparent (OCL-004, OCL-009).
+		mcpMethod := peekMCPMethodName(r)
+		mcpProto := strings.TrimSpace(r.Header.Get("MCP-Protocol-Version"))
+		isSynth := authz.IsSyntheticProbeRequest(r)
 		// The external bearer is stripped here; the relay-minted upstream
 		// identity is injected INSIDE serveProxied AFTER the visitor-header
 		// sanitizer runs, so a spoofed X-Ocliv-* metadata name can never
 		// reach the upstream.
 		r.Header.Del("Authorization")
-		s.serveProxied(w, r, t, sess, false, false, client)
+		cw := &statusCaptureWriter{ResponseWriter: w, status: http.StatusOK}
+		s.serveProxied(cw, r, t, sess, false, false, client)
+		s.recordManagedMCPObservation(t, client, mcpMethod, mcpProto, isSynth, cw.status)
 		return
 	}
 	// Pending verification (P0-A): a publication that has not completed
@@ -680,4 +692,118 @@ func (s *Server) serveProxied(w http.ResponseWriter, r *http.Request, t *routeTa
 		return
 	}
 	s.serveHTTP(w, r, stream, reqID, t)
+}
+
+type statusCaptureWriter struct {
+	http.ResponseWriter
+	status int
+	wrote  bool
+}
+
+func (w *statusCaptureWriter) WriteHeader(code int) {
+	if !w.wrote {
+		w.status = code
+		w.wrote = true
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusCaptureWriter) Write(p []byte) (int, error) {
+	if !w.wrote {
+		w.status = http.StatusOK
+		w.wrote = true
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *statusCaptureWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *statusCaptureWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+// peekMCPMethodName inspects MCP-Method or up to 4 KiB of a JSON-RPC POST
+// body to extract ONLY the top-level "method" string without retaining
+// parameters, arguments, or secrets, then restores r.Body verbatim.
+func peekMCPMethodName(r *http.Request) string {
+	if m := strings.TrimSpace(r.Header.Get("MCP-Method")); m != "" {
+		return m
+	}
+	if r.Method != http.MethodPost || r.Body == nil {
+		return ""
+	}
+	if !strings.Contains(strings.ToLower(r.Header.Get("Content-Type")), "application/json") {
+		return ""
+	}
+	const peekCap = 4096
+	orig := r.Body
+	buf, err := io.ReadAll(io.LimitReader(orig, peekCap))
+	r.Body = struct {
+		io.Reader
+		io.Closer
+	}{
+		Reader: io.MultiReader(bytes.NewReader(buf), orig),
+		Closer: orig,
+	}
+	if err != nil || len(buf) == 0 {
+		return ""
+	}
+	var env struct {
+		Method string `json:"method"`
+	}
+	if json.Unmarshal(buf, &env) == nil {
+		return strings.TrimSpace(env.Method)
+	}
+	return ""
+}
+
+// recordManagedMCPObservation records privacy-safe external host observations
+// for authorized managed MCP requests without storing any payloads or tokens
+// (OCL-009).
+func (s *Server) recordManagedMCPObservation(t *routeTarget, clientID, method, protoVersion string, isSynth bool, statusCode int) {
+	if s.authz == nil || t == nil || t.RouteID == "" {
+		return
+	}
+	resultCat := "ok"
+	if statusCode < 200 || statusCode >= 300 {
+		resultCat = "error"
+	}
+	clientKind := "generic"
+	if isSynth {
+		clientKind = "synthetic-probe"
+	} else if c, err := s.authz.Store().GetClient(clientID); err == nil && c != nil {
+		clientKind = authz.ClassifyClientKind(c.RedirectURIs, false)
+	}
+	var pubGen int64
+	_ = s.db.SQL().QueryRow(`SELECT state_generation FROM mcp_publications WHERE route_id=? AND tenant_id=?`, t.RouteID, t.TenantID).Scan(&pubGen)
+
+	obs := authz.HostObservation{
+		TenantID:              t.TenantID,
+		RouteID:               t.RouteID,
+		CanonicalURL:          routeURLFor(s.mcpHost, s.mcpPort, t.RouteID),
+		ClientID:              clientID,
+		ClientKind:            clientKind,
+		ProtocolVersion:       protoVersion,
+		PublicationGeneration: pubGen,
+		Stage:                 authz.StageClientMCPObserved,
+		ResultCategory:        resultCat,
+		IsSynthetic:           isSynth,
+		ObservedAt:            time.Now().UTC(),
+	}
+	_ = s.authz.Store().RecordHostObservation(obs)
+
+	switch method {
+	case "server/discover", "events/list":
+		obs.Stage = authz.StageEventsDiscoveryObserved
+		_ = s.authz.Store().RecordHostObservation(obs)
+	case "events/subscribe":
+		if resultCat == "ok" {
+			obs.Stage = authz.StageEventsSubscriptionObserved
+			_ = s.authz.Store().RecordHostObservation(obs)
+		}
+	}
 }

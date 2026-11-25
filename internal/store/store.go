@@ -367,6 +367,74 @@ CREATE INDEX IF NOT EXISTS idx_authz_trust_policies_route
   ON authz_trust_policies(tenant_id, route_id, enabled, revoked_at);
 `
 
+// schemaV24 adds:
+//   - grant provenance columns (auth_method, trust_policy_id, owner_issuer,
+//     owner_subject) on authz_grants so trust-policy revocation atomically
+//     revokes dependent grants while identifying pre-existing rows as 'legacy'
+//     (OCL-006);
+//   - route-scoped federated OIDC visitor authorization policies
+//     (authz_visitor_policies) and single-use OIDC transaction state
+//     (authz_oidc_tx) (OCL-005);
+//   - privacy-safe external host verification observations
+//     (mcp_host_observations) with no raw tokens, codes, secrets, or payloads
+//     (OCL-009).
+const schemaV24 = `
+ALTER TABLE authz_grants ADD COLUMN auth_method TEXT NOT NULL DEFAULT 'legacy';
+ALTER TABLE authz_grants ADD COLUMN trust_policy_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE authz_grants ADD COLUMN owner_issuer TEXT NOT NULL DEFAULT '';
+ALTER TABLE authz_grants ADD COLUMN owner_subject TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_authz_grants_trust_policy
+  ON authz_grants(tenant_id, route_id, trust_policy_id);
+CREATE TABLE IF NOT EXISTS authz_visitor_policies (
+  tenant_id TEXT NOT NULL,
+  route_id TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  issuer TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  client_secret TEXT NOT NULL DEFAULT '',
+  allowed_subjects_json TEXT NOT NULL DEFAULT '[]',
+  client_policy TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  revoked_at TEXT,
+  PRIMARY KEY (tenant_id, route_id)
+);
+CREATE TABLE IF NOT EXISTS authz_oidc_tx (
+  state TEXT PRIMARY KEY,
+  nonce TEXT NOT NULL,
+  pkce_verifier TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  tenant_id TEXT NOT NULL,
+  route_id TEXT NOT NULL,
+  redirect_uri TEXT NOT NULL,
+  code_challenge TEXT NOT NULL,
+  client_state TEXT NOT NULL DEFAULT '',
+  resource TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  trust_policy_id TEXT NOT NULL DEFAULT '',
+  expires_at TEXT NOT NULL,
+  consumed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_authz_oidc_tx_expires ON authz_oidc_tx(expires_at);
+CREATE TABLE IF NOT EXISTS mcp_host_observations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id TEXT NOT NULL,
+  route_id TEXT NOT NULL,
+  canonical_url TEXT NOT NULL,
+  client_id TEXT NOT NULL DEFAULT '',
+  client_kind TEXT NOT NULL DEFAULT 'generic',
+  protocol_version TEXT NOT NULL DEFAULT '',
+  publication_generation INTEGER NOT NULL DEFAULT 0,
+  stage TEXT NOT NULL,
+  result_category TEXT NOT NULL DEFAULT 'ok',
+  is_synthetic INTEGER NOT NULL DEFAULT 0,
+  observed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mcp_host_obs_route
+  ON mcp_host_observations(tenant_id, route_id, observed_at DESC);
+`
+
 // applyMigration runs one versioned migration body and its version
 // stamp in a single transaction: a failure anywhere rolls back the
 // body, so a version is never recorded for half-applied work (P1-2).
@@ -391,7 +459,7 @@ func applyMigration(sqldb *sql.DB, version int, body string) error {
 }
 
 // currentSchema is the newest version Open must reach.
-const currentSchema = 23
+const currentSchema = 24
 
 // SchemaVersion is the exported current schema version for tools that must
 // refuse unknown/newer databases without opening (and thereby migrating)
@@ -593,6 +661,7 @@ func Open(path string) (*DB, error) {
 		{21, schemaV21},
 		{22, schemaV22},
 		{23, schemaV23},
+		{24, schemaV24},
 	}
 	for _, m := range migrations {
 		var v int

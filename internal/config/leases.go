@@ -58,6 +58,12 @@ type LeaseRecord struct {
 	// Legacy records without this field default to false and never silently
 	// resume a persistent service.
 	Persistent bool `json:"persistent,omitempty"`
+	// LastKnownStatus, LastKnownRoute, and LastObservedAt retain the last
+	// authoritative relay observation separately so diagnostics never present
+	// stale local cache as current authoritative relay state (OCL-002).
+	LastKnownStatus string `json:"last_known_status,omitempty"`
+	LastKnownRoute  string `json:"last_known_route,omitempty"`
+	LastObservedAt  string `json:"last_observed_at,omitempty"`
 }
 
 // ResumeQuery is the canonical deployment identity (P1-5, Domain A).

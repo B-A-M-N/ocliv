@@ -11,11 +11,12 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/B-A-M-N/ocliv/internal/apperr"
+	"github.com/B-A-M-N/ocliv/internal/authz"
 	"github.com/B-A-M-N/ocliv/internal/config"
-	"github.com/B-A-M-N/ocliv/internal/identity"
 )
 
 // catalogEntry is the unified authoritative MCP URL record shared by
@@ -686,11 +687,15 @@ func cmdMCPCheck(argv []string) int {
 
 func cmdMCPCheckWithOps(argv []string, ops serviceOps, hc *http.Client) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ocliv mcp check NAME [--client generic|chatgpt|gemini|google-connected-app] [--trusted-issuer URL] [--token-file PATH] [--profile PROFILE] [--json]")
+		fmt.Fprintln(os.Stderr, "usage: ocliv mcp check NAME [--client generic|chatgpt|gemini|google-connected-app] [--capability tools|events] [--local-url URL] [--qualify-subscription] [--callback-url URL] [--trusted-issuer URL] [--token-file PATH] [--profile PROFILE] [--json]")
 		return apperr.ExitCLIValidation
 	}
 	name := argv[0]
 	clientKind := "generic"
+	capability := "tools"
+	localURLFlag := ""
+	callbackURL := ""
+	qualifySub := false
 	profile := ""
 	tokenFile := ""
 	var trustedIssuers []string
@@ -699,12 +704,32 @@ func cmdMCPCheckWithOps(argv []string, ops serviceOps, hc *http.Client) int {
 		switch {
 		case argv[i] == "--json":
 			asJSON = true
+		case argv[i] == "--qualify-subscription":
+			qualifySub = true
 		case argv[i] == "--client" || strings.HasPrefix(argv[i], "--client="):
 			v, ok := mcpFlagValue(argv, &i, "client")
 			if !ok {
 				return apperr.ExitCLIValidation
 			}
 			clientKind = strings.ToLower(v)
+		case argv[i] == "--capability" || strings.HasPrefix(argv[i], "--capability="):
+			v, ok := mcpFlagValue(argv, &i, "capability")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			capability = strings.ToLower(v)
+		case argv[i] == "--local-url" || strings.HasPrefix(argv[i], "--local-url="):
+			v, ok := mcpFlagValue(argv, &i, "local-url")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			localURLFlag = v
+		case argv[i] == "--callback-url" || strings.HasPrefix(argv[i], "--callback-url="):
+			v, ok := mcpFlagValue(argv, &i, "callback-url")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			callbackURL = v
 		case argv[i] == "--profile" || strings.HasPrefix(argv[i], "--profile="):
 			v, ok := mcpFlagValue(argv, &i, "profile")
 			if !ok {
@@ -734,6 +759,16 @@ func cmdMCPCheckWithOps(argv []string, ops serviceOps, hc *http.Client) int {
 		fmt.Fprintf(os.Stderr, "unknown --client %q (want generic|chatgpt|gemini|google-connected-app)\n", clientKind)
 		return apperr.ExitCLIValidation
 	}
+	switch capability {
+	case "tools", "events":
+	default:
+		fmt.Fprintf(os.Stderr, "unknown --capability %q (want tools|events)\n", capability)
+		return apperr.ExitCLIValidation
+	}
+	if qualifySub && capability != "events" {
+		fmt.Fprintln(os.Stderr, "--qualify-subscription requires --capability events")
+		return apperr.ExitCLIValidation
+	}
 	if profile == "" {
 		profile = config.ActiveProfile()
 	}
@@ -752,45 +787,130 @@ func cmdMCPCheckWithOps(argv []string, ops serviceOps, hc *http.Client) int {
 		}
 		return apperr.ExitRelayTLS
 	}
+
+	// Best-effort fetch of evidence-backed relay host observations (OCL-009).
+	var hostObs []authz.HostObservation
+	if entry.RouteID != "" {
+		if k, keyID, kerr := loadKeyForProfile(profile); kerr == nil {
+			relayURL := agentRelayURLForProfile(profile)
+			if svcStore, serr := openServicesForProfile(profile); serr == nil {
+				if rec, ok, _ := svcStore.Get(entry.Name); ok {
+					if rec.RelayURL != "" {
+						relayURL = rec.RelayURL
+					}
+					if localURLFlag == "" && rec.LocalURL != "" {
+						localURLFlag = rec.LocalURL
+					}
+				}
+			}
+			if relayURL != "" {
+				if ost, obody, oerr := ops.mgmtCall(relayURL, k, keyID, http.MethodGet, "/v1/agent/mcp-routes/"+entry.RouteID+"/observations"); oerr == nil && ost == http.StatusOK {
+					var obsResp struct {
+						Verification authz.HostVerificationSummary `json:"verification"`
+					}
+					if json.Unmarshal(obody, &obsResp) == nil {
+						hostObs = obsResp.Verification.Observations
+					}
+				}
+			}
+		}
+	}
+
 	disc := runReadOnlyDiscoveryCheckWithAllowlist(hc, entry.URL, trustedIssuers)
+	hostSummary := authz.SummarizeHostObservations(disc.Transport == "PASS", disc.Discovery == "PASS", hostObs)
 	authMCP := "UNKNOWN"
 	authMCPDetail := ""
-	if tokenFile != "" && disc.Transport == "PASS" {
-		tokBytes, terr := os.ReadFile(tokenFile)
+	var eventsQual *MCPEventsQualificationResult
+	probeMode := "mcp_managed_oauth"
+	if entry.AuthMethod == "upstream-oauth" {
+		probeMode = "mcp_upstream_oauth"
+	}
+
+	if capability == "events" {
+		var tok string
+		if tokenFile != "" {
+			var terr error
+			tok, terr = readTokenFileSafe(tokenFile)
+			if terr != nil {
+				authMCP = "FAIL"
+				authMCPDetail = "read --token-file: " + terr.Error()
+			}
+		}
+		if authMCP != "FAIL" {
+			epURL, perr := safeDiscoveryURL(entry.URL)
+			if perr != nil {
+				authMCP = "FAIL"
+				authMCPDetail = "unsafe public MCP endpoint: " + perr.Error()
+			} else {
+				var localEP *url.URL
+				if localURLFlag != "" {
+					if lep, lerr := localMCPEndpoint(localURLFlag); lerr == nil {
+						localEP = lep
+					}
+				}
+				evRes := QualifyMCPEvents(MCPEventsQualificationConfig{
+					PublicEndpoint:       epURL,
+					LocalEndpoint:        localEP,
+					AuthMode:             probeMode,
+					BearerToken:          tok,
+					TrustedIssuerOrigins: trustedIssuers,
+					Client:               wrapNoRedirectClient(hc),
+					QualifySubscription:  qualifySub,
+					CallbackURL:          callbackURL,
+					HostObservations:     hostObs,
+				})
+				eventsQual = &evRes
+				if evRes.MCPNegotiation == "PASS" {
+					authMCP = "PASS"
+					authMCPDetail = "protocol " + evRes.ProtocolVersion
+				} else if evRes.MCPNegotiation == "FAIL" {
+					authMCP = "FAIL"
+					authMCPDetail = evRes.Detail
+				}
+			}
+		}
+	} else if tokenFile != "" && disc.Transport == "PASS" {
+		tok, terr := readTokenFileSafe(tokenFile)
 		if terr != nil {
 			authMCP = "FAIL"
 			authMCPDetail = "read --token-file: " + terr.Error()
-		} else if tok := strings.TrimSpace(string(tokBytes)); tok == "" {
-			authMCP = "FAIL"
-			authMCPDetail = "--token-file is empty"
 		} else {
-			probeMode := "mcp_managed_oauth"
-			if entry.AuthMethod == "upstream-oauth" {
-				probeMode = "mcp_upstream_oauth"
-			}
-			out := runMCPProbeWithClient(entry.URL, probeMode, tok, wrapNoRedirectClient(hc))
-			if !out.Verified {
+			epURL, perr := safeDiscoveryURL(entry.URL)
+			if perr != nil {
 				authMCP = "FAIL"
-				authMCPDetail = out.Summary
+				authMCPDetail = "unsafe public MCP endpoint: " + perr.Error()
 			} else {
-				authMCP = "PASS"
-				authMCPDetail = out.Summary
-				if svcStore, serr := openServicesForProfile(profile); serr == nil {
-					if rec, ok, _ := svcStore.Get(entry.Name); ok && entry.StateGeneration > 0 {
-						now := time.Now().UTC()
-						_, _ = svcStore.UpdateCAS(entry.Name, rec.Revision, func(r *config.ServiceRecord) error {
-							r.VerificationEvidence = &config.VerificationEvidence{
-								RouteID:         entry.RouteID,
-								PublicURL:       entry.URL,
-								Issuer:          disc.Issuer,
-								Stage:           "MCP_AUTHENTICATED",
-								StateGeneration: entry.StateGeneration,
-								VerifiedAt:      now.Format(time.RFC3339),
-								ExpiresAt:       now.Add(24 * time.Hour).Format(time.RFC3339),
-							}
-							r.LastVerifiedAt = now.Format(time.RFC3339)
-							return nil
-						})
+				out := runMCPProbeWithConfig(MCPProbeConfig{
+					Endpoint:    epURL,
+					AuthMode:    probeMode,
+					BearerToken: tok,
+					Client:      wrapNoRedirectClient(hc),
+					IsPublic:    true,
+				})
+				if !out.Verified {
+					authMCP = "FAIL"
+					authMCPDetail = redactSecret(out.Summary, tok)
+				} else {
+					authMCP = "PASS"
+					authMCPDetail = redactSecret(out.Summary, tok)
+					if svcStore, serr := openServicesForProfile(profile); serr == nil {
+						if rec, ok, _ := svcStore.Get(entry.Name); ok && entry.StateGeneration > 0 {
+							now := time.Now().UTC()
+							_, _ = svcStore.UpdateCAS(entry.Name, rec.Revision, func(r *config.ServiceRecord) error {
+								r.VerificationEvidence = &config.VerificationEvidence{
+									RouteID:         entry.RouteID,
+									PublicURL:       entry.URL,
+									Issuer:          disc.Issuer,
+									ProtocolVersion: out.Protocol,
+									Stage:           "MCP_AUTHENTICATED",
+									StateGeneration: entry.StateGeneration,
+									VerifiedAt:      now.Format(time.RFC3339),
+									ExpiresAt:       now.Add(24 * time.Hour).Format(time.RFC3339),
+								}
+								r.LastVerifiedAt = now.Format(time.RFC3339)
+								return nil
+							})
+						}
 					}
 				}
 			}
@@ -842,14 +962,19 @@ func cmdMCPCheckWithOps(argv []string, ops serviceOps, hc *http.Client) int {
 			"endpoint":            disc.Transport,
 			"oauth_metadata":      disc.Discovery,
 			"client_profile":      profileCheck,
-			"client_registration": "UNKNOWN",
+			"client_registration": hostSummary.ClientRegistration,
 			"authenticated_mcp":   authMCP,
-			"external_acceptance": "UNKNOWN",
+			"external_acceptance": hostSummary.ExternalAcceptance,
+			"host_verification":   hostSummary,
 			"client":              clientKind,
+			"capability":          capability,
 			"detail":              disc.Detail,
 		}
 		if authMCPDetail != "" {
 			out["authenticated_mcp_detail"] = authMCPDetail
+		}
+		if eventsQual != nil {
+			out["events_qualification"] = eventsQual
 		}
 		if domainVerify != "SKIPPED" {
 			out["google_domain_verification"] = domainVerify
@@ -866,13 +991,23 @@ func cmdMCPCheckWithOps(argv []string, ops serviceOps, hc *http.Client) int {
 		if domainVerify != "SKIPPED" {
 			fmt.Printf("Google verification: %s\n", domainVerify)
 		}
-		fmt.Printf("Client registration: UNKNOWN (read-only check; no DCR client created)\n")
+		fmt.Printf("Client registration: %s\n", hostSummary.ClientRegistration)
+		fmt.Printf("Host stage:          %s\n", hostSummary.HighestStage)
 		if authMCPDetail != "" {
 			fmt.Printf("Authenticated MCP:   %s (%s)\n", authMCP, authMCPDetail)
 		} else {
 			fmt.Printf("Authenticated MCP:   %s\n", authMCP)
 		}
-		fmt.Printf("External acceptance: UNKNOWN (off-LAN client %s not executed)\n", clientKind)
+		if eventsQual != nil {
+			fmt.Printf("Events advertised:   %s\n", eventsQual.EventsAdvertised)
+			fmt.Printf("Events list:         %s (%d events)\n", eventsQual.EventsList, len(eventsQual.PublicEvents))
+			fmt.Printf("Catalog consistency: %s\n", eventsQual.CapabilityConsistency)
+			fmt.Printf("Subscription qual:   %s\n", eventsQual.Subscription)
+			fmt.Printf("Callback delivery:   %s\n", eventsQual.CallbackDelivery)
+			fmt.Printf("Host subscription:   %s\n", eventsQual.HostSubscription)
+			fmt.Printf("Host consumption:    %s\n", eventsQual.HostEventConsumption)
+		}
+		fmt.Printf("External acceptance: %s (preset_client_observed=%v)\n", hostSummary.ExternalAcceptance, hostSummary.PresetClientObserved)
 		if disc.Detail != "" {
 			fmt.Printf("Detail:              %s\n", disc.Detail)
 		}
@@ -880,10 +1015,49 @@ func cmdMCPCheckWithOps(argv []string, ops serviceOps, hc *http.Client) int {
 			fmt.Printf("Profile detail:      %s\n", profileDetail)
 		}
 	}
-	if disc.Transport != "PASS" || disc.Discovery != "PASS" || profileCheck != "PASS" || authMCP == "FAIL" {
+	if disc.Transport != "PASS" || disc.Discovery != "PASS" || profileCheck != "PASS" || authMCP == "FAIL" || (eventsQual != nil && !eventsQual.OK()) {
 		return apperr.ExitRelayTLS
 	}
 	return apperr.ExitOK
 }
 
-var _ = identity.KeyPair{}
+// readTokenFileSafe loads a bearer token from a single-FD O_NOFOLLOW regular
+// file with owner-only permissions (0600) and bounded size (OCL-003).
+func readTokenFileSafe(path string) (string, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return "", fmt.Errorf("open token file: %w", err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return "", fmt.Errorf("stat token file: %w", err)
+	}
+	if !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("token file must be a regular file")
+	}
+	if fi.Mode().Perm()&0o077 != 0 {
+		return "", fmt.Errorf("token file permissions %04o are too open (require 0600)", fi.Mode().Perm())
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		if int(st.Uid) != os.Geteuid() {
+			return "", fmt.Errorf("token file is not owned by the current user")
+		}
+	}
+	const maxTokenFileBytes = 64 * 1024
+	raw, err := io.ReadAll(io.LimitReader(f, maxTokenFileBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("read token file: %w", err)
+	}
+	if len(raw) > maxTokenFileBytes {
+		return "", fmt.Errorf("token file exceeds %d-byte limit", maxTokenFileBytes)
+	}
+	tok := strings.TrimSpace(string(raw))
+	if tok == "" {
+		return "", fmt.Errorf("--token-file is empty")
+	}
+	if strings.ContainsAny(tok, "\r\n") {
+		return "", fmt.Errorf("--token-file must contain a single-line bearer token")
+	}
+	return tok, nil
+}

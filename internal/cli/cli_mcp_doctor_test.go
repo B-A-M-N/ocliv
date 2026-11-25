@@ -220,8 +220,11 @@ func TestManagedDoctorRequiresMCPProtocol(t *testing.T) {
 			defer srv.Close()
 			out := runMCPProbe(probeTarget(srv), "mcp_managed_oauth")
 			if tc.valid {
-				if !out.Verified || out.Auth != "AUTH_REQUIRED" || doctorProtocolExit("mcp_managed_oauth", out.Verified) != apperr.ExitOK {
+				if !out.Verified || out.Auth != "RELAY_MANAGED_OAUTH" || out.AuthEvidence.Mode != "RELAY_MANAGED_OAUTH" || out.AuthEvidence.LocalAccess != "VERIFIED" || doctorProtocolExit("mcp_managed_oauth", out.Verified) != apperr.ExitOK {
 					t.Fatalf("managed protocol not verified: %+v", out)
+				}
+				if line := doctorAuthLine("mcp_managed_oauth", out.Auth); strings.Contains(line, "configure the upstream OAuth client") {
+					t.Fatalf("managed OAuth doctor line wrongly suggests upstream OAuth client: %q", line)
 				}
 			} else if out.Verified || doctorProtocolExit("mcp_managed_oauth", out.Verified) == apperr.ExitOK {
 				t.Fatalf("non-MCP endpoint passed managed protocol check: %+v", out)
@@ -347,5 +350,164 @@ func TestProbeAuthFacets(t *testing.T) {
 	}
 	if got := doctorAuthLine("mcp_upstream_oauth", "AUTH_UNVERIFIED"); !strings.Contains(got, "NOT proven") {
 		t.Fatalf("oauth auth line hides the gap: %q", got)
+	}
+}
+
+// OCL-001: Managed OAuth diagnostics must never recommend configuring an
+// upstream OAuth client on either modern or legacy MCP probe paths.
+func TestManagedOAuthDiagnosticsConsistentAcrossModernAndLegacy(t *testing.T) {
+	modernSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2026-07-28","tools":[{"name":"ping"}]}}`)
+	}))
+	defer modernSrv.Close()
+	legacySrv, _ := mcpProbeFixture(t, map[string]string{
+		"initialize":                `{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}`,
+		"notifications/initialized": `{}`,
+		"tools/list":                `{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"ping"}]}}`,
+	})
+	defer legacySrv.Close()
+
+	for name, srv := range map[string]*httptest.Server{"modern": modernSrv, "legacy": legacySrv} {
+		out := runMCPProbe(probeTarget(srv), "mcp_managed_oauth")
+		if !out.Verified {
+			t.Fatalf("%s: expected verified, got %+v", name, out)
+		}
+		if out.Auth != "RELAY_MANAGED_OAUTH" {
+			t.Fatalf("%s: auth=%q, want RELAY_MANAGED_OAUTH", name, out.Auth)
+		}
+		if out.AuthEvidence.Mode != "RELAY_MANAGED_OAUTH" || out.AuthEvidence.LocalAccess != "VERIFIED" ||
+			out.AuthEvidence.PublicEnforcement != "NOT_TESTED" || out.AuthEvidence.AuthenticatedPublicMCP != "NOT_TESTED" {
+			t.Fatalf("%s: unexpected AuthEvidence: %+v", name, out.AuthEvidence)
+		}
+		line := doctorAuthLine("mcp_managed_oauth", out.Auth)
+		if strings.Contains(line, "configure the upstream OAuth client") || strings.Contains(line, "server demands bearer") {
+			t.Fatalf("%s: misleading managed auth line: %q", name, line)
+		}
+	}
+}
+
+// OCL-003: Authenticated public MCP probe must preserve HTTPS scheme, exact
+// path-routed URL, nonstandard port, session DELETE URL, SSE decoding, and
+// redact bearer tokens on failure without following redirects.
+func TestMCPProbeConfigCanonicalEndpoints(t *testing.T) {
+	const secretTok = "super-secret-bearer-token-xyz"
+	var gotPaths []string
+	var gotMethods []string
+	var gotAuthHeaders []string
+	var mu sync.Mutex
+
+	tlsSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotPaths = append(gotPaths, r.URL.Path)
+		gotMethods = append(gotMethods, r.Method)
+		gotAuthHeaders = append(gotAuthHeaders, r.Header.Get("Authorization"))
+		mu.Unlock()
+		if r.URL.Path != "/r/route-abc/mcp" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer "+secretTok {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		var req struct {
+			ID     any    `json:"id"`
+			Method string `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Mcp-Session-Id", "sess-https-1")
+		switch req.Method {
+		case "initialize":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\"}}\n\n")
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/list":
+			if r.Header.Get("MCP-Protocol-Version") == "2026-07-28" {
+				// Force fallback to legacy path so session creation + DELETE are exercised too.
+				http.Error(w, "legacy only", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\"}]}}\n\n")
+		}
+	}))
+	defer tlsSrv.Close()
+
+	ep, err := localMCPEndpoint(tlsSrv.URL + "/r/route-abc/mcp")
+	if err != nil {
+		t.Fatalf("localMCPEndpoint: %v", err)
+	}
+	out := runMCPProbeWithConfig(MCPProbeConfig{
+		Endpoint:    ep,
+		AuthMode:    "mcp_managed_oauth",
+		BearerToken: secretTok,
+		Client:      wrapNoRedirectClient(tlsSrv.Client()),
+		IsPublic:    true,
+	})
+	if !out.Verified || out.Auth != "RELAY_MANAGED_OAUTH" || out.AuthEvidence.AuthenticatedPublicMCP != "VERIFIED" {
+		t.Fatalf("HTTPS path-routed probe failed: %+v", out)
+	}
+	if strings.Contains(out.Summary, secretTok) {
+		t.Fatalf("bearer token leaked into summary: %q", out.Summary)
+	}
+	mu.Lock()
+	sawDelete := false
+	for i, m := range gotMethods {
+		if gotPaths[i] != "/r/route-abc/mcp" {
+			t.Fatalf("unexpected request path %q (want /r/route-abc/mcp)", gotPaths[i])
+		}
+		if m == http.MethodDelete {
+			sawDelete = true
+			if gotAuthHeaders[i] != "Bearer "+secretTok {
+				t.Fatalf("DELETE session termination missing bearer auth")
+			}
+		}
+	}
+	mu.Unlock()
+	if !sawDelete {
+		t.Fatal("expected session DELETE on exact canonical path")
+	}
+
+	// Verify IPv6 loopback target construction preserves brackets and port.
+	v6ep, err := localMCPEndpoint("[::1]:18777")
+	if err != nil || v6ep.String() != "http://[::1]:18777/mcp" {
+		t.Fatalf("IPv6 endpoint = %v, err=%v", v6ep, err)
+	}
+
+	// Verify redirect never receives forwarded bearer credentials.
+	var evilGotAuth bool
+	evilSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			evilGotAuth = true
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer evilSrv.Close()
+	redirSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, evilSrv.URL+"/steal", http.StatusFound)
+	}))
+	defer redirSrv.Close()
+	redirEP, _ := localMCPEndpoint(redirSrv.URL + "/r/r1/mcp")
+	redirOut := runMCPProbeWithConfig(MCPProbeConfig{
+		Endpoint:    redirEP,
+		AuthMode:    "mcp_managed_oauth",
+		BearerToken: secretTok,
+		Client:      wrapNoRedirectClient(redirSrv.Client()),
+		IsPublic:    true,
+	})
+	if redirOut.Verified {
+		t.Fatalf("redirect probe must fail, got %+v", redirOut)
+	}
+	if evilGotAuth {
+		t.Fatal("bearer credential was forwarded to redirected origin!")
+	}
+	if strings.Contains(redirOut.Summary, secretTok) {
+		t.Fatalf("bearer token leaked in redirect failure summary: %q", redirOut.Summary)
 	}
 }

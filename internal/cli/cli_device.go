@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"time"
@@ -45,6 +46,7 @@ func cmdDevice(argv []string) int {
 
 func printDeviceUsage() {
 	fmt.Fprintln(os.Stderr, "usage: ocliv device add USER@HOST [--tenant default] [--relay URL] [--data DIR] [--profile NAME] [--install]")
+	fmt.Fprintln(os.Stderr, "       ocliv device add --local [--tenant default] [--relay URL] [--data DIR] [--profile NAME]")
 	fmt.Fprintln(os.Stderr, "       ocliv device add --local-user USER [--tenant default] [--relay URL] [--data DIR] [--profile NAME]")
 	fmt.Fprintln(os.Stderr, "       ocliv device list [--data DIR]")
 	fmt.Fprintln(os.Stderr, "       ocliv device revoke KEY_ID [--data DIR]")
@@ -157,7 +159,7 @@ func buildSSHInstallCommand(relayURL string) string {
 func cmdDeviceAdd(argv []string) int {
 	_, dataDir, _ := relayFlags(argv)
 	var target, localUser, relayURL, tenant, profile string
-	var autoInstall bool
+	var autoInstall, enrollSelfLocal bool
 
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
@@ -165,6 +167,8 @@ func cmdDeviceAdd(argv []string) int {
 		case a == "--help" || a == "-h":
 			printDeviceUsage()
 			return apperr.ExitOK
+		case a == "--local":
+			enrollSelfLocal = true
 		case a == "--local-user" || strings.HasPrefix(a, "--local-user="):
 			v, ok := mcpFlagValue(argv, &i, "local-user")
 			if !ok {
@@ -207,6 +211,27 @@ func cmdDeviceAdd(argv []string) int {
 		}
 	}
 
+	if enrollSelfLocal {
+		if localUser != "" || target != "" {
+			fmt.Fprintln(os.Stderr, "device add: --local cannot be combined with USER@HOST or --local-user")
+			return apperr.ExitCLIValidation
+		}
+		if os.Geteuid() == 0 {
+			if su := strings.TrimSpace(os.Getenv("SUDO_USER")); su != "" && su != "root" {
+				localUser = su
+			} else {
+				fmt.Fprintln(os.Stderr, "device add: refusing to enroll root as publisher; pass --local-user USER instead")
+				return apperr.ExitCLIValidation
+			}
+		} else {
+			cur, cerr := user.Current()
+			if cerr != nil || !validLocalUsername(cur.Username) {
+				fmt.Fprintln(os.Stderr, "device add: cannot resolve current local user")
+				return apperr.ExitInternal
+			}
+			localUser = cur.Username
+		}
+	}
 	if target == "" && localUser == "" {
 		printDeviceUsage()
 		return apperr.ExitCLIValidation
@@ -273,7 +298,14 @@ func enrollLocalUserDevice(dataDir, relayURL, tenant, localUser, profile string)
 	}
 
 	var cmd *exec.Cmd
-	if sudoPath, serr := exec.LookPath("sudo"); serr == nil {
+	curUser, curErr := user.Current()
+	sameNonRootUser := os.Geteuid() != 0 && curErr == nil && curUser.Username == localUser
+	if sameNonRootUser {
+		// OCL-008: When the publisher and relay share a host under the same
+		// permission-checked non-root account, enroll directly via stdin without
+		// needing sudo or manual pairing codes.
+		cmd = exec.Command(selfBin, loginArgs...)
+	} else if sudoPath, serr := exec.LookPath("sudo"); serr == nil {
 		args := append([]string{"-u", localUser, "-H", "--", selfBin}, loginArgs...)
 		cmd = exec.Command(sudoPath, args...)
 	} else {
