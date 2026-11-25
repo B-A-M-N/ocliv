@@ -36,6 +36,8 @@ across schema migrations or security-boundary changes.
 - **CycloneDX SBOM SHA-256 (`sbom.cdx.json`):** `fbedffc2346ccfd5e513a793e934f110e6682e24be99b87b0bee2093ca7b20da`
 - **Pi Stage Directory & Machine-Readable Receipts:** `/home/bamn/ocliv-stage/prod-7ff4115-2026-11-25/` (`qual-receipt.json`, `run-mig.sh`) and bundle `/home/bamn/ocliv-stage/prod-bundle-7ff4115-2026-11-25/`.
 - **Strict Isolated Qualification (`qualify-pi-isolated.py --release-dir $BUNDLE --receipt-out ./qual-receipt.json`):** **PASS 67 / SKIP 0 / FAIL 0** (`mode=strict-production`, `schema=V24`, `ephemeral_state_retained=false`, `scratch_cleanup_ok=true`).
+- **Production-Gate Live DB Online-Snapshot Migration Rehearsal (`sudo rehearse-prod-migration.py --production-gate --src-db /var/lib/ocliv/ocliv.db --qualification-receipt ./qual-receipt.json --receipt-out ./mig-receipt.json`):** **PASS 12 / FAIL 0** (`src_journal_mode=wal`, `src_schema=V17` → `V24`, snapshot SHA-256 `1ae6f7ac8ad45c7758c61b10658fade3d0b5b332d0c90c75802ac655ad7c1f7d`; 3 tenants, 3 agent keys, 7 leases, 5 publications, 9 clients, 12 grants, 30 revocations preserved identically; `PRAGMA integrity_check=ok`, `foreign_key_check=[]`, backup+validate+restore `--reset-authority` PASS with `preserved_diffs=[]`, candidate relay `/health/ready == 200` on restored DB).
+- **24-Hour Release-Gate Soak (`soak-isolated.py --release-gate`):** Running detached on Pi (`PID 951887`, log `/tmp/ocliv-soak-24h-7ff4115.out`, receipt target `./soak-24h-receipt.json`).
 - **Production Isolation Proof:** `ocliv-relay` MainPID `1577` → `1577`, `caddy` MainPID `1574` → `1574` (untouched).
 
 ## Prior Isolated Pi Staging Receipt (`e468beb` — preserved)
@@ -159,10 +161,10 @@ across schema migrations or security-boundary changes.
 
 | Gate | Tier | Status |
 |---|---|---|
-| Production release build with permanent production Ed25519 trust-root key (`release-2026-v1`) + CycloneDX SBOM (`cyclonedx-gomod`) + `govulncheck=pass` | Release Provenance | **VERIFIED** (`e468beb`, `release_sequence=1003`) |
-| Strict isolated Pi staging qualification (`qualify-pi-isolated.py`, 67/0/0) + V19→V24 migration rehearsal (12/0) | Isolated Artifact E2E | **VERIFIED** (`e468beb`, production PIDs untouched) |
-| Live production DB copy migration rehearsal (`sudo python3 rehearse-prod-migration.py --production-gate --src-db /var/lib/ocliv/ocliv.db ...`) | Operator-Gated Pre-Flight | **VERIFIED** (`e468beb`, V17→V24, **PASS 12/0**, `mig-receipt.json`) |
-| 24-hour release-gate soak (`soak-isolated.py --release-gate`) | Isolated Artifact E2E | **IN PROGRESS** (`PID 944743` on Pi; re-run on final candidate) |
+| Production release build with permanent production Ed25519 trust-root key (`release-2026-v1`) + CycloneDX SBOM (`cyclonedx-gomod`) + `govulncheck=pass` | Release Provenance | **VERIFIED** (`7ff4115`, `release_sequence=1004`) |
+| Strict isolated Pi staging qualification (`qualify-pi-isolated.py`, 67/0/0) | Isolated Artifact E2E | **VERIFIED** (`7ff4115`, production PIDs untouched) |
+| Live production DB copy migration rehearsal (`sudo python3 rehearse-prod-migration.py --production-gate --src-db /var/lib/ocliv/ocliv.db ...`) | Operator-Gated Pre-Flight | **VERIFIED** (`7ff4115`, V17→V24, **PASS 12/0**, `mig-receipt.json`) |
+| 24-hour release-gate soak (`soak-isolated.py --release-gate`) | Isolated Artifact E2E | **IN PROGRESS** (`7ff4115`, `PID 951887` on Pi) |
 | Native Ocliv transaction-bound OAuth E2E (no external IdP / no pairing-secret copying) | Public / Off-LAN / Live | **SOURCE & ISOLATED VERIFIED; live post-deploy check pending** |
 | Off-LAN trusted-TLS public ingress verification (no `-k`) & authenticated public Events workflow | Public / Off-LAN / Live | **NOT VERIFIED** |
 | Official ChatGPT OAuth end-to-end acceptance | Public / Off-LAN / Live | **NOT VERIFIED** |
