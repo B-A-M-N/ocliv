@@ -115,20 +115,25 @@ func MintChallenge() (string, error) {
 
 // consentPageData is the rendered consent screen.
 type consentPageData struct {
-	Challenge     string
-	ClientID      string
-	ClientName    string
-	Tenant        string
-	RouteID       string
-	RedirectURI   string
-	CodeChallenge string
-	State         string
-	Resource      string
-	ConsentURL    string
+	Challenge       string
+	ClientID        string
+	ClientName      string
+	Tenant          string
+	RouteID         string
+	RedirectURI     string
+	CodeChallenge   string
+	State           string
+	Resource        string
+	ConsentURL      string
+	ConsentStatus   string
+	ConsentComplete string
 }
 
-// renderConsent writes the operator consent screen. The pairing credential
-// is submitted by POST; it is never a query parameter.
+// renderConsent writes the native Ocliv operator authorization screen.
+// Primary workflow: approve this specific transaction via Ocliv's Ed25519-signed
+// management CLI (`ocliv service approve`) with zero pairing-secret copying;
+// the page polls for the operator's decision and completes the OAuth redirect
+// automatically. Manual pairing-secret entry remains available as a fallback.
 func (s *Server) renderConsent(w http.ResponseWriter, d consentPageData) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -141,11 +146,10 @@ var consentPageTemplate = template.Must(template.New("consent").Parse(`<!DOCTYPE
 <meta name="viewport" content="width=device-width, initial-scale=1"></head>
 <body><h1>Authorize {{.ClientName}}</h1>
 <p>Client <code>{{.ClientID}}</code> is requesting access to this MCP route.</p>
-<p>Approve only if you intend to grant it. The pairing credential is the
-operator's approval; it is single-use and expires.</p>
-<details><summary>Self-hosting on your own relay? Approve via CLI:</summary>
-<pre>ocliv authz approve --data /var/lib/ocliv --tenant {{.Tenant}} --route {{.RouteID}} --client {{.ClientID}} --direct</pre>
-</details>
+<p id="tx-status">Waiting for operator approval of transaction <code>{{.Challenge}}</code>…</p>
+<p>Approve this exact request from your enrolled publisher host (no secrets to copy):</p>
+<pre>ocliv service approve &lt;service-name&gt; --challenge {{.Challenge}}</pre>
+<details><summary>Manual pairing credential fallback</summary>
 <form method="post" action="{{.ConsentURL}}">
 <input type="hidden" name="challenge" value="{{.Challenge}}">
 <input type="hidden" name="client_id" value="{{.ClientID}}">
@@ -156,7 +160,27 @@ operator's approval; it is single-use and expires.</p>
 <label for="pairing_secret">Pairing credential</label>
 <input type="password" id="pairing_secret" name="pairing_secret" autocomplete="off" required>
 <button type="submit">Approve</button>
-</form></body></html>`))
+</form>
+</details>
+<form id="complete-form" method="post" action="{{.ConsentComplete}}" style="display:none">
+<input type="hidden" name="challenge" value="{{.Challenge}}">
+</form>
+<script>
+(function() {
+  var statusURL = {{.ConsentStatus}} + "?challenge=" + encodeURIComponent({{.Challenge}});
+  var timer = setInterval(function() {
+    fetch(statusURL, {cache: "no-store"}).then(function(r) { return r.json(); }).then(function(d) {
+      if (d.status === "approved" || d.status === "denied") {
+        clearInterval(timer);
+        document.getElementById("complete-form").submit();
+      } else if (d.status === "expired" || d.status === "consumed") {
+        clearInterval(timer);
+        document.getElementById("tx-status").textContent = "Authorization request " + d.status + ". Retry from your client.";
+      }
+    }).catch(function() {});
+  }, 1500);
+})();
+</script></body></html>`))
 
 // ProtectedResourceMetadata implements RFC 9728 for the route.
 func (s *Server) ProtectedResourceMetadata() map[string]any {
@@ -689,16 +713,18 @@ func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.renderConsent(w, consentPageData{
-		Challenge:     challengeID,
-		ClientID:      clientID,
-		ClientName:    client.Name,
-		Tenant:        s.tenant(),
-		RouteID:       s.RouteID,
-		RedirectURI:   redirectURI,
-		CodeChallenge: challenge,
-		State:         state,
-		Resource:      resource[0],
-		ConsentURL:    s.consentURL(),
+		Challenge:       challengeID,
+		ClientID:        clientID,
+		ClientName:      client.Name,
+		Tenant:          s.tenant(),
+		RouteID:         s.RouteID,
+		RedirectURI:     redirectURI,
+		CodeChallenge:   challenge,
+		State:           state,
+		Resource:        resource[0],
+		ConsentURL:      s.consentURL(),
+		ConsentStatus:   s.IssuerURL + "/consent/status",
+		ConsentComplete: s.IssuerURL + "/consent/complete",
 	})
 }
 
@@ -1061,6 +1087,93 @@ func (s *Server) ServeConsent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.issueCode(w, r, clientID, redirectURI, challenge, "S256", state, cons.Scope)
+}
+
+// ServeConsentStatus reports the current decision status of a transaction-bound
+// consent challenge for this route so the browser consent screen can complete
+// automatically once the operator approves or denies via Ocliv's Ed25519-signed
+// management channel (OCL-005 native default).
+func (s *Server) ServeConsentStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	challenge := strings.TrimSpace(r.URL.Query().Get("challenge"))
+	if challenge == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	cons, err := s.Store.GetConsentStatus(challenge, s.tenant(), s.RouteID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"status": "unknown"})
+		return
+	}
+	status := cons.Decision
+	if cons.ConsumedAt != nil {
+		status = "consumed"
+	} else if cons.Expired() {
+		status = "expired"
+	} else if status == "" {
+		status = "pending"
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": status})
+}
+
+// ServeConsentComplete atomically consumes an operator-decided consent
+// transaction (approved or denied via the Ed25519-signed management channel)
+// and completes the standard OAuth authorization redirect with PKCE + RFC 9207
+// `iss` — zero pairing secrets copied (OCL-005 native default).
+func (s *Server) ServeConsentComplete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var challenge string
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, MaxFormBody)
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		challenge = strings.TrimSpace(r.Form.Get("challenge"))
+	} else {
+		challenge = strings.TrimSpace(r.URL.Query().Get("challenge"))
+	}
+	if challenge == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "missing challenge"})
+		return
+	}
+	if vp, vperr := s.Store.GetVisitorAuthPolicy(s.tenant(), s.RouteID); vperr != nil || vp.IsActiveFederated() {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":             "access_denied",
+			"error_description": "route requires federated visitor authentication",
+		})
+		return
+	}
+	cons, err := s.Store.ConsumeDecidedConsent(challenge, s.tenant(), s.RouteID)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": err.Error()})
+		return
+	}
+	if cons.Decision == "denied" {
+		_ = s.Store.AuditAuthz("operator", s.tenant(), s.RouteID, cons.ClientID, "consent-complete", "denied", "operator denied transaction")
+		redirectAuthorizationError(w, r, cons.RedirectURI, cons.State, "access_denied", "operator denied authorization request", s.IssuerURL)
+		return
+	}
+	client, cerr := s.scopedClient(cons.ClientID)
+	if cerr != nil || client.RevokedAt != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_client", "error_description": "client revoked"})
+		return
+	}
+	grant, gerr := s.Store.GetGrant(cons.ClientID, s.tenant(), s.RouteID)
+	if gerr != nil || validateGrantPolicyLive(s.Store, grant, s.tenant(), s.RouteID) != nil {
+		redirectAuthorizationError(w, r, cons.RedirectURI, cons.State, "access_denied", "client grant is no longer active", s.IssuerURL)
+		return
+	}
+	_ = s.Store.AuditAuthz("operator", s.tenant(), s.RouteID, cons.ClientID, "consent-complete", "ok",
+		"native transaction-bound approval by "+cons.DecidedByKeyID)
+	s.issueCode(w, r, cons.ClientID, cons.RedirectURI, cons.CodeChallenge, "S256", cons.State, cons.Scope)
 }
 
 // DefaultRefreshTTL bounds a refresh token. It is deliberately short of

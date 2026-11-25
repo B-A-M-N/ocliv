@@ -22,10 +22,11 @@ import (
 	"golang.org/x/oauth2"
 )
 
-// Grant authorization provenance methods (OCL-006).
+// Grant authorization provenance methods (OCL-005, OCL-006).
 const (
 	GrantMethodLegacy         = "legacy"
 	GrantMethodPairing        = "pairing"
+	GrantMethodOperatorTx     = "operator_tx"
 	GrantMethodDirectOperator = "direct_operator"
 	GrantMethodTrustPolicy    = "trust_policy"
 	GrantMethodFederatedOIDC  = "federated_oidc"

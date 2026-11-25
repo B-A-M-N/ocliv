@@ -248,6 +248,20 @@ func (s *Server) handleAgentPublications(w http.ResponseWriter, r *http.Request)
 				return
 			}
 		}
+		if idx := strings.Index(rest, "/authz/consents/"); idx > 0 {
+			routeID := rest[:idx]
+			tail := rest[idx+len("/authz/consents/"):]
+			if validRouteID(routeID) {
+				if challenge, ok := strings.CutSuffix(tail, "/approve"); ok && challenge != "" && !strings.Contains(challenge, "/") {
+					s.serveKeyPublicationAuthzConsentDecide(w, tenant, keyID, routeID, challenge, true)
+					return
+				}
+				if challenge, ok := strings.CutSuffix(tail, "/deny"); ok && challenge != "" && !strings.Contains(challenge, "/") {
+					s.serveKeyPublicationAuthzConsentDecide(w, tenant, keyID, routeID, challenge, false)
+					return
+				}
+			}
+		}
 		if idx := strings.Index(rest, "/authz/approve/"); idx > 0 {
 			routeID := rest[:idx]
 			clientID := rest[idx+len("/authz/approve/"):]
@@ -679,10 +693,55 @@ func (s *Server) serveKeyPublicationAuthzPending(w http.ResponseWriter, tenant, 
 			out = append(out, p)
 		}
 	}
+	pendingTx := []authz.Consent{}
+	if s.authz != nil {
+		if list, lerr := s.authz.Store().ListPendingConsents(tenant, routeID); lerr == nil {
+			pendingTx = list
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"route_id":  routeID,
-		"tenant_id": tenant,
-		"pending":   out,
+		"route_id":             routeID,
+		"tenant_id":            tenant,
+		"pending":              out,
+		"pending_transactions": pendingTx,
+	})
+}
+
+func (s *Server) serveKeyPublicationAuthzConsentDecide(w http.ResponseWriter, tenant, keyID, routeID, challenge string, approve bool) {
+	if s.authz == nil {
+		http.Error(w, "managed authz unavailable", http.StatusConflict)
+		return
+	}
+	var exists int
+	if err := s.db.SQL().QueryRow(
+		`SELECT 1 FROM mcp_publications WHERE route_id=? AND tenant_id=? AND owner_key_id=? AND revoked_at IS NULL`,
+		routeID, tenant, keyID,
+	).Scan(&exists); err != nil {
+		http.Error(w, "unknown route", http.StatusNotFound)
+		return
+	}
+	cons, err := s.authz.Store().DecideConsentTransaction(challenge, tenant, routeID, keyID, approve)
+	if err != nil {
+		if errors.Is(err, authz.ErrFederatedPolicyRequired) {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	action := "authz-consent-deny"
+	if approve {
+		action = "authz-consent-approve"
+	}
+	s.db.AuditKey("agent", tenant, keyID, "", action, "ok", "challenge "+challenge+" client "+cons.ClientID+" route "+routeID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"route_id":    routeID,
+		"tenant_id":   tenant,
+		"challenge":   cons.Challenge,
+		"client_id":   cons.ClientID,
+		"client_name": cons.ClientName,
+		"decision":    cons.Decision,
+		"status":      cons.Decision,
 	})
 }
 

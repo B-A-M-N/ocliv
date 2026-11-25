@@ -222,13 +222,15 @@ const mcpOAuthUpstreamPrefix = "/oauth/"
 // mcpOAuthEndpoints is the exact set of upstream OAuth protocol paths a
 // route may serve. Anything else under /oauth/ fails closed.
 var mcpOAuthEndpoints = map[string]bool{
-	"/oauth/authorize": true,
-	"/oauth/callback":  true,
-	"/oauth/consent":   true,
-	"/oauth/token":     true,
-	"/oauth/register":  true,
-	"/oauth/revoke":    true,
-	"/oauth/jwks":      true,
+	"/oauth/authorize":        true,
+	"/oauth/callback":         true,
+	"/oauth/consent":          true,
+	"/oauth/consent/status":   true,
+	"/oauth/consent/complete": true,
+	"/oauth/token":            true,
+	"/oauth/register":         true,
+	"/oauth/revoke":           true,
+	"/oauth/jwks":             true,
 }
 
 // parseMCPRouteMetadataPath matches escaped request paths of the exact

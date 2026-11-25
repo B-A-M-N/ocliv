@@ -103,9 +103,10 @@ func cmdTrustWithOps(argv []string, ops serviceOps) int {
 		fmt.Fprintln(os.Stderr, "usage: ocliv trust NAME PRESET                     (e.g. ocliv trust tools chatgpt)")
 		fmt.Fprintln(os.Stderr, "       ocliv trust NAME --redirect-uri HTTPS_URI   (pin exact HTTPS callback)")
 		fmt.Fprintln(os.Stderr, "       ocliv trust NAME --client CLIENT_ID         (approve a pending client directly)")
-		fmt.Fprintln(os.Stderr, "       ocliv trust NAME --issuer URL --oidc-client-id ID --allow-subject SUB [--oidc-client-secret-file PATH] [--client-policy PRESET]")
+		fmt.Fprintln(os.Stderr, "       ocliv trust NAME --issuer URL --oidc-client-id ID --allow-subject SUB [--oidc-client-secret-file PATH] [--client-policy PRESET]  (optional external OIDC)")
 		fmt.Fprintln(os.Stderr, "       ocliv trust NAME --show-visitor-auth [--json]")
 		fmt.Fprintln(os.Stderr, "       ocliv trust NAME --list [--json]            (list active trust policies)")
+		fmt.Fprintln(os.Stderr, "note:  native Ocliv transaction-bound approval (`ocliv service approve NAME`) is the canonical self-hosted default; external OIDC is optional.")
 		if len(argv) == 0 {
 			return apperr.ExitCLIValidation
 		}

@@ -137,21 +137,28 @@ type Grant struct {
 	RedirectURIs []string
 }
 
-// Consent is a one-time, expiring, transaction-bound pairing challenge.
+// Consent is a one-time, expiring, transaction-bound authorization challenge.
 // It carries the authorization request it was created for, so a stolen
-// challenge cannot be replayed against a different transaction.
+// challenge cannot be replayed against a different transaction. In native
+// Ocliv authentication (canonical default), the operator approves or denies
+// the specific challenge over the Ed25519-signed management channel without
+// copying pairing secrets.
 type Consent struct {
-	Challenge     string
-	ClientID      string
-	Tenant        string
-	Route         string
-	RedirectURI   string
-	CodeChallenge string
-	State         string
-	Resource      string
-	Scope         string
-	ExpiresAt     time.Time
-	ConsumedAt    *time.Time
+	Challenge      string     `json:"challenge"`
+	ClientID       string     `json:"client_id"`
+	ClientName     string     `json:"client_name,omitempty"`
+	Tenant         string     `json:"tenant_id,omitempty"`
+	Route          string     `json:"route_id,omitempty"`
+	RedirectURI    string     `json:"redirect_uri"`
+	CodeChallenge  string     `json:"-"`
+	State          string     `json:"-"`
+	Resource       string     `json:"resource,omitempty"`
+	Scope          string     `json:"scope,omitempty"`
+	Decision       string     `json:"decision"` // "pending" | "approved" | "denied"
+	DecidedAt      *time.Time `json:"decided_at,omitempty"`
+	DecidedByKeyID string     `json:"decided_by_key_id,omitempty"`
+	ExpiresAt      time.Time  `json:"expires_at"`
+	ConsumedAt     *time.Time `json:"consumed_at,omitempty"`
 }
 
 // Expired reports whether the challenge has passed its expiry.
@@ -268,6 +275,21 @@ type Store interface {
 	CreateConsent(c Consent) error
 	// ConsumeConsent atomically marks a challenge consumed and returns it.
 	ConsumeConsent(challenge string) (*Consent, error)
+	// ListPendingConsents returns unconsumed, unexpired, pending consent
+	// transactions for (tenant, route), newest first.
+	ListPendingConsents(tenant, route string) ([]Consent, error)
+	// GetConsentStatus returns the current state of a consent challenge
+	// scoped to (tenant, route) without consuming it.
+	GetConsentStatus(challenge, tenant, route string) (*Consent, error)
+	// DecideConsentTransaction atomically approves or denies one pending
+	// consent transaction on behalf of the authenticated publisher operator
+	// (Ed25519 keyID). Approval activates the durable grant (operator_tx) in
+	// the same transaction without issuing or copying pairing secrets.
+	DecideConsentTransaction(challenge, tenant, route, operatorKeyID string, approve bool) (*Consent, error)
+	// ConsumeDecidedConsent atomically consumes an approved or denied consent
+	// transaction scoped to (tenant, route) so it can complete the OAuth
+	// browser redirect at most once.
+	ConsumeDecidedConsent(challenge, expectedTenant, expectedRoute string) (*Consent, error)
 
 	// CountClients reports clients registered for a route.
 	CountClients(tenant, route string) (int, error)
@@ -876,6 +898,127 @@ func (m *MemStore) CountPendingConsents(tenant, route string) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// ListPendingConsents returns unconsumed, unexpired, pending consent
+// transactions for (tenant, route), newest first.
+func (m *MemStore) ListPendingConsents(tenant, route string) ([]Consent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]Consent, 0)
+	for _, c := range m.consent {
+		dec := c.Decision
+		if dec == "" {
+			dec = "pending"
+		}
+		if c.Tenant == tenant && c.Route == route && c.ConsumedAt == nil && !c.Expired() && dec == "pending" {
+			cp := *c
+			cp.Decision = dec
+			if cl, ok := m.clients[c.ClientID]; ok && cl != nil {
+				cp.ClientName = cl.Name
+			}
+			out = append(out, cp)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].ExpiresAt.After(out[j].ExpiresAt)
+	})
+	return out, nil
+}
+
+// GetConsentStatus returns the current state of a consent challenge scoped to
+// (tenant, route) without consuming it.
+func (m *MemStore) GetConsentStatus(challenge, tenant, route string) (*Consent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.consent[challenge]
+	if !ok || c.Tenant != tenant || c.Route != route {
+		return nil, fmt.Errorf("authz: unknown consent challenge")
+	}
+	cp := *c
+	if cp.Decision == "" {
+		cp.Decision = "pending"
+	}
+	return &cp, nil
+}
+
+// DecideConsentTransaction atomically approves or denies one pending consent
+// transaction on behalf of the authenticated publisher operator (Ed25519 keyID).
+func (m *MemStore) DecideConsentTransaction(challenge, tenant, route, operatorKeyID string, approve bool) (*Consent, error) {
+	if challenge == "" || tenant == "" || route == "" {
+		return nil, fmt.Errorf("authz: challenge, tenant, and route are required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if vp, ok := m.visitorPolicies[visitorPolicyKey(tenant, route)]; ok && vp.IsActiveFederated() {
+		return nil, fmt.Errorf("%w: native consent decision prohibited on federated route", ErrFederatedPolicyRequired)
+	}
+	c, ok := m.consent[challenge]
+	if !ok || c.Tenant != tenant || c.Route != route {
+		return nil, fmt.Errorf("authz: unknown consent challenge")
+	}
+	if c.ConsumedAt != nil {
+		return nil, fmt.Errorf("authz: consent challenge already consumed")
+	}
+	if c.Expired() {
+		return nil, fmt.Errorf("authz: consent challenge expired")
+	}
+	if c.Decision != "" && c.Decision != "pending" {
+		return nil, fmt.Errorf("authz: consent challenge already %s", c.Decision)
+	}
+	cl, cok := m.clients[c.ClientID]
+	if !cok || cl.RevokedAt != nil || cl.Tenant != tenant || (cl.Route != "" && cl.Route != route) {
+		return nil, fmt.Errorf("authz: client %q is unknown or revoked", c.ClientID)
+	}
+	now := time.Now().UTC()
+	if approve {
+		k := grantKey(c.ClientID, tenant, route)
+		g, gok := m.grants[k]
+		if gok && g.Status == GrantRevoked {
+			return nil, fmt.Errorf("authz: grant for client %q route %q is revoked; revocation is terminal", c.ClientID, route)
+		}
+		if !gok {
+			g = &Grant{ClientID: c.ClientID, Tenant: tenant, Route: route, CreatedAt: now}
+			m.grants[k] = g
+		}
+		g.Status = GrantActive
+		g.SkipPairing = false
+		g.Provenance = GrantProvenance{Method: GrantMethodOperatorTx}
+		g.UpdatedAt = now
+		c.Decision = "approved"
+	} else {
+		c.Decision = "denied"
+	}
+	t := now
+	c.DecidedAt = &t
+	c.DecidedByKeyID = operatorKeyID
+	cp := *c
+	cp.ClientName = cl.Name
+	return &cp, nil
+}
+
+// ConsumeDecidedConsent atomically consumes an approved or denied consent
+// transaction scoped to (tenant, route) so it can complete at most once.
+func (m *MemStore) ConsumeDecidedConsent(challenge, expectedTenant, expectedRoute string) (*Consent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.consent[challenge]
+	if !ok || c.Tenant != expectedTenant || c.Route != expectedRoute {
+		return nil, fmt.Errorf("authz: unknown consent challenge")
+	}
+	if c.ConsumedAt != nil {
+		return nil, fmt.Errorf("authz: consent challenge already consumed")
+	}
+	if c.Expired() {
+		return nil, fmt.Errorf("authz: consent challenge expired")
+	}
+	if c.Decision != "approved" && c.Decision != "denied" {
+		return nil, fmt.Errorf("authz: consent challenge is still pending operator decision")
+	}
+	now := time.Now().UTC()
+	c.ConsumedAt = &now
+	cp := *c
+	return &cp, nil
 }
 
 // PruneAuthzExpired drops consumed/expired codes, consumed/expired

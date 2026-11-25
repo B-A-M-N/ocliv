@@ -384,6 +384,9 @@ ALTER TABLE authz_grants ADD COLUMN trust_policy_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE authz_grants ADD COLUMN owner_issuer TEXT NOT NULL DEFAULT '';
 ALTER TABLE authz_grants ADD COLUMN owner_subject TEXT NOT NULL DEFAULT '';
 UPDATE authz_grants SET skip_pairing = 0 WHERE skip_pairing <> 0 AND auth_method = 'legacy';
+ALTER TABLE authz_consent ADD COLUMN decision TEXT NOT NULL DEFAULT 'pending';
+ALTER TABLE authz_consent ADD COLUMN decided_at TEXT;
+ALTER TABLE authz_consent ADD COLUMN decided_by_key_id TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_authz_grants_trust_policy
   ON authz_grants(tenant_id, route_id, trust_policy_id);
 CREATE TABLE IF NOT EXISTS authz_visitor_policies (

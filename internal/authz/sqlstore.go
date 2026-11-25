@@ -1318,6 +1318,250 @@ func (s *SQLStore) ConsumeConsent(challenge string) (*Consent, error) {
 	return &c, nil
 }
 
+// ListPendingConsents returns unconsumed, unexpired, pending consent
+// transactions for (tenant, route), newest first.
+func (s *SQLStore) ListPendingConsents(tenant, route string) ([]Consent, error) {
+	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+	rows, err := s.db.Query(
+		`SELECT co.challenge, co.client_id, COALESCE(cl.name, ''), co.tenant_id, co.route_id,
+		        co.redirect_uri, co.code_challenge, co.state, co.resource, co.scope,
+		        co.decision, co.expires_at
+		 FROM authz_consent co
+		 LEFT JOIN authz_clients cl ON cl.id = co.client_id
+		 WHERE co.tenant_id=? AND co.route_id=? AND co.consumed_at IS NULL
+		   AND co.decision='pending' AND co.expires_at > ?
+		 ORDER BY co.expires_at DESC`,
+		tenant, route, nowStr,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("authz: list pending consents: %w", err)
+	}
+	defer rows.Close()
+	out := make([]Consent, 0)
+	for rows.Next() {
+		var c Consent
+		var expires string
+		if err := rows.Scan(&c.Challenge, &c.ClientID, &c.ClientName, &c.Tenant, &c.Route,
+			&c.RedirectURI, &c.CodeChallenge, &c.State, &c.Resource, &c.Scope,
+			&c.Decision, &expires); err != nil {
+			return nil, fmt.Errorf("authz: scan pending consent: %w", err)
+		}
+		c.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expires)
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// GetConsentStatus returns the current state of a consent challenge scoped to
+// (tenant, route) without consuming it.
+func (s *SQLStore) GetConsentStatus(challenge, tenant, route string) (*Consent, error) {
+	var (
+		c        Consent
+		expires  string
+		consumed sql.NullString
+		decided  sql.NullString
+	)
+	err := s.db.QueryRow(
+		`SELECT challenge, client_id, tenant_id, route_id, redirect_uri, code_challenge,
+		        state, resource, scope, decision, decided_at, decided_by_key_id, expires_at, consumed_at
+		 FROM authz_consent WHERE challenge=? AND tenant_id=? AND route_id=?`,
+		challenge, tenant, route,
+	).Scan(&c.Challenge, &c.ClientID, &c.Tenant, &c.Route, &c.RedirectURI, &c.CodeChallenge,
+		&c.State, &c.Resource, &c.Scope, &c.Decision, &decided, &c.DecidedByKeyID, &expires, &consumed)
+	if err != nil {
+		return nil, fmt.Errorf("authz: unknown consent challenge")
+	}
+	c.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expires)
+	if consumed.Valid {
+		t, _ := time.Parse(time.RFC3339Nano, consumed.String)
+		c.ConsumedAt = &t
+	}
+	if decided.Valid {
+		t, _ := time.Parse(time.RFC3339Nano, decided.String)
+		c.DecidedAt = &t
+	}
+	if c.Decision == "" {
+		c.Decision = "pending"
+	}
+	return &c, nil
+}
+
+// DecideConsentTransaction atomically approves or denies one pending consent
+// transaction on behalf of the authenticated publisher operator (Ed25519 keyID).
+// Approval activates the durable grant (auth_method='operator_tx', skip_pairing=0)
+// in the same SQLite transaction without issuing or copying pairing secrets.
+func (s *SQLStore) DecideConsentTransaction(challenge, tenant, route, operatorKeyID string, approve bool) (*Consent, error) {
+	if challenge == "" || tenant == "" || route == "" {
+		return nil, fmt.Errorf("authz: challenge, tenant, and route are required")
+	}
+	now := time.Now().UTC()
+	nowStr := now.Format(time.RFC3339Nano)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("authz: decide consent tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var fedCount int
+	if err := tx.QueryRow(
+		`SELECT COUNT(1) FROM authz_visitor_policies
+		 WHERE tenant_id=? AND route_id=? AND mode='federated' AND enabled=1 AND revoked_at IS NULL`,
+		tenant, route,
+	).Scan(&fedCount); err != nil {
+		return nil, fmt.Errorf("authz: check visitor auth policy: %w", err)
+	}
+	if fedCount > 0 {
+		return nil, fmt.Errorf("%w: native consent decision prohibited on federated route", ErrFederatedPolicyRequired)
+	}
+
+	var (
+		c        Consent
+		expires  string
+		consumed sql.NullString
+	)
+	err = tx.QueryRow(
+		`SELECT challenge, client_id, tenant_id, route_id, redirect_uri, code_challenge,
+		        state, resource, scope, decision, expires_at, consumed_at
+		 FROM authz_consent WHERE challenge=? AND tenant_id=? AND route_id=?`,
+		challenge, tenant, route,
+	).Scan(&c.Challenge, &c.ClientID, &c.Tenant, &c.Route, &c.RedirectURI, &c.CodeChallenge,
+		&c.State, &c.Resource, &c.Scope, &c.Decision, &expires, &consumed)
+	if err != nil {
+		return nil, fmt.Errorf("authz: unknown consent challenge")
+	}
+	if consumed.Valid {
+		return nil, fmt.Errorf("authz: consent challenge already consumed")
+	}
+	c.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expires)
+	if c.ExpiresAt.IsZero() || now.After(c.ExpiresAt) {
+		return nil, fmt.Errorf("authz: consent challenge expired")
+	}
+	if c.Decision != "" && c.Decision != "pending" {
+		return nil, fmt.Errorf("authz: consent challenge already %s", c.Decision)
+	}
+
+	var (
+		cName    string
+		cTenant  string
+		cRoute   string
+		cRevoked sql.NullString
+	)
+	if err := tx.QueryRow(
+		`SELECT name, tenant_id, route_id, revoked_at FROM authz_clients WHERE id=?`,
+		c.ClientID,
+	).Scan(&cName, &cTenant, &cRoute, &cRevoked); err != nil || cRevoked.Valid || cTenant != tenant || (cRoute != "" && cRoute != route) {
+		return nil, fmt.Errorf("authz: client %q is unknown or revoked", c.ClientID)
+	}
+
+	decision := "denied"
+	if approve {
+		decision = "approved"
+		var status string
+		gerr := tx.QueryRow(
+			`SELECT status FROM authz_grants WHERE client_id=? AND tenant_id=? AND route_id=?`,
+			c.ClientID, tenant, route,
+		).Scan(&status)
+		if gerr != nil && gerr != sql.ErrNoRows {
+			return nil, fmt.Errorf("authz: check grant status: %w", gerr)
+		}
+		if gerr == nil && status == string(GrantRevoked) {
+			return nil, fmt.Errorf("authz: grant for client %q route %q is revoked; revocation is terminal", c.ClientID, route)
+		}
+		res, err := tx.Exec(
+			`INSERT INTO authz_grants(client_id, tenant_id, route_id, status, created_at, updated_at, skip_pairing, auth_method)
+			 VALUES(?,?,?,?,?,?,0,?)
+			 ON CONFLICT(client_id, tenant_id, route_id)
+			 DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at,
+			   skip_pairing=0, auth_method=excluded.auth_method
+			 WHERE authz_grants.status <> 'revoked'`,
+			c.ClientID, tenant, route, string(GrantActive), nowStr, nowStr, GrantMethodOperatorTx,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("authz: activate operator_tx grant: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return nil, fmt.Errorf("authz: grant for client %q route %q is revoked; revocation is terminal", c.ClientID, route)
+		}
+	}
+
+	res, err := tx.Exec(
+		`UPDATE authz_consent SET decision=?, decided_at=?, decided_by_key_id=?
+		 WHERE challenge=? AND tenant_id=? AND route_id=? AND consumed_at IS NULL AND decision='pending'`,
+		decision, nowStr, operatorKeyID, challenge, tenant, route,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("authz: record consent decision: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return nil, fmt.Errorf("authz: consent challenge already decided or consumed")
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("authz: commit consent decision: %w", err)
+	}
+	c.ClientName = cName
+	c.Decision = decision
+	c.DecidedAt = &now
+	c.DecidedByKeyID = operatorKeyID
+	return &c, nil
+}
+
+// ConsumeDecidedConsent atomically consumes an approved or denied consent
+// transaction scoped to (tenant, route) so it can complete at most once.
+func (s *SQLStore) ConsumeDecidedConsent(challenge, expectedTenant, expectedRoute string) (*Consent, error) {
+	now := time.Now().UTC()
+	nowStr := now.Format(time.RFC3339Nano)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("authz: consume decided consent tx: %w", err)
+	}
+	defer tx.Rollback()
+	var (
+		c        Consent
+		expires  string
+		consumed sql.NullString
+		decided  sql.NullString
+	)
+	err = tx.QueryRow(
+		`SELECT challenge, client_id, tenant_id, route_id, redirect_uri, code_challenge,
+		        state, resource, scope, decision, decided_at, decided_by_key_id, expires_at, consumed_at
+		 FROM authz_consent WHERE challenge=? AND tenant_id=? AND route_id=?`,
+		challenge, expectedTenant, expectedRoute,
+	).Scan(&c.Challenge, &c.ClientID, &c.Tenant, &c.Route, &c.RedirectURI, &c.CodeChallenge,
+		&c.State, &c.Resource, &c.Scope, &c.Decision, &decided, &c.DecidedByKeyID, &expires, &consumed)
+	if err != nil {
+		return nil, fmt.Errorf("authz: unknown consent challenge")
+	}
+	if consumed.Valid {
+		return nil, fmt.Errorf("authz: consent challenge already consumed")
+	}
+	c.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expires)
+	if c.ExpiresAt.IsZero() || now.After(c.ExpiresAt) {
+		return nil, fmt.Errorf("authz: consent challenge expired")
+	}
+	if c.Decision != "approved" && c.Decision != "denied" {
+		return nil, fmt.Errorf("authz: consent challenge is still pending operator decision")
+	}
+	res, err := tx.Exec(
+		`UPDATE authz_consent SET consumed_at=? WHERE challenge=? AND consumed_at IS NULL`,
+		nowStr, challenge,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("authz: consume decided consent: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return nil, fmt.Errorf("authz: consent challenge already consumed")
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("authz: commit consume decided consent: %w", err)
+	}
+	c.ConsumedAt = &now
+	if decided.Valid {
+		t, _ := time.Parse(time.RFC3339Nano, decided.String)
+		c.DecidedAt = &t
+	}
+	return &c, nil
+}
+
 // AuditAuthz records an authorization-plane decision.
 func (s *SQLStore) AuditAuthz(actor, tenant, route, clientID, action, result, detail string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)

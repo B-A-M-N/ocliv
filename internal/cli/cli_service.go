@@ -2112,29 +2112,42 @@ func cmdServicePending(argv []string, ops serviceOps) int {
 			RedirectURIs string `json:"redirect_uris"`
 			Status       string `json:"status"`
 		} `json:"pending"`
+		PendingTransactions []struct {
+			Challenge   string `json:"challenge"`
+			ClientID    string `json:"client_id"`
+			ClientName  string `json:"client_name"`
+			RedirectURI string `json:"redirect_uri"`
+			ExpiresAt   string `json:"expires_at"`
+		} `json:"pending_transactions"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
 		fmt.Fprintln(os.Stderr, "invalid relay response")
 		return apperr.ExitInternal
 	}
-	if len(out.Pending) == 0 {
-		fmt.Println("no pending client approvals")
+	if len(out.PendingTransactions) == 0 && len(out.Pending) == 0 {
+		fmt.Println("no pending authorization requests")
 		return apperr.ExitOK
 	}
+	for _, tx := range out.PendingTransactions {
+		fmt.Printf("tx %s  client=%s name=%q redirect=%s expires=%s\n", tx.Challenge, tx.ClientID, tx.ClientName, tx.RedirectURI, tx.ExpiresAt)
+	}
 	for _, p := range out.Pending {
-		fmt.Printf("%s  name=%q status=%s redirects=%s\n", p.ClientID, p.Name, p.Status, p.RedirectURIs)
+		fmt.Printf("client %s  name=%q status=%s redirects=%s\n", p.ClientID, p.Name, p.Status, p.RedirectURIs)
+	}
+	if len(out.PendingTransactions) > 0 {
+		fmt.Printf("Approve without pairing secrets: ocliv service approve %s\n", name)
 	}
 	return apperr.ExitOK
 }
 
 func cmdServiceApprove(argv []string, ops serviceOps) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ocliv service approve NAME [--client CLIENT_ID] [--direct]")
+		fmt.Fprintln(os.Stderr, "usage: ocliv service approve NAME [--challenge ID] [--deny] [--client CLIENT_ID] [--direct]")
 		return apperr.ExitCLIValidation
 	}
 	name := argv[0]
-	var clientID string
-	var direct bool
+	var clientID, challengeID string
+	var direct, deny bool
 	for i := 1; i < len(argv); i++ {
 		if argv[i] == "--client" || strings.HasPrefix(argv[i], "--client=") {
 			v, ok := mcpFlagValue(argv, &i, "client")
@@ -2142,6 +2155,14 @@ func cmdServiceApprove(argv []string, ops serviceOps) int {
 				return apperr.ExitCLIValidation
 			}
 			clientID = v
+		} else if argv[i] == "--challenge" || strings.HasPrefix(argv[i], "--challenge=") {
+			v, ok := mcpFlagValue(argv, &i, "challenge")
+			if !ok {
+				return apperr.ExitCLIValidation
+			}
+			challengeID = v
+		} else if argv[i] == "--deny" {
+			deny = true
 		} else if argv[i] == "--direct" {
 			direct = true
 		} else {
@@ -2177,10 +2198,12 @@ func cmdServiceApprove(argv []string, ops serviceOps) int {
 		}
 		pubID = foundID
 	}
-	if clientID == "" {
+	// Canonical native Ocliv default: transaction-bound operator approval over
+	// the Ed25519-signed management channel (no pairing secrets copied).
+	if challengeID == "" && clientID == "" && !direct {
 		st, body, callErr := ops.mgmtCall(relayURL, k, keyID, http.MethodGet, "/v1/agent/mcp-routes/"+pubID+"/authz/pending")
 		if callErr != nil || st != http.StatusOK {
-			fmt.Fprintf(os.Stderr, "service approve: could not list pending clients (specify --client)\n")
+			fmt.Fprintf(os.Stderr, "service approve: could not list pending authorizations (specify --challenge or --client)\n")
 			return apperr.ExitRelayTLS
 		}
 		var out struct {
@@ -2188,12 +2211,65 @@ func cmdServiceApprove(argv []string, ops serviceOps) int {
 				ClientID string `json:"client_id"`
 				Name     string `json:"name"`
 			} `json:"pending"`
+			PendingTransactions []struct {
+				Challenge  string `json:"challenge"`
+				ClientID   string `json:"client_id"`
+				ClientName string `json:"client_name"`
+			} `json:"pending_transactions"`
 		}
-		if json.Unmarshal(body, &out) != nil || len(out.Pending) != 1 {
-			fmt.Fprintf(os.Stderr, "service approve: %d pending clients; specify --client <id>\n", len(out.Pending))
+		if json.Unmarshal(body, &out) != nil {
+			fmt.Fprintln(os.Stderr, "service approve: invalid relay response")
+			return apperr.ExitInternal
+		}
+		if len(out.PendingTransactions) == 1 {
+			challengeID = out.PendingTransactions[0].Challenge
+		} else if len(out.PendingTransactions) > 1 {
+			fmt.Fprintf(os.Stderr, "service approve: %d pending authorization transactions; specify --challenge <id>\n", len(out.PendingTransactions))
+			for _, tx := range out.PendingTransactions {
+				fmt.Fprintf(os.Stderr, "  %s  client=%s name=%q\n", tx.Challenge, tx.ClientID, tx.ClientName)
+			}
+			return apperr.ExitCLIValidation
+		} else if len(out.Pending) == 1 && !deny {
+			clientID = out.Pending[0].ClientID
+		} else {
+			fmt.Fprintf(os.Stderr, "service approve: %d pending transactions and %d pending clients; specify --challenge <id> or --client <id>\n", len(out.PendingTransactions), len(out.Pending))
 			return apperr.ExitCLIValidation
 		}
-		clientID = out.Pending[0].ClientID
+	}
+	if challengeID != "" {
+		action := "approve"
+		if deny {
+			action = "deny"
+		}
+		path := "/v1/agent/mcp-routes/" + pubID + "/authz/consents/" + challengeID + "/" + action
+		st, body, callErr := ops.mgmtCall(relayURL, k, keyID, http.MethodPost, path)
+		if callErr != nil {
+			fmt.Fprintf(os.Stderr, "service approve: %v\n", callErr)
+			return apperr.ExitRelayTLS
+		}
+		if st != http.StatusOK {
+			fmt.Fprintf(os.Stderr, "service approve: relay returned %d: %s\n", st, strings.TrimSpace(string(body)))
+			return apperr.ExitAuth
+		}
+		var res struct {
+			Challenge string `json:"challenge"`
+			ClientID  string `json:"client_id"`
+			Decision  string `json:"decision"`
+		}
+		if err := json.Unmarshal(body, &res); err != nil {
+			fmt.Fprintln(os.Stderr, "invalid relay consent decision response")
+			return apperr.ExitInternal
+		}
+		if deny {
+			fmt.Printf("✓ denied authorization transaction %s for %s (client=%s)\n", res.Challenge, name, res.ClientID)
+		} else {
+			fmt.Printf("✓ approved authorization transaction %s for %s (client=%s; browser will complete automatically)\n", res.Challenge, name, res.ClientID)
+		}
+		return apperr.ExitOK
+	}
+	if deny {
+		fmt.Fprintln(os.Stderr, "service approve: --deny requires a pending transaction (--challenge)")
+		return apperr.ExitCLIValidation
 	}
 	path := "/v1/agent/mcp-routes/" + pubID + "/authz/approve/" + clientID
 	if direct {

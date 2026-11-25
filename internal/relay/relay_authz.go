@@ -119,7 +119,7 @@ func isManagedAuthzPath(escapedPath string) bool {
 // managedAuthzKind names the public endpoint a request targeted, for rate
 // limiting. Discovery and jwks are not limited: they carry no write path.
 func managedAuthzKind(escapedPath string) (string, bool) {
-	for _, ep := range []string{"/oauth/register", "/oauth/authorize", "/oauth/callback", "/oauth/consent", "/oauth/token", "/oauth/revoke"} {
+	for _, ep := range []string{"/oauth/register", "/oauth/authorize", "/oauth/callback", "/oauth/consent/complete", "/oauth/consent/status", "/oauth/consent", "/oauth/token", "/oauth/revoke"} {
 		if strings.HasSuffix(escapedPath, ep) {
 			return strings.TrimPrefix(ep, "/oauth/"), true
 		}
@@ -220,6 +220,10 @@ func (s *Server) serveManagedAuthz(w http.ResponseWriter, r *http.Request, t *ro
 		srv.ServeAuthorize(w, r)
 	case strings.HasSuffix(r.URL.EscapedPath(), "/oauth/callback"):
 		srv.ServeOIDCCallback(w, r)
+	case strings.HasSuffix(r.URL.EscapedPath(), "/oauth/consent/status"):
+		srv.ServeConsentStatus(w, r)
+	case strings.HasSuffix(r.URL.EscapedPath(), "/oauth/consent/complete"):
+		srv.ServeConsentComplete(w, r)
 	case strings.HasSuffix(r.URL.EscapedPath(), "/oauth/consent"):
 		srv.ServeConsent(w, r)
 	case strings.HasSuffix(r.URL.EscapedPath(), "/oauth/token"):
