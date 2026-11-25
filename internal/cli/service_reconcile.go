@@ -24,45 +24,20 @@ type relayInventoryItem struct {
 	SessionLive     bool    `json:"session_live"`
 }
 
-// resolveRelayPublication queries the authenticated relay inventory for
-// an exact (pub_name, profile) match. Ambiguous matches fail closed.
+// resolveRelayPublication queries the authenticated relay inventory using the
+// single canonical OCL-011 publication resolver.
 func resolveRelayPublication(relayURL string, k *identity.KeyPair, keyID string, rec config.ServiceRecord, ops serviceOps) (pubID, pubURL string, found bool, err error) {
-	st, body, callErr := ops.mgmtCall(relayURL, k, keyID, http.MethodGet, "/v1/agent/mcp-routes")
-	if callErr != nil {
-		return "", "", false, fmt.Errorf("relay inventory unreachable: %w", callErr)
+	res, _, fetchErr := resolveServicePublication(relayURL, k, keyID, rec.Name, &rec, ops)
+	if fetchErr != nil {
+		return "", "", false, fetchErr
 	}
-	if st != http.StatusOK {
-		return "", "", false, fmt.Errorf("relay inventory returned HTTP %d: %s", st, strings.TrimSpace(string(body)))
+	if res.Found() {
+		return res.Publication.RouteID, res.Publication.urlString(), true, nil
 	}
-	var inv struct {
-		Publications []relayInventoryItem `json:"publications"`
+	if res.IsPermanentConflict() {
+		return "", "", false, fmt.Errorf("%s", res.ErrorString())
 	}
-	if jerr := json.Unmarshal(body, &inv); jerr != nil {
-		return "", "", false, fmt.Errorf("invalid relay inventory JSON: %w", jerr)
-	}
-	wantProfile := mcpIngressProfile(rec.Auth)
-	var matches []relayInventoryItem
-	for _, p := range inv.Publications {
-		if rec.PublicationID != "" && p.RouteID == rec.PublicationID {
-			matches = append(matches, p)
-			continue
-		}
-		if p.Name == rec.Name && (wantProfile == "" || p.Profile == wantProfile) {
-			matches = append(matches, p)
-		}
-	}
-	if len(matches) == 0 {
-		return "", "", false, nil
-	}
-	if len(matches) > 1 {
-		return "", "", false, fmt.Errorf("ambiguous relay publications (%d matches for %q/%q); specify exact publication ID", len(matches), rec.Name, wantProfile)
-	}
-	m := matches[0]
-	u := ""
-	if m.URL != nil {
-		u = *m.URL
-	}
-	return m.RouteID, u, true, nil
+	return "", "", false, nil
 }
 
 type relayHTTPLeaseItem struct {
@@ -661,6 +636,16 @@ func classifyFailureLayer(rep ServiceStatusReport) (layer, classification, code 
 		strings.Contains(strings.ToLower(rep.LastFailure), "unauthorized") {
 		return "authorization", "terminal", "TERMINAL_REVOKED_OR_AUTH"
 	}
+	if rep.Layers.Publication == "host_mismatch" || rep.RelayState == "HOST_MISMATCH" ||
+		strings.Contains(rep.IngressDetail, "HOST_MISMATCH") {
+		return "publication", "terminal", "TERMINAL_HOST_MISMATCH"
+	}
+	if rep.Layers.Publication == "ambiguous" || rep.RelayState == "ambiguous" {
+		return "publication", "terminal", "TERMINAL_AMBIGUOUS_PUBLICATION"
+	}
+	if rep.Layers.Publication == "incompatible" || rep.RelayState == "PROFILE_MISMATCH" {
+		return "publication", "terminal", "TERMINAL_BINDING_INCOMPATIBLE"
+	}
 	if !rep.BackendAvailable {
 		return "backend", "retryable", "BACKEND_UNAVAILABLE"
 	}
@@ -680,6 +665,87 @@ func classifyFailureLayer(rep ServiceStatusReport) (layer, classification, code 
 		return "lease", "retryable", "LEASE_OFFLINE"
 	}
 	return "publication", "retryable", "TRANSIENT_NOT_SERVING"
+}
+
+// repairServicePublicationBinding atomically repairs a missing or stale local
+// PublicationID/PublicURL binding when the canonical resolver identifies a
+// uniquely compatible publication, and consolidates any redundant route-ID-named
+// stub record's ProviderBindings without interrupting a live tunnel.
+func repairServicePublicationBinding(store *config.ServiceStore, rec config.ServiceRecord, relayURL string, k *identity.KeyPair, keyID string, ops serviceOps) (config.ServiceRecord, bool, error) {
+	if rec.Type != "mcp" || ops.mgmtCall == nil {
+		return rec, false, nil
+	}
+	res, _, err := resolveServicePublication(relayURL, k, keyID, rec.Name, &rec, ops)
+	if err != nil || !res.Found() {
+		return rec, false, nil
+	}
+	pub := res.Publication
+	pubURL := pub.urlString()
+	leaseID := pub.leaseIDString()
+
+	// Check for a redundant route-ID-named stub record (e.g. created by an
+	// earlier `ocliv connect google <route_id>` call) whose ProviderBindings
+	// must be preserved before cleanup.
+	var stubRec *config.ServiceRecord
+	if pub.RouteID != "" && pub.RouteID != rec.Name {
+		if s, ok, gerr := store.Get(pub.RouteID); gerr == nil && ok {
+			stubRec = &s
+		}
+	}
+
+	needsStubMerge := stubRec != nil && len(stubRec.ProviderBindings) > 0
+	needsRepair := res.NeedsBindingRepair(rec.PublicationID, rec.PublicURL) ||
+		(rec.Identity != nil && rec.Identity.PublicationID != pub.RouteID) ||
+		(leaseID != "" && rec.LeaseID == "") ||
+		needsStubMerge
+	if !needsRepair {
+		return rec, false, nil
+	}
+
+	updated, uerr := store.UpdateCAS(rec.Name, rec.Revision, func(r *config.ServiceRecord) error {
+		r.PublicationID = pub.RouteID
+		if r.Identity != nil {
+			r.Identity.PublicationID = pub.RouteID
+		}
+		if pubURL != "" {
+			r.PublicURL = pubURL
+		}
+		if leaseID != "" && r.LeaseID == "" {
+			r.LeaseID = leaseID
+		}
+		if stubRec != nil && len(stubRec.ProviderBindings) > 0 {
+			if r.ProviderBindings == nil {
+				r.ProviderBindings = map[string]config.ProviderBinding{}
+			}
+			for provider, binding := range stubRec.ProviderBindings {
+				if _, exists := r.ProviderBindings[provider]; !exists {
+					r.ProviderBindings[provider] = binding
+				}
+			}
+		}
+		if res.PreviousBindingID != "" && res.PreviousBindingID != pub.RouteID {
+			r.LastRecoveryAction = fmt.Sprintf("repaired stale binding %s -> %s", res.PreviousBindingID, pub.RouteID)
+		} else if rec.PublicationID == "" {
+			r.LastRecoveryAction = fmt.Sprintf("bound publication %s", pub.RouteID)
+		}
+		return nil
+	})
+	if uerr != nil {
+		return rec, false, uerr
+	}
+
+	// Only remove the redundant route-ID stub after the canonical record's
+	// CAS update has durably committed and only if the stub has no independent
+	// supervision or local backend ownership.
+	if stubRec != nil &&
+		stubRec.SystemdUnit == "" &&
+		stubRec.BackendUnit == "" &&
+		stubRec.LocalURL == "" &&
+		len(stubRec.StdioCmd) == 0 &&
+		(stubRec.PublicationID == "" || stubRec.PublicationID == pub.RouteID) {
+		_, _ = store.Delete(stubRec.Name)
+	}
+	return updated, true, nil
 }
 
 // reconcileServiceOnce reconciles a single service's runtime state against its
@@ -736,6 +802,12 @@ func reconcileServiceOnce(store *config.ServiceStore, name string, k *identity.K
 			return nil
 		})
 		return rep, nil
+	}
+
+	if repaired, didRepair, rerr := repairServicePublicationBinding(store, rec, relayURL, k, keyID, ops); rerr != nil {
+		return ServiceStatusReport{}, rerr
+	} else if didRepair {
+		rec = repaired
 	}
 
 	rep := inspectServiceStatus(rec, k, keyID, ops)

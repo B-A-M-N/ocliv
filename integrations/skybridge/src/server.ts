@@ -1,35 +1,57 @@
+import { lstatSync, readFileSync } from 'node:fs';
 import { Skybridge, customProvider } from 'skybridge/server';
 import { z } from 'zod';
 import { authorize, buildPrMetadata, safeError } from './core/ocliv.mjs';
 import { loadNativeConfig, NativeOclivClient } from './core/ocliv-native.mjs';
-import { loadPublisherConfig, PublisherController, PublisherError } from './core/publisher.mjs';
-import { Approvals } from './core/approvals.mjs';
-import { startOperatorApprovalSocket } from './core/operator-approvals.mjs';
+import {
+  loadPermissionsPolicyFile,
+  PermissionsEnforcer,
+  verifyIngressIdentity,
+} from './core/permissions.mjs';
+import { NativeControlPlane } from './core/control-plane.mjs';
 
-const issuer = process.env.OCLIV_OAUTH_ISSUER;
-const audience = process.env.OCLIV_OAUTH_AUDIENCE;
-const serverUrl = process.env.SERVER_URL;
-const publicResourceUrl = process.env.OCLIV_PUBLIC_RESOURCE_URL;
-// Least privilege: the write scope is advertised only when write
-// operations are actually enabled. Discovery otherwise offers read-only.
+const authMode = (
+  process.env.OCLIV_AUTH_MODE ??
+  (process.env.OCLIV_OAUTH_ISSUER ? 'external-oidc' : 'ocliv-managed')
+).trim();
+
+if (authMode !== 'ocliv-managed' && authMode !== 'external-oidc') {
+  throw new Error(`Invalid OCLIV_AUTH_MODE "${authMode}" (want ocliv-managed|external-oidc)`);
+}
+
+const issuer = (process.env.OCLIV_OAUTH_ISSUER ?? '').trim();
+const audience = (process.env.OCLIV_OAUTH_AUDIENCE ?? '').trim();
+const serverUrl = (process.env.SERVER_URL ?? '').trim();
+const publicResourceUrl = (process.env.OCLIV_PUBLIC_RESOURCE_URL ?? '').trim();
 const writeEnabled = (process.env.OCLIV_WRITE_ENABLED ?? 'false').trim() === 'true';
-// Never start a remotely accessible management MCP server without an IdP and explicit token audience.
-if (!issuer || !audience || !serverUrl || !publicResourceUrl || !issuer.startsWith('https://') || !serverUrl.startsWith('https://')) {
-  throw new Error('OCLIV_OAUTH_ISSUER, OCLIV_OAUTH_AUDIENCE, HTTPS SERVER_URL and OCLIV_PUBLIC_RESOURCE_URL required');
-}
-if (audience !== publicResourceUrl) throw new Error('OCLIV_OAUTH_AUDIENCE must equal OCLIV_PUBLIC_RESOURCE_URL');
-const resource = new URL(publicResourceUrl);
-if (resource.protocol !== 'https:' || resource.username || resource.password || resource.search || resource.hash || !/^\/r\/[A-Za-z0-9_-]{3,64}\/mcp$/.test(resource.pathname)) {
-  throw new Error('OCLIV_PUBLIC_RESOURCE_URL must be the exact HTTPS Ocliv route URL');
-}
-// Publisher-side identity for Ocliv signed management. The agent key
-// never leaves this host; remote callers authenticate via the Skybridge
-// OAuth provider above and are additionally subject-gated per tool.
-const nativeConfig = loadNativeConfig();
-const readOnly = { readOnlyHint:true, openWorldHint:false, destructiveHint:false };
 
-// Handlers must return { content, structuredContent }: content is the
-// human-readable verdict, structuredContent the typed result.
+if (authMode === 'external-oidc') {
+  if (!issuer || !audience || !serverUrl || !publicResourceUrl || !issuer.startsWith('https://') || !serverUrl.startsWith('https://')) {
+    throw new Error('OCLIV_OAUTH_ISSUER, OCLIV_OAUTH_AUDIENCE, HTTPS SERVER_URL and OCLIV_PUBLIC_RESOURCE_URL required in external-oidc mode');
+  }
+  if (audience !== publicResourceUrl) throw new Error('OCLIV_OAUTH_AUDIENCE must equal OCLIV_PUBLIC_RESOURCE_URL');
+  const resource = new URL(publicResourceUrl);
+  if (resource.protocol !== 'https:' || resource.username || resource.password || resource.search || resource.hash || !/^\/r\/[A-Za-z0-9_-]{3,64}\/mcp$/.test(resource.pathname)) {
+    throw new Error('OCLIV_PUBLIC_RESOURCE_URL must be the exact HTTPS Ocliv route URL');
+  }
+}
+
+function loadIngressSecret(): string {
+  const inline = (process.env.OCLIV_INGRESS_SECRET ?? '').trim();
+  if (inline) return inline;
+  const filePath = (process.env.OCLIV_INGRESS_SECRET_FILE ?? '').trim();
+  if (!filePath) return '';
+  const st = lstatSync(filePath);
+  if (!st.isFile() || st.isSymbolicLink() || (st.mode & 0o077) !== 0) {
+    throw new Error(`OCLIV_INGRESS_SECRET_FILE must be a regular 0600 file: ${filePath}`);
+  }
+  return readFileSync(filePath, 'utf8').trim();
+}
+
+const readOnly = { readOnlyHint: true, openWorldHint: false, destructiveHint: false };
+const mutating = { readOnlyHint: false, openWorldHint: false, destructiveHint: false };
+const destructive = { readOnlyHint: false, openWorldHint: false, destructiveHint: true };
+
 const done = (structuredContent: unknown) => ({
   content: JSON.stringify(structuredContent),
   structuredContent: structuredContent as Record<string, unknown>,
@@ -39,146 +61,348 @@ const failed = (e: unknown) => {
   return { content: `error ${s.code}: ${s.message}`, structuredContent: s, isError: true as const };
 };
 
+const oauthConfig =
+  authMode === 'external-oidc'
+    ? customProvider({
+        issuer,
+        audience,
+        baseUrl: serverUrl,
+        scopes: writeEnabled ? ['ocliv:read', 'ocliv:write'] : ['ocliv:read'],
+        requiredScopes: ['ocliv:read'],
+      })
+    : undefined;
+
 export const app = new Skybridge({
-  name:'ocliv-mcp', title:'Ocliv MCP Hosting', version:'0.2.0',
-  description:'Authenticated management and verification of Ocliv-hosted MCP endpoints via the Ocliv-native signed management protocol.',
-  setup:() => {
+  name: 'ocliv-mcp',
+  title: 'Ocliv MCP Control Plane',
+  version: '0.3.0',
+  description:
+    'Authenticated agent-facing control plane for Ocliv-hosted MCP and HTTP services via canonical native Ocliv operations.',
+  setup: () => {
     const subjects = new Set(
-      (process.env.OCLIV_ALLOWED_SUBJECTS ?? '').split(',').map((s) => s.trim()).filter(Boolean));
-    if (subjects.size === 0) throw new Error('OCLIV_ALLOWED_SUBJECTS required: at least one operator subject');
-    const verifyToken = (process.env.OCLIV_VERIFY_TOKEN ?? '').trim() || null;
-    // Write tools require an owner-only local approval socket. Decisions
-    // never pass through model-visible tool arguments.
-    const client = new NativeOclivClient(nativeConfig);
-    let publisher: PublisherController | null = null;
-    const approvals = new Approvals();
-    let approvalServer = null;
-    if (writeEnabled) {
-      publisher = new PublisherController(loadPublisherConfig(), {
-        inventoryClient: client,
-        relayOrigin: nativeConfig.relay,
-        ownerKeyId: nativeConfig.keyID,
-      });
-      const socketPath = (process.env.OCLIV_APPROVAL_SOCKET ?? '').trim();
-      if (!socketPath) throw new Error('OCLIV_APPROVAL_SOCKET required when OCLIV_WRITE_ENABLED=true');
-      approvalServer = startOperatorApprovalSocket(approvals, socketPath);
+      (process.env.OCLIV_ALLOWED_SUBJECTS ?? '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+    );
+    if (subjects.size === 0) {
+      throw new Error('OCLIV_ALLOWED_SUBJECTS required: at least one authorized agent/operator subject');
     }
-    return { subjects, verifyToken, client, publisher, approvals, approvalServer };
+    const ingressSecret = authMode === 'ocliv-managed' ? loadIngressSecret() : '';
+    if (authMode === 'ocliv-managed' && ingressSecret.length < 16) {
+      throw new Error('OCLIV_INGRESS_SECRET or OCLIV_INGRESS_SECRET_FILE (>=16 chars, 0600) required in ocliv-managed mode');
+    }
+    const permissionsFile = (process.env.OCLIV_PERMISSIONS_FILE ?? '').trim();
+    if (!permissionsFile) {
+      throw new Error('OCLIV_PERMISSIONS_FILE required: operator-controlled 0600 agent permissions policy');
+    }
+    const permissions = new PermissionsEnforcer(loadPermissionsPolicyFile(permissionsFile));
+
+    let nativeClient: NativeOclivClient | null = null;
+    if (process.env.OCLIV_RELAY_URL && process.env.OCLIV_AGENT_KEY_FILE) {
+      nativeClient = new NativeOclivClient(loadNativeConfig());
+    }
+    const bin = (process.env.OCLIV_BIN ?? 'ocliv').trim();
+    const relayUrl = (process.env.OCLIV_RELAY_URL ?? '').trim();
+    const profile = (process.env.OCLIV_PROFILE ?? '').trim();
+    const controlPlane = new NativeControlPlane({
+      bin,
+      profile,
+      relayUrl,
+      permissions,
+      nativeClient,
+    });
+    return { subjects, ingressSecret, controlPlane };
   },
-  oauth: customProvider({issuer, audience, baseUrl:serverUrl, scopes: writeEnabled ? ['ocliv:read','ocliv:write'] : ['ocliv:read'], requiredScopes:['ocliv:read']}),
-  handler:(server, {subjects, verifyToken, client, publisher, approvals}) => server
-    .registerTool({
-      name:'request-approval', title:'Request a write approval',
-      description:'Request operator review for a publish, stop, or unpublish action. The request remains AWAITING_OPERATOR until approved through the owner-only local operator socket. MCP callers cannot approve requests.',
-      inputSchema:{action:z.enum(['publish','stop','unpublish']),target:z.string().min(1).max(64)},
-      annotations:{readOnlyHint:false,openWorldHint:false,destructiveHint:false}, auth:{scopes:['ocliv:write']}
-    }, async ({action,target},extra)=>{
-      try {
-        const subject = authorize(extra.http?.authInfo,subjects,'ocliv:write');
-        const request = approvals.request({subject,action,target});
-        return done({ok:true,...request});
+  ...(oauthConfig ? { oauth: oauthConfig } : {}),
+  handler: (server, { subjects, ingressSecret, controlPlane }) => {
+    const resolveSubject = (extra: any, requiredScope = 'ocliv:read'): string => {
+      if (authMode === 'external-oidc') {
+        return authorize(extra?.http?.authInfo, subjects, requiredScope);
       }
-      catch(e) {return failed(e);}
-    })
-    .registerTool({
-      name:'get-ocliv-status', title:'Get Ocliv status',
-      description:'Read actual Ocliv relay reachability and durable publication states; never guesses tunnel liveness.',
-      annotations:readOnly, auth:{scopes:['ocliv:read']}
-    }, async (_, extra)=>{
-      try { authorize(extra.http?.authInfo,subjects); return done({ok:true,...await client.status()}); }
-      catch(e) {return failed(e);}
-    })
-    .registerTool({
-      name:'list-publications', title:'List Ocliv publications',
-      description:'List real Ocliv-published MCP endpoints owned by this publisher key, with durable publication state, relay-observed lease/session reachability (active does not mean reachable), and a verification view.',
-      annotations:readOnly, auth:{scopes:['ocliv:read']},
-      view:{component:'list-publications',description:'Published Ocliv MCP endpoints'}
-    }, async (_,extra)=>{
-      try { authorize(extra.http?.authInfo,subjects); return done({ok:true,publications:await client.list()}); }
-      catch(e) {return failed(e);}
-    })
-    .registerTool({
-      name:'get-publication', title:'Get one Ocliv publication',
-      description:'Identify a single owned publication by exact route ID.',
-      inputSchema:{publicationId:z.string().min(3).max(64)},
-      annotations:readOnly, auth:{scopes:['ocliv:read']}
-    }, async ({publicationId},extra)=>{
-      try { authorize(extra.http?.authInfo,subjects); return done({ok:true,publication:await client.get(publicationId)}); }
-      catch(e) {return failed(e);}
-    })
-    .registerTool({
-      name:'verify-publication', title:'Verify published MCP endpoint',
-      description:'Verify a published endpoint with the real OAuth discovery + registration handshake and, when a server-side token is provisioned, an authenticated initialize/tools/list. Without a token reports OAUTH_REQUIRED, never verified.',
-      inputSchema:{publicationId:z.string().min(3).max(64)},
-      annotations:{...readOnly,openWorldHint:true}, auth:{scopes:['ocliv:read']}
-    }, async ({publicationId},extra)=>{
-      try { authorize(extra.http?.authInfo,subjects); return done({ok:true,...await client.verifyPublication(publicationId,{verifyToken:verifyToken ?? undefined})}); }
-      catch(e) {return failed(e);}
-    })
-    .registerTool({
-      name:'publish-service', title:'Publish an allowlisted local service',
-      description:'Start (or reattach to) the supervised publisher for an allowlisted local service. Requires a locally operator-approved request ID, ocliv:write, and OCLIV_WRITE_ENABLED=true. Only allowlisted loopback targets.',
-      inputSchema:{serviceName:z.string().min(1).max(48),approvalId:z.string().min(1).max(128)},
-      annotations:{readOnlyHint:false,openWorldHint:false,destructiveHint:false}, auth:{scopes:['ocliv:write']}
-    }, async ({serviceName,approvalId},extra)=>{
-      try {
-        const subject = authorize(extra.http?.authInfo,subjects,'ocliv:write');
-        if (!publisher) return done({ok:false,code:'WRITE_DISABLED',message:'Publishing is disabled (OCLIV_WRITE_ENABLED is not true)'});
-        approvals.redeem({subject,action:'publish',target:serviceName,approvalId});
-        return done({ok:true,...await publisher.publish(serviceName,`PUBLISH ${serviceName}`)});
+      const req = extra?.http?.req ?? extra?.req;
+      const headers = req?.headers ?? extra?.http?.headers;
+      const remoteAddress = req?.socket?.remoteAddress ?? extra?.http?.remoteAddress ?? '';
+      const verified = verifyIngressIdentity({
+        headers,
+        remoteAddress,
+        ingressSecret,
+        allowedSubjects: subjects,
+      });
+      if (requiredScope && !verified.scopes.includes(requiredScope) && !verified.scopes.includes('ocliv:write')) {
+        throw new Error(`Required scope: ${requiredScope}`);
       }
-      catch(e) {return failed(e);}
-    })
-    .registerTool({
-      name:'resume-service', title:'Resume a retained publication',
-      description:'Restart or reattach the publisher for an operator-allowlisted service, preserving its stable route identity. Requires a locally operator-approved request ID, ocliv:write, and OCLIV_WRITE_ENABLED=true.',
-      inputSchema:{serviceName:z.string().min(1).max(48),approvalId:z.string().min(1).max(128)},
-      annotations:{readOnlyHint:false,openWorldHint:false,destructiveHint:false}, auth:{scopes:['ocliv:write']}
-    }, async ({serviceName,approvalId},extra)=>{
+      return verified.subject;
+    };
+
+    const run = async (extra: any, scope: string, fn: (subject: string) => Promise<unknown>) => {
       try {
-        const subject = authorize(extra.http?.authInfo,subjects,'ocliv:write');
-        if (!publisher) return done({ok:false,code:'WRITE_DISABLED',message:'Publisher control is disabled (OCLIV_WRITE_ENABLED is not true)'});
-        approvals.redeem({subject,action:'publish',target:serviceName,approvalId});
-        return done({ok:true,...await publisher.publish(serviceName,`PUBLISH ${serviceName}`)});
+        const subject = resolveSubject(extra, scope);
+        return done(await fn(subject));
+      } catch (e) {
+        return failed(e);
       }
-      catch(e) {return failed(e);}
-    })
-    .registerTool({
-      name:'unpublish-service', title:'Unpublish one publication',
-      description:'Stop the supervised local publisher (if it owns the route) and revoke exactly one publication via the signed native adapter. Requires a locally operator-approved request ID, ocliv:write, and OCLIV_WRITE_ENABLED=true.',
-      inputSchema:{publicationId:z.string().min(3).max(64),approvalId:z.string().min(1).max(128)},
-      annotations:{readOnlyHint:false,openWorldHint:false,destructiveHint:true}, auth:{scopes:['ocliv:write']}
-    }, async ({publicationId,approvalId},extra)=>{
-      try {
-        const subject = authorize(extra.http?.authInfo,subjects,'ocliv:write');
-        if (!publisher) return done({ok:false,code:'WRITE_DISABLED',message:'Unpublishing is disabled (OCLIV_WRITE_ENABLED is not true)'});
-        approvals.redeem({subject,action:'unpublish',target:publicationId,approvalId});
-        const result = await publisher.unpublish(publicationId,publicationId,{revoker:(id)=>client.unpublish(id)});
-        return done({ok:result.revoked==='REVOKED',...result});
-      }
-      catch(e) {return failed(e);}
-    })
-    .registerTool({
-      name:'stop-service', title:'Stop a publisher and retain its route',
-      description:'Gracefully stop the supervised publisher for one allowlisted service. Its stable route identity is retained offline and can be resumed with publish-service. Requires a locally operator-approved request ID, ocliv:write, and OCLIV_WRITE_ENABLED=true.',
-      inputSchema:{serviceName:z.string().min(1).max(48),approvalId:z.string().min(1).max(128)},
-      annotations:{readOnlyHint:false,openWorldHint:false,destructiveHint:false}, auth:{scopes:['ocliv:write']}
-    }, async ({serviceName,approvalId},extra)=>{
-      try {
-        const subject = authorize(extra.http?.authInfo,subjects,'ocliv:write');
-        if (!publisher) return done({ok:false,code:'WRITE_DISABLED',message:'Publisher control is disabled (OCLIV_WRITE_ENABLED is not true)'});
-        approvals.redeem({subject,action:'stop',target:serviceName,approvalId});
-        const res = await publisher.stop(serviceName,`STOP ${serviceName}`);
-        return done({ok:res.stopped === true,...res});
-      }
-      catch(e) {return failed(e);}
-    })
+    };
+
+    return (
+      server
+        // ==================== 1. Discovery & URL Retrieval ====================
+        .registerTool(
+          {
+            name: 'get_status',
+            title: 'Get Ocliv status',
+            description: 'Return relay connectivity, publisher enrollment, binary version, and capabilities.',
+            annotations: readOnly,
+            ...(oauthConfig ? { auth: { scopes: ['ocliv:read'] } } : {}),
+          },
+          async (_, extra) => run(extra, 'ocliv:read', (sub) => controlPlane.getStatus(sub))
+        )
+        .registerTool(
+          {
+            name: 'list_services',
+            title: 'List configured services',
+            description: 'List all configured local services, including disabled and unpublished services.',
+            annotations: readOnly,
+            ...(oauthConfig ? { auth: { scopes: ['ocliv:read'] } } : {}),
+          },
+          async (_, extra) => run(extra, 'ocliv:read', (sub) => controlPlane.listServices(sub))
+        )
+        .registerTool(
+          {
+            name: 'get_service',
+            title: 'Get service status',
+            description: 'Retrieve complete configuration and observed multi-layer state for one service by name.',
+            inputSchema: { service: z.string().min(1).max(64) },
+            annotations: readOnly,
+            ...(oauthConfig ? { auth: { scopes: ['ocliv:read'] } } : {}),
+          },
+          async (args, extra) => run(extra, 'ocliv:read', (sub) => controlPlane.getService(sub, args))
+        )
+        .registerTool(
+          {
+            name: 'get_url',
+            title: 'Get canonical service URL',
+            description: 'Return the persistent canonical HTTPS URL and observed reachability for a service in one call.',
+            inputSchema: { service: z.string().min(1).max(64) },
+            annotations: readOnly,
+            ...(oauthConfig ? { auth: { scopes: ['ocliv:read'] } } : {}),
+          },
+          async (args, extra) => run(extra, 'ocliv:read', (sub) => controlPlane.getUrl(sub, args))
+        )
+
+        // ==================== 2. Deployment & Lifecycle ====================
+        .registerTool(
+          {
+            name: 'deploy_service',
+            title: 'Deploy a local service',
+            description: 'Idempotently create or attach a protected publication for an operator-permitted local service.',
+            inputSchema: {
+              name: z.string().min(1).max(64),
+              port: z.number().int().min(1).max(65535),
+              path: z.string().min(1).max(128).optional(),
+              type: z.enum(['mcp', 'http']).optional(),
+              authentication: z.enum(['ocliv-managed', 'upstream-oauth']).optional(),
+              persistent: z.boolean().optional(),
+            },
+            annotations: mutating,
+            ...(oauthConfig ? { auth: { scopes: ['ocliv:write'] } } : {}),
+          },
+          async (args, extra) => run(extra, 'ocliv:write', (sub) => controlPlane.deployService(sub, args))
+        )
+        .registerTool(
+          {
+            name: 'enable_service',
+            title: 'Enable service',
+            description: 'Activate or resume an existing publication without changing its canonical URL or grants.',
+            inputSchema: { service: z.string().min(1).max(64) },
+            annotations: mutating,
+            ...(oauthConfig ? { auth: { scopes: ['ocliv:write'] } } : {}),
+          },
+          async (args, extra) => run(extra, 'ocliv:write', (sub) => controlPlane.enableService(sub, args))
+        )
+        .registerTool(
+          {
+            name: 'disable_service',
+            title: 'Disable service',
+            description: 'Disable public exposure for a service while preserving its canonical URL and OAuth grants.',
+            inputSchema: { service: z.string().min(1).max(64) },
+            annotations: mutating,
+            ...(oauthConfig ? { auth: { scopes: ['ocliv:write'] } } : {}),
+          },
+          async (args, extra) => run(extra, 'ocliv:write', (sub) => controlPlane.disableService(sub, args))
+        )
+        .registerTool(
+          {
+            name: 'restart_service',
+            title: 'Restart service',
+            description: 'Recover or rebind the publisher tunnel without destroying service identity or URL.',
+            inputSchema: { service: z.string().min(1).max(64) },
+            annotations: mutating,
+            ...(oauthConfig ? { auth: { scopes: ['ocliv:write'] } } : {}),
+          },
+          async (args, extra) => run(extra, 'ocliv:write', (sub) => controlPlane.restartService(sub, args))
+        )
+        .registerTool(
+          {
+            name: 'reconcile_service',
+            title: 'Reconcile service',
+            description: 'Atomically repair stale publication bindings and resolve configuration drift.',
+            inputSchema: { service: z.string().min(1).max(64) },
+            annotations: mutating,
+            ...(oauthConfig ? { auth: { scopes: ['ocliv:write'] } } : {}),
+          },
+          async (args, extra) => run(extra, 'ocliv:write', (sub) => controlPlane.reconcileService(sub, args))
+        )
+        .registerTool(
+          {
+            name: 'remove_service',
+            title: 'Remove service',
+            description: 'Permanently retire a hosted service and its publication.',
+            inputSchema: { service: z.string().min(1).max(64) },
+            annotations: destructive,
+            ...(oauthConfig ? { auth: { scopes: ['ocliv:write'] } } : {}),
+          },
+          async (args, extra) => run(extra, 'ocliv:write', (sub) => controlPlane.removeService(sub, args))
+        )
+
+        // ==================== 3. Authentication & Access ====================
+        .registerTool(
+          {
+            name: 'get_auth_status',
+            title: 'Get authentication status',
+            description: 'Inspect authentication mode, authorization enforcement, trust policies, and pending requests.',
+            inputSchema: { service: z.string().min(1).max(64) },
+            annotations: readOnly,
+            ...(oauthConfig ? { auth: { scopes: ['ocliv:read'] } } : {}),
+          },
+          async (args, extra) => run(extra, 'ocliv:read', (sub) => controlPlane.getAuthStatus(sub, args))
+        )
+        .registerTool(
+          {
+            name: 'list_pending_authorizations',
+            title: 'List pending authorizations',
+            description: 'Retrieve pending native OAuth authorization transactions for a service.',
+            inputSchema: { service: z.string().min(1).max(64) },
+            annotations: readOnly,
+            ...(oauthConfig ? { auth: { scopes: ['ocliv:read'] } } : {}),
+          },
+          async (args, extra) => run(extra, 'ocliv:read', (sub) => controlPlane.listPendingAuthorizations(sub, args))
+        )
+        .registerTool(
+          {
+            name: 'decide_authorization',
+            title: 'Approve or deny authorization transaction',
+            description: 'Approve or deny one exact pending OAuth transaction by challenge ID (requires independent authorize_visitor permission).',
+            inputSchema: {
+              service: z.string().min(1).max(64),
+              challenge: z.string().min(3).max(128),
+              decision: z.enum(['approve', 'deny']),
+            },
+            annotations: mutating,
+            ...(oauthConfig ? { auth: { scopes: ['ocliv:write'] } } : {}),
+          },
+          async (args, extra) => run(extra, 'ocliv:write', (sub) => controlPlane.decideAuthorization(sub, args))
+        )
+        .registerTool(
+          {
+            name: 'list_authorized_clients',
+            title: 'List authorized clients',
+            description: 'Inspect route-scoped trust policies and provider client bindings for a service.',
+            inputSchema: { service: z.string().min(1).max(64) },
+            annotations: readOnly,
+            ...(oauthConfig ? { auth: { scopes: ['ocliv:read'] } } : {}),
+          },
+          async (args, extra) => run(extra, 'ocliv:read', (sub) => controlPlane.listAuthorizedClients(sub, args))
+        )
+        .registerTool(
+          {
+            name: 'revoke_client',
+            title: 'Revoke client access',
+            description: 'Immediately revoke OAuth access for one specific client ID on a service.',
+            inputSchema: {
+              service: z.string().min(1).max(64),
+              clientId: z.string().min(3).max(128),
+            },
+            annotations: destructive,
+            ...(oauthConfig ? { auth: { scopes: ['ocliv:write'] } } : {}),
+          },
+          async (args, extra) => run(extra, 'ocliv:write', (sub) => controlPlane.revokeClient(sub, args))
+        )
+        .registerTool(
+          {
+            name: 'get_auth_policy',
+            title: 'Get authorization policy',
+            description: 'Inspect the service route trust policies and visitor authentication mode.',
+            inputSchema: { service: z.string().min(1).max(64) },
+            annotations: readOnly,
+            ...(oauthConfig ? { auth: { scopes: ['ocliv:read'] } } : {}),
+          },
+          async (args, extra) => run(extra, 'ocliv:read', (sub) => controlPlane.getAuthPolicy(sub, args))
+        )
+        .registerTool(
+          {
+            name: 'set_auth_policy',
+            title: 'Set authorization policy',
+            description: 'Add a route-scoped OAuth trust preset (e.g. chatgpt) or exact HTTPS redirect URI.',
+            inputSchema: {
+              service: z.string().min(1).max(64),
+              preset: z.enum(['chatgpt']).optional(),
+              redirectUri: z.string().url().optional(),
+            },
+            annotations: mutating,
+            ...(oauthConfig ? { auth: { scopes: ['ocliv:write'] } } : {}),
+          },
+          async (args, extra) => run(extra, 'ocliv:write', (sub) => controlPlane.setAuthPolicy(sub, args))
+        )
+
+        // ==================== 4. Diagnostics & Verification ====================
+        .registerTool(
+          {
+            name: 'verify_service',
+            title: 'Verify service endpoint',
+            description: 'Run canonical native transport, OAuth discovery, and MCP verification checks.',
+            inputSchema: { service: z.string().min(1).max(64) },
+            annotations: { ...readOnly, openWorldHint: true },
+            ...(oauthConfig ? { auth: { scopes: ['ocliv:read'] } } : {}),
+          },
+          async (args, extra) => run(extra, 'ocliv:read', (sub) => controlPlane.verifyService(sub, args))
+        )
+        .registerTool(
+          {
+            name: 'diagnose_service',
+            title: 'Diagnose service',
+            description: 'Identify the exact failing operational layer using native status and doctor diagnostics.',
+            inputSchema: { service: z.string().min(1).max(64) },
+            annotations: readOnly,
+            ...(oauthConfig ? { auth: { scopes: ['ocliv:read'] } } : {}),
+          },
+          async (args, extra) => run(extra, 'ocliv:read', (sub) => controlPlane.diagnoseService(sub, args))
+        )
+        .registerTool(
+          {
+            name: 'verify_events',
+            title: 'Verify MCP Events capability',
+            description: 'Verify MCP Events discovery and subscription capability using the native verifier.',
+            inputSchema: { service: z.string().min(1).max(64) },
+            annotations: { ...readOnly, openWorldHint: true },
+            ...(oauthConfig ? { auth: { scopes: ['ocliv:read'] } } : {}),
+          },
+          async (args, extra) => run(extra, 'ocliv:read', (sub) => controlPlane.verifyEvents(sub, args))
+        )
+    );
+  },
 });
-// Server-root protected-resource metadata in the exact form the Ocliv relay
-// forwards route discovery to (upstream
-// `/.well-known/oauth-protected-resource/mcp`). Without this, the relay's
-// strict discovery probe 404s and publication can never verify.
-app.use('/.well-known/oauth-protected-resource/mcp', (_req: unknown, res: { json: (body: unknown) => void }) => {
-  res.json(buildPrMetadata({resource: publicResourceUrl as string, issuer: issuer as string, scopes: writeEnabled ? ['ocliv:read','ocliv:write'] : ['ocliv:read']}));
-});
+
+if (authMode === 'external-oidc') {
+  app.use('/.well-known/oauth-protected-resource/mcp', (_req: unknown, res: { json: (body: unknown) => void }) => {
+    res.json(
+      buildPrMetadata({
+        resource: publicResourceUrl,
+        issuer,
+        scopes: writeEnabled ? ['ocliv:read', 'ocliv:write'] : ['ocliv:read'],
+      })
+    );
+  });
+}
+
 export type AppType = typeof app;

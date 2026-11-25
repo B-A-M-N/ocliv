@@ -68,6 +68,8 @@ func TestCLITrustUntrustAndRevokeClient(t *testing.T) {
 		mgmtCall: func(relayURL string, k *identity.KeyPair, keyID, method, path string) (int, []byte, error) {
 			lastMethod, lastPath = method, path
 			switch {
+			case method == http.MethodGet && path == "/v1/agent/mcp-routes":
+				return http.StatusOK, []byte(`{"publications":[{"route_id":"AbCdEfGhIjKlMnOpQrStUv","pub_name":"tools","profile":"managed-oauth","url":"https://relay.example/r/AbCdEfGhIjKlMnOpQrStUv/mcp","publication_state":"VERIFIED","desired_enabled":true,"host_binding":"VALID","admission":"READY","admission_reason":"READY"}]}`), nil
 			case method == http.MethodPost && strings.Contains(path, "/authz/approve-direct/"):
 				return http.StatusOK, []byte(`{"client_id":"cli_123","direct":true,"status":"approved"}`), nil
 			case method == http.MethodDelete && strings.Contains(path, "/trust/"):
@@ -206,6 +208,8 @@ func TestCLIFederatedVisitorAuthAndDeviceLocalFlags(t *testing.T) {
 		mgmtCall: func(relayURL string, k *identity.KeyPair, keyID, method, path string) (int, []byte, error) {
 			lastMethod, lastPath = method, path
 			switch {
+			case method == http.MethodGet && path == "/v1/agent/mcp-routes":
+				return http.StatusOK, []byte(`{"publications":[{"route_id":"AbCdEfGhIjKlMnOpQrStUv","pub_name":"tools","profile":"managed-oauth","url":"https://relay.example/r/AbCdEfGhIjKlMnOpQrStUv/mcp","publication_state":"VERIFIED","desired_enabled":true,"host_binding":"VALID","admission":"READY","admission_reason":"READY"}]}`), nil
 			case method == http.MethodGet && strings.HasSuffix(path, "/visitor-auth"):
 				return http.StatusOK, []byte(`{"policy":{"mode":"federated","issuer":"https://idp.example","client_id":"cid-1","allowed_subjects":["auth0|u1"],"client_policy":"chatgpt","enabled":true}}`), nil
 			case method == http.MethodDelete && strings.HasSuffix(path, "/visitor-auth"):

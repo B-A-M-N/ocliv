@@ -278,6 +278,8 @@ go test ./... -count=1 -timeout=420s
 
 | Resource | Purpose |
 |---|---|
+| [docs/FOR_BEGINNERS.md](docs/FOR_BEGINNERS.md) | Plain-English beginner's manual (AI/MCP safety warnings, step-by-step setup, ChatGPT & Gemini) |
+| [docs/CONNECTING-CHATGPT-AND-GEMINI.md](docs/CONNECTING-CHATGPT-AND-GEMINI.md) | Step-by-step guide for registering Ocliv MCP servers with ChatGPT and Gemini |
 | [docs/SETUP.md](docs/SETUP.md) | Relay installation, edge modes, and TLS setup |
 | [docs/OPERATOR.md](docs/OPERATOR.md) | Day-2 operations, backups, restores, and key lifecycle |
 | [docs/MCP-HOSTING.md](docs/MCP-HOSTING.md) | Publishing local HTTP and stdio MCP servers |

@@ -480,19 +480,7 @@ func inspectServiceStatus(rec config.ServiceRecord, k *identity.KeyPair, keyID s
 	rep.Layers.Authorization = "valid"
 
 	var inv struct {
-		Publications []struct {
-			RouteID          string  `json:"route_id"`
-			Name             string  `json:"pub_name"`
-			Profile          string  `json:"profile"`
-			URL              *string `json:"url"`
-			LeaseID          *string `json:"lease_id"`
-			PublicationState string  `json:"publication_state"`
-			DesiredEnabled   bool    `json:"desired_enabled"`
-			StateGeneration  int64   `json:"state_generation"`
-			SessionLive      bool    `json:"session_live"`
-			Admission        string  `json:"admission"`
-			AdmissionReason  string  `json:"admission_reason"`
-		} `json:"publications"`
+		Publications []relayPublication `json:"publications"`
 	}
 	if err := json.Unmarshal(body, &inv); err != nil {
 		rep.State = ServiceStateUnknown
@@ -501,34 +489,54 @@ func inspectServiceStatus(rec config.ServiceRecord, k *identity.KeyPair, keyID s
 		return rep
 	}
 
-	wantIngress := mcpIngressProfile(rec.Auth)
-	var matched bool
-	var pubState, admission, admissionReason string
-	var relayDesired, sessionLive bool
-	for _, p := range inv.Publications {
-		if (rec.PublicationID != "" && p.RouteID == rec.PublicationID) ||
-			(p.Name == rec.Name && (wantIngress == "" || p.Profile == wantIngress)) {
-			matched = true
-			rep.PublicationID = p.RouteID
-			if p.URL != nil {
-				rep.PublicURL = *p.URL
-			}
-			if p.LeaseID != nil {
-				rep.LeaseID = *p.LeaseID
-			}
-			if p.StateGeneration > 0 {
-				rep.StateGeneration = p.StateGeneration
-			}
-			pubState = p.PublicationState
-			relayDesired = p.DesiredEnabled
-			sessionLive = p.SessionLive
-			admission = p.Admission
-			admissionReason = p.AdmissionReason
-			break
+	res := resolvePublicationFromInventory(rec.Name, &rec, inv.Publications)
+	switch res.Status {
+	case ResolutionAmbiguous:
+		rep.RelayState = "ambiguous"
+		rep.Layers.Publication = "ambiguous"
+		rep.Layers.Lease = "unknown"
+		rep.State = ServiceStateFaulted
+		rep.Health = HealthBlocked
+		rep.IngressDetail = res.ErrorString()
+		rep.LastFailure = res.ErrorString()
+		return rep
+	case ResolutionBindingHostMismatch:
+		if res.Publication != nil {
+			rep.PublicationID = res.Publication.RouteID
 		}
-	}
-
-	if !matched {
+		rep.RelayState = "HOST_MISMATCH"
+		rep.Layers.Publication = "host_mismatch"
+		rep.Layers.Lease = "offline"
+		rep.State = ServiceStateFaulted
+		rep.Health = HealthBlocked
+		rep.IngressDetail = res.ErrorString()
+		rep.LastFailure = res.ErrorString()
+		return rep
+	case ResolutionBindingIncompatible:
+		if res.Publication != nil {
+			rep.PublicationID = res.Publication.RouteID
+		}
+		rep.RelayState = "PROFILE_MISMATCH"
+		rep.Layers.Publication = "incompatible"
+		rep.Layers.Lease = "offline"
+		rep.State = ServiceStateFaulted
+		rep.Health = HealthBlocked
+		rep.IngressDetail = res.ErrorString()
+		rep.LastFailure = res.ErrorString()
+		return rep
+	case ResolutionBindingRevoked:
+		if res.Publication != nil {
+			rep.PublicationID = res.Publication.RouteID
+		}
+		rep.RelayState = "REVOKED"
+		rep.Layers.Publication = "revoked"
+		rep.Layers.Authorization = "revoked"
+		rep.State = ServiceStateRevoked
+		rep.Health = HealthBlocked
+		rep.IngressDetail = res.ErrorString()
+		rep.LastFailure = res.ErrorString()
+		return rep
+	case ResolutionNotFound:
 		rep.RelayState = "not_registered"
 		rep.Layers.Publication = "not_registered"
 		rep.Layers.Lease = "offline"
@@ -545,6 +553,33 @@ func inspectServiceStatus(rec config.ServiceRecord, k *identity.KeyPair, keyID s
 			rep.State = ServiceStateOffline
 			rep.Health = HealthFailed
 		}
+		return rep
+	}
+
+	p := res.Publication
+	rep.PublicationID = p.RouteID
+	if p.URL != nil {
+		rep.PublicURL = *p.URL
+	}
+	if p.LeaseID != nil {
+		rep.LeaseID = *p.LeaseID
+	}
+	if p.StateGeneration > 0 {
+		rep.StateGeneration = p.StateGeneration
+	}
+	pubState := p.PublicationState
+	relayDesired := p.DesiredEnabled
+	sessionLive := p.SessionLive
+	admission := p.Admission
+	admissionReason := p.AdmissionReason
+	if p.isHostMismatch() {
+		rep.RelayState = "HOST_MISMATCH"
+		rep.Layers.Publication = "host_mismatch"
+		rep.Layers.Lease = "offline"
+		rep.State = ServiceStateFaulted
+		rep.Health = HealthBlocked
+		rep.IngressDetail = "HOST_MISMATCH"
+		rep.LastFailure = fmt.Sprintf("publication %s has HOST_MISMATCH (host=%q)", p.RouteID, p.Host)
 		return rep
 	}
 

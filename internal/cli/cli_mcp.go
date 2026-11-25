@@ -30,8 +30,13 @@ import (
 
 // manageTools is the complete tool surface of `ocliv mcp manage`. It is a
 // closed set by construction: no shell, exec, or command tool exists and
-// none can be added by a caller (M12).
-var manageTools = []string{"ocliv_status", "ocliv_share", "ocliv_revoke"}
+// none can be added by a caller (M12, OCL-012).
+var manageTools = []string{
+	"get_status", "list_services", "get_service", "get_url",
+	"deploy_service", "enable_service", "disable_service", "restart_service", "reconcile_service", "remove_service",
+	"get_auth_status", "list_pending_authorizations", "decide_authorization", "list_authorized_clients", "revoke_client", "get_auth_policy", "set_auth_policy",
+	"verify_service", "diagnose_service", "verify_events",
+}
 
 func cmdMCP(argv []string) int {
 	if len(argv) == 0 {
@@ -245,11 +250,19 @@ func runMCPManage(in io.Reader, out io.Writer) int {
 				"serverInfo":      map[string]any{"name": "ocliv-manage", "version": "1.0.0"},
 			})
 		case "tools/list":
-			tools := make([]any, 0, len(manageTools))
-			for _, name := range manageTools {
+			tools := make([]any, 0, len(ocl012ManageToolSpecs))
+			for _, spec := range ocl012ManageToolSpecs {
+				schema := map[string]any{
+					"type":       "object",
+					"properties": spec.Properties,
+				}
+				if len(spec.Required) > 0 {
+					schema["required"] = spec.Required
+				}
 				tools = append(tools, map[string]any{
-					"name":        name,
-					"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+					"name":        spec.Name,
+					"description": spec.Description,
+					"inputSchema": schema,
 				})
 			}
 			rpcResult(out, req.ID, map[string]any{"tools": tools})
@@ -291,7 +304,16 @@ func runMCPManage(in io.Reader, out io.Writer) int {
 				}
 				rpcResult(out, req.ID, map[string]any{"content": []any{map[string]any{"type": "text", "text": string(body)}}})
 			default:
-				rpcError(out, req.ID, -32601, fmt.Sprintf("unknown tool %q", p.Name))
+				res, herr := handleMCPManageTool(p.Name, p.Arguments, relayURL, k, keyID, defaultServiceOps())
+				if herr != nil {
+					if strings.HasPrefix(herr.Error(), "unknown tool") {
+						rpcError(out, req.ID, -32601, herr.Error())
+					} else {
+						rpcError(out, req.ID, -32000, herr.Error())
+					}
+					continue
+				}
+				rpcResult(out, req.ID, mcpToolResult(res))
 			}
 		default:
 			rpcError(out, req.ID, -32601, fmt.Sprintf("unknown method %q", req.Method))

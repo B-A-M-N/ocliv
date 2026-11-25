@@ -126,56 +126,16 @@ func resolveCatalogEntry(name, profile string, ops serviceOps) (catalogEntry, in
 		return catalogEntry{Name: name, Profile: profile, Freshness: "MISSING", FailureReason: reason}, apperr.ExitRelayTLS
 	}
 	var inv struct {
-		Publications []struct {
-			RouteID          string  `json:"route_id"`
-			Name             string  `json:"pub_name"`
-			Profile          string  `json:"profile"`
-			URL              *string `json:"url"`
-			DesiredEnabled   bool    `json:"desired_enabled"`
-			StateGeneration  int64   `json:"state_generation"`
-			SessionLive      bool    `json:"session_live"`
-			PublicationState string  `json:"publication_state"`
-			RevokedAt        *string `json:"revoked_at"`
-		} `json:"publications"`
+		Publications []relayPublication `json:"publications"`
 	}
 	if err := json.Unmarshal(body, &inv); err != nil {
 		return catalogEntry{Name: name, Profile: profile, Freshness: "MISSING", FailureReason: "unparseable relay inventory"}, apperr.ExitInternal
 	}
-	var matches []catalogEntry
-	for _, p := range inv.Publications {
-		exactID := p.RouteID == name || (localRec != nil && localRec.PublicationID != "" && p.RouteID == localRec.PublicationID)
-		if !exactID && p.Name != name {
-			continue
-		}
-		u := ""
-		if p.URL != nil {
-			u = *p.URL
-		}
-		fresh := "AUTHORITATIVE"
-		if p.PublicationState == "REVOKED" || p.RevokedAt != nil {
-			fresh = "REVOKED"
-		}
-		authMode, mapErr := relayProfileToAuthMode(p.Profile)
-		failReason := ""
-		if mapErr != nil {
-			failReason = mapErr.Error()
-		}
-		matches = append(matches, catalogEntry{
-			Name:            p.Name,
-			Profile:         profile,
-			RouteID:         p.RouteID,
-			URL:             u,
-			IngressProfile:  p.Profile,
-			AuthMethod:      authMode,
-			Freshness:       fresh,
-			RelayState:      p.PublicationState,
-			DesiredEnabled:  p.DesiredEnabled,
-			SessionLive:     p.SessionLive,
-			FailureReason:   failReason,
-			StateGeneration: p.StateGeneration,
-		})
+	res := resolvePublicationFromInventory(name, localRec, inv.Publications)
+	if res.IsPermanentConflict() {
+		return catalogEntry{Name: name, Profile: profile, Freshness: "MISSING", FailureReason: res.ErrorString()}, apperr.ExitCLIValidation
 	}
-	if len(matches) == 0 {
+	if !res.Found() {
 		if localRec != nil && localRec.PublicURL != "" {
 			return catalogEntry{
 				Name:          name,
@@ -189,10 +149,30 @@ func resolveCatalogEntry(name, profile string, ops serviceOps) (catalogEntry, in
 		}
 		return catalogEntry{Name: name, Profile: profile, Freshness: "MISSING", FailureReason: "unknown publication " + name}, apperr.ExitCLIValidation
 	}
-	if len(matches) > 1 {
-		return catalogEntry{Name: name, Profile: profile, Freshness: "MISSING", FailureReason: fmt.Sprintf("ambiguous name %q (%d matching routes)", name, len(matches))}, apperr.ExitCLIValidation
+	p := res.Publication
+	fresh := "AUTHORITATIVE"
+	if p.isRevoked() {
+		fresh = "REVOKED"
 	}
-	return matches[0], apperr.ExitOK
+	authMode, mapErr := relayProfileToAuthMode(p.Profile)
+	failReason := ""
+	if mapErr != nil {
+		failReason = mapErr.Error()
+	}
+	return catalogEntry{
+		Name:            p.Name,
+		Profile:         profile,
+		RouteID:         p.RouteID,
+		URL:             p.urlString(),
+		IngressProfile:  p.Profile,
+		AuthMethod:      authMode,
+		Freshness:       fresh,
+		RelayState:      p.PublicationState,
+		DesiredEnabled:  p.DesiredEnabled,
+		SessionLive:     p.SessionLive,
+		FailureReason:   failReason,
+		StateGeneration: p.StateGeneration,
+	}, apperr.ExitOK
 }
 
 type discoveryCheckResult struct {

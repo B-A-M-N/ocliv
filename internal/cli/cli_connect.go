@@ -364,12 +364,36 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 		fmt.Fprintln(os.Stderr, err)
 		return apperr.ExitInternal
 	}
-	fp := googleBindingFingerprint(serviceName, tenant, disc.Issuer, entry.RouteID, connType, redirects)
+	// Resolve canonical local service record so connecting by route ID updates
+	// the existing named service instead of creating a duplicate route-ID stub.
 	rec, hasRec, gerr := svcStore.Get(serviceName)
 	if gerr != nil {
 		fmt.Fprintln(os.Stderr, gerr)
 		return apperr.ExitInternal
 	}
+	if !hasRec && entry.Name != "" && entry.Name != serviceName {
+		if byName, ok, nerr := svcStore.Get(entry.Name); nerr == nil && ok {
+			rec = byName
+			hasRec = true
+			serviceName = byName.Name
+		}
+	}
+	if !hasRec && entry.RouteID != "" {
+		if allRecs, lerr := svcStore.List(); lerr == nil {
+			for _, candidate := range allRecs {
+				if candidate.PublicationID == entry.RouteID {
+					rec = candidate
+					hasRec = true
+					serviceName = candidate.Name
+					break
+				}
+			}
+		}
+	}
+	if !hasRec && entry.Name != "" && serviceName == entry.RouteID {
+		serviceName = entry.Name
+	}
+	fp := googleBindingFingerprint(serviceName, tenant, disc.Issuer, entry.RouteID, connType, redirects)
 	var existing *config.ProviderBinding
 	if hasRec && rec.ProviderBindings != nil {
 		if b, bok := rec.ProviderBindings["google"]; bok {
@@ -611,6 +635,15 @@ func cmdConnectGoogle(argv []string, ops serviceOps, hc *http.Client) int {
 	}
 	if hasRec {
 		updatedCommit, err := svcStore.UpdateCAS(serviceName, rec.Revision, func(r *config.ServiceRecord) error {
+			if r.PublicationID == "" && entry.RouteID != "" {
+				r.PublicationID = entry.RouteID
+				if r.Identity != nil {
+					r.Identity.PublicationID = entry.RouteID
+				}
+			}
+			if r.PublicURL == "" && entry.URL != "" {
+				r.PublicURL = entry.URL
+			}
 			if r.ProviderBindings == nil {
 				r.ProviderBindings = map[string]config.ProviderBinding{}
 			}

@@ -38,15 +38,14 @@ func resolveServiceOrRoute(target, profile string, ops serviceOps) (displayName,
 			if relayURL == "" {
 				relayURL = agentRelayURLForProfile(p)
 			}
-			pubID := rec.PublicationID
-			if pubID == "" {
-				foundID, _, found, rerr := resolveRelayPublication(relayURL, k, keyID, rec, ops)
-				if rerr != nil || !found {
-					return "", "", "", nil, "", apperr.ExitInternal, fmt.Errorf("no publication found for service %q (%v)", target, rerr)
-				}
-				pubID = foundID
+			foundID, _, found, rerr := resolveRelayPublication(relayURL, k, keyID, rec, ops)
+			if rerr != nil {
+				return "", "", "", nil, "", apperr.ExitCLIValidation, fmt.Errorf("cannot resolve publication for service %q: %w", target, rerr)
 			}
-			return rec.Name, pubID, relayURL, k, keyID, apperr.ExitOK, nil
+			if !found {
+				return "", "", "", nil, "", apperr.ExitInternal, fmt.Errorf("no publication found for service %q", target)
+			}
+			return rec.Name, foundID, relayURL, k, keyID, apperr.ExitOK, nil
 		}
 	}
 	// Fallback: treat target as a direct route ID owned by the active profile key.

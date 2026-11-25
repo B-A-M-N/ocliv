@@ -22,8 +22,8 @@ function readinessLabel(p: Publication): 'Transport Ready' | 'Offline' | 'Unveri
 }
 
 export default function ListPublications() {
-  const { output, isPending } = useToolInfo<'list-publications'>();
-  const { callToolAsync, isPending: isVerifying } = useCallTool('verify-publication');
+  const { output, isPending } = useToolInfo<'list_services'>();
+  const { callToolAsync, isPending: isVerifying } = useCallTool('verify_service');
   const [message, setMessage] = useState('');
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<'all' | 'Transport Ready' | 'Offline' | 'Unverified'>('all');
@@ -65,7 +65,7 @@ export default function ListPublications() {
           }}>Copy URL</button>}
           <button type="button" disabled={isVerifying} onClick={async()=>{
             setMessage('Verifying…');
-            try { const result = await callToolAsync({ publicationId:p.id });
+            try { const result = await callToolAsync({ service: p.label || p.id });
               const r = result.structuredContent as unknown as VerifyOutput;
               setMessage(r?.verified ? `Verified ${p.id}: ${(r.tools ?? []).join(', ') || 'no tools listed'}` : `${p.id}: ${r?.message ?? r?.code ?? 'verification failed'}`);
             } catch { setMessage('Verification failed; check endpoint and credentials.'); }

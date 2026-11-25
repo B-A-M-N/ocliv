@@ -377,16 +377,10 @@ func renderServiceControlPanel(svcs []config.ServiceRecord, ops serviceOps) int 
 	// Best-effort fetch of trusted clients per route from the signed publications endpoint.
 	trustedByRoute := map[string][]string{}
 	if kerr == nil && relayURL != "" {
-		if st, body, err := ops.mgmtCall(relayURL, k, keyID, http.MethodGet, "/v1/agent/mcp-routes"); err == nil && st == http.StatusOK {
-			var pubs []struct {
-				RouteID        string   `json:"route_id"`
-				TrustedClients []string `json:"trusted_clients"`
-			}
-			if json.Unmarshal(body, &pubs) == nil {
-				for _, p := range pubs {
-					if len(p.TrustedClients) > 0 {
-						trustedByRoute[p.RouteID] = p.TrustedClients
-					}
+		if pubs, _, err := fetchRelayPublications(relayURL, k, keyID, ops); err == nil {
+			for _, p := range pubs {
+				if len(p.TrustedClients) > 0 {
+					trustedByRoute[p.RouteID] = p.TrustedClients
 				}
 			}
 		}
@@ -410,20 +404,24 @@ func renderServiceControlPanel(svcs []config.ServiceRecord, ops serviceOps) int 
 		if urlStr == "" {
 			urlStr = "-"
 		}
+		resolvedPubID := rep.PublicationID
+		if resolvedPubID == "" {
+			resolvedPubID = rec.PublicationID
+		}
 		trustedStr := ""
-		if tcs := trustedByRoute[rec.PublicationID]; len(tcs) > 0 {
+		if tcs := trustedByRoute[resolvedPubID]; len(tcs) > 0 {
 			trustedStr = "  trusted=" + strings.Join(tcs, ",")
 		}
 		fmt.Printf("  %-14s  %-4s  %-10s  %s%s\n", rec.Name, rec.Type, rep.State, urlStr, trustedStr)
 
 		// Collect pending OAuth clients for managed-OAuth MCP services.
-		if rec.Type == "mcp" && rec.PublicationID != "" && rk != nil {
+		if rec.Type == "mcp" && resolvedPubID != "" && rk != nil {
 			rURL := rec.RelayURL
 			if rURL == "" {
 				rURL = relayURL
 			}
 			if rURL != "" {
-				if st, body, err := ops.mgmtCall(rURL, rk, rKeyID, http.MethodGet, "/v1/agent/mcp-routes/"+rec.PublicationID+"/authz/pending"); err == nil && st == http.StatusOK {
+				if st, body, err := ops.mgmtCall(rURL, rk, rKeyID, http.MethodGet, "/v1/agent/mcp-routes/"+resolvedPubID+"/authz/pending"); err == nil && st == http.StatusOK {
 					var pResp struct {
 						Pending []struct {
 							ClientID string `json:"client_id"`

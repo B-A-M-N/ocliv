@@ -2084,15 +2084,16 @@ func cmdServicePending(argv []string, ops serviceOps) int {
 	if relayURL == "" {
 		relayURL = agentRelayURLForProfile(rec.Profile)
 	}
-	pubID := rec.PublicationID
-	if pubID == "" {
-		foundID, _, found, rerr := resolveRelayPublication(relayURL, k, keyID, rec, ops)
-		if rerr != nil || !found {
-			fmt.Fprintf(os.Stderr, "service pending: no publication found for %q (%v)\n", name, rerr)
-			return apperr.ExitInternal
-		}
-		pubID = foundID
+	foundID, _, found, rerr := resolveRelayPublication(relayURL, k, keyID, rec, ops)
+	if rerr != nil {
+		fmt.Fprintf(os.Stderr, "service pending: %v\n", rerr)
+		return apperr.ExitCLIValidation
 	}
+	if !found {
+		fmt.Fprintf(os.Stderr, "service pending: no publication found for %q\n", name)
+		return apperr.ExitInternal
+	}
+	pubID := foundID
 	st, body, callErr := ops.mgmtCall(relayURL, k, keyID, http.MethodGet, "/v1/agent/mcp-routes/"+pubID+"/authz/pending")
 	if callErr != nil {
 		fmt.Fprintf(os.Stderr, "service pending: %v\n", callErr)
@@ -2228,15 +2229,16 @@ func cmdServiceApprove(argv []string, ops serviceOps) int {
 	if relayURL == "" {
 		relayURL = agentRelayURLForProfile(rec.Profile)
 	}
-	pubID := rec.PublicationID
-	if pubID == "" {
-		foundID, _, found, rerr := resolveRelayPublication(relayURL, k, keyID, rec, ops)
-		if rerr != nil || !found {
-			fmt.Fprintf(os.Stderr, "service approve: no publication found for %q (%v)\n", name, rerr)
-			return apperr.ExitInternal
-		}
-		pubID = foundID
+	foundID, _, found, rerr := resolveRelayPublication(relayURL, k, keyID, rec, ops)
+	if rerr != nil {
+		fmt.Fprintf(os.Stderr, "service approve: %v\n", rerr)
+		return apperr.ExitCLIValidation
 	}
+	if !found {
+		fmt.Fprintf(os.Stderr, "service approve: no publication found for %q\n", name)
+		return apperr.ExitInternal
+	}
+	pubID := foundID
 
 	// Canonical native Ocliv default: transaction-bound operator approval over
 	// the Ed25519-signed management channel. Never fall back silently into

@@ -44,6 +44,9 @@ func TestServiceApproveRejectsConflictsAndNoImplicitLegacyFallback(t *testing.T)
 	calledTxApprove := false
 	ops := serviceOps{
 		mgmtCall: func(_ string, _ *identity.KeyPair, _, method, path string) (int, []byte, error) {
+			if method == http.MethodGet && path == "/v1/agent/mcp-routes" {
+				return 200, []byte(`{"publications":[{"route_id":"pub-tools-1","pub_name":"tools","profile":"managed-oauth","url":"https://relay.example/r/pub-tools-1/mcp","publication_state":"VERIFIED","desired_enabled":true,"host_binding":"VALID","admission":"READY","admission_reason":"READY"}]}`), nil
+			}
 			if method == http.MethodGet && path == "/v1/agent/mcp-routes/pub-tools-1/authz/pending" {
 				// One pending client, ZERO pending authorization transactions!
 				return 200, []byte(`{"pending":[{"client_id":"cli_1","name":"ChatGPT"}],"pending_transactions":[]}`), nil
@@ -92,6 +95,9 @@ func TestServiceApproveRejectsConflictsAndNoImplicitLegacyFallback(t *testing.T)
 	// 4. Non-interactive approve with 1 pending transaction but NO --challenge MUST fail closed (CHALLENGE_REQUIRED).
 	opsOneTx := serviceOps{
 		mgmtCall: func(_ string, _ *identity.KeyPair, _, method, path string) (int, []byte, error) {
+			if method == http.MethodGet && path == "/v1/agent/mcp-routes" {
+				return 200, []byte(`{"publications":[{"route_id":"pub-tools-1","pub_name":"tools","profile":"managed-oauth","url":"https://relay.example/r/pub-tools-1/mcp","publication_state":"VERIFIED","desired_enabled":true,"host_binding":"VALID","admission":"READY","admission_reason":"READY"}]}`), nil
+			}
 			if method == http.MethodGet && path == "/v1/agent/mcp-routes/pub-tools-1/authz/pending" {
 				return 200, []byte(`{"pending":[],"pending_transactions":[{"challenge":"cns_only","client_id":"cli_1","client_name":"ChatGPT","redirect_uri":"https://chatgpt.com/connector_platform_oauth_redirect","scope":"mcp:tools"}]}`), nil
 			}
