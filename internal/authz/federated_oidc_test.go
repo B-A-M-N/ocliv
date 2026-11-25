@@ -17,16 +17,25 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
+type testIDTokenClaims struct {
+	jwt.RegisteredClaims
+	Nonce string `json:"nonce"`
+	AZP   string `json:"azp,omitempty"`
+}
+
 type mockOIDCProvider struct {
-	srv      *httptest.Server
-	pub      ed25519.PublicKey
-	priv     ed25519.PrivateKey
-	kid      string
-	mu       sync.Mutex
-	codes    map[string]mockIDPCode
-	nextSub  string
-	badNonce bool
-	badAud   string
+	srv             *httptest.Server
+	pub             ed25519.PublicKey
+	priv            ed25519.PrivateKey
+	kid             string
+	mu              sync.Mutex
+	codes           map[string]mockIDPCode
+	nextSub         string
+	badNonce        bool
+	badAud          string
+	extraAud        string
+	azp             string
+	onTokenExchange func()
 }
 
 type mockIDPCode struct {
@@ -84,7 +93,13 @@ func (p *mockOIDCProvider) handle(w http.ResponseWriter, r *http.Request) {
 		delete(p.codes, code)
 		badNonce := p.badNonce
 		badAud := p.badAud
+		extraAud := p.extraAud
+		azp := p.azp
+		hook := p.onTokenExchange
 		p.mu.Unlock()
+		if hook != nil {
+			hook()
+		}
 		if !ok || CodeChallengeS256(verifier) != rec.challenge || r.Form.Get("redirect_uri") != rec.redirect {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant"})
 			return
@@ -93,20 +108,23 @@ func (p *mockOIDCProvider) handle(w http.ResponseWriter, r *http.Request) {
 		if badNonce {
 			nonce = "wrong-nonce"
 		}
-		aud := rec.clientID
+		aud := jwt.ClaimStrings{rec.clientID}
 		if badAud != "" {
-			aud = badAud
+			aud = jwt.ClaimStrings{badAud}
+		} else if extraAud != "" {
+			aud = jwt.ClaimStrings{rec.clientID, extraAud}
 		}
 		now := time.Now()
-		tok := jwt.NewWithClaims(jwt.SigningMethodEdDSA, oidcIDTokenClaims{
+		tok := jwt.NewWithClaims(jwt.SigningMethodEdDSA, testIDTokenClaims{
 			RegisteredClaims: jwt.RegisteredClaims{
 				Issuer:    p.srv.URL,
 				Subject:   rec.subject,
-				Audience:  jwt.ClaimStrings{aud},
+				Audience:  aud,
 				ExpiresAt: jwt.NewNumericDate(now.Add(5 * time.Minute)),
 				IssuedAt:  jwt.NewNumericDate(now),
 			},
 			Nonce: nonce,
+			AZP:   azp,
 		})
 		tok.Header["kid"] = p.kid
 		signed, err := tok.SignedString(p.priv)
@@ -115,8 +133,9 @@ func (p *mockOIDCProvider) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"id_token":   signed,
-			"token_type": "Bearer",
+			"access_token": "mock-idp-access-token",
+			"id_token":     signed,
+			"token_type":   "Bearer",
 		})
 	default:
 		http.NotFound(w, r)
@@ -159,8 +178,24 @@ func TestFederatedOIDCE2EAndProvenanceRevocation(t *testing.T) {
 	idp := newMockOIDCProvider(t, "auth0|owner-123")
 
 	srv := newTrustTestServer(t, st, "tenant-a", "route-priv")
-	srv.OIDCClient = &OIDCClient{HTTPClient: idp.srv.Client()}
+	srv.OIDCClient = &OIDCClient{HTTPClient: idp.srv.Client(), AllowLoopbackForTest: true}
 	authzCheck := NewAuthorizer(srv.Issuer, st)
+
+	// Register a separately approved direct operator client AND a legacy grant
+	// BEFORE enabling federated auth so we can prove:
+	//  1. Direct approval is prohibited once federated auth is active.
+	//  2. Revoking the ChatGPT trust policy preserves those rows' DB status
+	//     without accidentally revoking unrelated provenance.
+	_, directReg := postDCR(t, srv, "DirectCLI", []string{"https://other.example/cb"})
+	directClientID := directReg["client_id"].(string)
+	if err := st.ApproveGrantDirect(directClientID, "tenant-a", "route-priv"); err != nil {
+		t.Fatalf("ApproveGrantDirect (pre-federated): %v", err)
+	}
+	_, legacyReg := postDCR(t, srv, "LegacyClient", []string{"https://legacy.example/cb"})
+	legacyClientID := legacyReg["client_id"].(string)
+	if _, err := db.Exec(`UPDATE authz_grants SET status='active', auth_method='legacy', trust_policy_id='' WHERE client_id=?`, legacyClientID); err != nil {
+		t.Fatalf("seed legacy grant: %v", err)
+	}
 
 	preset, _ := LookupTrustPreset("chatgpt")
 	polID, _ := MintTrustPolicyID()
@@ -187,19 +222,6 @@ func TestFederatedOIDCE2EAndProvenanceRevocation(t *testing.T) {
 		Enabled:         true,
 	}); err != nil {
 		t.Fatalf("SetVisitorAuthPolicy: %v", err)
-	}
-
-	// Register a separately approved direct operator client AND a legacy grant
-	// so we can prove revoking the ChatGPT trust policy preserves them.
-	_, directReg := postDCR(t, srv, "DirectCLI", []string{"https://other.example/cb"})
-	directClientID := directReg["client_id"].(string)
-	if err := st.ApproveGrantDirect(directClientID, "tenant-a", "route-priv"); err != nil {
-		t.Fatalf("ApproveGrantDirect: %v", err)
-	}
-	_, legacyReg := postDCR(t, srv, "LegacyClient", []string{"https://legacy.example/cb"})
-	legacyClientID := legacyReg["client_id"].(string)
-	if _, err := db.Exec(`UPDATE authz_grants SET status='active', auth_method='legacy', trust_policy_id='' WHERE client_id=?`, legacyClientID); err != nil {
-		t.Fatalf("seed legacy grant: %v", err)
 	}
 
 	// 1. Register ChatGPT client via public DCR -> starts PENDING (no active grant yet).
@@ -414,9 +436,9 @@ func TestFederatedOIDCSecurityNegativeBoundaries(t *testing.T) {
 	idp := newMockOIDCProvider(t, "auth0|owner-123")
 
 	srvA := newTrustTestServer(t, st, "tenant-a", "route-a")
-	srvA.OIDCClient = &OIDCClient{HTTPClient: idp.srv.Client()}
+	srvA.OIDCClient = &OIDCClient{HTTPClient: idp.srv.Client(), AllowLoopbackForTest: true}
 	srvB := newTrustTestServer(t, st, "tenant-a", "route-b")
-	srvB.OIDCClient = &OIDCClient{HTTPClient: idp.srv.Client()}
+	srvB.OIDCClient = &OIDCClient{HTTPClient: idp.srv.Client(), AllowLoopbackForTest: true}
 
 	preset, _ := LookupTrustPreset("chatgpt")
 	if err := st.SetVisitorAuthPolicy(VisitorAuthPolicy{

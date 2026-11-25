@@ -351,9 +351,9 @@ func TestRelayObservationsEndpointSeparatesSyntheticFromExternalHost(t *testing.
 
 	rt := &routeTarget{TenantID: "tenant-obs", RouteID: routeID}
 	// Synthetic probe events/subscribe must be tagged synthetic and NOT advance real host stage.
-	srv.recordManagedMCPObservation(rt, "cli_cgpt_obs", "events/subscribe", "2026-07-28", true, http.StatusOK)
+	srv.recordManagedMCPObservation(rt, "cli_cgpt_obs", "events/subscribe", "2026-07-28", true, http.StatusOK, "application/json", []byte(`{"jsonrpc":"2.0","id":1,"result":{"subscriptionId":"sub_synth"}}`))
 	// Real client events/list advances real stage to EVENTS_DISCOVERY_OBSERVED.
-	srv.recordManagedMCPObservation(rt, "cli_cgpt_obs", "events/list", "2026-07-28", false, http.StatusOK)
+	srv.recordManagedMCPObservation(rt, "cli_cgpt_obs", "events/list", "2026-07-28", false, http.StatusOK, "application/json", []byte(`{"jsonrpc":"2.0","id":2,"result":{"events":[]}}`))
 
 	rec := httptest.NewRecorder()
 	srv.handleAgentPublications(rec, signMgmtReq(t, ownerKey, http.MethodGet, "/v1/agent/mcp-routes/"+routeID+"/observations", nil))

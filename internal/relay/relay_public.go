@@ -347,9 +347,13 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request, t *routeTar
 		// sanitizer runs, so a spoofed X-Ocliv-* metadata name can never
 		// reach the upstream.
 		r.Header.Del("Authorization")
-		cw := &statusCaptureWriter{ResponseWriter: w, status: http.StatusOK}
+		cw := &statusCaptureWriter{
+			ResponseWriter: w,
+			status:         http.StatusOK,
+			capturePreview: mcpMethod != "",
+		}
 		s.serveProxied(cw, r, t, sess, false, false, client)
-		s.recordManagedMCPObservation(t, client, mcpMethod, mcpProto, isSynth, cw.status)
+		s.recordManagedMCPObservation(t, client, mcpMethod, mcpProto, isSynth, cw.status, cw.Header().Get("Content-Type"), cw.preview.Bytes())
 		return
 	}
 	// Pending verification (P0-A): a publication that has not completed
@@ -694,10 +698,14 @@ func (s *Server) serveProxied(w http.ResponseWriter, r *http.Request, t *routeTa
 	s.serveHTTP(w, r, stream, reqID, t)
 }
 
+const maxObservationPreviewBytes = 16384
+
 type statusCaptureWriter struct {
 	http.ResponseWriter
-	status int
-	wrote  bool
+	status         int
+	wrote          bool
+	capturePreview bool
+	preview        bytes.Buffer
 }
 
 func (w *statusCaptureWriter) WriteHeader(code int) {
@@ -713,6 +721,14 @@ func (w *statusCaptureWriter) Write(p []byte) (int, error) {
 		w.status = http.StatusOK
 		w.wrote = true
 	}
+	if w.capturePreview && w.preview.Len() < maxObservationPreviewBytes {
+		rem := maxObservationPreviewBytes - w.preview.Len()
+		if len(p) <= rem {
+			_, _ = w.preview.Write(p)
+		} else {
+			_, _ = w.preview.Write(p[:rem])
+		}
+	}
 	return w.ResponseWriter.Write(p)
 }
 
@@ -726,51 +742,123 @@ func (w *statusCaptureWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
 
-// peekMCPMethodName inspects MCP-Method or up to 4 KiB of a JSON-RPC POST
-// body to extract ONLY the top-level "method" string without retaining
-// parameters, arguments, or secrets, then restores r.Body verbatim.
+// peekMCPMethodName inspects up to 4 KiB of a JSON-RPC POST body FIRST to
+// extract ONLY the top-level "method" string without retaining parameters,
+// arguments, or secrets, then restores r.Body verbatim. It never trusts a
+// client-supplied MCP-Method header over the actual JSON-RPC body.
 func peekMCPMethodName(r *http.Request) string {
-	if m := strings.TrimSpace(r.Header.Get("MCP-Method")); m != "" {
-		return m
-	}
-	if r.Method != http.MethodPost || r.Body == nil {
+	if r.Method == http.MethodPost && r.Body != nil &&
+		strings.Contains(strings.ToLower(r.Header.Get("Content-Type")), "application/json") {
+		const peekCap = 4096
+		orig := r.Body
+		buf, err := io.ReadAll(io.LimitReader(orig, peekCap))
+		r.Body = struct {
+			io.Reader
+			io.Closer
+		}{
+			Reader: io.MultiReader(bytes.NewReader(buf), orig),
+			Closer: orig,
+		}
+		if err == nil && len(buf) > 0 {
+			var env struct {
+				Method string `json:"method"`
+			}
+			if json.Unmarshal(buf, &env) == nil && strings.TrimSpace(env.Method) != "" {
+				return strings.TrimSpace(env.Method)
+			}
+		}
 		return ""
-	}
-	if !strings.Contains(strings.ToLower(r.Header.Get("Content-Type")), "application/json") {
-		return ""
-	}
-	const peekCap = 4096
-	orig := r.Body
-	buf, err := io.ReadAll(io.LimitReader(orig, peekCap))
-	r.Body = struct {
-		io.Reader
-		io.Closer
-	}{
-		Reader: io.MultiReader(bytes.NewReader(buf), orig),
-		Closer: orig,
-	}
-	if err != nil || len(buf) == 0 {
-		return ""
-	}
-	var env struct {
-		Method string `json:"method"`
-	}
-	if json.Unmarshal(buf, &env) == nil {
-		return strings.TrimSpace(env.Method)
 	}
 	return ""
 }
 
+// parseMCPJSONRPCResult inspects a bounded JSON or SSE response preview to
+// distinguish transport-level HTTP 200 from an actual JSON-RPC result vs error.
+// No raw response payloads are ever persisted.
+func parseMCPJSONRPCResult(contentType string, raw []byte) (resultObj map[string]any, hasRPCError bool, parsed bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil, false, false
+	}
+	decodeEnv := func(b []byte) (map[string]any, bool, bool) {
+		var env map[string]any
+		if json.Unmarshal(b, &env) != nil || env == nil {
+			return nil, false, false
+		}
+		if errVal, hasErr := env["error"]; hasErr && errVal != nil {
+			return nil, true, true
+		}
+		if resVal, hasRes := env["result"]; hasRes {
+			resMap, _ := resVal.(map[string]any)
+			return resMap, false, true
+		}
+		return nil, false, false
+	}
+	if strings.Contains(strings.ToLower(contentType), "text/event-stream") || bytes.HasPrefix(trimmed, []byte("event:")) || bytes.HasPrefix(trimmed, []byte("data:")) {
+		for _, line := range bytes.Split(trimmed, []byte("\n")) {
+			line = bytes.TrimSpace(line)
+			if !bytes.HasPrefix(line, []byte("data:")) {
+				continue
+			}
+			payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+			if res, isErr, ok := decodeEnv(payload); ok {
+				return res, isErr, true
+			}
+		}
+		return nil, false, false
+	}
+	return decodeEnv(trimmed)
+}
+
+func mcpResultAdvertisesEvents(res map[string]any) bool {
+	if len(res) == 0 {
+		return false
+	}
+	caps, ok := res["capabilities"].(map[string]any)
+	if !ok || len(caps) == 0 {
+		return false
+	}
+	if ev, ok := caps["events"]; ok && ev != nil {
+		if b, isBool := ev.(bool); isBool {
+			return b
+		}
+		return true
+	}
+	if exp, ok := caps["experimental"].(map[string]any); ok {
+		if ev, ok := exp["events"]; ok && ev != nil {
+			if b, isBool := ev.(bool); isBool {
+				return b
+			}
+			return true
+		}
+	}
+	return false
+}
+
 // recordManagedMCPObservation records privacy-safe external host observations
 // for authorized managed MCP requests without storing any payloads or tokens
-// (OCL-009).
-func (s *Server) recordManagedMCPObservation(t *routeTarget, clientID, method, protoVersion string, isSynth bool, statusCode int) {
+// (OCL-009). Transport status is recorded separately from validated JSON-RPC
+// protocol outcomes so HTTP 200 JSON-RPC errors are never reported as success.
+func (s *Server) recordManagedMCPObservation(t *routeTarget, clientID, method, protoVersion string, isSynth bool, statusCode int, contentType string, respPreview []byte) {
 	if s.authz == nil || t == nil || t.RouteID == "" {
 		return
 	}
+	transportStatus := "ok"
 	resultCat := "ok"
 	if statusCode < 200 || statusCode >= 300 {
+		transportStatus = "error"
 		resultCat = "error"
+	}
+	var (
+		rpcRes   map[string]any
+		rpcErr   bool
+		rpcValid bool
+	)
+	if transportStatus == "ok" && method != "" && len(respPreview) > 0 {
+		rpcRes, rpcErr, rpcValid = parseMCPJSONRPCResult(contentType, respPreview)
+		if rpcErr {
+			resultCat = "error"
+		}
 	}
 	clientKind := "generic"
 	if isSynth {
@@ -790,18 +878,33 @@ func (s *Server) recordManagedMCPObservation(t *routeTarget, clientID, method, p
 		ProtocolVersion:       protoVersion,
 		PublicationGeneration: pubGen,
 		Stage:                 authz.StageClientMCPObserved,
+		TransportStatus:       transportStatus,
 		ResultCategory:        resultCat,
 		IsSynthetic:           isSynth,
 		ObservedAt:            time.Now().UTC(),
 	}
 	_ = s.authz.Store().RecordHostObservation(obs)
 
+	if transportStatus != "ok" || resultCat != "ok" || !rpcValid {
+		return
+	}
 	switch method {
-	case "server/discover", "events/list":
-		obs.Stage = authz.StageEventsDiscoveryObserved
-		_ = s.authz.Store().RecordHostObservation(obs)
+	case "server/discover", "initialize":
+		if mcpResultAdvertisesEvents(rpcRes) {
+			obs.Stage = authz.StageEventsDiscoveryObserved
+			_ = s.authz.Store().RecordHostObservation(obs)
+		}
+	case "events/list":
+		if _, hasEvents := rpcRes["events"].([]any); hasEvents {
+			obs.Stage = authz.StageEventsDiscoveryObserved
+			_ = s.authz.Store().RecordHostObservation(obs)
+		}
 	case "events/subscribe":
-		if resultCat == "ok" {
+		subID, _ := rpcRes["subscriptionId"].(string)
+		if subID == "" {
+			subID, _ = rpcRes["id"].(string)
+		}
+		if strings.TrimSpace(subID) != "" {
 			obs.Stage = authz.StageEventsSubscriptionObserved
 			_ = s.authz.Store().RecordHostObservation(obs)
 		}

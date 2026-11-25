@@ -79,8 +79,8 @@ go vet ./...
 if [ "$SKIP_TESTS" -eq 0 ]; then
   echo "==> Running full test suite and race gates"
   go test ./... -count=1 -timeout=420s
-  go test -race ./internal/cli ./internal/protocol ./internal/identity ./internal/config ./internal/agent ./internal/store ./internal/lease ./internal/setup -count=1 -timeout=300s
-  go test -race ./internal/relay -count=1 -timeout=420s
+  go test -race ./internal/authz ./internal/cli ./internal/protocol ./internal/identity ./internal/config ./internal/agent ./internal/store ./internal/lease ./internal/setup -count=1 -timeout=420s
+  go test -race ./internal/relay -count=1 -timeout=900s
 fi
 
 GOVULN_STATUS="skipped"

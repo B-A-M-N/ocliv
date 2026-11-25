@@ -13,11 +13,24 @@ import (
 // SQLStore is the durable Store backed by the relay database (schemaV8).
 // It is safe for concurrent use; SQLite serializes writers.
 type SQLStore struct {
-	db *sql.DB
+	db        *sql.DB
+	secretKey []byte // optional 32-byte AES-256-GCM key for sealing authz_visitor_policies.client_secret
 }
 
 // NewSQLStore wraps a database handle. The schemaV8 tables must exist.
 func NewSQLStore(db *sql.DB) *SQLStore { return &SQLStore{db: db} }
+
+// SetSecretKey configures the 32-byte key used to encrypt and decrypt
+// authz_visitor_policies.client_secret at rest in SQLite.
+func (s *SQLStore) SetSecretKey(key []byte) {
+	if len(key) == 0 {
+		s.secretKey = nil
+		return
+	}
+	cp := make([]byte, len(key))
+	copy(cp, key)
+	s.secretKey = cp
+}
 
 // RegisterClient inserts a client. A duplicate id is rejected. The client
 // is scoped to the tenant + route it registered through: a public
@@ -529,6 +542,9 @@ func (s *SQLStore) RevokeTrustPolicy(tenant, route, idOrKind string) (int, error
 }
 
 // SetVisitorAuthPolicy persists or updates a route's visitor auth policy (OCL-005).
+// Every write atomically increments revision so in-flight OIDC transactions
+// bound to a superseded policy revision fail closed, and seals client_secret
+// with AES-256-GCM when a secret key is configured.
 func (s *SQLStore) SetVisitorAuthPolicy(p VisitorAuthPolicy) error {
 	clean, err := ValidateVisitorAuthPolicy(p)
 	if err != nil {
@@ -543,21 +559,60 @@ func (s *SQLStore) SetVisitorAuthPolicy(p VisitorAuthPolicy) error {
 	if clean.Enabled {
 		enabled = 1
 	}
-	_, err = s.db.Exec(
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("authz: set visitor policy tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var (
+		prevRev      int64
+		prevIssuer   string
+		prevClientID string
+		prevSecret   string
+	)
+	err = tx.QueryRow(
+		`SELECT revision, issuer, client_id, client_secret
+		 FROM authz_visitor_policies WHERE tenant_id=? AND route_id=?`,
+		clean.TenantID, clean.RouteID,
+	).Scan(&prevRev, &prevIssuer, &prevClientID, &prevSecret)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("authz: read existing visitor auth policy: %w", err)
+	}
+	nextRev := prevRev + 1
+	if nextRev < 1 {
+		nextRev = 1
+	}
+	storedSecret := ""
+	if clean.Mode == VisitorAuthModeFederated {
+		if clean.ClientSecret != "" {
+			sealed, serr := SealVisitorSecret(s.secretKey, clean.TenantID, clean.RouteID, clean.Issuer, clean.ClientID, clean.ClientSecret)
+			if serr != nil {
+				return serr
+			}
+			storedSecret = sealed
+		} else if err == nil && prevIssuer == clean.Issuer && prevClientID == clean.ClientID {
+			// Preserve existing secret across subject/policy updates for the same IdP app.
+			storedSecret = prevSecret
+		}
+	}
+	if _, err := tx.Exec(
 		`INSERT INTO authz_visitor_policies(
 		   tenant_id, route_id, mode, issuer, client_id, client_secret,
-		   allowed_subjects_json, client_policy, enabled, created_at, updated_at, revoked_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL)
+		   allowed_subjects_json, client_policy, enabled, revision, created_at, updated_at, revoked_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL)
 		 ON CONFLICT(tenant_id, route_id)
 		 DO UPDATE SET mode=excluded.mode, issuer=excluded.issuer, client_id=excluded.client_id,
 		   client_secret=excluded.client_secret, allowed_subjects_json=excluded.allowed_subjects_json,
-		   client_policy=excluded.client_policy, enabled=excluded.enabled,
+		   client_policy=excluded.client_policy, enabled=excluded.enabled, revision=excluded.revision,
 		   updated_at=excluded.updated_at, revoked_at=NULL`,
-		clean.TenantID, clean.RouteID, clean.Mode, clean.Issuer, clean.ClientID, clean.ClientSecret,
-		string(subsJSON), clean.ClientPolicy, enabled, now, now,
-	)
-	if err != nil {
+		clean.TenantID, clean.RouteID, clean.Mode, clean.Issuer, clean.ClientID, storedSecret,
+		string(subsJSON), clean.ClientPolicy, enabled, nextRev, now, now,
+	); err != nil {
 		return fmt.Errorf("authz: set visitor auth policy: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("authz: commit visitor auth policy: %w", err)
 	}
 	return nil
 }
@@ -565,26 +620,32 @@ func (s *SQLStore) SetVisitorAuthPolicy(p VisitorAuthPolicy) error {
 // GetVisitorAuthPolicy loads the active, unrevoked visitor auth policy for (tenant, route).
 func (s *SQLStore) GetVisitorAuthPolicy(tenant, route string) (*VisitorAuthPolicy, error) {
 	var (
-		p         VisitorAuthPolicy
-		subsJSON  string
-		enabled   int
-		createdAt string
-		updatedAt string
+		p            VisitorAuthPolicy
+		subsJSON     string
+		enabled      int
+		storedSecret string
+		createdAt    string
+		updatedAt    string
 	)
 	err := s.db.QueryRow(
 		`SELECT tenant_id, route_id, mode, issuer, client_id, client_secret,
-		        allowed_subjects_json, client_policy, enabled, created_at, updated_at
+		        allowed_subjects_json, client_policy, enabled, revision, created_at, updated_at
 		 FROM authz_visitor_policies
 		 WHERE tenant_id=? AND route_id=? AND enabled=1 AND revoked_at IS NULL`,
 		tenant, route,
-	).Scan(&p.TenantID, &p.RouteID, &p.Mode, &p.Issuer, &p.ClientID, &p.ClientSecret,
-		&subsJSON, &p.ClientPolicy, &enabled, &createdAt, &updatedAt)
+	).Scan(&p.TenantID, &p.RouteID, &p.Mode, &p.Issuer, &p.ClientID, &storedSecret,
+		&subsJSON, &p.ClientPolicy, &enabled, &p.Revision, &createdAt, &updatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("authz: get visitor auth policy: %w", err)
 	}
+	secret, serr := OpenVisitorSecret(s.secretKey, p.TenantID, p.RouteID, p.Issuer, p.ClientID, storedSecret)
+	if serr != nil {
+		return nil, serr
+	}
+	p.ClientSecret = secret
 	p.Enabled = enabled != 0
 	_ = json.Unmarshal([]byte(subsJSON), &p.AllowedSubjects)
 	p.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
@@ -645,11 +706,11 @@ func (s *SQLStore) CreateOIDCTransaction(t OIDCTransaction) error {
 		`INSERT INTO authz_oidc_tx(
 		   state, nonce, pkce_verifier, client_id, tenant_id, route_id,
 		   redirect_uri, code_challenge, client_state, resource, scope,
-		   trust_policy_id, expires_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		   trust_policy_id, visitor_policy_revision, expires_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		t.State, t.Nonce, t.PKCEVerifier, t.ClientID, t.Tenant, t.Route,
 		t.RedirectURI, t.CodeChallenge, t.ClientState, t.Resource, t.Scope,
-		t.TrustPolicyID, t.ExpiresAt.UTC().Format(time.RFC3339Nano),
+		t.TrustPolicyID, t.PolicyRevision, t.ExpiresAt.UTC().Format(time.RFC3339Nano),
 	); err != nil {
 		return fmt.Errorf("authz: create oidc tx: %w", err)
 	}
@@ -670,12 +731,12 @@ func (s *SQLStore) ConsumeOIDCTransaction(state, expectedTenant, expectedRoute s
 	err = tx.QueryRow(
 		`SELECT state, nonce, pkce_verifier, client_id, tenant_id, route_id,
 		        redirect_uri, code_challenge, client_state, resource, scope,
-		        trust_policy_id, expires_at, consumed_at
+		        trust_policy_id, visitor_policy_revision, expires_at, consumed_at
 		 FROM authz_oidc_tx WHERE state=?`,
 		state,
 	).Scan(&t.State, &t.Nonce, &t.PKCEVerifier, &t.ClientID, &t.Tenant, &t.Route,
 		&t.RedirectURI, &t.CodeChallenge, &t.ClientState, &t.Resource, &t.Scope,
-		&t.TrustPolicyID, &expires, &consumed)
+		&t.TrustPolicyID, &t.PolicyRevision, &expires, &consumed)
 	if err != nil {
 		return nil, fmt.Errorf("authz: unknown oidc transaction state")
 	}
@@ -1208,6 +1269,11 @@ func (s *SQLStore) PruneAuthzExpired(now time.Time) error {
 		`DELETE FROM authz_revocations WHERE revoked_at < ?`, revCutoff); err != nil {
 		return fmt.Errorf("authz: prune revocations: %w", err)
 	}
+	obsCutoff := now.UTC().Add(-HostObservationRetention).Format(time.RFC3339Nano)
+	if _, err := s.db.Exec(
+		`DELETE FROM mcp_host_observations WHERE observed_at < ?`, obsCutoff); err != nil {
+		return fmt.Errorf("authz: prune host observations: %w", err)
+	}
 	return nil
 }
 
@@ -1290,7 +1356,8 @@ func (s *SQLStore) ListAuthzAudit(limit int) ([]AuthzAudit, error) {
 	return out, rows.Err()
 }
 
-// RecordHostObservation persists a privacy-safe host observation (OCL-009).
+// RecordHostObservation persists a privacy-safe host observation (OCL-009)
+// and enforces per-route bounded retention (MaxHostObservationsPerRoute).
 func (s *SQLStore) RecordHostObservation(obs HostObservation) error {
 	if obs.TenantID == "" || obs.RouteID == "" || obs.Stage == "" {
 		return nil
@@ -1304,6 +1371,10 @@ func (s *SQLStore) RecordHostObservation(obs HostObservation) error {
 	if obs.ClientKind == "" {
 		obs.ClientKind = "generic"
 	}
+	transportOK := 1
+	if obs.TransportStatus == "error" {
+		transportOK = 0
+	}
 	synth := 0
 	if obs.IsSynthetic {
 		synth = 1
@@ -1311,15 +1382,26 @@ func (s *SQLStore) RecordHostObservation(obs HostObservation) error {
 	if _, err := s.db.Exec(
 		`INSERT INTO mcp_host_observations(
 		   tenant_id, route_id, canonical_url, client_id, client_kind,
-		   protocol_version, publication_generation, stage, result_category,
+		   protocol_version, publication_generation, stage, transport_ok, result_category,
 		   is_synthetic, observed_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
 		obs.TenantID, obs.RouteID, obs.CanonicalURL, obs.ClientID, obs.ClientKind,
-		obs.ProtocolVersion, obs.PublicationGeneration, obs.Stage, obs.ResultCategory,
+		obs.ProtocolVersion, obs.PublicationGeneration, obs.Stage, transportOK, obs.ResultCategory,
 		synth, obs.ObservedAt.UTC().Format(time.RFC3339Nano),
 	); err != nil {
 		return fmt.Errorf("authz: record host observation: %w", err)
 	}
+	// Bound per-route observation history so long-running relays cannot grow unbounded.
+	_, _ = s.db.Exec(
+		`DELETE FROM mcp_host_observations
+		 WHERE tenant_id=? AND route_id=?
+		   AND id NOT IN (
+		     SELECT id FROM mcp_host_observations
+		     WHERE tenant_id=? AND route_id=?
+		     ORDER BY id DESC LIMIT ?
+		   )`,
+		obs.TenantID, obs.RouteID, obs.TenantID, obs.RouteID, MaxHostObservationsPerRoute,
+	)
 	return nil
 }
 
@@ -1330,7 +1412,7 @@ func (s *SQLStore) ListHostObservations(tenant, route string, limit int) ([]Host
 	}
 	rows, err := s.db.Query(
 		`SELECT tenant_id, route_id, canonical_url, client_id, client_kind,
-		        protocol_version, publication_generation, stage, result_category,
+		        protocol_version, publication_generation, stage, transport_ok, result_category,
 		        is_synthetic, observed_at
 		 FROM mcp_host_observations
 		 WHERE tenant_id=? AND route_id=?
@@ -1344,11 +1426,17 @@ func (s *SQLStore) ListHostObservations(tenant, route string, limit int) ([]Host
 	out := make([]HostObservation, 0)
 	for rows.Next() {
 		var o HostObservation
+		var transportOK int
 		var synth int
 		var ts string
 		if err := rows.Scan(&o.TenantID, &o.RouteID, &o.CanonicalURL, &o.ClientID, &o.ClientKind,
-			&o.ProtocolVersion, &o.PublicationGeneration, &o.Stage, &o.ResultCategory, &synth, &ts); err != nil {
+			&o.ProtocolVersion, &o.PublicationGeneration, &o.Stage, &transportOK, &o.ResultCategory, &synth, &ts); err != nil {
 			return nil, fmt.Errorf("authz: scan host observation: %w", err)
+		}
+		if transportOK != 0 {
+			o.TransportStatus = "ok"
+		} else {
+			o.TransportStatus = "error"
 		}
 		o.IsSynthetic = synth != 0
 		o.ObservedAt, _ = time.Parse(time.RFC3339Nano, ts)
@@ -1408,6 +1496,17 @@ func (s *SQLStore) ApproveGrantWithPairingSecret(clientID, tenant, route, secret
 		return fmt.Errorf("authz: approve tx: %w", err)
 	}
 	defer tx.Rollback()
+	var fedCount int
+	if err := tx.QueryRow(
+		`SELECT COUNT(1) FROM authz_visitor_policies
+		 WHERE tenant_id=? AND route_id=? AND mode='federated' AND enabled=1 AND revoked_at IS NULL`,
+		tenant, route,
+	).Scan(&fedCount); err != nil {
+		return fmt.Errorf("authz: check visitor auth policy: %w", err)
+	}
+	if fedCount > 0 {
+		return fmt.Errorf("%w: pairing approval is prohibited on federated route", ErrFederatedPolicyRequired)
+	}
 	var status string
 	err = tx.QueryRow(
 		`SELECT status FROM authz_grants WHERE client_id=? AND tenant_id=? AND route_id=?`,
@@ -1458,6 +1557,17 @@ func (s *SQLStore) ApproveGrantDirect(clientID, tenant, route string) error {
 		return fmt.Errorf("authz: approve direct tx: %w", err)
 	}
 	defer tx.Rollback()
+	var fedCount int
+	if err := tx.QueryRow(
+		`SELECT COUNT(1) FROM authz_visitor_policies
+		 WHERE tenant_id=? AND route_id=? AND mode='federated' AND enabled=1 AND revoked_at IS NULL`,
+		tenant, route,
+	).Scan(&fedCount); err != nil {
+		return fmt.Errorf("authz: check visitor auth policy: %w", err)
+	}
+	if fedCount > 0 {
+		return fmt.Errorf("%w: direct approval is prohibited on federated route", ErrFederatedPolicyRequired)
+	}
 	var status string
 	err = tx.QueryRow(
 		`SELECT status FROM authz_grants WHERE client_id=? AND tenant_id=? AND route_id=?`,
@@ -1534,6 +1644,174 @@ func (s *SQLStore) ApproveGrantWithProvenance(clientID, tenant, route string, sk
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("authz: approve provenance commit: %w", err)
+	}
+	return nil
+}
+
+// ApproveFederatedGrantAtomic transactionally validates client identity &
+// revocation, publication existence & non-revocation (when mcp_publications
+// exists), current visitor policy state & revision, allowed issuer & subject,
+// current trust policy state & exact redirect match, and grant non-revocation
+// inside a SINGLE SQLite transaction before activating the federated grant
+// (OCL-005). Any concurrent revocation or policy replacement during IdP token
+// exchange rolls back cleanly without activating a grant.
+func (s *SQLStore) ApproveFederatedGrantAtomic(req FederatedGrantActivation) error {
+	if req.ClientID == "" || req.Tenant == "" || req.Route == "" {
+		return fmt.Errorf("authz: federated grant activation requires client, tenant, and route")
+	}
+	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("authz: federated grant tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. Verify client identity, revocation, route scope, and redirect URI binding.
+	var (
+		cTenant   string
+		cRoute    string
+		cURIsJSON string
+		cRevoked  sql.NullString
+	)
+	if err := tx.QueryRow(
+		`SELECT tenant_id, route_id, redirect_uris, revoked_at FROM authz_clients WHERE id=?`,
+		req.ClientID,
+	).Scan(&cTenant, &cRoute, &cURIsJSON, &cRevoked); err != nil {
+		return fmt.Errorf("authz: client %q unknown: %w", req.ClientID, err)
+	}
+	if cRevoked.Valid {
+		return fmt.Errorf("authz: client %q is revoked", req.ClientID)
+	}
+	if cTenant == "" || cTenant != req.Tenant || (cRoute != "" && cRoute != req.Route) {
+		return fmt.Errorf("authz: client %q is not bound to tenant %q route %q", req.ClientID, req.Tenant, req.Route)
+	}
+	var clientURIs []string
+	if err := json.Unmarshal([]byte(cURIsJSON), &clientURIs); err != nil {
+		return fmt.Errorf("authz: decode client redirect_uris: %w", err)
+	}
+	if req.RedirectURI != "" {
+		if err := ValidateRedirectURI(req.RedirectURI, clientURIs); err != nil {
+			return fmt.Errorf("authz: redirect_uri not bound to client: %w", err)
+		}
+	}
+
+	// 2. Verify publication identity & non-revocation when mcp_publications exists.
+	var pubTable string
+	if err := tx.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='mcp_publications'`).Scan(&pubTable); err == nil && pubTable != "" {
+		var pubRevoked sql.NullString
+		if err := tx.QueryRow(
+			`SELECT revoked_at FROM mcp_publications WHERE route_id=? AND tenant_id=?`,
+			req.Route, req.Tenant,
+		).Scan(&pubRevoked); err != nil {
+			return fmt.Errorf("authz: publication %q not found for tenant %q", req.Route, req.Tenant)
+		}
+		if pubRevoked.Valid {
+			return fmt.Errorf("authz: publication %q is revoked", req.Route)
+		}
+	}
+
+	// 3. Verify current visitor policy state, revision, issuer, and allowed subject.
+	var (
+		vp        VisitorAuthPolicy
+		subsJSON  string
+		vpEnabled int
+		vpRevoked sql.NullString
+	)
+	err = tx.QueryRow(
+		`SELECT tenant_id, route_id, mode, issuer, client_id, allowed_subjects_json,
+		        client_policy, enabled, revision, revoked_at
+		 FROM authz_visitor_policies WHERE tenant_id=? AND route_id=?`,
+		req.Tenant, req.Route,
+	).Scan(&vp.TenantID, &vp.RouteID, &vp.Mode, &vp.Issuer, &vp.ClientID, &subsJSON,
+		&vp.ClientPolicy, &vpEnabled, &vp.Revision, &vpRevoked)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("%w: visitor auth policy absent", ErrPolicyRevisionMismatch)
+	}
+	if err != nil {
+		return fmt.Errorf("authz: verify visitor auth policy: %w", err)
+	}
+	vp.Enabled = vpEnabled != 0
+	if vpRevoked.Valid {
+		t, _ := time.Parse(time.RFC3339Nano, vpRevoked.String)
+		vp.RevokedAt = &t
+	}
+	_ = json.Unmarshal([]byte(subsJSON), &vp.AllowedSubjects)
+	if !vp.IsActiveFederated() {
+		return fmt.Errorf("%w: visitor auth policy inactive or revoked", ErrPolicyRevisionMismatch)
+	}
+	if req.ExpectedPolicyRevision > 0 && vp.Revision != req.ExpectedPolicyRevision {
+		return fmt.Errorf("%w: expected revision %d, current %d", ErrPolicyRevisionMismatch, req.ExpectedPolicyRevision, vp.Revision)
+	}
+	if !vp.AllowsSubject(req.OwnerIssuer, req.OwnerSubject) {
+		return fmt.Errorf("authz: subject is not allowed by active visitor auth policy")
+	}
+
+	// 4. Verify current trust policy state (when required by client_policy or bound by tx).
+	if vp.ClientPolicy != "" || req.TrustPolicyID != "" {
+		if req.TrustPolicyID == "" {
+			return fmt.Errorf("%w: missing required trust policy binding", ErrTrustPolicyInactive)
+		}
+		var (
+			tpTenant   string
+			tpRoute    string
+			tpKind     string
+			tpURIsJSON string
+			tpEnabled  int
+			tpRevoked  sql.NullString
+		)
+		err = tx.QueryRow(
+			`SELECT tenant_id, route_id, kind, redirect_uris_json, enabled, revoked_at
+			 FROM authz_trust_policies WHERE id=?`,
+			req.TrustPolicyID,
+		).Scan(&tpTenant, &tpRoute, &tpKind, &tpURIsJSON, &tpEnabled, &tpRevoked)
+		if err != nil || tpTenant != req.Tenant || tpRoute != req.Route || tpEnabled != 1 || tpRevoked.Valid {
+			return ErrTrustPolicyInactive
+		}
+		var tpURIs []string
+		if uerr := json.Unmarshal([]byte(tpURIsJSON), &tpURIs); uerr != nil || !ExactRedirectURISetEqual(tpURIs, clientURIs) {
+			return ErrTrustPolicyInactive
+		}
+		if vp.ClientPolicy != "" && vp.ClientPolicy != "custom" && tpKind != vp.ClientPolicy {
+			return ErrTrustPolicyInactive
+		}
+	}
+
+	// 5. Verify existing grant is not revoked (revocation is terminal).
+	var status string
+	err = tx.QueryRow(
+		`SELECT status FROM authz_grants WHERE client_id=? AND tenant_id=? AND route_id=?`,
+		req.ClientID, req.Tenant, req.Route,
+	).Scan(&status)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("authz: check grant status: %w", err)
+	}
+	if err == nil && status == string(GrantRevoked) {
+		return fmt.Errorf("authz: grant for client %q route %q is revoked; revocation is terminal", req.ClientID, req.Route)
+	}
+
+	// 6. Atomically activate the federated grant.
+	res, err := tx.Exec(
+		`INSERT INTO authz_grants(
+		   client_id, tenant_id, route_id, status, created_at, updated_at,
+		   skip_pairing, auth_method, trust_policy_id, owner_issuer, owner_subject)
+		 VALUES(?,?,?,?,?,?,0,?,?,?,?)
+		 ON CONFLICT(client_id, tenant_id, route_id)
+		 DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at,
+		   skip_pairing=0, auth_method=excluded.auth_method,
+		   trust_policy_id=excluded.trust_policy_id, owner_issuer=excluded.owner_issuer,
+		   owner_subject=excluded.owner_subject
+		 WHERE authz_grants.status <> 'revoked'`,
+		req.ClientID, req.Tenant, req.Route, string(GrantActive), nowStr, nowStr,
+		GrantMethodFederatedOIDC, req.TrustPolicyID, req.OwnerIssuer, req.OwnerSubject,
+	)
+	if err != nil {
+		return fmt.Errorf("authz: activate federated grant: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("authz: grant for client %q route %q is revoked; revocation is terminal", req.ClientID, req.Route)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("authz: commit federated grant: %w", err)
 	}
 	return nil
 }

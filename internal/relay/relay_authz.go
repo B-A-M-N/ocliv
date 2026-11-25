@@ -25,8 +25,11 @@ type authzManager struct {
 
 // newAuthzManager loads (or creates) the relay's issuer key. It fails closed:
 // a relay that cannot load its issuer cannot serve managed routes.
-func newAuthzManager(db *store.DB) (*authzManager, error) {
+func newAuthzManager(db *store.DB, serverKey ...[]byte) (*authzManager, error) {
 	st := authz.NewSQLStore(db.SQL())
+	if len(serverKey) > 0 && len(serverKey[0]) > 0 {
+		st.SetSecretKey(authz.DeriveVisitorSecretKey(serverKey[0]))
+	}
 	issuer, err := st.LoadIssuer()
 	if err != nil {
 		return nil, fmt.Errorf("relay: load authz issuer: %w", err)

@@ -17,6 +17,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -439,7 +440,13 @@ func (s *Server) enrichAgentPublication(tenant, keyID string, p *agentPublicatio
 		if obs, err := s.authz.Store().ListHostObservations(tenant, p.RouteID, 50); err == nil {
 			endpointReady := p.Admission == "READY"
 			oauthCompat := endpointReady && p.Profile == ingressProfileManaged
-			summary := authz.SummarizeHostObservations(endpointReady, oauthCompat, obs)
+			summary := authz.SummarizeHostObservationsFiltered(endpointReady, oauthCompat, obs, authz.HostObservationFilter{
+				TenantID:              tenant,
+				RouteID:               p.RouteID,
+				CanonicalURL:          routeURLFor(s.mcpHost, s.mcpPort, p.RouteID),
+				PublicationGeneration: p.StateGeneration,
+				MaxAge:                authz.DefaultObservationMaxAge,
+			})
 			p.HostVerification = &summary
 		}
 	}
@@ -714,6 +721,10 @@ func (s *Server) serveKeyPublicationAuthzApprove(w http.ResponseWriter, r *http.
 	}
 	if direct {
 		if err := s.authz.Store().ApproveGrantDirect(clientID, tenant, routeID); err != nil {
+			if errors.Is(err, authz.ErrFederatedPolicyRequired) {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
@@ -733,6 +744,10 @@ func (s *Server) serveKeyPublicationAuthzApprove(w http.ResponseWriter, r *http.
 		return
 	}
 	if err := s.authz.Store().ApproveGrantWithPairingSecret(clientID, tenant, routeID, secret, authz.DefaultPairingTTL); err != nil {
+		if errors.Is(err, authz.ErrFederatedPolicyRequired) {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -817,6 +832,10 @@ func (s *Server) serveKeyPublicationAuthzRegister(w http.ResponseWriter, r *http
 	if req.Approve {
 		if err := s.authz.Store().ApproveGrantDirect(clientID, tenant, routeID); err != nil {
 			_ = s.authz.Store().RevokeClient(clientID)
+			if errors.Is(err, authz.ErrFederatedPolicyRequired) {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}

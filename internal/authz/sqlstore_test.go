@@ -75,19 +75,22 @@ func applySchema(t *testing.T, db *sql.DB) {
 			   tenant_id TEXT NOT NULL, route_id TEXT NOT NULL, mode TEXT NOT NULL,
 			   issuer TEXT NOT NULL, client_id TEXT NOT NULL, client_secret TEXT NOT NULL DEFAULT '',
 			   allowed_subjects_json TEXT NOT NULL DEFAULT '[]', client_policy TEXT NOT NULL DEFAULT '',
-			   enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+			   enabled INTEGER NOT NULL DEFAULT 1, revision INTEGER NOT NULL DEFAULT 1,
+			   created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
 			   revoked_at TEXT, PRIMARY KEY (tenant_id, route_id))`,
 		`CREATE TABLE authz_oidc_tx (
 			   state TEXT PRIMARY KEY, nonce TEXT NOT NULL, pkce_verifier TEXT NOT NULL,
 			   client_id TEXT NOT NULL, tenant_id TEXT NOT NULL, route_id TEXT NOT NULL,
 			   redirect_uri TEXT NOT NULL, code_challenge TEXT NOT NULL, client_state TEXT NOT NULL DEFAULT '',
 			   resource TEXT NOT NULL, scope TEXT NOT NULL, trust_policy_id TEXT NOT NULL DEFAULT '',
+			   visitor_policy_revision INTEGER NOT NULL DEFAULT 0,
 			   expires_at TEXT NOT NULL, consumed_at TEXT)`,
 		`CREATE TABLE mcp_host_observations (
 			   id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, route_id TEXT NOT NULL,
 			   canonical_url TEXT NOT NULL, client_id TEXT NOT NULL DEFAULT '',
 			   client_kind TEXT NOT NULL DEFAULT 'generic', protocol_version TEXT NOT NULL DEFAULT '',
 			   publication_generation INTEGER NOT NULL DEFAULT 0, stage TEXT NOT NULL,
+			   transport_ok INTEGER NOT NULL DEFAULT 1,
 			   result_category TEXT NOT NULL DEFAULT 'ok', is_synthetic INTEGER NOT NULL DEFAULT 0,
 			   observed_at TEXT NOT NULL)`,
 	} {

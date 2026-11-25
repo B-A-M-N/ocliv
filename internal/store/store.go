@@ -383,6 +383,7 @@ ALTER TABLE authz_grants ADD COLUMN auth_method TEXT NOT NULL DEFAULT 'legacy';
 ALTER TABLE authz_grants ADD COLUMN trust_policy_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE authz_grants ADD COLUMN owner_issuer TEXT NOT NULL DEFAULT '';
 ALTER TABLE authz_grants ADD COLUMN owner_subject TEXT NOT NULL DEFAULT '';
+UPDATE authz_grants SET skip_pairing = 0 WHERE skip_pairing <> 0 AND auth_method = 'legacy';
 CREATE INDEX IF NOT EXISTS idx_authz_grants_trust_policy
   ON authz_grants(tenant_id, route_id, trust_policy_id);
 CREATE TABLE IF NOT EXISTS authz_visitor_policies (
@@ -395,6 +396,7 @@ CREATE TABLE IF NOT EXISTS authz_visitor_policies (
   allowed_subjects_json TEXT NOT NULL DEFAULT '[]',
   client_policy TEXT NOT NULL DEFAULT '',
   enabled INTEGER NOT NULL DEFAULT 1,
+  revision INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   revoked_at TEXT,
@@ -413,6 +415,7 @@ CREATE TABLE IF NOT EXISTS authz_oidc_tx (
   resource TEXT NOT NULL,
   scope TEXT NOT NULL,
   trust_policy_id TEXT NOT NULL DEFAULT '',
+  visitor_policy_revision INTEGER NOT NULL DEFAULT 0,
   expires_at TEXT NOT NULL,
   consumed_at TEXT
 );
@@ -427,6 +430,7 @@ CREATE TABLE IF NOT EXISTS mcp_host_observations (
   protocol_version TEXT NOT NULL DEFAULT '',
   publication_generation INTEGER NOT NULL DEFAULT 0,
   stage TEXT NOT NULL,
+  transport_ok INTEGER NOT NULL DEFAULT 1,
   result_category TEXT NOT NULL DEFAULT 'ok',
   is_synthetic INTEGER NOT NULL DEFAULT 0,
   observed_at TEXT NOT NULL

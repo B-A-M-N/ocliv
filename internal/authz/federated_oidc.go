@@ -2,24 +2,24 @@ package authz
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/ed25519"
-	"crypto/elliptic"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
-	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
-	"math/big"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
+	"github.com/coreos/go-oidc/v3/oidc"
+	"golang.org/x/oauth2"
 )
 
 // Grant authorization provenance methods (OCL-006).
@@ -41,6 +41,13 @@ const (
 const (
 	DefaultOIDCTxTTL         = 10 * time.Minute
 	MaxPendingOIDCTxPerRoute = 100
+)
+
+// Sentinel errors for authoritative federated policy enforcement.
+var (
+	ErrFederatedPolicyRequired = errors.New("authz: route requires federated visitor authentication")
+	ErrPolicyRevisionMismatch  = errors.New("authz: visitor auth policy changed or was revoked during login")
+	ErrOIDCEgressBlocked       = errors.New("authz: OIDC provider endpoint blocked by egress policy")
 )
 
 // GrantProvenance records exactly how an authorization grant was established so
@@ -67,9 +74,15 @@ type VisitorAuthPolicy struct {
 	AllowedSubjects []string   `json:"allowed_subjects"`
 	ClientPolicy    string     `json:"client_policy,omitempty"` // e.g. "chatgpt" or ""
 	Enabled         bool       `json:"enabled"`
+	Revision        int64      `json:"revision"`
 	CreatedAt       time.Time  `json:"created_at"`
 	UpdatedAt       time.Time  `json:"updated_at"`
 	RevokedAt       *time.Time `json:"revoked_at,omitempty"`
+}
+
+// IsActiveFederated reports whether this policy actively enforces federated OIDC.
+func (p *VisitorAuthPolicy) IsActiveFederated() bool {
+	return p != nil && p.Enabled && p.RevokedAt == nil && p.Mode == VisitorAuthModeFederated
 }
 
 // Redacted returns a safe view of the policy without client_secret.
@@ -82,7 +95,7 @@ func (p VisitorAuthPolicy) Redacted() VisitorAuthPolicy {
 
 // AllowsSubject reports whether (issuer, subject) matches this active policy.
 func (p *VisitorAuthPolicy) AllowsSubject(issuer, subject string) bool {
-	if p == nil || !p.Enabled || p.RevokedAt != nil || p.Mode != VisitorAuthModeFederated {
+	if !p.IsActiveFederated() {
 		return false
 	}
 	if issuer == "" || subject == "" || p.Issuer != issuer {
@@ -154,26 +167,41 @@ func ValidateVisitorAuthPolicy(p VisitorAuthPolicy) (VisitorAuthPolicy, error) {
 }
 
 // OIDCTransaction binds one in-flight federated OIDC login to the originating
-// MCP client authorization transaction (OCL-005).
+// MCP client authorization transaction and exact visitor policy revision (OCL-005).
 type OIDCTransaction struct {
-	State         string
-	Nonce         string
-	PKCEVerifier  string
-	ClientID      string
-	Tenant        string
-	Route         string
-	RedirectURI   string
-	CodeChallenge string
-	ClientState   string
-	Resource      string
-	Scope         string
-	TrustPolicyID string
-	ExpiresAt     time.Time
-	ConsumedAt    *time.Time
+	State          string
+	Nonce          string
+	PKCEVerifier   string
+	ClientID       string
+	Tenant         string
+	Route          string
+	RedirectURI    string
+	CodeChallenge  string
+	ClientState    string
+	Resource       string
+	Scope          string
+	TrustPolicyID  string
+	PolicyRevision int64
+	ExpiresAt      time.Time
+	ConsumedAt     *time.Time
 }
 
 // Expired reports whether the transaction has passed its expiry.
 func (t *OIDCTransaction) Expired() bool { return time.Now().After(t.ExpiresAt) }
+
+// FederatedGrantActivation carries every invariant that must be verified
+// atomically inside a single store transaction before activating a federated
+// OIDC grant.
+type FederatedGrantActivation struct {
+	ClientID               string
+	Tenant                 string
+	Route                  string
+	RedirectURI            string
+	ExpectedPolicyRevision int64
+	TrustPolicyID          string
+	OwnerIssuer            string
+	OwnerSubject           string
+}
 
 func mintRandomToken(prefix string, nBytes int) (string, error) {
 	buf := make([]byte, nBytes)
@@ -183,30 +211,160 @@ func mintRandomToken(prefix string, nBytes int) (string, error) {
 	return prefix + base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
-// OIDCDiscovery holds the validated OpenID Provider discovery metadata.
-type OIDCDiscovery struct {
-	Issuer                string `json:"issuer"`
-	AuthorizationEndpoint string `json:"authorization_endpoint"`
-	TokenEndpoint         string `json:"token_endpoint"`
-	JWKSURI               string `json:"jwks_uri"`
+// --- At-rest encryption for authz_visitor_policies.client_secret ---
+
+const visitorSecretEncPrefix = "enc:v1:"
+
+// DeriveVisitorSecretKey derives a domain-separated 32-byte AES-256-GCM key
+// from the relay's durable 32-byte server key (which lives in 0600
+// visitor-hmac.key outside the SQLite database).
+func DeriveVisitorSecretKey(serverKey []byte) []byte {
+	if len(serverKey) == 0 {
+		return nil
+	}
+	h := sha256.New()
+	h.Write([]byte("ocliv-visitor-oidc-secret-v1:"))
+	h.Write(serverKey)
+	return h.Sum(nil)
 }
 
-// OIDCClient executes discovery, authorization-code exchange, and JWKS JWT
-// verification against an upstream OIDC identity provider (OCL-005).
+func visitorSecretAAD(tenant, route, issuer, clientID string) []byte {
+	return []byte(tenant + "\x00" + route + "\x00" + issuer + "\x00" + clientID)
+}
+
+// SealVisitorSecret encrypts a non-empty OIDC client secret using AES-256-GCM
+// bound to (tenant, route, issuer, clientID) via AAD.
+func SealVisitorSecret(key []byte, tenant, route, issuer, clientID, plaintext string) (string, error) {
+	if plaintext == "" || len(key) == 0 {
+		return plaintext, nil
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", fmt.Errorf("authz: init visitor secret cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("authz: init visitor secret gcm: %w", err)
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", fmt.Errorf("authz: visitor secret nonce: %w", err)
+	}
+	aad := visitorSecretAAD(tenant, route, issuer, clientID)
+	sealed := gcm.Seal(nonce, nonce, []byte(plaintext), aad)
+	return visitorSecretEncPrefix + base64.RawStdEncoding.EncodeToString(sealed), nil
+}
+
+// OpenVisitorSecret decrypts an AES-256-GCM sealed OIDC client secret.
+// Plaintext values without the enc:v1: prefix are returned as-is for backward
+// compatibility when no encryption key was previously configured; sealed values
+// always fail closed if the key is missing or AAD/tag verification fails.
+func OpenVisitorSecret(key []byte, tenant, route, issuer, clientID, stored string) (string, error) {
+	if stored == "" || !strings.HasPrefix(stored, visitorSecretEncPrefix) {
+		return stored, nil
+	}
+	if len(key) == 0 {
+		return "", fmt.Errorf("authz: visitor policy client_secret is encrypted but no decryption key is configured")
+	}
+	raw, err := base64.RawStdEncoding.DecodeString(strings.TrimPrefix(stored, visitorSecretEncPrefix))
+	if err != nil {
+		return "", fmt.Errorf("authz: corrupt encrypted visitor policy client_secret")
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", fmt.Errorf("authz: init visitor secret cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("authz: init visitor secret gcm: %w", err)
+	}
+	if len(raw) < gcm.NonceSize()+gcm.Overhead() {
+		return "", fmt.Errorf("authz: truncated encrypted visitor policy client_secret")
+	}
+	nonce := raw[:gcm.NonceSize()]
+	ct := raw[gcm.NonceSize():]
+	aad := visitorSecretAAD(tenant, route, issuer, clientID)
+	pt, err := gcm.Open(nil, nonce, ct, aad)
+	if err != nil {
+		return "", fmt.Errorf("authz: decrypt visitor policy client_secret failed (key rotated or DB tampered)")
+	}
+	return string(pt), nil
+}
+
+// --- Maintained OIDC Client (go-oidc/v3 + golang.org/x/oauth2) with strict egress policy ---
+
+// OIDCClient executes discovery, authorization-code exchange, and ID token
+// verification against an upstream OIDC identity provider using maintained
+// go-oidc/v3 and golang.org/x/oauth2 libraries with strict HTTPS and
+// private-network egress enforcement (OCL-005).
 type OIDCClient struct {
-	HTTPClient *http.Client
+	HTTPClient           *http.Client
+	AllowLoopbackForTest bool // test-only opt-in for httptest.NewTLSServer; never set in production
+}
+
+var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
+
+func isBlockedOIDCEgressIP(ip net.IP) bool {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return true
+	}
+	addr = addr.Unmap()
+	if addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() ||
+		addr.IsLinkLocalMulticast() || addr.IsMulticast() || addr.IsUnspecified() ||
+		cgnatPrefix.Contains(addr) {
+		return true
+	}
+	return false
+}
+
+func safeOIDCDialContext(base *net.Dialer, allowLoopback bool) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid host:port %q", ErrOIDCEgressBlocked, addr)
+		}
+		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+		if err != nil || len(ips) == 0 {
+			return nil, fmt.Errorf("%w: resolve %q: %v", ErrOIDCEgressBlocked, host, err)
+		}
+		for _, ip := range ips {
+			if allowLoopback && ip.IsLoopback() {
+				continue
+			}
+			if isBlockedOIDCEgressIP(ip) {
+				return nil, fmt.Errorf("%w: destination %q resolved to non-public address", ErrOIDCEgressBlocked, host)
+			}
+		}
+		// Connect directly to the first verified IP to prevent DNS rebinding TOCTOU.
+		return base.DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
+	}
 }
 
 func (c *OIDCClient) httpClient() *http.Client {
+	allowLoopback := c != nil && c.AllowLoopbackForTest
+	dialer := &net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}
 	if c != nil && c.HTTPClient != nil {
 		cp := *c.HTTPClient
 		cp.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 			return fmt.Errorf("authz: redirects blocked during OIDC provider exchange")
 		}
+		if tr, ok := cp.Transport.(*http.Transport); ok && tr != nil {
+			trCopy := tr.Clone()
+			trCopy.DialContext = safeOIDCDialContext(dialer, allowLoopback)
+			cp.Transport = trCopy
+		} else if cp.Transport == nil {
+			tr := http.DefaultTransport.(*http.Transport).Clone()
+			tr.DialContext = safeOIDCDialContext(dialer, allowLoopback)
+			cp.Transport = tr
+		}
 		return &cp
 	}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DialContext = safeOIDCDialContext(dialer, allowLoopback)
 	return &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout:   10 * time.Second,
+		Transport: tr,
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return fmt.Errorf("authz: redirects blocked during OIDC provider exchange")
 		},
@@ -221,222 +379,125 @@ func validateStrictHTTPSURL(raw, field string) error {
 	return nil
 }
 
-// Discover fetches and validates <issuer>/.well-known/openid-configuration.
-func (c *OIDCClient) Discover(ctx context.Context, issuer string) (*OIDCDiscovery, error) {
+// providerWithContext uses go-oidc/v3 to discover and validate the OIDC provider
+// while enforcing strict HTTPS on all endpoints and our SSRF egress policy.
+func (c *OIDCClient) providerWithContext(ctx context.Context, issuer string) (context.Context, *oidc.Provider, error) {
 	if err := validateStrictHTTPSURL(issuer, "issuer"); err != nil {
-		return nil, err
+		return ctx, nil, err
 	}
-	discURL := strings.TrimRight(issuer, "/") + "/.well-known/openid-configuration"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, discURL, nil)
+	hc := c.httpClient()
+	oidcCtx := oidc.ClientContext(ctx, hc)
+	prov, err := oidc.NewProvider(oidcCtx, issuer)
 	if err != nil {
-		return nil, err
+		return oidcCtx, nil, fmt.Errorf("authz: OIDC discovery failed: %w", err)
 	}
-	resp, err := c.httpClient().Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("authz: OIDC discovery fetch failed: %w", err)
+	ep := prov.Endpoint()
+	if err := validateStrictHTTPSURL(ep.AuthURL, "authorization_endpoint"); err != nil {
+		return oidcCtx, nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("authz: OIDC discovery returned HTTP %d", resp.StatusCode)
+	if err := validateStrictHTTPSURL(ep.TokenURL, "token_endpoint"); err != nil {
+		return oidcCtx, nil, err
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 128*1024))
-	if err != nil {
-		return nil, fmt.Errorf("authz: read OIDC discovery: %w", err)
+	var meta struct {
+		Issuer  string `json:"issuer"`
+		JWKSURI string `json:"jwks_uri"`
 	}
-	var doc OIDCDiscovery
-	if err := json.Unmarshal(body, &doc); err != nil {
-		return nil, fmt.Errorf("authz: decode OIDC discovery: %w", err)
+	if err := prov.Claims(&meta); err != nil {
+		return oidcCtx, nil, fmt.Errorf("authz: decode OIDC discovery claims: %w", err)
 	}
-	if doc.Issuer != issuer {
-		return nil, fmt.Errorf("authz: OIDC discovery issuer mismatch: got %q want %q", doc.Issuer, issuer)
+	if meta.Issuer != issuer {
+		return oidcCtx, nil, fmt.Errorf("authz: OIDC discovery issuer mismatch: got %q want %q", meta.Issuer, issuer)
 	}
-	if err := validateStrictHTTPSURL(doc.AuthorizationEndpoint, "authorization_endpoint"); err != nil {
-		return nil, err
+	if err := validateStrictHTTPSURL(meta.JWKSURI, "jwks_uri"); err != nil {
+		return oidcCtx, nil, err
 	}
-	if err := validateStrictHTTPSURL(doc.TokenEndpoint, "token_endpoint"); err != nil {
-		return nil, err
-	}
-	if err := validateStrictHTTPSURL(doc.JWKSURI, "jwks_uri"); err != nil {
-		return nil, err
-	}
-	return &doc, nil
+	return oidcCtx, prov, nil
 }
 
-// ExchangeCode redeems the IdP authorization code with PKCE verifier and
-// returns the raw OIDC id_token JWT.
-func (c *OIDCClient) ExchangeCode(ctx context.Context, tokenEndpoint, clientID, clientSecret, code, callbackURL, pkceVerifier string) (string, error) {
-	form := url.Values{
-		"grant_type":    {"authorization_code"},
-		"code":          {code},
-		"redirect_uri":  {callbackURL},
-		"client_id":     {clientID},
-		"code_verifier": {pkceVerifier},
-	}
-	if clientSecret != "" {
-		form.Set("client_secret", clientSecret)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenEndpoint, strings.NewReader(form.Encode()))
+// BuildAuthorizeURL discovers the provider and constructs the PKCE + nonce +
+// state authorization URL using golang.org/x/oauth2.
+func (c *OIDCClient) BuildAuthorizeURL(ctx context.Context, issuer, clientID, callbackURL, state, nonce, pkceVerifier string) (string, error) {
+	_, prov, err := c.providerWithContext(ctx, issuer)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-	resp, err := c.httpClient().Do(req)
+	cfg := oauth2.Config{
+		ClientID:    clientID,
+		Endpoint:    prov.Endpoint(),
+		RedirectURL: callbackURL,
+		Scopes:      []string{oidc.ScopeOpenID},
+	}
+	return cfg.AuthCodeURL(
+		state,
+		oauth2.S256ChallengeOption(pkceVerifier),
+		oauth2.SetAuthURLParam("nonce", nonce),
+	), nil
+}
+
+// ExchangeAndVerify redeems the IdP authorization code with PKCE via
+// golang.org/x/oauth2 and verifies the returned ID token using go-oidc/v3
+// (signature, JWKS key selection, issuer, audience, expiration, nonce, and
+// OIDC Core §3.1.3.7 authorized-party `azp` validation).
+func (c *OIDCClient) ExchangeAndVerify(ctx context.Context, issuer, clientID, clientSecret, code, callbackURL, pkceVerifier, expectedNonce string) (string, error) {
+	if issuer == "" || clientID == "" || expectedNonce == "" {
+		return "", fmt.Errorf("authz: OIDC verification requires issuer, client_id, and nonce")
+	}
+	oidcCtx, prov, err := c.providerWithContext(ctx, issuer)
+	if err != nil {
+		return "", err
+	}
+	cfg := oauth2.Config{
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		Endpoint:     prov.Endpoint(),
+		RedirectURL:  callbackURL,
+		Scopes:       []string{oidc.ScopeOpenID},
+	}
+	oauthTok, err := cfg.Exchange(oidcCtx, code, oauth2.VerifierOption(pkceVerifier))
 	if err != nil {
 		return "", fmt.Errorf("authz: OIDC token exchange failed: %w", err)
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 128*1024))
-	if err != nil {
-		return "", fmt.Errorf("authz: read OIDC token response: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("authz: OIDC token endpoint returned HTTP %d", resp.StatusCode)
-	}
-	var tokResp struct {
-		IDToken string `json:"id_token"`
-	}
-	if err := json.Unmarshal(body, &tokResp); err != nil || strings.TrimSpace(tokResp.IDToken) == "" {
+	rawIDToken, ok := oauthTok.Extra("id_token").(string)
+	if !ok || strings.TrimSpace(rawIDToken) == "" {
 		return "", fmt.Errorf("authz: OIDC token response missing id_token")
 	}
-	return tokResp.IDToken, nil
-}
-
-type oidcIDTokenClaims struct {
-	jwt.RegisteredClaims
-	Nonce string `json:"nonce"`
-}
-
-type rawJWK struct {
-	Kty string `json:"kty"`
-	Kid string `json:"kid"`
-	Use string `json:"use"`
-	Alg string `json:"alg"`
-	N   string `json:"n"`
-	E   string `json:"e"`
-	Crv string `json:"crv"`
-	X   string `json:"x"`
-	Y   string `json:"y"`
-}
-
-func parseJWKPublicKey(k rawJWK) (any, error) {
-	switch k.Kty {
-	case "RSA":
-		nb, err := base64.RawURLEncoding.DecodeString(k.N)
-		if err != nil {
-			return nil, err
-		}
-		eb, err := base64.RawURLEncoding.DecodeString(k.E)
-		if err != nil {
-			return nil, err
-		}
-		eInt := int(new(big.Int).SetBytes(eb).Int64())
-		if eInt < 3 {
-			return nil, fmt.Errorf("invalid RSA exponent")
-		}
-		return &rsa.PublicKey{N: new(big.Int).SetBytes(nb), E: eInt}, nil
-	case "EC":
-		xb, err := base64.RawURLEncoding.DecodeString(k.X)
-		if err != nil {
-			return nil, err
-		}
-		yb, err := base64.RawURLEncoding.DecodeString(k.Y)
-		if err != nil {
-			return nil, err
-		}
-		var curve elliptic.Curve
-		switch k.Crv {
-		case "P-256":
-			curve = elliptic.P256()
-		case "P-384":
-			curve = elliptic.P384()
-		case "P-521":
-			curve = elliptic.P521()
-		default:
-			return nil, fmt.Errorf("unsupported EC curve %q", k.Crv)
-		}
-		return &ecdsa.PublicKey{Curve: curve, X: new(big.Int).SetBytes(xb), Y: new(big.Int).SetBytes(yb)}, nil
-	case "OKP":
-		if k.Crv != "Ed25519" {
-			return nil, fmt.Errorf("unsupported OKP curve %q", k.Crv)
-		}
-		xb, err := base64.RawURLEncoding.DecodeString(k.X)
-		if err != nil || len(xb) != ed25519.PublicKeySize {
-			return nil, fmt.Errorf("invalid Ed25519 JWK")
-		}
-		return ed25519.PublicKey(xb), nil
-	default:
-		return nil, fmt.Errorf("unsupported JWK kty %q", k.Kty)
-	}
-}
-
-// VerifyIDToken validates the IdP id_token signature against jwksURI and
-// enforces exact issuer, audience, nonce, expiration, and non-empty subject.
-func (c *OIDCClient) VerifyIDToken(ctx context.Context, jwksURI, expectedIssuer, expectedAudience, expectedNonce, rawIDToken string) (string, error) {
-	if expectedIssuer == "" || expectedAudience == "" || expectedNonce == "" {
-		return "", fmt.Errorf("authz: OIDC verification requires issuer, audience, and nonce")
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, jwksURI, nil)
-	if err != nil {
-		return "", err
-	}
-	resp, err := c.httpClient().Do(req)
-	if err != nil {
-		return "", fmt.Errorf("authz: fetch OIDC JWKS: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("authz: OIDC JWKS returned HTTP %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
-	if err != nil {
-		return "", fmt.Errorf("authz: read OIDC JWKS: %w", err)
-	}
-	var jwks struct {
-		Keys []rawJWK `json:"keys"`
-	}
-	if err := json.Unmarshal(body, &jwks); err != nil || len(jwks.Keys) == 0 {
-		return "", fmt.Errorf("authz: invalid OIDC JWKS")
-	}
-
-	claims := &oidcIDTokenClaims{}
-	_, err = jwt.ParseWithClaims(
-		rawIDToken,
-		claims,
-		func(t *jwt.Token) (any, error) {
-			kid, _ := t.Header["kid"].(string)
-			for _, k := range jwks.Keys {
-				if k.Use != "" && k.Use != "sig" {
-					continue
-				}
-				if kid != "" && k.Kid != "" && k.Kid != kid {
-					continue
-				}
-				if kid != "" && k.Kid == "" && len(jwks.Keys) > 1 {
-					continue
-				}
-				pub, perr := parseJWKPublicKey(k)
-				if perr != nil {
-					continue
-				}
-				return pub, nil
-			}
-			return nil, fmt.Errorf("authz: no matching JWK for kid %q", kid)
+	verifier := prov.Verifier(&oidc.Config{
+		ClientID: clientID,
+		SupportedSigningAlgs: []string{
+			oidc.RS256, oidc.RS384, oidc.RS512,
+			oidc.ES256, oidc.ES384, oidc.ES512,
+			oidc.PS256, oidc.PS384, oidc.PS512,
+			oidc.EdDSA,
 		},
-		jwt.WithValidMethods([]string{"RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "EdDSA"}),
-		jwt.WithIssuer(expectedIssuer),
-		jwt.WithAudience(expectedAudience),
-		jwt.WithExpirationRequired(),
-		jwt.WithLeeway(30*time.Second),
-	)
+	})
+	idToken, err := verifier.Verify(oidcCtx, rawIDToken)
 	if err != nil {
 		return "", fmt.Errorf("authz: OIDC id_token verification failed: %w", err)
 	}
-	if subtle.ConstantTimeCompare([]byte(claims.Nonce), []byte(expectedNonce)) != 1 {
+	if idToken.Issuer != issuer {
+		return "", fmt.Errorf("authz: OIDC id_token issuer mismatch")
+	}
+	if subtle.ConstantTimeCompare([]byte(idToken.Nonce), []byte(expectedNonce)) != 1 {
 		return "", fmt.Errorf("authz: OIDC id_token nonce mismatch")
 	}
-	if strings.TrimSpace(claims.Subject) == "" {
+	// OIDC Core §3.1.3.7 azp enforcement:
+	// - If the ID Token contains multiple audiences, azp MUST be present and equal clientID.
+	// - If azp is present (even with a single audience), azp MUST equal clientID.
+	var azpClaims struct {
+		AZP string `json:"azp"`
+	}
+	if err := idToken.Claims(&azpClaims); err != nil {
+		return "", fmt.Errorf("authz: decode OIDC id_token claims: %w", err)
+	}
+	if len(idToken.Audience) > 1 {
+		if subtle.ConstantTimeCompare([]byte(azpClaims.AZP), []byte(clientID)) != 1 {
+			return "", fmt.Errorf("authz: OIDC id_token multi-audience token missing matching azp")
+		}
+	} else if azpClaims.AZP != "" && subtle.ConstantTimeCompare([]byte(azpClaims.AZP), []byte(clientID)) != 1 {
+		return "", fmt.Errorf("authz: OIDC id_token azp mismatch")
+	}
+	if strings.TrimSpace(idToken.Subject) == "" {
 		return "", fmt.Errorf("authz: OIDC id_token missing subject")
 	}
-	return claims.Subject, nil
+	return idToken.Subject, nil
 }

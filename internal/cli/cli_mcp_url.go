@@ -817,7 +817,12 @@ func cmdMCPCheckWithOps(argv []string, ops serviceOps, hc *http.Client) int {
 	}
 
 	disc := runReadOnlyDiscoveryCheckWithAllowlist(hc, entry.URL, trustedIssuers)
-	hostSummary := authz.SummarizeHostObservations(disc.Transport == "PASS", disc.Discovery == "PASS", hostObs)
+	hostSummary := authz.SummarizeHostObservationsFiltered(disc.Transport == "PASS", disc.Discovery == "PASS", hostObs, authz.HostObservationFilter{
+		RouteID:               entry.RouteID,
+		CanonicalURL:          entry.URL,
+		PublicationGeneration: entry.StateGeneration,
+		MaxAge:                authz.DefaultObservationMaxAge,
+	})
 	authMCP := "UNKNOWN"
 	authMCPDetail := ""
 	var eventsQual *MCPEventsQualificationResult

@@ -221,6 +221,11 @@ type Store interface {
 	// provenance (e.g. federated_oidc + trust_policy_id + issuer + subject).
 	// It refuses unknown/wrong-tenant clients and never resurrects a revoked grant.
 	ApproveGrantWithProvenance(clientID, tenant, route string, skipPairing bool, prov GrantProvenance) error
+	// ApproveFederatedGrantAtomic transactionally validates client identity,
+	// publication state, current trust policy, current visitor policy state &
+	// revision, allowed issuer/subject, and grant revocation state in ONE
+	// atomic transaction before activating a federated grant (OCL-005).
+	ApproveFederatedGrantAtomic(req FederatedGrantActivation) error
 	CreateOpaqueRefresh(r OpaqueRefresh) error
 	RotateOpaqueRefresh(oldHash, newHash, clientID, tenant, route string, now time.Time, extendBy time.Duration) (*OpaqueRefresh, error)
 	ExtendOpaqueRefresh(tokenHash, clientID, tenant, route string, now time.Time, extendBy time.Duration) (*OpaqueRefresh, error)
@@ -506,6 +511,9 @@ func (m *MemStore) ApproveGrantWithPairingSecret(clientID, tenant, route, secret
 		return fmt.Errorf("authz: client %q is registered for tenant %q route %q, not tenant %q route %q",
 			clientID, c.Tenant, c.Route, tenant, route)
 	}
+	if vp, ok := m.visitorPolicies[visitorPolicyKey(tenant, route)]; ok && vp.IsActiveFederated() {
+		return fmt.Errorf("%w: pairing approval is prohibited on federated route", ErrFederatedPolicyRequired)
+	}
 	k := grantKey(clientID, tenant, route)
 	now := time.Now()
 	g, ok := m.grants[k]
@@ -546,6 +554,9 @@ func (m *MemStore) ApproveGrantDirect(clientID, tenant, route string) error {
 	if c.Tenant != tenant {
 		return fmt.Errorf("authz: client %q is registered for tenant %q, not tenant %q",
 			clientID, c.Tenant, tenant)
+	}
+	if vp, ok := m.visitorPolicies[visitorPolicyKey(tenant, route)]; ok && vp.IsActiveFederated() {
+		return fmt.Errorf("%w: direct approval is prohibited on federated route", ErrFederatedPolicyRequired)
 	}
 	k := grantKey(clientID, tenant, route)
 	now := time.Now()
@@ -604,6 +615,77 @@ func (m *MemStore) ApproveGrantWithProvenance(clientID, tenant, route string, sk
 	g.Status = GrantActive
 	g.SkipPairing = skipPairing
 	g.Provenance = prov
+	g.UpdatedAt = now
+	return nil
+}
+
+// ApproveFederatedGrantAtomic transactionally validates client identity,
+// redirect URI, current visitor policy state & revision, allowed issuer &
+// subject, current trust policy, and grant revocation under the store lock
+// before activating the federated grant (OCL-005).
+func (m *MemStore) ApproveFederatedGrantAtomic(req FederatedGrantActivation) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, cok := m.clients[req.ClientID]
+	if !cok || c.RevokedAt != nil {
+		return fmt.Errorf("authz: client %q unknown or revoked", req.ClientID)
+	}
+	if c.Tenant == "" || c.Tenant != req.Tenant || (c.Route != "" && c.Route != req.Route) {
+		return fmt.Errorf("authz: client %q is not bound to tenant %q route %q", req.ClientID, req.Tenant, req.Route)
+	}
+	if req.RedirectURI != "" {
+		if err := ValidateRedirectURI(req.RedirectURI, c.RedirectURIs); err != nil {
+			return fmt.Errorf("authz: redirect_uri not bound to client: %w", err)
+		}
+	}
+	vp, ok := m.visitorPolicies[visitorPolicyKey(req.Tenant, req.Route)]
+	if !ok || !vp.IsActiveFederated() {
+		return fmt.Errorf("%w: visitor auth policy inactive", ErrPolicyRevisionMismatch)
+	}
+	if req.ExpectedPolicyRevision > 0 && vp.Revision != req.ExpectedPolicyRevision {
+		return fmt.Errorf("%w: expected revision %d, current %d", ErrPolicyRevisionMismatch, req.ExpectedPolicyRevision, vp.Revision)
+	}
+	if !vp.AllowsSubject(req.OwnerIssuer, req.OwnerSubject) {
+		return fmt.Errorf("authz: subject %q under issuer %q is not allowed by active visitor policy", req.OwnerSubject, req.OwnerIssuer)
+	}
+	if vp.ClientPolicy != "" || req.TrustPolicyID != "" {
+		if req.TrustPolicyID == "" {
+			return fmt.Errorf("%w: missing required trust policy binding", ErrTrustPolicyInactive)
+		}
+		tp, tpok := m.trustPolicies[req.TrustPolicyID]
+		if !tpok || !tp.Enabled || tp.RevokedAt != nil || tp.TenantID != req.Tenant || tp.RouteID != req.Route {
+			return ErrTrustPolicyInactive
+		}
+		if !ExactRedirectURISetEqual(tp.RedirectURIs, c.RedirectURIs) {
+			return ErrTrustPolicyInactive
+		}
+		if vp.ClientPolicy != "" && vp.ClientPolicy != "custom" && tp.Kind != vp.ClientPolicy {
+			return ErrTrustPolicyInactive
+		}
+	}
+	k := grantKey(req.ClientID, req.Tenant, req.Route)
+	now := time.Now().UTC()
+	g, exists := m.grants[k]
+	if exists && g.Status == GrantRevoked {
+		return fmt.Errorf("authz: grant for client %q route %q is revoked; revocation is terminal", req.ClientID, req.Route)
+	}
+	if !exists {
+		g = &Grant{
+			ClientID:  req.ClientID,
+			Tenant:    req.Tenant,
+			Route:     req.Route,
+			CreatedAt: now,
+		}
+		m.grants[k] = g
+	}
+	g.Status = GrantActive
+	g.SkipPairing = false
+	g.Provenance = GrantProvenance{
+		Method:        GrantMethodFederatedOIDC,
+		TrustPolicyID: req.TrustPolicyID,
+		OwnerIssuer:   req.OwnerIssuer,
+		OwnerSubject:  req.OwnerSubject,
+	}
 	g.UpdatedAt = now
 	return nil
 }
@@ -942,10 +1024,32 @@ func (m *MemStore) RecordHostObservation(obs HostObservation) error {
 	if obs.ObservedAt.IsZero() {
 		obs.ObservedAt = time.Now().UTC()
 	}
+	if obs.TransportStatus == "" {
+		obs.TransportStatus = "ok"
+	}
 	if obs.ResultCategory == "" {
 		obs.ResultCategory = "ok"
 	}
 	m.hostObs = append(m.hostObs, obs)
+	// Enforce bounded per-route retention (OCL-009).
+	count := 0
+	for _, o := range m.hostObs {
+		if o.TenantID == obs.TenantID && o.RouteID == obs.RouteID {
+			count++
+		}
+	}
+	if count > MaxHostObservationsPerRoute {
+		excess := count - MaxHostObservationsPerRoute
+		kept := make([]HostObservation, 0, len(m.hostObs)-excess)
+		for _, o := range m.hostObs {
+			if excess > 0 && o.TenantID == obs.TenantID && o.RouteID == obs.RouteID {
+				excess--
+				continue
+			}
+			kept = append(kept, o)
+		}
+		m.hostObs = kept
+	}
 	return nil
 }
 
@@ -1325,14 +1429,24 @@ func (m *MemStore) SetVisitorAuthPolicy(p VisitorAuthPolicy) error {
 	if m.visitorPolicies == nil {
 		m.visitorPolicies = map[string]*VisitorAuthPolicy{}
 	}
+	key := visitorPolicyKey(clean.TenantID, clean.RouteID)
 	now := time.Now().UTC()
+	var rev int64 = 1
+	if prev, ok := m.visitorPolicies[key]; ok && prev != nil {
+		rev = prev.Revision + 1
+		if clean.Mode == VisitorAuthModeFederated && clean.ClientSecret == "" &&
+			prev.Issuer == clean.Issuer && prev.ClientID == clean.ClientID {
+			clean.ClientSecret = prev.ClientSecret
+		}
+	}
 	if clean.CreatedAt.IsZero() {
 		clean.CreatedAt = now
 	}
+	clean.Revision = rev
 	clean.UpdatedAt = now
 	clean.RevokedAt = nil
 	cp := clean
-	m.visitorPolicies[visitorPolicyKey(clean.TenantID, clean.RouteID)] = &cp
+	m.visitorPolicies[key] = &cp
 	return nil
 }
 

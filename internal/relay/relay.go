@@ -312,7 +312,7 @@ func New(o Options) (*Server, error) {
 		s.log = noopLog{}
 	}
 	if o.DB != nil {
-		m, err := newAuthzManager(o.DB)
+		m, err := newAuthzManager(o.DB, o.ServerKey)
 		if err != nil {
 			return nil, err
 		}

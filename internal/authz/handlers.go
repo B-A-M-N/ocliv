@@ -404,11 +404,11 @@ func (s *Server) scopedClient(id string) (*Client, error) {
 }
 
 // exactOperatorApprovedBinding returns true only when an explicit, active,
-// non-revoked per-client operator direct grant exists for this exact
-// (client, tenant, route) with SkipPairing enabled and the requested
-// redirectURI is bound to client. Redirect-URI-only trust policy grants are
-// explicitly excluded (OCL-005): a matching redirect URI alone must never
-// authorize a private route without human/resource-owner authentication.
+// non-revoked per-client operator direct grant (GrantMethodDirectOperator)
+// exists for this exact (client, tenant, route) with SkipPairing enabled and
+// the requested redirectURI is bound to client. Redirect-URI-only trust policy
+// grants and migrated legacy grants are explicitly excluded (OCL-005, OCL-006):
+// migrated direct grants are quarantined until explicitly reauthorized.
 func exactOperatorApprovedBinding(grant *Grant, client *Client, tenant, routeID, redirectURI string) bool {
 	if grant == nil || client == nil || client.RevokedAt != nil {
 		return false
@@ -416,7 +416,7 @@ func exactOperatorApprovedBinding(grant *Grant, client *Client, tenant, routeID,
 	if grant.Status != GrantActive || !grant.SkipPairing {
 		return false
 	}
-	if grant.Provenance.Method == GrantMethodTrustPolicy {
+	if grant.Provenance.Method != GrantMethodDirectOperator {
 		return false
 	}
 	if grant.Tenant != tenant || grant.Route != routeID || client.Tenant != tenant {
@@ -431,11 +431,33 @@ func exactOperatorApprovedBinding(grant *Grant, client *Client, tenant, routeID,
 }
 
 // validateGrantPolicyLive re-checks live grant status AND provenance policy
-// invariants (active trust policy and active federated visitor policy/subject)
+// invariants (active trust policy and authoritative federated visitor policy)
 // on every request, code redemption, and refresh rotation (OCL-005, OCL-006).
 func validateGrantPolicyLive(store Store, grant *Grant, tenant, routeID string) error {
 	if grant == nil || grant.Status != GrantActive {
 		return fmt.Errorf("authz: client is not approved for this route")
+	}
+	vp, vperr := store.GetVisitorAuthPolicy(tenant, routeID)
+	if vperr != nil {
+		return fmt.Errorf("authz: verify visitor auth policy: %w", vperr)
+	}
+	// Make the route's federated authentication policy authoritative:
+	// when a federated visitor auth policy is active, ONLY grants established
+	// through federated OIDC for an currently-allowed (issuer, subject) may be
+	// used. Legacy, pairing, direct_operator, and trust_policy-only grants fail
+	// closed immediately.
+	if vp.IsActiveFederated() {
+		if grant.Provenance.Method != GrantMethodFederatedOIDC {
+			return fmt.Errorf("%w: non-federated grant (%s) cannot access federated route", ErrFederatedPolicyRequired, grant.Provenance.Method)
+		}
+		if !vp.AllowsSubject(grant.Provenance.OwnerIssuer, grant.Provenance.OwnerSubject) {
+			return fmt.Errorf("authz: federated resource-owner subject is no longer authorized for this route")
+		}
+		if vp.ClientPolicy != "" && grant.Provenance.TrustPolicyID == "" {
+			return fmt.Errorf("authz: federated grant missing required client_policy trust binding")
+		}
+	} else if grant.Provenance.Method == GrantMethodFederatedOIDC {
+		return fmt.Errorf("authz: federated visitor auth policy is no longer active for this route")
 	}
 	if grant.Provenance.TrustPolicyID != "" {
 		policies, err := store.ListTrustPolicies(tenant, routeID)
@@ -445,21 +467,15 @@ func validateGrantPolicyLive(store Store, grant *Grant, tenant, routeID string) 
 		found := false
 		for _, p := range policies {
 			if p.ID == grant.Provenance.TrustPolicyID && p.Enabled && p.RevokedAt == nil {
+				if vp.IsActiveFederated() && vp.ClientPolicy != "" && vp.ClientPolicy != "custom" && p.Kind != vp.ClientPolicy {
+					continue
+				}
 				found = true
 				break
 			}
 		}
 		if !found {
 			return fmt.Errorf("authz: trust policy %q has been revoked", grant.Provenance.TrustPolicyID)
-		}
-	}
-	if grant.Provenance.Method == GrantMethodFederatedOIDC {
-		vp, err := store.GetVisitorAuthPolicy(tenant, routeID)
-		if err != nil {
-			return fmt.Errorf("authz: verify visitor auth policy: %w", err)
-		}
-		if !vp.AllowsSubject(grant.Provenance.OwnerIssuer, grant.Provenance.OwnerSubject) {
-			return fmt.Errorf("authz: federated resource-owner subject is no longer authorized for this route")
 		}
 	}
 	return nil
@@ -599,15 +615,23 @@ func (s *Server) ServeAuthorize(w http.ResponseWriter, r *http.Request) {
 		redirectAuthorizationError(w, r, redirectURI, state, "access_denied", "client revoked", s.IssuerURL)
 		return
 	}
+	// OCL-005: Federated resource-owner authentication is authoritative when
+	// configured on the route. Evaluate it BEFORE any legacy/direct-grant
+	// authorization branch so enabling federated OIDC cannot be bypassed by
+	// pre-existing grants.
+	vp, vperr := s.Store.GetVisitorAuthPolicy(s.tenant(), s.RouteID)
+	if vperr != nil {
+		redirectAuthorizationError(w, r, redirectURI, state, "server_error", "visitor auth policy unavailable", s.IssuerURL)
+		return
+	}
+	if vp.IsActiveFederated() {
+		s.startFederatedOIDC(w, r, vp, client, redirectURI, challenge, state, resource[0], grantedScope)
+		return
+	}
 	if exactOperatorApprovedBinding(grant, client, s.tenant(), s.RouteID, redirectURI) &&
 		(len(s.AutoApproveRedirectHosts) == 0 || s.canAutoApproveClient(client)) {
 		_ = s.Store.AuditAuthz("client", s.tenant(), s.RouteID, clientID, "authorize", "ok", "direct operator pre-approved grant")
 		s.issueCode(w, r, clientID, redirectURI, challenge, "S256", state, grantedScope)
-		return
-	}
-	// OCL-005: Federated resource-owner authentication via OIDC.
-	if vp, vperr := s.Store.GetVisitorAuthPolicy(s.tenant(), s.RouteID); vperr == nil && vp != nil && vp.Mode == VisitorAuthModeFederated && vp.Enabled && vp.RevokedAt == nil {
-		s.startFederatedOIDC(w, r, vp, client, redirectURI, challenge, state, resource[0], grantedScope)
 		return
 	}
 	// Approved AND consented: the ordinary OAuth authorization-code + PKCE
@@ -750,12 +774,6 @@ func (s *Server) startFederatedOIDC(w http.ResponseWriter, r *http.Request, vp *
 		return
 	}
 
-	disc, err := s.oidcClient().Discover(r.Context(), vp.Issuer)
-	if err != nil {
-		_ = s.Store.AuditAuthz("visitor", s.tenant(), s.RouteID, client.ID, "federated-authorize", "error", "oidc discovery failed")
-		redirectAuthorizationError(w, r, redirectURI, clientState, "server_error", "identity provider unavailable", s.IssuerURL)
-		return
-	}
 	oidcState, err := mintRandomToken("ost_", 24)
 	if err != nil {
 		redirectAuthorizationError(w, r, redirectURI, clientState, "server_error", "internal error", s.IssuerURL)
@@ -771,49 +789,42 @@ func (s *Server) startFederatedOIDC(w http.ResponseWriter, r *http.Request, vp *
 		redirectAuthorizationError(w, r, redirectURI, clientState, "server_error", "internal error", s.IssuerURL)
 		return
 	}
+	idpAuthURL, err := s.oidcClient().BuildAuthorizeURL(r.Context(), vp.Issuer, vp.ClientID, s.oidcCallbackURL(), oidcState, oidcNonce, pkceVerifier)
+	if err != nil {
+		_ = s.Store.AuditAuthz("visitor", s.tenant(), s.RouteID, client.ID, "federated-authorize", "error", "oidc discovery failed")
+		redirectAuthorizationError(w, r, redirectURI, clientState, "server_error", "identity provider unavailable", s.IssuerURL)
+		return
+	}
 	if err := s.Store.CreateOIDCTransaction(OIDCTransaction{
-		State:         oidcState,
-		Nonce:         oidcNonce,
-		PKCEVerifier:  pkceVerifier,
-		ClientID:      client.ID,
-		Tenant:        s.tenant(),
-		Route:         s.RouteID,
-		RedirectURI:   redirectURI,
-		CodeChallenge: codeChallenge,
-		ClientState:   clientState,
-		Resource:      resource,
-		Scope:         scope,
-		TrustPolicyID: trustPolicyID,
-		ExpiresAt:     time.Now().UTC().Add(s.oidcTxTTL()),
+		State:          oidcState,
+		Nonce:          oidcNonce,
+		PKCEVerifier:   pkceVerifier,
+		ClientID:       client.ID,
+		Tenant:         s.tenant(),
+		Route:          s.RouteID,
+		RedirectURI:    redirectURI,
+		CodeChallenge:  codeChallenge,
+		ClientState:    clientState,
+		Resource:       resource,
+		Scope:          scope,
+		TrustPolicyID:  trustPolicyID,
+		PolicyRevision: vp.Revision,
+		ExpiresAt:      time.Now().UTC().Add(s.oidcTxTTL()),
 	}); err != nil {
 		redirectAuthorizationError(w, r, redirectURI, clientState, "server_error", "internal error", s.IssuerURL)
 		return
 	}
-	idpAuthURL, err := url.Parse(disc.AuthorizationEndpoint)
-	if err != nil {
-		redirectAuthorizationError(w, r, redirectURI, clientState, "server_error", "invalid identity provider endpoint", s.IssuerURL)
-		return
-	}
-	qp := idpAuthURL.Query()
-	qp.Set("response_type", "code")
-	qp.Set("client_id", vp.ClientID)
-	qp.Set("redirect_uri", s.oidcCallbackURL())
-	qp.Set("scope", "openid")
-	qp.Set("state", oidcState)
-	qp.Set("nonce", oidcNonce)
-	qp.Set("code_challenge", CodeChallengeS256(pkceVerifier))
-	qp.Set("code_challenge_method", "S256")
-	idpAuthURL.RawQuery = qp.Encode()
 	w.Header().Set("Cache-Control", "no-store")
-	http.Redirect(w, r, idpAuthURL.String(), http.StatusFound)
+	http.Redirect(w, r, idpAuthURL, http.StatusFound)
 }
 
 // ServeOIDCCallback completes federated resource-owner authentication after
 // the upstream OIDC provider redirects back to /r/<route-id>/oauth/callback
-// (OCL-005). It validates state, exchanges the code with PKCE, verifies the
-// id_token signature/issuer/audience/nonce/expiry via JWKS, enforces the
-// route's allowed_subjects allowlist, atomically establishes a durable grant
-// with full provenance, and mints the standard Ocliv authorization code.
+// (OCL-005). It validates state, exchanges the code with PKCE via oauth2,
+// verifies the id_token via go-oidc/v3 (signature, issuer, audience, azp,
+// nonce, expiry), and then atomically validates client, publication, trust
+// policy, visitor policy state & revision, subject allowlist, and revocation
+// inside ONE store transaction before activating the grant.
 func (s *Server) ServeOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -851,49 +862,34 @@ func (s *Server) ServeOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	vp, vperr := s.Store.GetVisitorAuthPolicy(s.tenant(), s.RouteID)
-	if vperr != nil || vp == nil || vp.Mode != VisitorAuthModeFederated || !vp.Enabled || vp.RevokedAt != nil {
-		redirectAuthorizationError(w, r, tx.RedirectURI, tx.ClientState, "access_denied", "federated visitor auth policy inactive", s.IssuerURL)
+	if vperr != nil || !vp.IsActiveFederated() || (tx.PolicyRevision > 0 && vp.Revision != tx.PolicyRevision) {
+		redirectAuthorizationError(w, r, tx.RedirectURI, tx.ClientState, "access_denied", "federated visitor auth policy inactive or changed", s.IssuerURL)
 		return
 	}
-	// Re-verify trust policy atomically before granting (TOCTOU protection).
-	if tx.TrustPolicyID != "" {
-		matched, merr := s.Store.MatchTrustPolicy(s.tenant(), s.RouteID, client.RedirectURIs)
-		if merr != nil || matched == nil || matched.ID != tx.TrustPolicyID {
-			_ = s.Store.AuditAuthz("visitor", s.tenant(), s.RouteID, tx.ClientID, "federated-callback", "denied", "trust policy revoked during login")
-			redirectAuthorizationError(w, r, tx.RedirectURI, tx.ClientState, "access_denied", "client trust policy is no longer active", s.IssuerURL)
-			return
-		}
-	}
-	disc, derr := s.oidcClient().Discover(r.Context(), vp.Issuer)
-	if derr != nil {
-		redirectAuthorizationError(w, r, tx.RedirectURI, tx.ClientState, "server_error", "identity provider discovery failed", s.IssuerURL)
-		return
-	}
-	rawIDToken, exErr := s.oidcClient().ExchangeCode(r.Context(), disc.TokenEndpoint, vp.ClientID, vp.ClientSecret, idpCode, s.oidcCallbackURL(), tx.PKCEVerifier)
+	subject, exErr := s.oidcClient().ExchangeAndVerify(
+		r.Context(), vp.Issuer, vp.ClientID, vp.ClientSecret,
+		idpCode, s.oidcCallbackURL(), tx.PKCEVerifier, tx.Nonce,
+	)
 	if exErr != nil {
-		_ = s.Store.AuditAuthz("visitor", s.tenant(), s.RouteID, tx.ClientID, "federated-callback", "denied", "oidc code exchange failed")
+		_ = s.Store.AuditAuthz("visitor", s.tenant(), s.RouteID, tx.ClientID, "federated-callback", "denied", "oidc exchange or verification failed")
 		redirectAuthorizationError(w, r, tx.RedirectURI, tx.ClientState, "access_denied", "identity provider authentication failed", s.IssuerURL)
 		return
 	}
-	subject, verErr := s.oidcClient().VerifyIDToken(r.Context(), disc.JWKSURI, vp.Issuer, vp.ClientID, tx.Nonce, rawIDToken)
-	if verErr != nil {
-		_ = s.Store.AuditAuthz("visitor", s.tenant(), s.RouteID, tx.ClientID, "federated-callback", "denied", "oidc id_token verification failed")
-		redirectAuthorizationError(w, r, tx.RedirectURI, tx.ClientState, "access_denied", "identity token validation failed", s.IssuerURL)
-		return
+	// Atomically re-verify client, publication, trust policy, visitor policy
+	// state & revision, allowed issuer/subject, and grant revocation inside
+	// ONE store transaction before activating the grant (eliminates TOCTOU).
+	act := FederatedGrantActivation{
+		ClientID:               tx.ClientID,
+		Tenant:                 s.tenant(),
+		Route:                  s.RouteID,
+		RedirectURI:            tx.RedirectURI,
+		ExpectedPolicyRevision: tx.PolicyRevision,
+		TrustPolicyID:          tx.TrustPolicyID,
+		OwnerIssuer:            vp.Issuer,
+		OwnerSubject:           subject,
 	}
-	if !vp.AllowsSubject(vp.Issuer, subject) {
-		_ = s.Store.AuditAuthz("visitor", s.tenant(), s.RouteID, tx.ClientID, "federated-callback", "denied", "subject not allowed")
-		redirectAuthorizationError(w, r, tx.RedirectURI, tx.ClientState, "access_denied", "authenticated account is not authorized for this route", s.IssuerURL)
-		return
-	}
-	prov := GrantProvenance{
-		Method:        GrantMethodFederatedOIDC,
-		TrustPolicyID: tx.TrustPolicyID,
-		OwnerIssuer:   vp.Issuer,
-		OwnerSubject:  subject,
-	}
-	if err := s.Store.ApproveGrantWithProvenance(tx.ClientID, s.tenant(), s.RouteID, false, prov); err != nil {
-		_ = s.Store.AuditAuthz("visitor", s.tenant(), s.RouteID, tx.ClientID, "federated-callback", "denied", "grant activation failed")
+	if err := s.Store.ApproveFederatedGrantAtomic(act); err != nil {
+		_ = s.Store.AuditAuthz("visitor", s.tenant(), s.RouteID, tx.ClientID, "federated-callback", "denied", "atomic federated grant activation denied")
 		redirectAuthorizationError(w, r, tx.RedirectURI, tx.ClientState, "access_denied", "grant authorization failed", s.IssuerURL)
 		return
 	}
@@ -1024,6 +1020,13 @@ func (s *Server) ServeConsent(w http.ResponseWriter, r *http.Request) {
 	client, err := s.scopedClient(clientID)
 	if err != nil || client.RevokedAt != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_client"})
+		return
+	}
+	if vp, vperr := s.Store.GetVisitorAuthPolicy(s.tenant(), s.RouteID); vperr != nil || vp.IsActiveFederated() {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":             "access_denied",
+			"error_description": "route requires federated visitor authentication",
+		})
 		return
 	}
 	grant, err := s.Store.GetGrant(clientID, s.tenant(), s.RouteID)

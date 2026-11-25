@@ -20,16 +20,19 @@ import (
 	"github.com/B-A-M-N/ocliv/internal/authz"
 )
 
-// Explicit MCP Events qualification outcomes (OCL-004).
-// The first four can be established independently of an external host; the
-// final two require real non-synthetic host workflow evidence.
+// Explicit MCP Events qualification outcomes and levels (OCL-004).
+// Read-only, subscription, callback delivery, and cleanup levels can be
+// established independently of an external host; host event consumption
+// requires real non-synthetic host workflow evidence.
 const (
-	EventsStageAdvertised               = "EVENTS_ADVERTISED"
-	EventsStageListVerified             = "EVENTS_LIST_VERIFIED"
-	EventsStageSubscriptionVerified     = "SUBSCRIPTION_VERIFIED"
-	EventsStageCallbackDeliveryVerified = "CALLBACK_DELIVERY_VERIFIED"
-	EventsStageHostSubscriptionObserved = "HOST_SUBSCRIPTION_OBSERVED"
-	EventsStageHostConsumptionVerified  = "HOST_EVENT_CONSUMPTION_VERIFIED"
+	EventsStageAdvertised                  = "EVENTS_ADVERTISED"
+	EventsStageListVerified                = "EVENTS_LIST_VERIFIED"
+	EventsStageReadOnlyVerified            = "READ_ONLY_EVENTS_VERIFIED"
+	EventsStageSubscriptionVerified        = "SUBSCRIPTION_VERIFIED"
+	EventsStageCallbackDeliveryVerified    = "CALLBACK_DELIVERY_VERIFIED"
+	EventsStageSubscriptionCleanupVerified = "SUBSCRIPTION_CLEANUP_VERIFIED"
+	EventsStageHostSubscriptionObserved    = "HOST_SUBSCRIPTION_OBSERVED"
+	EventsStageHostConsumptionVerified     = "HOST_EVENT_CONSUMPTION_VERIFIED"
 )
 
 // MCPEventsQualificationConfig configures authenticated MCP Events
@@ -46,24 +49,30 @@ type MCPEventsQualificationConfig struct {
 	QualifySubscription  bool          // opt-in mutating qualification (never run in default doctor)
 	CallbackURL          string        // optional explicit callback URL; empty starts a controlled loopback receiver
 	SubscriptionTTL      time.Duration // bounded subscription lifetime (default 30s)
-	CallbackTimeout      time.Duration // max wait for callback delivery (default 3s)
+	CallbackTimeout      time.Duration // max wait for callback delivery (default 10s)
 	HostObservations     []authz.HostObservation
 }
 
 // MCPEventsQualificationResult separates every stage of MCP Events
 // qualification so relay forwarding is never conflated with host consumption.
 type MCPEventsQualificationResult struct {
-	PublicTransport        string   `json:"public_transport"`        // PASS | FAIL
-	ResourceDiscovery      string   `json:"resource_discovery"`      // PASS | FAIL
-	AnonymousAuthorization string   `json:"anonymous_authorization"` // PASS | FAIL | SKIPPED
-	InvalidTokenRejection  string   `json:"invalid_token_rejection"` // PASS | FAIL | SKIPPED
-	MCPNegotiation         string   `json:"mcp_negotiation"`         // PASS | FAIL | SKIPPED
-	ServerDiscovery        string   `json:"server_discovery"`        // PASS | UNSUPPORTED | FAIL | SKIPPED
-	EventsAdvertised       string   `json:"events_advertised"`       // PASS | FAIL | UNKNOWN | SKIPPED
-	EventsList             string   `json:"events_list"`             // PASS | FAIL | SKIPPED
-	CapabilityConsistency  string   `json:"capability_consistency"`  // PASS | FAIL | SKIPPED
-	Subscription           string   `json:"subscription"`            // PASS | FAIL | NOT_REQUESTED
-	CallbackDelivery       string   `json:"callback_delivery"`       // PASS | FAIL | NOT_REQUESTED
+	QualificationLevel     string   `json:"qualification_level"`            // NONE | READ_ONLY_EVENTS_VERIFIED | SUBSCRIPTION_VERIFIED | CALLBACK_DELIVERY_VERIFIED | SUBSCRIPTION_CLEANUP_VERIFIED
+	PublicTransport        string   `json:"public_transport"`               // PASS | FAIL
+	ResourceDiscovery      string   `json:"resource_discovery"`             // PASS | FAIL
+	AnonymousAuthorization string   `json:"anonymous_authorization"`        // PASS | FAIL | SKIPPED
+	InvalidTokenRejection  string   `json:"invalid_token_rejection"`        // PASS | FAIL | SKIPPED
+	MCPNegotiation         string   `json:"mcp_negotiation"`                // PASS | FAIL | SKIPPED
+	ServerDiscovery        string   `json:"server_discovery"`               // PASS | UNSUPPORTED | FAIL | SKIPPED
+	EventsAdvertised       string   `json:"events_advertised"`              // PASS | FAIL | UNKNOWN | SKIPPED
+	EventsList             string   `json:"events_list"`                    // PASS | FAIL | SKIPPED
+	CapabilityConsistency  string   `json:"capability_consistency"`         // PASS | FAIL | SKIPPED
+	Subscription           string   `json:"subscription"`                   // PASS | FAIL | NOT_REQUESTED
+	CallbackMode           string   `json:"callback_mode,omitempty"`        // loopback_local | external_unverified
+	CallbackDelivery       string   `json:"callback_delivery"`              // PASS | FAIL | UNVERIFIED | NOT_REQUESTED
+	CallbackCorrelation    string   `json:"callback_correlation,omitempty"` // VERIFIED | FAILED | UNVERIFIED
+	SubscriptionCleanup    string   `json:"subscription_cleanup"`           // PASS | FAIL | NOT_REQUESTED
+	RequestedSubscription  bool     `json:"requested_subscription,omitempty"`
+	RequestedLocalCompare  bool     `json:"requested_local_compare,omitempty"`
 	ProtocolVersion        string   `json:"protocol_version,omitempty"`
 	PublicEvents           []string `json:"public_events,omitempty"`
 	LocalEvents            []string `json:"local_events,omitempty"`
@@ -73,8 +82,11 @@ type MCPEventsQualificationResult struct {
 	Detail                 string   `json:"detail,omitempty"`
 }
 
-// OK reports whether all required read-only (and, if requested, subscription)
-// qualification stages succeeded.
+// OK reports whether all required qualification stages for the requested level
+// succeeded. Read-only runs require read-only catalog verification (plus local
+// comparison if a local endpoint was provided); opt-in subscription runs
+// require subscription creation, correlated authenticated callback delivery,
+// AND verified subscription cleanup.
 func (r MCPEventsQualificationResult) OK() bool {
 	if r.PublicTransport != "PASS" || r.ResourceDiscovery != "PASS" {
 		return false
@@ -91,8 +103,17 @@ func (r MCPEventsQualificationResult) OK() bool {
 	if r.CapabilityConsistency == "FAIL" {
 		return false
 	}
-	if r.Subscription == "FAIL" || r.CallbackDelivery == "FAIL" {
+	if r.RequestedLocalCompare && r.CapabilityConsistency != "PASS" {
 		return false
+	}
+	if r.RequestedSubscription {
+		if r.Subscription != "PASS" || r.CallbackDelivery != "PASS" || r.SubscriptionCleanup != "PASS" {
+			return false
+		}
+	} else {
+		if r.Subscription == "FAIL" || r.CallbackDelivery == "FAIL" || r.SubscriptionCleanup == "FAIL" {
+			return false
+		}
 	}
 	return true
 }
@@ -426,6 +447,7 @@ func probeEventsCatalogOnEndpoint(ep *url.URL, bearer string, hc *http.Client) (
 // qualification runs only when cfg.QualifySubscription is explicitly true.
 func QualifyMCPEvents(cfg MCPEventsQualificationConfig) MCPEventsQualificationResult {
 	res := MCPEventsQualificationResult{
+		QualificationLevel:     "NONE",
 		PublicTransport:        "FAIL",
 		ResourceDiscovery:      "FAIL",
 		AnonymousAuthorization: "SKIPPED",
@@ -437,6 +459,9 @@ func QualifyMCPEvents(cfg MCPEventsQualificationConfig) MCPEventsQualificationRe
 		CapabilityConsistency:  "SKIPPED",
 		Subscription:           "NOT_REQUESTED",
 		CallbackDelivery:       "NOT_REQUESTED",
+		SubscriptionCleanup:    "NOT_REQUESTED",
+		RequestedSubscription:  cfg.QualifySubscription,
+		RequestedLocalCompare:  cfg.LocalEndpoint != nil,
 		ObservedOutcomes:       []string{},
 		HostSubscription:       "UNVERIFIED",
 		HostEventConsumption:   "UNVERIFIED",
@@ -571,10 +596,18 @@ func QualifyMCPEvents(cfg MCPEventsQualificationConfig) MCPEventsQualificationRe
 		}
 	}
 
-	// Stage 10 (opt-in only): Subscription & authenticated callback delivery with cleanup.
+	if res.EventsAdvertised == "PASS" && res.EventsList == "PASS" &&
+		(!cfg.QualifySubscription || res.CapabilityConsistency != "FAIL") &&
+		(cfg.LocalEndpoint == nil || res.CapabilityConsistency == "PASS") {
+		res.QualificationLevel = EventsStageReadOnlyVerified
+		res.ObservedOutcomes = append(res.ObservedOutcomes, EventsStageReadOnlyVerified)
+	}
+
+	// Stage 10 (opt-in only): Subscription & authenticated callback delivery with verified cleanup.
 	if cfg.QualifySubscription {
 		res.Subscription = "FAIL"
 		res.CallbackDelivery = "FAIL"
+		res.SubscriptionCleanup = "FAIL"
 		if err := qualifyEventsSubscription(cfg, pubSess, res.ProtocolVersion, pubEvents, &res); err != nil {
 			res.Detail = redactSecret(err.Error(), cfg.BearerToken)
 			return res
@@ -582,6 +615,41 @@ func QualifyMCPEvents(cfg MCPEventsQualificationConfig) MCPEventsQualificationRe
 	}
 
 	return res
+}
+
+func callbackPayloadMatches(payload map[string]any, expectedSubID, expectedEvent string) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	gotSub, _ := payload["subscriptionId"].(string)
+	if gotSub == "" {
+		gotSub, _ = payload["subscription_id"].(string)
+	}
+	if strings.TrimSpace(gotSub) != expectedSubID {
+		return false
+	}
+	// Require an identifiable event marker (event/type/name/eventId/id).
+	var gotEvent string
+	for _, k := range []string{"event", "type", "name"} {
+		if s, ok := payload[k].(string); ok && strings.TrimSpace(s) != "" {
+			gotEvent = strings.TrimSpace(s)
+			break
+		}
+	}
+	var gotID string
+	for _, k := range []string{"eventId", "event_id", "id"} {
+		if s, ok := payload[k].(string); ok && strings.TrimSpace(s) != "" {
+			gotID = strings.TrimSpace(s)
+			break
+		}
+	}
+	if gotEvent == "" && gotID == "" {
+		return false
+	}
+	if expectedEvent != "" && gotEvent != "" && gotEvent != expectedEvent {
+		return false
+	}
+	return true
 }
 
 func qualifyEventsSubscription(cfg MCPEventsQualificationConfig, sess *mcpSessionClient, protocolVersion string, events []string, res *MCPEventsQualificationResult) error {
@@ -599,20 +667,21 @@ func qualifyEventsSubscription(cfg MCPEventsQualificationConfig, sess *mcpSessio
 		ttl = 30 * time.Second
 	}
 	cbTimeout := cfg.CallbackTimeout
-	if cbTimeout <= 0 || cbTimeout > 30*time.Second {
-		cbTimeout = 3 * time.Second
+	if cbTimeout <= 0 || cbTimeout > 60*time.Second {
+		cbTimeout = 10 * time.Second
 	}
 
-	var deliveredCh chan bool
+	var deliveredCh chan map[string]any
 	var cbSrv *http.Server
 	callbackURL := strings.TrimSpace(cfg.CallbackURL)
 	if callbackURL == "" {
-		deliveredCh = make(chan bool, 1)
-		var once sync.Once
+		res.CallbackMode = "loopback_local"
+		deliveredCh = make(chan map[string]any, 16)
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			return fmt.Errorf("start local callback receiver: %w", err)
 		}
+		var cbMu sync.Mutex
 		mux := http.NewServeMux()
 		mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
@@ -630,9 +699,23 @@ func qualifyEventsSubscription(cfg MCPEventsQualificationConfig, sess *mcpSessio
 				http.Error(w, "unauthorized callback", http.StatusUnauthorized)
 				return
 			}
-			_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, 64*1024))
+			body, rerr := io.ReadAll(io.LimitReader(r.Body, 64*1024))
+			if rerr != nil {
+				http.Error(w, "invalid callback body", http.StatusBadRequest)
+				return
+			}
+			var payload map[string]any
+			if jerr := json.Unmarshal(body, &payload); jerr != nil || len(payload) == 0 {
+				http.Error(w, "callback payload must be a JSON object", http.StatusBadRequest)
+				return
+			}
 			w.WriteHeader(http.StatusAccepted)
-			once.Do(func() { deliveredCh <- true })
+			cbMu.Lock()
+			select {
+			case deliveredCh <- payload:
+			default:
+			}
+			cbMu.Unlock()
 		})
 		cbSrv = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 		go func() { _ = cbSrv.Serve(ln) }()
@@ -642,15 +725,19 @@ func qualifyEventsSubscription(cfg MCPEventsQualificationConfig, sess *mcpSessio
 			_ = cbSrv.Shutdown(ctx)
 		}()
 		callbackURL = "http://" + ln.Addr().String() + "/callback"
+	} else {
+		res.CallbackMode = "external_unverified"
 	}
 
+	var expectedEvent string
 	subParams := map[string]any{
 		"callbackUrl":    callbackURL,
 		"callbackSecret": callbackSecret,
 		"ttlSeconds":     int(ttl.Seconds()),
 	}
 	if len(events) > 0 {
-		subParams["events"] = []string{events[0]}
+		expectedEvent = events[0]
+		subParams["events"] = []string{expectedEvent}
 	}
 	if protocolVersion == "2026-07-28" {
 		subParams["_meta"] = map[string]any{
@@ -678,8 +765,13 @@ func qualifyEventsSubscription(cfg MCPEventsQualificationConfig, sess *mcpSessio
 		return fmt.Errorf("events/subscribe did not return a subscriptionId")
 	}
 
-	// Always clean up the bounded test subscription on exit.
-	defer func() {
+	res.Subscription = "PASS"
+	res.QualificationLevel = EventsStageSubscriptionVerified
+	res.ObservedOutcomes = append(res.ObservedOutcomes, EventsStageSubscriptionVerified)
+
+	// Always clean up the bounded test subscription AND verify cleanup succeeded.
+	var cleanupErr error
+	cleanup := func() {
 		unsubParams := map[string]any{"subscriptionId": subID}
 		if protocolVersion == "2026-07-28" {
 			unsubParams["_meta"] = map[string]any{
@@ -687,24 +779,56 @@ func qualifyEventsSubscription(cfg MCPEventsQualificationConfig, sess *mcpSessio
 				"io.modelcontextprotocol/clientCapabilities": map[string]any{},
 			}
 		}
-		_, _, _ = sess.call("events/unsubscribe", unsubParams, protocolVersion)
-	}()
+		_, unsubEnv, uerr := sess.call("events/unsubscribe", unsubParams, protocolVersion)
+		if uerr != nil {
+			res.SubscriptionCleanup = "FAIL"
+			cleanupErr = fmt.Errorf("events/unsubscribe failed: %w", uerr)
+			return
+		}
+		if _, hasErr := unsubEnv["error"]; hasErr {
+			res.SubscriptionCleanup = "FAIL"
+			cleanupErr = fmt.Errorf("events/unsubscribe returned JSON-RPC error")
+			return
+		}
+		res.SubscriptionCleanup = "PASS"
+		res.ObservedOutcomes = append(res.ObservedOutcomes, EventsStageSubscriptionCleanupVerified)
+	}
 
-	res.Subscription = "PASS"
-	res.ObservedOutcomes = append(res.ObservedOutcomes, EventsStageSubscriptionVerified)
-
+	var deliveryErr error
 	if deliveredCh != nil {
-		select {
-		case <-deliveredCh:
-			res.CallbackDelivery = "PASS"
-			res.ObservedOutcomes = append(res.ObservedOutcomes, EventsStageCallbackDeliveryVerified)
-		case <-time.After(cbTimeout):
-			res.CallbackDelivery = "FAIL"
-			return fmt.Errorf("timed out waiting %s for authenticated callback delivery", cbTimeout)
+		deadline := time.NewTimer(cbTimeout)
+		defer deadline.Stop()
+		matched := false
+		for !matched {
+			select {
+			case payload := <-deliveredCh:
+				if callbackPayloadMatches(payload, subID, expectedEvent) {
+					matched = true
+					res.CallbackDelivery = "PASS"
+					res.CallbackCorrelation = "VERIFIED"
+					res.QualificationLevel = EventsStageCallbackDeliveryVerified
+					res.ObservedOutcomes = append(res.ObservedOutcomes, EventsStageCallbackDeliveryVerified)
+				}
+			case <-deadline.C:
+				res.CallbackDelivery = "FAIL"
+				res.CallbackCorrelation = "FAILED"
+				deliveryErr = fmt.Errorf("timed out waiting %s for correlated authenticated callback delivery (subscriptionId=%s)", cbTimeout, subID)
+				matched = true
+			}
 		}
 	} else {
-		// External callback URL supplied: cannot observe local delivery directly.
-		res.CallbackDelivery = "NOT_REQUESTED"
+		// External callback URL supplied: cannot independently verify delivery here.
+		res.CallbackDelivery = "UNVERIFIED"
+		res.CallbackCorrelation = "UNVERIFIED"
+		deliveryErr = fmt.Errorf("external callback URL cannot be independently verified by this probe")
 	}
-	return nil
+
+	cleanup()
+	if res.CallbackDelivery == "PASS" && res.SubscriptionCleanup == "PASS" {
+		res.QualificationLevel = EventsStageSubscriptionCleanupVerified
+	}
+	if deliveryErr != nil {
+		return deliveryErr
+	}
+	return cleanupErr
 }

@@ -974,7 +974,7 @@ func resetRestoredAuthority(candidatePath string) error {
 		}
 		var visitorPolTable string
 		if err := tx.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='authz_visitor_policies'`).Scan(&visitorPolTable); err == nil && visitorPolTable != "" {
-			if _, err := tx.Exec(`UPDATE authz_visitor_policies SET enabled=0, revoked_at=?, updated_at=? WHERE revoked_at IS NULL OR enabled<>0`, now, now); err != nil {
+			if _, err := tx.Exec(`UPDATE authz_visitor_policies SET enabled=0, revoked_at=?, updated_at=?, client_secret='' WHERE revoked_at IS NULL OR enabled<>0 OR client_secret<>''`, now, now); err != nil {
 				return err
 			}
 		}
