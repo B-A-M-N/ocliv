@@ -35,7 +35,9 @@ across schema migrations or security-boundary changes.
 - **CycloneDX SBOM SHA-256 (`sbom.cdx.json`):** `09239f98877c675cd94ffca72e123070b2502afc94ad4c5843528cb0686d0015`
 - **Pi Stage Directory & Machine-Readable Receipts:** `/home/bamn/ocliv-stage/prod-e468beb-2026-11-25/` (`qual-receipt.json`, `mig-v19-v24-receipt.json`, `soak-smoke-receipt.json`) and bundle `/home/bamn/ocliv-stage/prod-bundle-e468beb-2026-11-25/` — strict public allowlist verified (`I5b` fail-closed `WORK_DIR` removal PASS + `I6` zero raw logs/keys/DBs/secrets retained).
 - **Strict Isolated Qualification (`qualify-pi-isolated.py --release-dir $BUNDLE --receipt-out ./qual-receipt.json`):** **PASS 67 / SKIP 0 / FAIL 0** (`mode=strict-production`, `schema=V24`, `ephemeral_state_retained=false`, `scratch_cleanup_ok=true`).
-- **V19→V24 Online-Snapshot Migration Rehearsal (`rehearse-prod-migration.py --qualification-receipt ./qual-receipt.json --receipt-out ./mig-v19-v24-receipt.json`):** **PASS 12 / FAIL 0** (`src_schema=V19` → `V24`, `preserved_diffs=[]`, all 8 reset authority counts `0`, restored-DB live relay `/health/ready == 200`).
+- **Production-Gate Live DB Online-Snapshot Migration Rehearsal (`sudo rehearse-prod-migration.py --production-gate --src-db /var/lib/ocliv/ocliv.db --qualification-receipt ./qual-receipt.json --receipt-out ./mig-receipt.json`):** **PASS 12 / FAIL 0** (`src_journal_mode=wal`, `src_schema=V17` → `V24`, snapshot SHA-256 `62742ee0834938d8da28a55a0a3de601b5fdf5e17bc7ab8af7a765260b8cf8cc`; 3 tenants, 3 agent keys, 7 leases, 5 publications, 9 clients, 12 grants, 30 revocations preserved with identical 64-hex semantic digests; `PRAGMA integrity_check=ok`, `foreign_key_check=[]`, backup+validate+restore `--reset-authority` PASS with `preserved_diffs=[]`, candidate relay `/health/ready == 200` on restored DB).
+- **24-Hour Release-Gate Soak (`soak-isolated.py --release-gate`):** Launched detached on Pi (`PID 944743`, receipt target `./soak-24h-receipt.json`; in progress).
+- **Pre-Promotion Live Backup Taken:** `/var/lib/ocliv/backup-pre-e468beb.db` (verified written by operator).
 - **Dual-Lane Workload Soak Smoke (`soak-isolated.py --self-test` + `--duration 20 --warmup 5 --sample-interval 5`):** **PASS** (`SOAK_SELF_TEST=OK`, `samples=5`, `dataplane_200=5`, `route_401=5`, `reconnects=1`, `pair_ok=5`, FDs `15->15`, RSS `16176KB->16648KB`, `active_sessions=2`).
 - **Current Live Deployment Inventory (Read-Only Pre-Flight):**
   - Local publisher `/home/bamn/.local/bin/ocliv`: `vcs.revision=43043a9b86a7e6085d19524e70e3f4edc7063645` (`2026-11-18T04:14:06Z`, `vcs.modified=true`) — NOT yet upgraded.
@@ -146,8 +148,8 @@ across schema migrations or security-boundary changes.
 |---|---|---|
 | Production release build with permanent production Ed25519 trust-root key (`release-2026-v1`) + CycloneDX SBOM (`cyclonedx-gomod`) + `govulncheck=pass` | Release Provenance | **VERIFIED** (`e468beb`, `release_sequence=1003`) |
 | Strict isolated Pi staging qualification (`qualify-pi-isolated.py`, 67/0/0) + V19→V24 migration rehearsal (12/0) | Isolated Artifact E2E | **VERIFIED** (`e468beb`, production PIDs untouched) |
-| Live production DB copy migration rehearsal (`sudo python3 rehearse-prod-migration.py --production-gate --src-db /var/lib/ocliv/ocliv.db ...`) | Operator-Gated Pre-Flight | **PENDING (interactive `sudo` required)** |
-| 24-hour release-gate soak (`soak-isolated.py --release-gate`) | Isolated Artifact E2E | **NOT VERIFIED** |
+| Live production DB copy migration rehearsal (`sudo python3 rehearse-prod-migration.py --production-gate --src-db /var/lib/ocliv/ocliv.db ...`) | Operator-Gated Pre-Flight | **VERIFIED** (`e468beb`, V17→V24, **PASS 12/0**, `mig-receipt.json`) |
+| 24-hour release-gate soak (`soak-isolated.py --release-gate`) | Isolated Artifact E2E | **IN PROGRESS** (`PID 944743` on Pi) |
 | Real OIDC Identity Provider (Auth0) application setup & live authorization-code E2E | Public / Off-LAN / Live | **NOT VERIFIED** |
 | Off-LAN trusted-TLS public ingress verification (no `-k`) & authenticated public Events workflow | Public / Off-LAN / Live | **NOT VERIFIED** |
 | Official ChatGPT OAuth end-to-end acceptance | Public / Off-LAN / Live | **NOT VERIFIED** |
