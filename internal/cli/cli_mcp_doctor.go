@@ -292,7 +292,7 @@ func runMCPProbe(target, mode string) mcpProbeOutcome {
 // operator-supplied upstream bearer. The token is used only in the request
 // header and is never included in probe output.
 func runMCPProbeWithBearer(target, mode, bearer string) mcpProbeOutcome {
-	return runMCPProbeWithClient(target, mode, bearer, &http.Client{Timeout: 5 * time.Second})
+	return runMCPProbeWithClient(target, mode, bearer, &http.Client{Timeout: 25 * time.Second})
 }
 
 func runMCPProbeWithClient(target, mode, bearer string, client *http.Client) mcpProbeOutcome {
@@ -338,7 +338,7 @@ func runMCPProbeWithConfig(cfg MCPProbeConfig) mcpProbeOutcome {
 	isPublic := cfg.IsPublic || strings.EqualFold(cfg.Endpoint.Scheme, "https")
 	client := cfg.Client
 	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Second}
+		client = &http.Client{Timeout: 25 * time.Second}
 	}
 	var sessionID string
 	var sessionVersion string
