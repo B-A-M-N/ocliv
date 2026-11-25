@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -2140,36 +2141,74 @@ func cmdServicePending(argv []string, ops serviceOps) int {
 	return apperr.ExitOK
 }
 
+func isInteractiveStdin() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
 func cmdServiceApprove(argv []string, ops serviceOps) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ocliv service approve NAME [--challenge ID] [--deny] [--client CLIENT_ID] [--direct]")
+		fmt.Fprintln(os.Stderr, "usage: ocliv service approve NAME --challenge ID [--deny] [--json]")
+		fmt.Fprintln(os.Stderr, "       ocliv service approve NAME [--json]                       (inspect pending / interactive confirm)")
+		fmt.Fprintln(os.Stderr, "       ocliv service approve NAME --legacy-pairing --client ID   (explicit legacy pairing fallback)")
+		fmt.Fprintln(os.Stderr, "       ocliv service approve NAME --direct --client ID           (explicit direct operator grant)")
 		return apperr.ExitCLIValidation
 	}
 	name := argv[0]
 	var clientID, challengeID string
-	var direct, deny bool
+	var direct, legacyPairing, deny, jsonOut bool
 	for i := 1; i < len(argv); i++ {
-		if argv[i] == "--client" || strings.HasPrefix(argv[i], "--client=") {
+		switch {
+		case argv[i] == "--client" || strings.HasPrefix(argv[i], "--client="):
 			v, ok := mcpFlagValue(argv, &i, "client")
 			if !ok {
 				return apperr.ExitCLIValidation
 			}
 			clientID = v
-		} else if argv[i] == "--challenge" || strings.HasPrefix(argv[i], "--challenge=") {
+		case argv[i] == "--challenge" || strings.HasPrefix(argv[i], "--challenge="):
 			v, ok := mcpFlagValue(argv, &i, "challenge")
 			if !ok {
 				return apperr.ExitCLIValidation
 			}
 			challengeID = v
-		} else if argv[i] == "--deny" {
+		case argv[i] == "--deny":
 			deny = true
-		} else if argv[i] == "--direct" {
+		case argv[i] == "--direct":
 			direct = true
-		} else {
+		case argv[i] == "--legacy-pairing":
+			legacyPairing = true
+		case argv[i] == "--json":
+			jsonOut = true
+		default:
 			fmt.Fprintf(os.Stderr, "unknown flag %q\n", argv[i])
 			return apperr.ExitCLIValidation
 		}
 	}
+	// Reject conflicting authorization flags fail-closed.
+	if challengeID != "" && (clientID != "" || direct || legacyPairing) {
+		fmt.Fprintln(os.Stderr, "service approve: --challenge cannot be combined with --client, --direct, or --legacy-pairing")
+		return apperr.ExitCLIValidation
+	}
+	if direct && legacyPairing {
+		fmt.Fprintln(os.Stderr, "service approve: --direct and --legacy-pairing are mutually exclusive")
+		return apperr.ExitCLIValidation
+	}
+	if deny && (clientID != "" || direct || legacyPairing) {
+		fmt.Fprintln(os.Stderr, "service approve: --deny applies only to transaction-bound --challenge approval")
+		return apperr.ExitCLIValidation
+	}
+	if (direct || legacyPairing) && clientID == "" {
+		fmt.Fprintln(os.Stderr, "service approve: --direct and --legacy-pairing require --client <CLIENT_ID>")
+		return apperr.ExitCLIValidation
+	}
+	if clientID != "" && !direct && !legacyPairing {
+		fmt.Fprintln(os.Stderr, "service approve: --client requires explicit --legacy-pairing or --direct; for canonical native approval use `ocliv service approve NAME --challenge ID`")
+		return apperr.ExitCLIValidation
+	}
+
 	store, err := openServices()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -2198,44 +2237,88 @@ func cmdServiceApprove(argv []string, ops serviceOps) int {
 		}
 		pubID = foundID
 	}
+
 	// Canonical native Ocliv default: transaction-bound operator approval over
-	// the Ed25519-signed management channel (no pairing secrets copied).
-	if challengeID == "" && clientID == "" && !direct {
+	// the Ed25519-signed management channel. Never fall back silently into
+	// legacy pairing-secret issuance and never silently auto-approve an
+	// unconfirmed transaction in non-interactive mode.
+	if challengeID == "" && !direct && !legacyPairing {
+		if deny {
+			fmt.Fprintln(os.Stderr, "service approve: --deny requires an explicit --challenge <ID>")
+			return apperr.ExitCLIValidation
+		}
 		st, body, callErr := ops.mgmtCall(relayURL, k, keyID, http.MethodGet, "/v1/agent/mcp-routes/"+pubID+"/authz/pending")
 		if callErr != nil || st != http.StatusOK {
-			fmt.Fprintf(os.Stderr, "service approve: could not list pending authorizations (specify --challenge or --client)\n")
+			fmt.Fprintf(os.Stderr, "service approve: could not list pending authorizations\n")
 			return apperr.ExitRelayTLS
 		}
 		var out struct {
-			Pending []struct {
-				ClientID string `json:"client_id"`
-				Name     string `json:"name"`
-			} `json:"pending"`
 			PendingTransactions []struct {
-				Challenge  string `json:"challenge"`
-				ClientID   string `json:"client_id"`
-				ClientName string `json:"client_name"`
+				Challenge   string `json:"challenge"`
+				ClientID    string `json:"client_id"`
+				ClientName  string `json:"client_name"`
+				RedirectURI string `json:"redirect_uri"`
+				Scope       string `json:"scope"`
+				ExpiresAt   string `json:"expires_at"`
 			} `json:"pending_transactions"`
 		}
 		if json.Unmarshal(body, &out) != nil {
 			fmt.Fprintln(os.Stderr, "service approve: invalid relay response")
 			return apperr.ExitInternal
 		}
-		if len(out.PendingTransactions) == 1 {
-			challengeID = out.PendingTransactions[0].Challenge
-		} else if len(out.PendingTransactions) > 1 {
-			fmt.Fprintf(os.Stderr, "service approve: %d pending authorization transactions; specify --challenge <id>\n", len(out.PendingTransactions))
-			for _, tx := range out.PendingTransactions {
-				fmt.Fprintf(os.Stderr, "  %s  client=%s name=%q\n", tx.Challenge, tx.ClientID, tx.ClientName)
+		if len(out.PendingTransactions) == 0 {
+			if jsonOut {
+				b, _ := json.MarshalIndent(map[string]any{
+					"status":      "AWAITING_AUTHORIZATION_REQUEST",
+					"service":     name,
+					"route_id":    pubID,
+					"next_action": "Start OAuth from the MCP client.",
+				}, "", "  ")
+				fmt.Println(string(b))
+			} else {
+				fmt.Printf("status: AWAITING_AUTHORIZATION_REQUEST (service=%s route=%s)\n", name, pubID)
+				fmt.Println("Next: Start OAuth from the MCP client, then run `ocliv service approve " + name + " --challenge <ID>`.")
 			}
-			return apperr.ExitCLIValidation
-		} else if len(out.Pending) == 1 && !deny {
-			clientID = out.Pending[0].ClientID
+			return apperr.ExitOK
+		}
+		if len(out.PendingTransactions) == 1 && isInteractiveStdin() && !jsonOut {
+			tx := out.PendingTransactions[0]
+			fmt.Printf("Pending authorization transaction:\n")
+			fmt.Printf("  Challenge:    %s\n", tx.Challenge)
+			fmt.Printf("  Client:       %s (%s)\n", tx.ClientName, tx.ClientID)
+			fmt.Printf("  Route:        %s (%s)\n", name, pubID)
+			fmt.Printf("  Redirect URI: %s\n", tx.RedirectURI)
+			fmt.Printf("  Scopes:       %s\n", tx.Scope)
+			fmt.Printf("  Expires:      %s\n", tx.ExpiresAt)
+			fmt.Printf("Approve this exact transaction? [y/N]: ")
+			ans, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+			ans = strings.ToLower(strings.TrimSpace(ans))
+			if ans != "y" && ans != "yes" {
+				fmt.Println("cancelled (transaction left pending)")
+				return apperr.ExitOK
+			}
+			challengeID = tx.Challenge
 		} else {
-			fmt.Fprintf(os.Stderr, "service approve: %d pending transactions and %d pending clients; specify --challenge <id> or --client <id>\n", len(out.PendingTransactions), len(out.Pending))
+			if jsonOut {
+				b, _ := json.MarshalIndent(map[string]any{
+					"status":               "CHALLENGE_REQUIRED",
+					"service":              name,
+					"route_id":             pubID,
+					"pending_transactions": out.PendingTransactions,
+					"next_action":          "Re-run with explicit --challenge <ID> matching the browser authorization screen.",
+				}, "", "  ")
+				fmt.Println(string(b))
+			} else {
+				fmt.Fprintf(os.Stderr, "service approve: explicit --challenge <ID> required (%d pending transaction(s)):\n", len(out.PendingTransactions))
+				for _, tx := range out.PendingTransactions {
+					fmt.Fprintf(os.Stderr, "  %s  client=%s name=%q redirect=%s scope=%q\n", tx.Challenge, tx.ClientID, tx.ClientName, tx.RedirectURI, tx.Scope)
+				}
+				fmt.Fprintf(os.Stderr, "Run: ocliv service approve %s --challenge <ID>\n", name)
+			}
 			return apperr.ExitCLIValidation
 		}
 	}
+
 	if challengeID != "" {
 		action := "approve"
 		if deny {
@@ -2250,6 +2333,10 @@ func cmdServiceApprove(argv []string, ops serviceOps) int {
 		if st != http.StatusOK {
 			fmt.Fprintf(os.Stderr, "service approve: relay returned %d: %s\n", st, strings.TrimSpace(string(body)))
 			return apperr.ExitAuth
+		}
+		if jsonOut {
+			fmt.Println(string(body))
+			return apperr.ExitOK
 		}
 		var res struct {
 			Challenge string `json:"challenge"`
@@ -2267,10 +2354,8 @@ func cmdServiceApprove(argv []string, ops serviceOps) int {
 		}
 		return apperr.ExitOK
 	}
-	if deny {
-		fmt.Fprintln(os.Stderr, "service approve: --deny requires a pending transaction (--challenge)")
-		return apperr.ExitCLIValidation
-	}
+
+	// Explicit legacy pairing or direct operator grant paths (only when explicitly requested).
 	path := "/v1/agent/mcp-routes/" + pubID + "/authz/approve/" + clientID
 	if direct {
 		path = "/v1/agent/mcp-routes/" + pubID + "/authz/approve-direct/" + clientID
@@ -2283,6 +2368,10 @@ func cmdServiceApprove(argv []string, ops serviceOps) int {
 	if st != http.StatusOK {
 		fmt.Fprintf(os.Stderr, "service approve: relay returned %d: %s\n", st, strings.TrimSpace(string(body)))
 		return apperr.ExitAuth
+	}
+	if jsonOut {
+		fmt.Println(string(body))
+		return apperr.ExitOK
 	}
 	var res struct {
 		ClientID      string `json:"client_id"`
@@ -2297,7 +2386,7 @@ func cmdServiceApprove(argv []string, ops serviceOps) int {
 		fmt.Printf("✓ approved client %s for %s (route=%s, direct; pairing bypassed)\n", res.ClientID, name, pubID)
 		return apperr.ExitOK
 	}
-	fmt.Printf("✓ approved client %s for %s (route=%s)\n", res.ClientID, name, pubID)
+	fmt.Printf("✓ approved client %s for %s (route=%s, legacy pairing)\n", res.ClientID, name, pubID)
 	fmt.Printf("Pairing secret (single-use; enter in consent form):\n%s\n", res.PairingSecret)
 	return apperr.ExitOK
 }

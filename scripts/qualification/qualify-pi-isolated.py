@@ -587,6 +587,98 @@ check("D: malformed trailing JSON refused", st in (400, 413), "st=" + str(st))
 st, b, loc, cx = consent(ra, cidA, ch2, pair2, cch2)
 check("D: consent challenge replay rejected", not cx, "st=" + str(st))
 
+print("== Phase D2: native transaction-bound operator authorization E2E (zero pairing secrets) ==")
+_nat_add = sh([BIN, "service", "add", "qa", "--attach", "http://127.0.0.1:28099/mcp", "--relay", BASE], ENV)
+check("D2.1: register local service record for native approve", _nat_add.returncode == 0, _nat_add.stderr[:80])
+_nat_wait = sh([BIN, "service", "approve", "qa", "--json"], ENV)
+_nat_wait_ok = False
+try:
+    _nat_wait_ok = (_nat_wait.returncode == 0) and (json.loads(_nat_wait.stdout).get("status") == "AWAITING_AUTHORIZATION_REQUEST")
+except Exception:
+    pass
+check("D2.2: approve with no pending tx returns AWAITING_AUTHORIZATION_REQUEST (no legacy fallback)", _nat_wait_ok, f"rc={_nat_wait.returncode} out={_nat_wait.stdout[:80]}")
+
+cidNat, stNat = dcr(ra)
+check("D2.3: DCR native client on routeA", bool(cidNat) and stNat == 201, f"cid={cidNat} st={stNat}")
+verN1, chN1 = pkce()
+stN1, pageN1, hdrN1 = authorize(ra, cidNat, chN1)
+cchN1 = challenge_of(pageN1)
+_hdr_low = {k.lower(): v for k, v in hdrN1.items()}
+_sec_hdrs_ok = (
+    _hdr_low.get("referrer-policy") == "no-referrer"
+    and _hdr_low.get("x-frame-options") == "DENY"
+    and "no-store" in _hdr_low.get("cache-control", "")
+)
+check("D2.4: native consent page renders with strict security headers", stN1 == 200 and bool(cchN1) and _sec_hdrs_ok, f"st={stN1} ref={_hdr_low.get('referrer-policy')} xfo={_hdr_low.get('x-frame-options')}")
+
+stCS, bCS, _ = http_req("GET", "/r/" + ra + "/oauth/consent/status?challenge=" + urllib.parse.quote(cchN1 or ""))
+check("D2.5: consent status reports pending", stCS == 200 and '"pending"' in bCS, f"st={stCS} b={bCS[:60]}")
+stCSB, _, _ = http_req("GET", "/r/" + rb + "/oauth/consent/status?challenge=" + urllib.parse.quote(cchN1 or ""))
+check("D2.6: cross-route consent status rejected (404)", stCSB == 404, f"st={stCSB}")
+stGetComp, _, _ = http_req("GET", "/r/" + ra + "/oauth/consent/complete?challenge=" + urllib.parse.quote(cchN1 or ""))
+check("D2.7: consent complete is POST-only (GET -> 405)", stGetComp == 405, f"st={stGetComp}")
+stPreComp, _, _ = http_req("POST", "/r/" + ra + "/oauth/consent/complete", urllib.parse.urlencode({"challenge": cchN1 or ""}), {"Content-Type": "application/x-www-form-urlencoded"})
+check("D2.8: premature consent complete before decision rejected (400)", stPreComp == 400, f"st={stPreComp}")
+
+_nat_pend = sh([BIN, "service", "pending", "qa", "--json"], ENV)
+_pend_ok = False
+try:
+    _pj = json.loads(_nat_pend.stdout)
+    _txs = _pj.get("pending_transactions", [])
+    _pend_ok = (
+        _nat_pend.returncode == 0
+        and any(t.get("challenge") == cchN1 and t.get("client_id") == cidNat and "code_challenge" not in t and "state" not in t for t in _txs)
+    )
+except Exception:
+    pass
+check("D2.9: signed pending lists minimal tx metadata (no code_challenge/state)", _pend_ok, f"rc={_nat_pend.returncode}")
+
+_nat_nochal = sh([BIN, "service", "approve", "qa", "--json"], ENV)
+_nochal_ok = False
+try:
+    _nochal_ok = (_nat_nochal.returncode != 0) and (json.loads(_nat_nochal.stdout).get("status") == "CHALLENGE_REQUIRED")
+except Exception:
+    pass
+check("D2.10: non-interactive approve without --challenge refuses (CHALLENGE_REQUIRED)", _nochal_ok, f"rc={_nat_nochal.returncode}")
+
+_nat_conf = sh([BIN, "service", "approve", "qa", "--challenge", cchN1 or "x", "--direct"], ENV)
+check("D2.11: conflicting --challenge + --direct rejected", _nat_conf.returncode != 0, f"rc={_nat_conf.returncode}")
+
+_nat_deny = sh([BIN, "service", "approve", "qa", "--challenge", cchN1 or "", "--deny", "--json"], ENV)
+check("D2.12: signed operator deny succeeds", _nat_deny.returncode == 0 and '"denied"' in _nat_deny.stdout, f"rc={_nat_deny.returncode}")
+stDenyC, _, hdrDenyC = http_req("POST", "/r/" + ra + "/oauth/consent/complete", urllib.parse.urlencode({"challenge": cchN1 or ""}), {"Content-Type": "application/x-www-form-urlencoded"})
+check("D2.13: denied tx completes with access_denied redirect", stDenyC == 302 and "error=access_denied" in hdrDenyC.get("Location", ""), f"st={stDenyC}")
+
+# Now approve tx #2 via signed management channel without any pairing secret.
+verN2, chN2 = pkce()
+stN2, pageN2, _ = authorize(ra, cidNat, chN2)
+cchN2 = challenge_of(pageN2)
+_nat_app = sh([BIN, "service", "approve", "qa", "--challenge", cchN2 or "", "--json"], ENV)
+check("D2.14: signed operator approve succeeds (no pairing secret)", _nat_app.returncode == 0 and '"approved"' in _nat_app.stdout and "pairing_secret" not in _nat_app.stdout, f"rc={_nat_app.returncode}")
+stCSA, bCSA, _ = http_req("GET", "/r/" + ra + "/oauth/consent/status?challenge=" + urllib.parse.quote(cchN2 or ""))
+check("D2.15: consent status transitions to approved", stCSA == 200 and '"approved"' in bCSA, f"st={stCSA}")
+stComp, _, hdrComp = http_req("POST", "/r/" + ra + "/oauth/consent/complete", urllib.parse.urlencode({"challenge": cchN2 or ""}), {"Content-Type": "application/x-www-form-urlencoded"})
+_compLoc = hdrComp.get("Location", "")
+_compQs = urllib.parse.parse_qs(urllib.parse.urlparse(_compLoc).query) if _compLoc else {}
+_natCode = _compQs.get("code", [None])[0]
+check("D2.16: POST consent complete issues PKCE code + state + RFC 9207 iss", stComp == 302 and bool(_natCode) and _compQs.get("state", [None])[0] == "st" and bool(_compQs.get("iss", [None])[0]), f"st={stComp}")
+stCompRep, _, _ = http_req("POST", "/r/" + ra + "/oauth/consent/complete", urllib.parse.urlencode({"challenge": cchN2 or ""}), {"Content-Type": "application/x-www-form-urlencoded"})
+check("D2.17: consent complete replay rejected (400)", stCompRep == 400, f"st={stCompRep}")
+
+stNT, tokN = token(ra, {"grant_type": "authorization_code", "code": _natCode or "", "client_id": cidNat, "redirect_uri": CB, "code_verifier": verN2, "resource": RES + "/r/" + ra + "/mcp"})
+atN, rtN = tokN.get("access_token"), tokN.get("refresh_token")
+check("D2.18: native PKCE code exchange yields access + refresh tokens", stNT == 200 and bool(atN) and bool(rtN), f"st={stNT}")
+eN0 = tally()["execs"]
+stNM, _ = tools(ra, atN)
+check("D2.19: native token executes authenticated MCP tools/call", stNM == 200 and tally()["execs"] == eN0 + 1, f"st={stNM}")
+stNR, tokN2 = token(ra, {"grant_type": "refresh_token", "refresh_token": rtN or "", "client_id": cidNat, "resource": RES + "/r/" + ra + "/mcp"})
+atN2, rtN2 = tokN2.get("access_token"), tokN2.get("refresh_token")
+check("D2.20: native refresh rotation succeeds", stNR == 200 and bool(atN2) and bool(rtN2), f"st={stNR}")
+_nat_rev = sh([BIN, "authz", "revoke", "--data", DB, "--client", cidNat, "--tenant", "t1", "--route", ra], ENV)
+stNRevM, _ = tools(ra, atN2)
+stNRevR, _ = token(ra, {"grant_type": "refresh_token", "refresh_token": rtN2 or "", "client_id": cidNat, "resource": RES + "/r/" + ra + "/mcp"})
+check("D2.21: grant revocation immediately blocks access & refresh tokens", _nat_rev.returncode == 0 and stNRevM == 401 and stNRevR != 200, f"rev={_nat_rev.returncode} mcp={stNRevM} ref={stNRevR}")
+
 print("== Phase E: recovery rehearsal (staging only) ==")
 _pre_rev = os.path.join(WORK_DIR, "pre-revoke.db")
 _reset_dir = os.path.join(WORK_DIR, "reset-dir")

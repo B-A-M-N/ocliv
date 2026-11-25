@@ -117,6 +117,10 @@ func buildVersionInfo() map[string]any {
 			"cors_mcp_headers",
 			"persistent_named_leases",
 			"mgmt_body_sig_v2",
+			"native_tx_authz",
+			"optional_federated_oidc",
+			"mcp_events_qualification",
+			"host_observations",
 		},
 	}
 }

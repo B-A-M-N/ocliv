@@ -79,6 +79,10 @@ RESET_TO_ZERO = {
     "authz_issuer_keys": "SELECT COUNT(*) FROM authz_issuer_key",
     "unrevoked_access_tokens": "SELECT COUNT(*) FROM access_tokens WHERE revoked_at IS NULL",
     "unrevoked_visitor_sessions": "SELECT COUNT(*) FROM visitor_sessions WHERE revoked_at IS NULL",
+    "unconsumed_authz_consents": "SELECT COUNT(*) FROM authz_consent WHERE consumed_at IS NULL",
+    "unconsumed_oidc_tx": "SELECT COUNT(*) FROM authz_oidc_tx WHERE consumed_at IS NULL",
+    "active_trust_policies": "SELECT COUNT(*) FROM authz_trust_policies WHERE enabled=1 OR revoked_at IS NULL",
+    "active_visitor_policies": "SELECT COUNT(*) FROM authz_visitor_policies WHERE enabled=1 OR revoked_at IS NULL OR client_secret<>''",
 }
 
 

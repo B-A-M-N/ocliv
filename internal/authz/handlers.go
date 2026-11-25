@@ -137,6 +137,9 @@ type consentPageData struct {
 func (s *Server) renderConsent(w http.ResponseWriter, d consentPageData) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; form-action 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'")
 	w.WriteHeader(http.StatusOK)
 	_ = consentPageTemplate.Execute(w, d)
 }
@@ -168,17 +171,35 @@ var consentPageTemplate = template.Must(template.New("consent").Parse(`<!DOCTYPE
 <script>
 (function() {
   var statusURL = {{.ConsentStatus}} + "?challenge=" + encodeURIComponent({{.Challenge}});
+  var statusEl = document.getElementById("tx-status");
+  var polls = 0, failures = 0, maxPolls = 300, maxFailures = 5;
   var timer = setInterval(function() {
-    fetch(statusURL, {cache: "no-store"}).then(function(r) { return r.json(); }).then(function(d) {
+    polls++;
+    if (polls > maxPolls) {
+      clearInterval(timer);
+      statusEl.textContent = "Authorization request expired. Retry from your client.";
+      return;
+    }
+    fetch(statusURL, {cache: "no-store", referrerPolicy: "no-referrer"}).then(function(r) {
+      if (!r.ok) { throw new Error("status " + r.status); }
+      return r.json();
+    }).then(function(d) {
+      failures = 0;
       if (d.status === "approved" || d.status === "denied") {
         clearInterval(timer);
         document.getElementById("complete-form").submit();
-      } else if (d.status === "expired" || d.status === "consumed") {
+      } else if (d.status === "expired" || d.status === "consumed" || d.status === "unknown") {
         clearInterval(timer);
-        document.getElementById("tx-status").textContent = "Authorization request " + d.status + ". Retry from your client.";
+        statusEl.textContent = "Authorization request " + d.status + ". Retry from your client.";
       }
-    }).catch(function() {});
-  }, 1500);
+    }).catch(function() {
+      failures++;
+      if (failures >= maxFailures) {
+        clearInterval(timer);
+        statusEl.textContent = "Stopped polling after repeated connection errors. Reload or retry from your client.";
+      }
+    });
+  }, 2000);
 })();
 </script></body></html>`))
 
@@ -1099,6 +1120,9 @@ func (s *Server) ServeConsentStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
 	challenge := strings.TrimSpace(r.URL.Query().Get("challenge"))
 	if challenge == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
@@ -1123,23 +1147,21 @@ func (s *Server) ServeConsentStatus(w http.ResponseWriter, r *http.Request) {
 // ServeConsentComplete atomically consumes an operator-decided consent
 // transaction (approved or denied via the Ed25519-signed management channel)
 // and completes the standard OAuth authorization redirect with PKCE + RFC 9207
-// `iss` — zero pairing secrets copied (OCL-005 native default).
+// `iss` — POST-only, zero pairing secrets copied (OCL-005 native default).
 func (s *Server) ServeConsentComplete(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	var challenge string
-	if r.Method == http.MethodPost {
-		r.Body = http.MaxBytesReader(w, r.Body, MaxFormBody)
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
-		}
-		challenge = strings.TrimSpace(r.Form.Get("challenge"))
-	} else {
-		challenge = strings.TrimSpace(r.URL.Query().Get("challenge"))
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Frame-Options", "DENY")
+	r.Body = http.MaxBytesReader(w, r.Body, MaxFormBody)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
 	}
+	challenge := strings.TrimSpace(r.Form.Get("challenge"))
 	if challenge == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "missing challenge"})
 		return

@@ -693,10 +693,27 @@ func (s *Server) serveKeyPublicationAuthzPending(w http.ResponseWriter, tenant, 
 			out = append(out, p)
 		}
 	}
-	pendingTx := []authz.Consent{}
+	type pendingConsentView struct {
+		Challenge   string    `json:"challenge"`
+		ClientID    string    `json:"client_id"`
+		ClientName  string    `json:"client_name,omitempty"`
+		RedirectURI string    `json:"redirect_uri"`
+		Scope       string    `json:"scope,omitempty"`
+		ExpiresAt   time.Time `json:"expires_at"`
+	}
+	pendingTx := []pendingConsentView{}
 	if s.authz != nil {
 		if list, lerr := s.authz.Store().ListPendingConsents(tenant, routeID); lerr == nil {
-			pendingTx = list
+			for _, c := range list {
+				pendingTx = append(pendingTx, pendingConsentView{
+					Challenge:   c.Challenge,
+					ClientID:    c.ClientID,
+					ClientName:  c.ClientName,
+					RedirectURI: c.RedirectURI,
+					Scope:       c.Scope,
+					ExpiresAt:   c.ExpiresAt,
+				})
+			}
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -705,6 +722,13 @@ func (s *Server) serveKeyPublicationAuthzPending(w http.ResponseWriter, tenant, 
 		"pending":              out,
 		"pending_transactions": pendingTx,
 	})
+}
+
+func redactChallengeForLog(ch string) string {
+	if len(ch) <= 8 {
+		return "[redacted]"
+	}
+	return ch[:4] + "…" + ch[len(ch)-4:]
 }
 
 func (s *Server) serveKeyPublicationAuthzConsentDecide(w http.ResponseWriter, tenant, keyID, routeID, challenge string, approve bool) {
@@ -733,7 +757,7 @@ func (s *Server) serveKeyPublicationAuthzConsentDecide(w http.ResponseWriter, te
 	if approve {
 		action = "authz-consent-approve"
 	}
-	s.db.AuditKey("agent", tenant, keyID, "", action, "ok", "challenge "+challenge+" client "+cons.ClientID+" route "+routeID)
+	s.db.AuditKey("agent", tenant, keyID, "", action, "ok", "tx "+redactChallengeForLog(challenge)+" client "+cons.ClientID+" route "+routeID)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"route_id":    routeID,
 		"tenant_id":   tenant,

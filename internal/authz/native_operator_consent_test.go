@@ -85,7 +85,12 @@ func TestNativeOperatorTransactionBoundAuthorizationE2E(t *testing.T) {
 		t.Fatalf("cross-route consent status must return 404, got %d", crossRec.Code)
 	}
 
-	// Completing before operator decision fails closed.
+	// Completing before operator decision fails closed, and GET is rejected (POST-only).
+	getComp := httptest.NewRecorder()
+	srv.ServeConsentComplete(getComp, httptest.NewRequest(http.MethodGet, srv.IssuerURL+"/consent/complete?challenge="+denyChallenge, nil))
+	if getComp.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /consent/complete must return 405, got %d", getComp.Code)
+	}
 	premature := httptest.NewRecorder()
 	srv.ServeConsentComplete(premature, httptest.NewRequest(http.MethodPost, srv.IssuerURL+"/consent/complete", strings.NewReader("challenge="+denyChallenge)))
 	if premature.Code != http.StatusBadRequest {
