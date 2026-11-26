@@ -2,21 +2,44 @@ package cli
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
 
-// AgentPermissionsFlags defines the 9 independent capabilities that an
-// operator can grant to an authenticated agent principal.
-// Sensitive operations (authorize_visitor, manage_auth_policy, revoke_client,
-// remove_publication, deployment) are strictly separated.
+const (
+	maxPendingPerPrincipal = 16
+	maxTotalApprovalStore  = 256
+)
+
+var (
+	// ErrPolicyConflict indicates a CAS revision mismatch while saving agent permissions.
+	ErrPolicyConflict = errors.New("agent permissions policy revision conflict; reload and retry")
+)
+
+// ServiceGrant explicitly binds a set of permitted actions to ONE specific
+// service (by immutable service_id and/or service_name), preventing
+// cross-product permission escalation across unrelated services (OCL-014.3).
+type ServiceGrant struct {
+	ServiceID        string   `json:"service_id,omitempty"`
+	ServiceName      string   `json:"service_name,omitempty"`
+	Actions          []string `json:"actions"`
+	AllowedPorts     []int    `json:"allowed_ports,omitempty"`
+	AllowedAuthModes []string `json:"allowed_auth_modes,omitempty"`
+}
+
+// AgentPermissionsFlags is retained strictly for conservative one-way migration
+// of pre-OCL-014 policies and UI checkbox rendering for a single service grant.
 type AgentPermissionsFlags struct {
 	Inspect           bool `json:"inspect"`
 	GetURL            bool `json:"get_url"`
@@ -29,50 +52,79 @@ type AgentPermissionsFlags struct {
 	RemovePublication bool `json:"remove_publication"`
 }
 
-// AgentPermissionRule scopes capabilities to explicit service names/immutable
-// service IDs, permitted deployment ports, and permitted authentication modes.
-// Fail-closed: empty AllowedServices + empty AllowedServiceIDs authorizes NO
-// services; empty AllowedPorts authorizes NO deployment ports.
+// AgentPermissionRule defines an authenticated principal's explicit grants.
+// Legacy flat fields (AgentPermissions/AllowedServices/AllowedPorts) are
+// migrated conservatively on load and never allowed to widen authority.
 type AgentPermissionRule struct {
-	AgentPermissions  AgentPermissionsFlags `json:"agent_permissions"`
-	AllowedServices   []string              `json:"allowed_services,omitempty"`
-	AllowedServiceIDs []string              `json:"allowed_service_ids,omitempty"`
-	AllowedPorts      []int                 `json:"allowed_ports,omitempty"`
-	AllowedAuthModes  []string              `json:"allowed_auth_modes,omitempty"`
+	Grants []ServiceGrant `json:"grants,omitempty"`
+
+	// Legacy fields (read-only migration input from pre-OCL-014 files).
+	AgentPermissions  *AgentPermissionsFlags `json:"agent_permissions,omitempty"`
+	AllowedServices   []string               `json:"allowed_services,omitempty"`
+	AllowedServiceIDs []string               `json:"allowed_service_ids,omitempty"`
+	AllowedPorts      []int                  `json:"allowed_ports,omitempty"`
+	AllowedAuthModes  []string               `json:"allowed_auth_modes,omitempty"`
 }
 
 // AgentPermissionsPolicy is persisted by the operator in
-// `~/.config/ocliv/agent-permissions.json` (0600, regular file, owner-UID).
-// No MCP tool can modify this file.
+// `~/.config/ocliv/agent-permissions.json` (0600, regular file, owner-UID,
+// revision-controlled). No MCP tool can modify this file.
 type AgentPermissionsPolicy struct {
-	AgentPermissions  *AgentPermissionsFlags         `json:"agent_permissions,omitempty"`
-	AllowedServices   []string                       `json:"allowed_services,omitempty"`
-	AllowedServiceIDs []string                       `json:"allowed_service_ids,omitempty"`
-	AllowedPorts      []int                          `json:"allowed_ports,omitempty"`
-	AllowedAuthModes  []string                       `json:"allowed_auth_modes,omitempty"`
-	Agents            map[string]AgentPermissionRule `json:"agents,omitempty"`
+	SchemaVersion int                            `json:"schema_version,omitempty"`
+	Revision      int64                          `json:"revision"`
+	Agents        map[string]AgentPermissionRule `json:"agents"`
+
+	// Legacy top-level fields (read-only migration input).
+	AgentPermissions  *AgentPermissionsFlags `json:"agent_permissions,omitempty"`
+	AllowedServices   []string               `json:"allowed_services,omitempty"`
+	AllowedServiceIDs []string               `json:"allowed_service_ids,omitempty"`
+	AllowedPorts      []int                  `json:"allowed_ports,omitempty"`
+	AllowedAuthModes  []string               `json:"allowed_auth_modes,omitempty"`
 }
 
-// OperatorApprovalRequest represents an agent's pending request for an
-// operation outside its current durable permissions. Only the authenticated
-// human operator (via Ocliv Control Center or CLI) can approve or deny it.
+// AuthorizationIntent is an immutable, normalized description of ONE exact
+// operation that a single-use approval authorizes (OCL-014.1).
+type AuthorizationIntent struct {
+	Operation     string         `json:"operation"`
+	Permission    string         `json:"permission"`
+	Principal     string         `json:"principal"`
+	ServiceID     string         `json:"service_id,omitempty"`
+	ServiceName   string         `json:"service_name,omitempty"`
+	PublicationID string         `json:"publication_id,omitempty"`
+	Revision      int64          `json:"revision,omitempty"`
+	Arguments     map[string]any `json:"arguments,omitempty"`
+}
+
+// Digest returns the deterministic SHA-256 hex digest ("sha256:...") of the
+// canonical JSON encoding of the exact AuthorizationIntent.
+func (in AuthorizationIntent) Digest() string {
+	// Normalize Arguments keys via Go's encoding/json map key sorting.
+	b, _ := json.Marshal(in)
+	sum := sha256.Sum256(b)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// OperatorApprovalRequest represents an agent's pending request for ONE exact
+// operation intent outside its durable grants. Stored under cross-process flock.
 type OperatorApprovalRequest struct {
-	RequestID            string   `json:"request_id"`
-	Principal            string   `json:"principal"`
-	Action               string   `json:"action"`
-	Permission           string   `json:"permission"`
-	Service              string   `json:"service,omitempty"`
-	ServiceID            string   `json:"service_id,omitempty"`
-	Port                 int      `json:"port,omitempty"`
-	AuthMode             string   `json:"auth_mode,omitempty"`
-	RequestedPermissions []string `json:"requested_permissions"`
-	Status               string   `json:"status"` // PENDING | APPROVED_ONCE | APPROVED_PERSISTENT | DENIED | CONSUMED | EXPIRED
-	CreatedAt            string   `json:"created_at"`
-	ExpiresAt            string   `json:"expires_at"`
-	DecidedAt            string   `json:"decided_at,omitempty"`
+	RequestID            string              `json:"request_id"`
+	Principal            string              `json:"principal"`
+	Action               string              `json:"action"`
+	Permission           string              `json:"permission"`
+	Service              string              `json:"service,omitempty"`
+	ServiceID            string              `json:"service_id,omitempty"`
+	PublicationID        string              `json:"publication_id,omitempty"`
+	Port                 int                 `json:"port,omitempty"`
+	AuthMode             string              `json:"auth_mode,omitempty"`
+	Intent               AuthorizationIntent `json:"intent"`
+	IntentDigest         string              `json:"intent_digest"`
+	RequestedPermissions []string            `json:"requested_permissions"`
+	Status               string              `json:"status"` // PENDING | APPROVED_ONCE | APPROVED_PERSISTENT | DENIED | CONSUMED | EXPIRED
+	CreatedAt            string              `json:"created_at"`
+	ExpiresAt            string              `json:"expires_at"`
+	DecidedAt            string              `json:"decided_at,omitempty"`
+	ConsumedAt           string              `json:"consumed_at,omitempty"`
 }
-
-var approvalStoreMu sync.Mutex
 
 func agentPermissionsFilePath() (string, error) {
 	if p := strings.TrimSpace(os.Getenv("OCLIV_PERMISSIONS_FILE")); p != "" {
@@ -96,21 +148,39 @@ func approvalRequestsFilePath() (string, error) {
 	return filepath.Join(dir, "approval-requests.json"), nil
 }
 
-// defaultLocalAgentPermissionsPolicy returns the fail-closed default used only
-// when no operator policy file exists yet: read-only inspect/get_url/verify for
-// the local-stdio principal across configured services, with ALL mutating and
-// sensitive actions denied until explicitly granted by the operator.
+// withFileLock acquires an exclusive OS-level advisory lock (flock) on
+// `<targetPath>.lock` (0600) so separate processes (Control Center, MCP manage,
+// CLI) serialize transactional reads and writes safely (OCL-014.2).
+func withFileLock(targetPath string, fn func() error) error {
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o700); err != nil {
+		return fmt.Errorf("create lock dir: %w", err)
+	}
+	lockPath := targetPath + ".lock"
+	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return fmt.Errorf("open lock file: %w", err)
+	}
+	defer lf.Close()
+	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("acquire flock: %w", err)
+	}
+	defer func() { _ = syscall.Flock(int(lf.Fd()), syscall.LOCK_UN) }()
+	return fn()
+}
+
 func defaultLocalAgentPermissionsPolicy() AgentPermissionsPolicy {
 	return AgentPermissionsPolicy{
+		SchemaVersion: 2,
+		Revision:      0,
 		Agents: map[string]AgentPermissionRule{
 			"local-stdio": {
-				AgentPermissions: AgentPermissionsFlags{
-					Inspect: true,
-					GetURL:  true,
-					Verify:  true,
+				Grants: []ServiceGrant{
+					{
+						ServiceName:      "*",
+						Actions:          []string{"inspect", "get_url", "verify"},
+						AllowedAuthModes: []string{"ocliv-managed"},
+					},
 				},
-				AllowedServices:  []string{"*"},
-				AllowedAuthModes: []string{"ocliv-managed"},
 			},
 		},
 	}
@@ -168,172 +238,267 @@ func atomicWriteOwnerOnly0600(path string, data []byte) error {
 	return os.Rename(tmpName, path)
 }
 
+func flagsToActions(f *AgentPermissionsFlags) []string {
+	if f == nil {
+		return nil
+	}
+	var out []string
+	if f.Inspect {
+		out = append(out, "inspect")
+	}
+	if f.GetURL {
+		out = append(out, "get_url")
+	}
+	if f.Verify {
+		out = append(out, "verify")
+	}
+	if f.Lifecycle {
+		out = append(out, "lifecycle")
+	}
+	if f.Deployment {
+		out = append(out, "deployment")
+	}
+	if f.AuthorizeVisitor {
+		out = append(out, "authorize_visitor")
+	}
+	if f.ManageAuthPolicy {
+		out = append(out, "manage_auth_policy")
+	}
+	if f.RevokeClient {
+		out = append(out, "revoke_client")
+	}
+	if f.RemovePublication {
+		out = append(out, "remove_publication")
+	}
+	return out
+}
+
+// migrateLegacyRule conservatively converts legacy flat fields into explicit
+// per-service ServiceGrants without ever widening authority (OCL-014.3).
+func migrateLegacyRule(r AgentPermissionRule) AgentPermissionRule {
+	if len(r.Grants) > 0 || r.AgentPermissions == nil {
+		return r
+	}
+	actions := flagsToActions(r.AgentPermissions)
+	if len(actions) == 0 {
+		return AgentPermissionRule{}
+	}
+	modes := r.AllowedAuthModes
+	if len(modes) == 0 {
+		modes = []string{"ocliv-managed"}
+	}
+	var grants []ServiceGrant
+	for _, svc := range r.AllowedServices {
+		svc = strings.TrimSpace(svc)
+		if svc == "" {
+			continue
+		}
+		grants = append(grants, ServiceGrant{
+			ServiceName:      svc,
+			Actions:          slices.Clone(actions),
+			AllowedPorts:     slices.Clone(r.AllowedPorts),
+			AllowedAuthModes: slices.Clone(modes),
+		})
+	}
+	for _, id := range r.AllowedServiceIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		grants = append(grants, ServiceGrant{
+			ServiceID:        id,
+			Actions:          slices.Clone(actions),
+			AllowedPorts:     slices.Clone(r.AllowedPorts),
+			AllowedAuthModes: slices.Clone(modes),
+		})
+	}
+	return AgentPermissionRule{Grants: grants}
+}
+
+func normalizePolicy(pol AgentPermissionsPolicy) AgentPermissionsPolicy {
+	if pol.Agents == nil {
+		pol.Agents = map[string]AgentPermissionRule{}
+	}
+	if pol.AgentPermissions != nil {
+		if _, exists := pol.Agents["local-stdio"]; !exists {
+			pol.Agents["local-stdio"] = migrateLegacyRule(AgentPermissionRule{
+				AgentPermissions:  pol.AgentPermissions,
+				AllowedServices:   pol.AllowedServices,
+				AllowedServiceIDs: pol.AllowedServiceIDs,
+				AllowedPorts:      pol.AllowedPorts,
+				AllowedAuthModes:  pol.AllowedAuthModes,
+			})
+		}
+		pol.AgentPermissions = nil
+		pol.AllowedServices = nil
+		pol.AllowedServiceIDs = nil
+		pol.AllowedPorts = nil
+		pol.AllowedAuthModes = nil
+	}
+	for k, r := range pol.Agents {
+		pol.Agents[k] = migrateLegacyRule(r)
+	}
+	pol.SchemaVersion = 2
+	return pol
+}
+
+// loadAgentPermissionsPolicy loads and validates the operator permissions policy
+// fail-closed. Corrupted or insecure files return an error rather than being
+// silently replaced (OCL-014.2).
 func loadAgentPermissionsPolicy() (AgentPermissionsPolicy, error) {
 	path, err := agentPermissionsFilePath()
 	if err != nil {
 		return defaultLocalAgentPermissionsPolicy(), nil
 	}
-	f, err := openRegularOwnerOnly0600(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return defaultLocalAgentPermissionsPolicy(), nil
-		}
-		return AgentPermissionsPolicy{}, fmt.Errorf("load agent-permissions.json: %w", err)
-	}
-	defer f.Close()
 	var pol AgentPermissionsPolicy
-	if err := json.NewDecoder(f).Decode(&pol); err != nil {
-		return AgentPermissionsPolicy{}, fmt.Errorf("invalid agent-permissions.json: %w", err)
-	}
-	if pol.Agents == nil {
-		pol.Agents = map[string]AgentPermissionRule{}
+	err = withFileLock(path, func() error {
+		f, oerr := openRegularOwnerOnly0600(path)
+		if oerr != nil {
+			if os.IsNotExist(oerr) {
+				pol = defaultLocalAgentPermissionsPolicy()
+				return nil
+			}
+			return oerr
+		}
+		defer f.Close()
+		if derr := json.NewDecoder(f).Decode(&pol); derr != nil {
+			return fmt.Errorf("corrupted agent-permissions.json: %w", derr)
+		}
+		pol = normalizePolicy(pol)
+		return nil
+	})
+	if err != nil {
+		return AgentPermissionsPolicy{}, fmt.Errorf("load agent-permissions.json: %w", err)
 	}
 	return pol, nil
 }
 
-// saveAgentPermissionsPolicy atomically persists operator-edited permissions
-// with 0600 mode. Callable ONLY from operator-authenticated Control Center / CLI,
-// NEVER from an MCP tool handler.
-func saveAgentPermissionsPolicy(pol AgentPermissionsPolicy) error {
+// saveAgentPermissionsPolicyCAS atomically persists operator-edited permissions
+// with 0600 mode under cross-process flock and revision CAS check (OCL-014.6).
+// When expectedRevision >= 0, fails with ErrPolicyConflict if another window
+// modified the policy concurrently.
+func saveAgentPermissionsPolicyCAS(pol AgentPermissionsPolicy, expectedRevision int64) (AgentPermissionsPolicy, error) {
 	path, err := agentPermissionsFilePath()
 	if err != nil {
-		return err
+		return AgentPermissionsPolicy{}, err
 	}
-	b, err := json.MarshalIndent(pol, "", "  ")
-	if err != nil {
-		return err
-	}
-	return atomicWriteOwnerOnly0600(path, append(b, '\n'))
-}
-
-func (p AgentPermissionsPolicy) ruleFor(principal string) (AgentPermissionRule, bool) {
-	principal = strings.TrimSpace(principal)
-	if principal == "" {
-		return AgentPermissionRule{}, false
-	}
-	if p.Agents != nil {
-		if r, ok := p.Agents[principal]; ok {
-			return r, true
-		}
-	}
-	if p.AgentPermissions != nil {
-		return AgentPermissionRule{
-			AgentPermissions:  *p.AgentPermissions,
-			AllowedServices:   p.AllowedServices,
-			AllowedServiceIDs: p.AllowedServiceIDs,
-			AllowedPorts:      p.AllowedPorts,
-			AllowedAuthModes:  p.AllowedAuthModes,
-		}, true
-	}
-	return AgentPermissionRule{}, false
-}
-
-func (r AgentPermissionRule) canAccessService(serviceName, serviceID string) bool {
-	// Fail-closed: omitted/empty allowlists authorize NO services.
-	for _, s := range r.AllowedServices {
-		if s == "*" || (serviceName != "" && s == serviceName) {
-			return true
-		}
-	}
-	if serviceID != "" {
-		for _, id := range r.AllowedServiceIDs {
-			if id == serviceID {
-				return true
+	var saved AgentPermissionsPolicy
+	err = withFileLock(path, func() error {
+		var currentRev int64
+		if f, oerr := openRegularOwnerOnly0600(path); oerr == nil {
+			var cur AgentPermissionsPolicy
+			if derr := json.NewDecoder(f).Decode(&cur); derr != nil {
+				_ = f.Close()
+				return fmt.Errorf("corrupted agent-permissions.json: %w", derr)
 			}
+			_ = f.Close()
+			currentRev = cur.Revision
+		} else if !os.IsNotExist(oerr) {
+			return oerr
+		}
+		if expectedRevision >= 0 && currentRev != expectedRevision {
+			return ErrPolicyConflict
+		}
+		pol = normalizePolicy(pol)
+		pol.Revision = currentRev + 1
+		b, merr := json.MarshalIndent(pol, "", "  ")
+		if merr != nil {
+			return merr
+		}
+		if werr := atomicWriteOwnerOnly0600(path, append(b, '\n')); werr != nil {
+			return werr
+		}
+		saved = pol
+		return nil
+	})
+	return saved, err
+}
+
+func saveAgentPermissionsPolicy(pol AgentPermissionsPolicy) error {
+	_, err := saveAgentPermissionsPolicyCAS(pol, -1)
+	return err
+}
+
+func (g ServiceGrant) matchesService(serviceName, serviceID string) bool {
+	if g.ServiceName == "*" {
+		return true
+	}
+	if serviceID != "" && g.ServiceID != "" && g.ServiceID == serviceID {
+		return true
+	}
+	if serviceName != "" && g.ServiceName != "" && g.ServiceName == serviceName {
+		// If the grant is pinned to a specific immutable service_id and the
+		// caller provided a different non-empty service_id, refuse mismatch.
+		if g.ServiceID != "" && serviceID != "" && g.ServiceID != serviceID {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+func (g ServiceGrant) hasAction(action string) bool {
+	return slices.Contains(g.Actions, action)
+}
+
+func (p AgentPermissionsPolicy) canAccessService(principal, serviceName, serviceID string) bool {
+	rule, ok := p.Agents[strings.TrimSpace(principal)]
+	if !ok {
+		return false
+	}
+	for _, g := range rule.Grants {
+		if g.matchesService(serviceName, serviceID) && len(g.Actions) > 0 {
+			return true
 		}
 	}
 	return false
 }
 
-func (p AgentPermissionsPolicy) canAccessService(principal, serviceName, serviceID string) bool {
-	rule, ok := p.ruleFor(principal)
-	if !ok {
-		return false
-	}
-	return rule.canAccessService(serviceName, serviceID)
-}
-
-func (r AgentPermissionRule) hasAction(action string) bool {
-	switch action {
-	case "inspect":
-		return r.AgentPermissions.Inspect
-	case "get_url":
-		return r.AgentPermissions.GetURL
-	case "verify":
-		return r.AgentPermissions.Verify
-	case "lifecycle":
-		return r.AgentPermissions.Lifecycle
-	case "deployment":
-		return r.AgentPermissions.Deployment
-	case "authorize_visitor":
-		return r.AgentPermissions.AuthorizeVisitor
-	case "manage_auth_policy":
-		return r.AgentPermissions.ManageAuthPolicy
-	case "revoke_client":
-		return r.AgentPermissions.RevokeClient
-	case "remove_publication":
-		return r.AgentPermissions.RemovePublication
-	default:
-		return false
-	}
-}
-
-// check evaluates durable permissions first, then single-use operator approvals.
-// Returns (allowed, reasonCode, detail).
+// check evaluates explicit per-service action-to-resource grants (OCL-014.3).
+// For global read operations (serviceName == "" && serviceID == ""), returns
+// true if ANY grant for the principal permits the action.
+// For service-scoped operations, ONLY grants matching THAT exact service are
+// evaluated — preventing cross-product escalation across services!
 func (p AgentPermissionsPolicy) check(principal, action, serviceName, serviceID string, port int, authMode string) (bool, string, string) {
-	rule, ok := p.ruleFor(principal)
+	rule, ok := p.Agents[strings.TrimSpace(principal)]
 	if !ok {
 		return false, "NO_PRINCIPAL_POLICY", fmt.Sprintf("principal %q has no operator-granted permissions", principal)
 	}
-	if !rule.hasAction(action) {
+	if serviceName == "" && serviceID == "" {
+		for _, g := range rule.Grants {
+			if g.hasAction(action) {
+				return true, "", ""
+			}
+		}
 		return false, "PERMISSION_NOT_GRANTED", fmt.Sprintf("operator has not granted %q to %q", action, principal)
 	}
-	if serviceName != "" || serviceID != "" {
-		if !rule.canAccessService(serviceName, serviceID) {
-			return false, "FORBIDDEN_TARGET", fmt.Sprintf("service %q is outside operator allowed_services for %q", serviceName, principal)
+	for _, g := range rule.Grants {
+		if !g.matchesService(serviceName, serviceID) {
+			continue
 		}
+		if !g.hasAction(action) {
+			continue
+		}
+		if action == "deployment" {
+			if len(g.AllowedPorts) == 0 || (port > 0 && !slices.Contains(g.AllowedPorts, port)) {
+				continue
+			}
+			modes := g.AllowedAuthModes
+			if len(modes) == 0 {
+				modes = []string{"ocliv-managed"}
+			}
+			if authMode != "" && !slices.Contains(modes, authMode) {
+				continue
+			}
+		}
+		return true, "", ""
 	}
-	if action == "deployment" {
-		if len(rule.AllowedPorts) == 0 {
-			return false, "FORBIDDEN_PORT", fmt.Sprintf("no deployment ports are allowlisted for %q", principal)
-		}
-		if port > 0 {
-			portOK := false
-			for _, ap := range rule.AllowedPorts {
-				if ap == port {
-					portOK = true
-					break
-				}
-			}
-			if !portOK {
-				return false, "FORBIDDEN_PORT", fmt.Sprintf("port %d is outside operator allowed_ports", port)
-			}
-		}
-		modes := rule.AllowedAuthModes
-		if len(modes) == 0 {
-			modes = []string{"ocliv-managed"}
-		}
-		if authMode != "" {
-			modeOK := false
-			for _, am := range modes {
-				if am == authMode {
-					modeOK = true
-					break
-				}
-			}
-			if !modeOK {
-				return false, "FORBIDDEN_AUTH_MODE", fmt.Sprintf("auth mode %q is outside operator allowed_auth_modes", authMode)
-			}
-		}
-	}
-	return true, "", ""
+	return false, "PERMISSION_NOT_GRANTED", fmt.Sprintf("operator has not granted %q on service %q to %q", action, serviceName, principal)
 }
 
-func loadApprovalRequestsLocked() ([]OperatorApprovalRequest, error) {
-	path, err := approvalRequestsFilePath()
-	if err != nil {
-		return nil, err
-	}
+// ==================== CROSS-PROCESS TRANSACTIONAL APPROVAL STORE (OCL-014.1 + 014.2) ====================
+
+func loadApprovalRequestsFileLocked(path string) ([]OperatorApprovalRequest, error) {
 	f, err := openRegularOwnerOnly0600(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -344,16 +509,13 @@ func loadApprovalRequestsLocked() ([]OperatorApprovalRequest, error) {
 	defer f.Close()
 	var list []OperatorApprovalRequest
 	if err := json.NewDecoder(f).Decode(&list); err != nil {
-		return []OperatorApprovalRequest{}, nil
+		// Fail closed on corrupted approval store: never silently overwrite!
+		return nil, fmt.Errorf("corrupted approval-requests.json: %w", err)
 	}
 	return list, nil
 }
 
-func saveApprovalRequestsLocked(list []OperatorApprovalRequest) error {
-	path, err := approvalRequestsFilePath()
-	if err != nil {
-		return err
-	}
+func saveApprovalRequestsFileLocked(path string, list []OperatorApprovalRequest) error {
 	b, err := json.MarshalIndent(list, "", "  ")
 	if err != nil {
 		return err
@@ -362,200 +524,249 @@ func saveApprovalRequestsLocked(list []OperatorApprovalRequest) error {
 }
 
 func listOperatorApprovalRequests() ([]OperatorApprovalRequest, error) {
-	approvalStoreMu.Lock()
-	defer approvalStoreMu.Unlock()
-	list, err := loadApprovalRequestsLocked()
+	path, err := approvalRequestsFilePath()
 	if err != nil {
 		return nil, err
 	}
-	now := time.Now().UTC()
-	changed := false
-	for i := range list {
-		if list[i].Status == "PENDING" || list[i].Status == "APPROVED_ONCE" {
-			if exp, perr := time.Parse(time.RFC3339, list[i].ExpiresAt); perr == nil && now.After(exp) {
-				list[i].Status = "EXPIRED"
-				changed = true
+	var out []OperatorApprovalRequest
+	err = withFileLock(path, func() error {
+		list, lerr := loadApprovalRequestsFileLocked(path)
+		if lerr != nil {
+			return lerr
+		}
+		now := time.Now().UTC()
+		changed := false
+		for i := range list {
+			if list[i].Status == "PENDING" || list[i].Status == "APPROVED_ONCE" {
+				if exp, perr := time.Parse(time.RFC3339, list[i].ExpiresAt); perr == nil && now.After(exp) {
+					list[i].Status = "EXPIRED"
+					changed = true
+				}
 			}
 		}
-	}
-	if changed {
-		_ = saveApprovalRequestsLocked(list)
-	}
-	return list, nil
+		if changed {
+			if serr := saveApprovalRequestsFileLocked(path, list); serr != nil {
+				return serr
+			}
+		}
+		out = list
+		return nil
+	})
+	return out, err
 }
 
-func createOperatorApprovalRequest(principal, toolName, permission, service, serviceID string, port int, authMode string) (OperatorApprovalRequest, error) {
-	approvalStoreMu.Lock()
-	defer approvalStoreMu.Unlock()
-	list, err := loadApprovalRequestsLocked()
+func createOperatorApprovalRequest(intent AuthorizationIntent, port int, authMode string) (OperatorApprovalRequest, error) {
+	path, err := approvalRequestsFilePath()
 	if err != nil {
 		return OperatorApprovalRequest{}, err
 	}
-	now := time.Now().UTC()
-	// Deduplicate an existing live PENDING request for the exact same tuple.
-	for _, r := range list {
-		if r.Status == "PENDING" && r.Principal == principal && r.Action == toolName && r.Permission == permission && r.Service == service && r.Port == port {
-			if exp, perr := time.Parse(time.RFC3339, r.ExpiresAt); perr == nil && now.Before(exp) {
-				return r, nil
+	digest := intent.Digest()
+	var created OperatorApprovalRequest
+	err = withFileLock(path, func() error {
+		list, lerr := loadApprovalRequestsFileLocked(path)
+		if lerr != nil {
+			return lerr
+		}
+		now := time.Now().UTC()
+		pendingForPrincipal := 0
+		for i := range list {
+			if list[i].Status == "PENDING" {
+				if exp, perr := time.Parse(time.RFC3339, list[i].ExpiresAt); perr == nil && now.After(exp) {
+					list[i].Status = "EXPIRED"
+					continue
+				}
+				if list[i].Principal == intent.Principal && list[i].IntentDigest == digest {
+					created = list[i]
+					return nil
+				}
+				if list[i].Principal == intent.Principal {
+					pendingForPrincipal++
+				}
 			}
 		}
-	}
-	var rnd [12]byte
-	_, _ = rand.Read(rnd[:])
-	req := OperatorApprovalRequest{
-		RequestID:            "req_" + base64.RawURLEncoding.EncodeToString(rnd[:]),
-		Principal:            principal,
-		Action:               toolName,
-		Permission:           permission,
-		Service:              service,
-		ServiceID:            serviceID,
-		Port:                 port,
-		AuthMode:             authMode,
-		RequestedPermissions: []string{permission},
-		Status:               "PENDING",
-		CreatedAt:            now.Format(time.RFC3339),
-		ExpiresAt:            now.Add(15 * time.Minute).Format(time.RFC3339),
-	}
-	// Keep queue bounded to last 128 requests.
-	if len(list) >= 128 {
-		list = list[len(list)-127:]
-	}
-	list = append(list, req)
-	if err := saveApprovalRequestsLocked(list); err != nil {
-		return OperatorApprovalRequest{}, err
-	}
-	return req, nil
+		if pendingForPrincipal >= maxPendingPerPrincipal {
+			return fmt.Errorf("too many pending approval requests (%d) for principal %q", pendingForPrincipal, intent.Principal)
+		}
+		var rnd [12]byte
+		if _, rerr := rand.Read(rnd[:]); rerr != nil {
+			return rerr
+		}
+		req := OperatorApprovalRequest{
+			RequestID:            "req_" + base64.RawURLEncoding.EncodeToString(rnd[:]),
+			Principal:            intent.Principal,
+			Action:               intent.Operation,
+			Permission:           intent.Permission,
+			Service:              intent.ServiceName,
+			ServiceID:            intent.ServiceID,
+			PublicationID:        intent.PublicationID,
+			Port:                 port,
+			AuthMode:             authMode,
+			Intent:               intent,
+			IntentDigest:         digest,
+			RequestedPermissions: []string{intent.Permission},
+			Status:               "PENDING",
+			CreatedAt:            now.Format(time.RFC3339),
+			ExpiresAt:            now.Add(15 * time.Minute).Format(time.RFC3339),
+		}
+		if len(list) >= maxTotalApprovalStore {
+			list = list[len(list)-(maxTotalApprovalStore-1):]
+		}
+		list = append(list, req)
+		if serr := saveApprovalRequestsFileLocked(path, list); serr != nil {
+			return serr
+		}
+		created = req
+		return nil
+	})
+	return created, err
 }
 
-func consumeSingleUseApproval(principal, permission, service string, port int) bool {
-	approvalStoreMu.Lock()
-	defer approvalStoreMu.Unlock()
-	list, err := loadApprovalRequestsLocked()
+// consumeSingleUseApproval performs a cross-process locked atomic CAS from
+// APPROVED_ONCE -> CONSUMED bound strictly to (principal, exact intentDigest).
+// Fail-closed: returns (false, err) on any storage error; NEVER considers an
+// approval consumed unless the durable write succeeded (OCL-014.1, OCL-014.2).
+func consumeSingleUseApproval(principal, intentDigest string) (bool, error) {
+	path, err := approvalRequestsFilePath()
 	if err != nil {
-		return false
+		return false, err
 	}
-	now := time.Now().UTC()
-	for i := range list {
-		r := &list[i]
-		if r.Status != "APPROVED_ONCE" {
-			continue
+	consumed := false
+	err = withFileLock(path, func() error {
+		list, lerr := loadApprovalRequestsFileLocked(path)
+		if lerr != nil {
+			return lerr
 		}
-		if exp, perr := time.Parse(time.RFC3339, r.ExpiresAt); perr == nil && now.After(exp) {
-			r.Status = "EXPIRED"
-			continue
+		now := time.Now().UTC()
+		for i := range list {
+			r := &list[i]
+			if r.Status != "APPROVED_ONCE" {
+				continue
+			}
+			if exp, perr := time.Parse(time.RFC3339, r.ExpiresAt); perr == nil && now.After(exp) {
+				r.Status = "EXPIRED"
+				continue
+			}
+			if r.Principal == principal && r.IntentDigest == intentDigest && intentDigest != "" {
+				r.Status = "CONSUMED"
+				r.ConsumedAt = now.Format(time.RFC3339)
+				if serr := saveApprovalRequestsFileLocked(path, list); serr != nil {
+					// Fail closed: storage write failed, do NOT authorize execution!
+					return serr
+				}
+				consumed = true
+				return nil
+			}
 		}
-		if r.Principal == principal && r.Permission == permission && (r.Service == "" || r.Service == service) && (r.Port == 0 || r.Port == port) {
-			r.Status = "CONSUMED"
-			_ = saveApprovalRequestsLocked(list)
-			return true
-		}
+		return nil
+	})
+	if err != nil {
+		return false, err
 	}
-	return false
+	return consumed, nil
 }
 
 // decideOperatorApprovalRequest is callable ONLY from the operator-authenticated
 // Control Center (never from MCP tools). Supports: "allow_once", "allow_persistent", "deny".
 func decideOperatorApprovalRequest(requestID, decision string) (OperatorApprovalRequest, error) {
-	approvalStoreMu.Lock()
-	defer approvalStoreMu.Unlock()
-	list, err := loadApprovalRequestsLocked()
+	path, err := approvalRequestsFilePath()
 	if err != nil {
 		return OperatorApprovalRequest{}, err
 	}
-	now := time.Now().UTC()
-	for i := range list {
-		if list[i].RequestID != requestID {
-			continue
+	var decided OperatorApprovalRequest
+	err = withFileLock(path, func() error {
+		list, lerr := loadApprovalRequestsFileLocked(path)
+		if lerr != nil {
+			return lerr
 		}
-		if list[i].Status != "PENDING" {
-			return list[i], fmt.Errorf("request %s is already %s", requestID, list[i].Status)
-		}
-		if exp, perr := time.Parse(time.RFC3339, list[i].ExpiresAt); perr == nil && now.After(exp) {
-			list[i].Status = "EXPIRED"
-			_ = saveApprovalRequestsLocked(list)
-			return list[i], fmt.Errorf("request %s has expired", requestID)
-		}
-		switch decision {
-		case "allow_once":
-			list[i].Status = "APPROVED_ONCE"
-		case "allow_persistent":
-			list[i].Status = "APPROVED_PERSISTENT"
-			if err := grantPersistentPermissionFromRequest(list[i]); err != nil {
-				return list[i], err
+		now := time.Now().UTC()
+		for i := range list {
+			if list[i].RequestID != requestID {
+				continue
 			}
-		case "deny":
-			list[i].Status = "DENIED"
-		default:
-			return list[i], fmt.Errorf("invalid decision %q (want allow_once|allow_persistent|deny)", decision)
+			if list[i].Status != "PENDING" {
+				return fmt.Errorf("request %s is already %s", requestID, list[i].Status)
+			}
+			if exp, perr := time.Parse(time.RFC3339, list[i].ExpiresAt); perr == nil && now.After(exp) {
+				list[i].Status = "EXPIRED"
+				_ = saveApprovalRequestsFileLocked(path, list)
+				return fmt.Errorf("request %s has expired", requestID)
+			}
+			switch decision {
+			case "allow_once":
+				list[i].Status = "APPROVED_ONCE"
+			case "allow_persistent":
+				if gerr := grantPersistentServicePermission(list[i]); gerr != nil {
+					return gerr
+				}
+				list[i].Status = "APPROVED_PERSISTENT"
+			case "deny":
+				list[i].Status = "DENIED"
+			default:
+				return fmt.Errorf("invalid decision %q (want allow_once|allow_persistent|deny)", decision)
+			}
+			list[i].DecidedAt = now.Format(time.RFC3339)
+			if serr := saveApprovalRequestsFileLocked(path, list); serr != nil {
+				return serr
+			}
+			decided = list[i]
+			return nil
 		}
-		list[i].DecidedAt = now.Format(time.RFC3339)
-		if err := saveApprovalRequestsLocked(list); err != nil {
-			return list[i], err
-		}
-		return list[i], nil
-	}
-	return OperatorApprovalRequest{}, fmt.Errorf("unknown approval request %q", requestID)
+		return fmt.Errorf("unknown approval request %q", requestID)
+	})
+	return decided, err
 }
 
-func grantPersistentPermissionFromRequest(req OperatorApprovalRequest) error {
+// grantPersistentServicePermission adds ONLY the exact requested permission
+// scoped strictly to the exact requested service (and port/auth mode if
+// deployment), NEVER widening permissions on other services (OCL-014.3).
+func grantPersistentServicePermission(req OperatorApprovalRequest) error {
 	pol, err := loadAgentPermissionsPolicy()
 	if err != nil {
-		pol = defaultLocalAgentPermissionsPolicy()
+		return err
 	}
 	if pol.Agents == nil {
 		pol.Agents = map[string]AgentPermissionRule{}
 	}
-	rule, ok := pol.Agents[req.Principal]
-	if !ok {
-		rule = AgentPermissionRule{AllowedAuthModes: []string{"ocliv-managed"}}
-	}
-	switch req.Permission {
-	case "inspect":
-		rule.AgentPermissions.Inspect = true
-	case "get_url":
-		rule.AgentPermissions.GetURL = true
-	case "verify":
-		rule.AgentPermissions.Verify = true
-	case "lifecycle":
-		rule.AgentPermissions.Lifecycle = true
-	case "deployment":
-		rule.AgentPermissions.Deployment = true
-	case "authorize_visitor":
-		rule.AgentPermissions.AuthorizeVisitor = true
-	case "manage_auth_policy":
-		rule.AgentPermissions.ManageAuthPolicy = true
-	case "revoke_client":
-		rule.AgentPermissions.RevokeClient = true
-	case "remove_publication":
-		rule.AgentPermissions.RemovePublication = true
-	}
-	if req.Service != "" && !rule.canAccessService(req.Service, req.ServiceID) {
-		rule.AllowedServices = append(rule.AllowedServices, req.Service)
-	}
-	if req.ServiceID != "" {
-		foundID := false
-		for _, id := range rule.AllowedServiceIDs {
-			if id == req.ServiceID {
-				foundID = true
-				break
-			}
-		}
-		if !foundID {
-			rule.AllowedServiceIDs = append(rule.AllowedServiceIDs, req.ServiceID)
+	rule := pol.Agents[req.Principal]
+	idx := -1
+	for i, g := range rule.Grants {
+		if (req.ServiceID != "" && g.ServiceID == req.ServiceID) ||
+			(req.Service != "" && g.ServiceName == req.Service && (g.ServiceID == "" || g.ServiceID == req.ServiceID)) {
+			idx = i
+			break
 		}
 	}
-	if req.Port > 0 {
-		foundPort := false
-		for _, p := range rule.AllowedPorts {
-			if p == req.Port {
-				foundPort = true
-				break
-			}
+	if idx < 0 {
+		g := ServiceGrant{
+			ServiceID:   req.ServiceID,
+			ServiceName: req.Service,
+			Actions:     []string{req.Permission},
 		}
-		if !foundPort {
-			rule.AllowedPorts = append(rule.AllowedPorts, req.Port)
+		if req.Port > 0 {
+			g.AllowedPorts = []int{req.Port}
 		}
+		if req.AuthMode != "" {
+			g.AllowedAuthModes = []string{req.AuthMode}
+		}
+		rule.Grants = append(rule.Grants, g)
+	} else {
+		g := rule.Grants[idx]
+		if g.ServiceID == "" && req.ServiceID != "" {
+			g.ServiceID = req.ServiceID
+		}
+		if !slices.Contains(g.Actions, req.Permission) {
+			g.Actions = append(g.Actions, req.Permission)
+			sort.Strings(g.Actions)
+		}
+		if req.Port > 0 && !slices.Contains(g.AllowedPorts, req.Port) {
+			g.AllowedPorts = append(g.AllowedPorts, req.Port)
+		}
+		if req.AuthMode != "" && !slices.Contains(g.AllowedAuthModes, req.AuthMode) {
+			g.AllowedAuthModes = append(g.AllowedAuthModes, req.AuthMode)
+		}
+		rule.Grants[idx] = g
 	}
 	pol.Agents[req.Principal] = rule
-	return saveAgentPermissionsPolicy(pol)
+	_, err = saveAgentPermissionsPolicyCAS(pol, pol.Revision)
+	return err
 }

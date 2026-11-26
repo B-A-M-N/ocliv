@@ -133,7 +133,14 @@ func TestControlCenterSecuritySessionCSRFOriginHostAndOperatorApprovals(t *testi
 	}
 
 	// 6. Operator approves a pending agent permission request persistently via Control Center.
-	pendingReq, err := createOperatorApprovalRequest("agent-ci", "enable_service", "lifecycle", "agentgateway", "svc_agw", 0, "")
+	pendingReq, err := createOperatorApprovalRequest(AuthorizationIntent{
+		Operation:   "enable_service",
+		Permission:  "lifecycle",
+		Principal:   "agent-ci",
+		ServiceID:   "svc_agw",
+		ServiceName: "agentgateway",
+		Arguments:   map[string]any{"service": "agentgateway", "op": "enable"},
+	}, 0, "")
 	if err != nil {
 		t.Fatalf("createOperatorApprovalRequest: %v", err)
 	}

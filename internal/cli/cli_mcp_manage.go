@@ -302,27 +302,45 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		return nil, fmt.Errorf("service store unavailable: %s", sanitizeMCPError(serr))
 	}
 
-	// authorizeAction checks durable permissions first, then single-use operator
-	// approvals; if denied, records a durable pending approval request and
-	// returns an actionable OPERATOR_AUTHORIZATION_REQUIRED structured payload.
-	authorizeAction := func(action, serviceName, serviceID string, port int, authMode string) (map[string]any, bool) {
+	// authorizeAction checks durable per-service grants first, then exact-intent
+	// single-use operator approvals under cross-process flock. Any storage error
+	// fails closed (OCL-014.1, OCL-014.2, OCL-014.3).
+	authorizeAction := func(action, serviceName, serviceID, pubID string, rev int64, normArgs map[string]any, port int, authMode string) (map[string]any, bool, error) {
 		if ok, _, _ := pol.check(principal, action, serviceName, serviceID, port, authMode); ok {
-			return nil, true
+			return nil, true, nil
 		}
-		if consumeSingleUseApproval(principal, action, serviceName, port) {
-			return nil, true
+		intent := AuthorizationIntent{
+			Operation:     name,
+			Permission:    action,
+			Principal:     principal,
+			ServiceID:     serviceID,
+			ServiceName:   serviceName,
+			PublicationID: pubID,
+			Revision:      rev,
+			Arguments:     normArgs,
 		}
-		req, _ := createOperatorApprovalRequest(principal, name, action, serviceName, serviceID, port, authMode)
+		consumed, cerr := consumeSingleUseApproval(principal, intent.Digest())
+		if cerr != nil {
+			return nil, false, fmt.Errorf("approval store error (fail-closed): %s", sanitizeMCPError(cerr))
+		}
+		if consumed {
+			return nil, true, nil
+		}
+		req, rerr := createOperatorApprovalRequest(intent, port, authMode)
+		if rerr != nil {
+			return nil, false, fmt.Errorf("approval request failed: %s", sanitizeMCPError(rerr))
+		}
 		return map[string]any{
 			"ok":                    false,
 			"status":                "OPERATOR_AUTHORIZATION_REQUIRED",
 			"request_id":            req.RequestID,
+			"intent_digest":         req.IntentDigest,
 			"principal":             principal,
 			"action":                name,
 			"service":               serviceName,
 			"requested_permissions": []string{action},
 			"message":               "Review this request in Ocliv Control Center.",
-		}, false
+		}, false, nil
 	}
 
 	resolveSvc := func(svcName string) (config.ServiceRecord, string, string, *identity.KeyPair, string, error) {
@@ -356,7 +374,9 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 
 	switch name {
 	case "get_status":
-		if denied, ok := authorizeAction("inspect", "", "", 0, ""); !ok {
+		if denied, ok, aerr := authorizeAction("inspect", "", "", "", 0, nil, 0, ""); aerr != nil {
+			return nil, aerr
+		} else if !ok {
 			return denied, nil
 		}
 		svcs, _ := store.List()
@@ -372,19 +392,22 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		}
 		pubs, _, pubErr := fetchRelayPublications(relayURL, k, keyID, ops)
 		return map[string]any{
-			"ok":               true,
-			"principal":        principal,
-			"relay_url":        relayURL,
-			"key_id":           keyID,
-			"relay_reachable":  pubErr == nil,
-			"publications":     len(pubs),
-			"services_count":   visibleCount,
-			"version":          buildVersionInfo(),
-			"permissions_mode": "operator-controlled",
+			"ok":                  true,
+			"principal":           principal,
+			"transport_isolation": "shared-local-stdio",
+			"relay_url":           relayURL,
+			"key_id":              keyID,
+			"relay_reachable":     pubErr == nil,
+			"publications":        len(pubs),
+			"services_count":      visibleCount,
+			"version":             buildVersionInfo(),
+			"permissions_mode":    "operator-controlled",
 		}, nil
 
 	case "list_services":
-		if denied, ok := authorizeAction("inspect", "", "", 0, ""); !ok {
+		if denied, ok, aerr := authorizeAction("inspect", "", "", "", 0, nil, 0, ""); aerr != nil {
+			return nil, aerr
+		} else if !ok {
 			return denied, nil
 		}
 		svcs, err := store.List()
@@ -411,7 +434,9 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		if err != nil {
 			return nil, err
 		}
-		if denied, ok := authorizeAction("inspect", rec.Name, svcID, 0, ""); !ok {
+		if denied, ok, aerr := authorizeAction("inspect", rec.Name, svcID, rec.PublicationID, rec.Revision, map[string]any{"service": rec.Name}, 0, ""); aerr != nil {
+			return nil, aerr
+		} else if !ok {
 			return denied, nil
 		}
 		rep := inspectServiceStatus(rec, rk, rKeyID, ops)
@@ -423,7 +448,9 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		if err != nil {
 			return nil, err
 		}
-		if denied, ok := authorizeAction("get_url", rec.Name, svcID, 0, ""); !ok {
+		if denied, ok, aerr := authorizeAction("get_url", rec.Name, svcID, rec.PublicationID, rec.Revision, map[string]any{"service": rec.Name}, 0, ""); aerr != nil {
+			return nil, aerr
+		} else if !ok {
 			return denied, nil
 		}
 		rep := inspectServiceStatus(rec, rk, rKeyID, ops)
@@ -496,10 +523,26 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 
 		existing, exists, _ := store.Get(svcName)
 		existingSvcID := ""
-		if exists && existing.Identity != nil {
-			existingSvcID = existing.Identity.ServiceID
+		existingPubID := ""
+		var existingRev int64
+		if exists {
+			existingPubID = existing.PublicationID
+			existingRev = existing.Revision
+			if existing.Identity != nil {
+				existingSvcID = existing.Identity.ServiceID
+			}
 		}
-		if denied, ok := authorizeAction("deployment", svcName, existingSvcID, port, authMode); !ok {
+		deployArgs := map[string]any{
+			"name":           svcName,
+			"port":           port,
+			"path":           localPath,
+			"type":           svcType,
+			"authentication": authMode,
+			"persistent":     persistent,
+		}
+		if denied, ok, aerr := authorizeAction("deployment", svcName, existingSvcID, existingPubID, existingRev, deployArgs, port, authMode); aerr != nil {
+			return nil, aerr
+		} else if !ok {
 			return denied, nil
 		}
 
@@ -598,7 +641,9 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		if err != nil {
 			return nil, err
 		}
-		if denied, ok := authorizeAction("lifecycle", rec.Name, svcID, 0, ""); !ok {
+		if denied, ok, aerr := authorizeAction("lifecycle", rec.Name, svcID, rec.PublicationID, rec.Revision, map[string]any{"service": rec.Name, "op": "enable"}, 0, ""); aerr != nil {
+			return nil, aerr
+		} else if !ok {
 			return denied, nil
 		}
 		out, _, startErr := startHostedService(serviceStartRequest{Name: rec.Name}, ops)
@@ -626,7 +671,9 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		if err != nil {
 			return nil, err
 		}
-		if denied, ok := authorizeAction("lifecycle", rec.Name, svcID, 0, ""); !ok {
+		if denied, ok, aerr := authorizeAction("lifecycle", rec.Name, svcID, rec.PublicationID, rec.Revision, map[string]any{"service": rec.Name, "op": "disable"}, 0, ""); aerr != nil {
+			return nil, aerr
+		} else if !ok {
 			return denied, nil
 		}
 		res := stopServiceAuthoritatively(store, rec, rk, rKeyID, ops)
@@ -655,7 +702,9 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		if err != nil {
 			return nil, err
 		}
-		if denied, ok := authorizeAction("lifecycle", rec.Name, svcID, 0, ""); !ok {
+		if denied, ok, aerr := authorizeAction("lifecycle", rec.Name, svcID, rec.PublicationID, rec.Revision, map[string]any{"service": rec.Name, "op": "restart"}, 0, ""); aerr != nil {
+			return nil, aerr
+		} else if !ok {
 			return denied, nil
 		}
 		out, _, restErr := restartHostedServiceInProfile(rec.Profile, rec.Name, ops)
@@ -683,7 +732,9 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		if err != nil {
 			return nil, err
 		}
-		if denied, ok := authorizeAction("lifecycle", rec.Name, svcID, 0, ""); !ok {
+		if denied, ok, aerr := authorizeAction("lifecycle", rec.Name, svcID, rec.PublicationID, rec.Revision, map[string]any{"service": rec.Name, "op": "reconcile"}, 0, ""); aerr != nil {
+			return nil, aerr
+		} else if !ok {
 			return denied, nil
 		}
 		rep, rerr := reconcileServiceOnce(store, rec.Name, rk, rKeyID, ops, time.Now())
@@ -712,7 +763,9 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		if err != nil {
 			return nil, err
 		}
-		if denied, ok := authorizeAction("remove_publication", rec.Name, svcID, 0, ""); !ok {
+		if denied, ok, aerr := authorizeAction("remove_publication", rec.Name, svcID, rec.PublicationID, rec.Revision, map[string]any{"service": rec.Name}, 0, ""); aerr != nil {
+			return nil, aerr
+		} else if !ok {
 			return denied, nil
 		}
 		// Authoritative removal preserves the local record if remote revocation cannot be confirmed.
@@ -745,7 +798,9 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		if err != nil {
 			return nil, err
 		}
-		if denied, ok := authorizeAction("inspect", rec.Name, svcID, 0, ""); !ok {
+		if denied, ok, aerr := authorizeAction("inspect", rec.Name, svcID, rec.PublicationID, rec.Revision, map[string]any{"service": rec.Name}, 0, ""); aerr != nil {
+			return nil, aerr
+		} else if !ok {
 			return denied, nil
 		}
 		rep := inspectServiceStatus(rec, rk, rKeyID, ops)
@@ -780,7 +835,9 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		if err != nil {
 			return nil, err
 		}
-		if denied, ok := authorizeAction("inspect", rec.Name, svcID, 0, ""); !ok {
+		if denied, ok, aerr := authorizeAction("inspect", rec.Name, svcID, rec.PublicationID, rec.Revision, map[string]any{"service": rec.Name}, 0, ""); aerr != nil {
+			return nil, aerr
+		} else if !ok {
 			return denied, nil
 		}
 		pubID, _, found, rerr := resolveRelayPublication(rURL, rk, rKeyID, rec, ops)
@@ -836,7 +893,9 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		if err != nil {
 			return nil, err
 		}
-		if denied, ok := authorizeAction("authorize_visitor", rec.Name, svcID, 0, ""); !ok {
+		if denied, ok, aerr := authorizeAction("authorize_visitor", rec.Name, svcID, rec.PublicationID, rec.Revision, map[string]any{"service": rec.Name, "challenge": challenge, "decision": decision}, 0, ""); aerr != nil {
+			return nil, aerr
+		} else if !ok {
 			return denied, nil
 		}
 		pubID, _, found, rerr := resolveRelayPublication(rURL, rk, rKeyID, rec, ops)
@@ -870,7 +929,9 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		if err != nil {
 			return nil, err
 		}
-		if denied, ok := authorizeAction("inspect", rec.Name, svcID, 0, ""); !ok {
+		if denied, ok, aerr := authorizeAction("inspect", rec.Name, svcID, rec.PublicationID, rec.Revision, map[string]any{"service": rec.Name}, 0, ""); aerr != nil {
+			return nil, aerr
+		} else if !ok {
 			return denied, nil
 		}
 		pubID, _, found, rerr := resolveRelayPublication(rURL, rk, rKeyID, rec, ops)
@@ -922,7 +983,9 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		if err != nil {
 			return nil, err
 		}
-		if denied, ok := authorizeAction("revoke_client", rec.Name, svcID, 0, ""); !ok {
+		if denied, ok, aerr := authorizeAction("revoke_client", rec.Name, svcID, rec.PublicationID, rec.Revision, map[string]any{"service": rec.Name, "client_id": clientID}, 0, ""); aerr != nil {
+			return nil, aerr
+		} else if !ok {
 			return denied, nil
 		}
 		pubID, _, found, rerr := resolveRelayPublication(rURL, rk, rKeyID, rec, ops)
@@ -956,7 +1019,9 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		if err != nil {
 			return nil, err
 		}
-		if denied, ok := authorizeAction("inspect", rec.Name, svcID, 0, ""); !ok {
+		if denied, ok, aerr := authorizeAction("inspect", rec.Name, svcID, rec.PublicationID, rec.Revision, map[string]any{"service": rec.Name}, 0, ""); aerr != nil {
+			return nil, aerr
+		} else if !ok {
 			return denied, nil
 		}
 		pubID, _, found, rerr := resolveRelayPublication(rURL, rk, rKeyID, rec, ops)
@@ -1011,8 +1076,10 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		if err != nil {
 			return nil, err
 		}
-		// Strictly independent permission from authorize_visitor.
-		if denied, ok := authorizeAction("manage_auth_policy", rec.Name, svcID, 0, ""); !ok {
+		// Strictly independent permission from authorize_visitor, bound to exact policy arguments.
+		if denied, ok, aerr := authorizeAction("manage_auth_policy", rec.Name, svcID, rec.PublicationID, rec.Revision, map[string]any{"service": rec.Name, "preset": preset, "redirect_uri": redirectURI}, 0, ""); aerr != nil {
+			return nil, aerr
+		} else if !ok {
 			return denied, nil
 		}
 		pubID, _, found, rerr := resolveRelayPublication(rURL, rk, rKeyID, rec, ops)
@@ -1052,7 +1119,9 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		if err != nil {
 			return nil, err
 		}
-		if denied, ok := authorizeAction("verify", rec.Name, svcID, 0, ""); !ok {
+		if denied, ok, aerr := authorizeAction("verify", rec.Name, svcID, rec.PublicationID, rec.Revision, map[string]any{"service": rec.Name}, 0, ""); aerr != nil {
+			return nil, aerr
+		} else if !ok {
 			return denied, nil
 		}
 		rep := inspectServiceStatus(rec, rk, rKeyID, ops)
@@ -1095,7 +1164,9 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		if err != nil {
 			return nil, err
 		}
-		if denied, ok := authorizeAction("inspect", rec.Name, svcID, 0, ""); !ok {
+		if denied, ok, aerr := authorizeAction("inspect", rec.Name, svcID, rec.PublicationID, rec.Revision, map[string]any{"service": rec.Name}, 0, ""); aerr != nil {
+			return nil, aerr
+		} else if !ok {
 			return denied, nil
 		}
 		rep := inspectServiceStatus(rec, rk, rKeyID, ops)
@@ -1115,7 +1186,9 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		if err != nil {
 			return nil, err
 		}
-		if denied, ok := authorizeAction("verify", rec.Name, svcID, 0, ""); !ok {
+		if denied, ok, aerr := authorizeAction("verify", rec.Name, svcID, rec.PublicationID, rec.Revision, map[string]any{"service": rec.Name}, 0, ""); aerr != nil {
+			return nil, aerr
+		} else if !ok {
 			return denied, nil
 		}
 		rep := inspectServiceStatus(rec, rk, rKeyID, ops)

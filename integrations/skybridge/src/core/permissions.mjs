@@ -61,32 +61,72 @@ function normalizeActionFlags(raw = {}) {
   return out;
 }
 
+function normalizeGrant(g) {
+  if (!g || typeof g !== 'object') return null;
+  const actions = Array.isArray(g.actions)
+    ? g.actions.filter((a) => typeof a === 'string' && PERMISSION_ACTIONS.has(a))
+    : [];
+  const serviceName = typeof g.service_name === 'string' ? g.service_name.trim() : '';
+  const serviceId = typeof g.service_id === 'string' ? g.service_id.trim() : '';
+  if (!serviceName && !serviceId) return null;
+  const allowedPorts = Array.isArray(g.allowed_ports)
+    ? g.allowed_ports.filter((p) => Number.isInteger(p) && p >= 1 && p <= 65535)
+    : [];
+  const allowedAuthModes = Array.isArray(g.allowed_auth_modes)
+    ? g.allowed_auth_modes.filter((m) => typeof m === 'string' && ALLOWED_AUTH_MODES.has(m))
+    : ['ocliv-managed'];
+  return {
+    serviceName,
+    serviceId,
+    actions: new Set(actions),
+    allowedPorts: new Set(allowedPorts),
+    allowedAuthModes: new Set(allowedAuthModes),
+  };
+}
+
 function normalizeRule(raw) {
   if (!raw || typeof raw !== 'object') {
     throw new PermissionError('INVALID_POLICY', 'Permission rule must be an object');
   }
+  if (Array.isArray(raw.grants)) {
+    const grants = raw.grants.map(normalizeGrant).filter(Boolean);
+    return { grants };
+  }
+  // Conservative migration from legacy flat flags + allowed_services (never widens).
   const permissions = normalizeActionFlags(raw.agent_permissions ?? raw.permissions ?? raw);
-  // Fail-closed: an omitted or empty allowed_services list authorizes NO services (never a wildcard).
+  const actions = [...PERMISSION_ACTIONS].filter((k) => permissions[k] === true);
   const allowedServices = Array.isArray(raw.allowed_services)
     ? raw.allowed_services.filter((s) => typeof s === 'string' && (s === '*' || SERVICE_NAME_RE.test(s)))
     : [];
   const allowedServiceIDs = Array.isArray(raw.allowed_service_ids)
     ? raw.allowed_service_ids.filter((s) => typeof s === 'string' && s.trim().length > 0)
     : [];
-  // Fail-closed: an omitted or empty allowed_ports list authorizes NO deployment ports.
   const allowedPorts = Array.isArray(raw.allowed_ports)
     ? raw.allowed_ports.filter((p) => Number.isInteger(p) && p >= 1 && p <= 65535)
     : [];
   const allowedAuthModes = Array.isArray(raw.allowed_auth_modes)
     ? raw.allowed_auth_modes.filter((m) => typeof m === 'string' && ALLOWED_AUTH_MODES.has(m))
     : ['ocliv-managed'];
-  return {
-    permissions,
-    allowedServices: new Set(allowedServices),
-    allowedServiceIDs: new Set(allowedServiceIDs),
-    allowedPorts: new Set(allowedPorts),
-    allowedAuthModes: new Set(allowedAuthModes),
-  };
+  const grants = [];
+  for (const s of allowedServices) {
+    grants.push({
+      serviceName: s,
+      serviceId: '',
+      actions: new Set(actions),
+      allowedPorts: new Set(allowedPorts),
+      allowedAuthModes: new Set(allowedAuthModes),
+    });
+  }
+  for (const id of allowedServiceIDs) {
+    grants.push({
+      serviceName: '',
+      serviceId: id,
+      actions: new Set(actions),
+      allowedPorts: new Set(allowedPorts),
+      allowedAuthModes: new Set(allowedAuthModes),
+    });
+  }
+  return { grants };
 }
 
 export function loadPermissionsPolicyFromObject(doc) {
@@ -141,13 +181,20 @@ export class PermissionsEnforcer {
     return this.policy.defaultRule;
   }
 
+  grantMatchesService(grant, service, serviceId = '') {
+    if (grant.serviceName === '*') return true;
+    if (serviceId && grant.serviceId && grant.serviceId === serviceId) return true;
+    if (service && grant.serviceName && grant.serviceName === service) {
+      if (grant.serviceId && serviceId && grant.serviceId !== serviceId) return false;
+      return true;
+    }
+    return false;
+  }
+
   canAccessService(subject, service, serviceId = '') {
     const rule = this.ruleFor(subject);
     if (!rule) return false;
-    if (rule.allowedServices.has('*')) return true;
-    if (service && rule.allowedServices.has(service)) return true;
-    if (serviceId && rule.allowedServiceIDs.has(serviceId)) return true;
-    return false;
+    return rule.grants.some((g) => g.actions.size > 0 && this.grantMatchesService(g, service, serviceId));
   }
 
   assertAllowed({ subject, action, service = null, serviceId = '', port = null, authMode = null }) {
@@ -164,42 +211,33 @@ export class PermissionsEnforcer {
         message: 'Review this request in Ocliv Control Center.',
       });
     }
-    if (rule.permissions[action] !== true) {
+    if (!service && !serviceId) {
+      if (rule.grants.some((g) => g.actions.has(action))) return true;
       throw new PermissionError(
         'OPERATOR_AUTHORIZATION_REQUIRED',
-        `Identity "${subject}" is not permitted to perform "${action}". Review this request in Ocliv Control Center.`,
-        {
-          status: 'OPERATOR_AUTHORIZATION_REQUIRED',
-          action,
-          service: service ?? '',
-          requested_permissions: [action],
-          message: 'Review this request in Ocliv Control Center.',
-        }
+        `Identity "${subject}" is not permitted to perform "${action}". Review this request in Ocliv Control Center.`
       );
     }
-    if (service !== null && service !== undefined && service !== '') {
-      if (!this.canAccessService(subject, service, serviceId)) {
-        throw new PermissionError(
-          'FORBIDDEN_TARGET',
-          `Identity "${subject}" is not authorized to operate on service "${service}"`
-        );
+    for (const g of rule.grants) {
+      if (!this.grantMatchesService(g, service, serviceId)) continue;
+      if (!g.actions.has(action)) continue;
+      if (action === 'deployment') {
+        if (g.allowedPorts.size === 0 || (port !== null && port !== undefined && !g.allowedPorts.has(Number(port)))) {
+          throw new PermissionError('FORBIDDEN_PORT', `Port ${port} is outside the operator-permitted port allowlist for "${subject}"`);
+        }
+        if (authMode !== null && authMode !== undefined && !g.allowedAuthModes.has(authMode)) {
+          throw new PermissionError('FORBIDDEN_AUTH_MODE', `Authentication mode "${authMode}" is not permitted for "${subject}"`);
+        }
       }
+      return true;
     }
-    if (action === 'deployment') {
-      if (rule.allowedPorts.size === 0 || (port !== null && port !== undefined && !rule.allowedPorts.has(Number(port)))) {
-        throw new PermissionError(
-          'FORBIDDEN_PORT',
-          `Port ${port} is outside the operator-permitted port allowlist for "${subject}"`
-        );
-      }
-      if (authMode !== null && authMode !== undefined && !rule.allowedAuthModes.has(authMode)) {
-        throw new PermissionError(
-          'FORBIDDEN_AUTH_MODE',
-          `Authentication mode "${authMode}" is not permitted for "${subject}"`
-        );
-      }
+    if (!this.canAccessService(subject, service, serviceId)) {
+      throw new PermissionError('FORBIDDEN_TARGET', `Identity "${subject}" is not authorized to operate on service "${service}"`);
     }
-    return true;
+    throw new PermissionError(
+      'OPERATOR_AUTHORIZATION_REQUIRED',
+      `Identity "${subject}" is not permitted to perform "${action}" on "${service}". Review this request in Ocliv Control Center.`
+    );
   }
 }
 
@@ -253,20 +291,24 @@ function headerValue(headers, name) {
 const MAX_REPLAY_ENTRIES = 4096;
 
 export class IngressReplayCache {
-  constructor() {
+  constructor(maxEntries = MAX_REPLAY_ENTRIES) {
+    this.maxEntries = maxEntries;
     this.seen = new Map();
   }
+  /**
+   * Consume a single-use nonce. Fail-closed on capacity saturation (OCL-014.4):
+   * never evict still-valid unexpired replay entries.
+   */
   consume(nonce, nowSec, ttlSec = 120) {
     for (const [k, exp] of this.seen) {
       if (exp <= nowSec) this.seen.delete(k);
     }
-    if (this.seen.has(nonce)) return false;
-    if (this.seen.size >= MAX_REPLAY_ENTRIES) {
-      const oldest = this.seen.keys().next().value;
-      if (oldest !== undefined) this.seen.delete(oldest);
+    if (this.seen.has(nonce)) return { ok: false, code: 'INGRESS_REPLAY_REJECTED' };
+    if (this.seen.size >= this.maxEntries) {
+      return { ok: false, code: 'INGRESS_REPLAY_CAPACITY' };
     }
     this.seen.set(nonce, nowSec + ttlSec);
-    return true;
+    return { ok: true, code: '' };
   }
 }
 
@@ -330,8 +372,14 @@ export function verifyIngressIdentity({
   if (a.length !== b.length || !timingSafeEqual(a, b)) {
     throw new PermissionError('INGRESS_SPOOF_REJECTED', 'Publisher ingress identity signature verification failed');
   }
-  if (replayCache && !replayCache.consume(`${route}:${nonce}`, nowSec, maxSkewSec * 2)) {
-    throw new PermissionError('INGRESS_REPLAY_REJECTED', 'Replayed publisher ingress assertion rejected');
+  if (replayCache) {
+    const res = replayCache.consume(`${route}:${nonce}`, nowSec, maxSkewSec * 2);
+    if (!res.ok) {
+      if (res.code === 'INGRESS_REPLAY_CAPACITY') {
+        throw new PermissionError('INGRESS_REPLAY_CAPACITY', 'Ingress replay cache capacity exhausted; rejecting assertion fail-closed');
+      }
+      throw new PermissionError('INGRESS_REPLAY_REJECTED', 'Replayed publisher ingress assertion rejected');
+    }
   }
   if (allowedSubjects && allowedSubjects.size > 0 && !allowedSubjects.has(subject)) {
     throw new PermissionError('FORBIDDEN', 'Verified subject is not allowlisted for this Ocliv deployment');

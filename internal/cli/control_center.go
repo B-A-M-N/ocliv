@@ -7,6 +7,7 @@ import (
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -28,23 +29,32 @@ import (
 //go:embed ui/index.html
 var controlCenterHTML string
 
+//go:embed ui/app.js
+var controlCenterJS string
+
 const (
-	controlCenterSessionCookie = "ocliv_cc_session"
-	controlCenterMaxBodyBytes  = 64 * 1024
+	controlCenterSessionCookie  = "ocliv_cc_session"
+	controlCenterMaxBodyBytes   = 64 * 1024
+	controlCenterIdleTimeout    = 2 * time.Hour
+	controlCenterMaxSessionLife = 8 * time.Hour
 )
 
 type controlCenterServer struct {
-	mu             sync.Mutex
-	addr           string // host:port bound strictly on 127.0.0.1
-	bootstrapToken string
-	bootstrapUsed  bool
-	sessionToken   string
-	csrfToken      string
-	relayURL       string
-	key            *identity.KeyPair
-	keyID          string
-	ops            serviceOps
-	auditPath      string
+	mu               sync.Mutex
+	addr             string // host:port bound strictly on 127.0.0.1
+	port             int
+	bootstrapToken   string
+	bootstrapUsed    bool
+	sessionToken     string
+	sessionCreatedAt time.Time
+	sessionLastSeen  time.Time
+	sessionRevoked   bool
+	csrfToken        string
+	relayURL         string
+	key              *identity.KeyPair
+	keyID            string
+	ops              serviceOps
+	auditPath        string
 }
 
 func randomToken256() (string, error) {
@@ -72,8 +82,11 @@ func newControlCenterServer(addr, relayURL string, k *identity.KeyPair, keyID st
 	if dir, _, _, derr := agentFiles(); derr == nil {
 		auditPath = filepath.Join(dir, "control-center-audit.jsonl")
 	}
+	_, portStr, _ := net.SplitHostPort(addr)
+	portNum, _ := strconv.Atoi(portStr)
 	return &controlCenterServer{
 		addr:           addr,
+		port:           portNum,
 		bootstrapToken: boot,
 		sessionToken:   sess,
 		csrfToken:      csrf,
@@ -85,14 +98,16 @@ func newControlCenterServer(addr, relayURL string, k *identity.KeyPair, keyID st
 	}, nil
 }
 
-func (cc *controlCenterServer) audit(action, target, outcome string) {
+func (cc *controlCenterServer) audit(action, target, outcome string) error {
 	if cc.auditPath == "" {
-		return
+		return nil
 	}
-	_ = os.MkdirAll(filepath.Dir(cc.auditPath), 0o700)
+	if err := os.MkdirAll(filepath.Dir(cc.auditPath), 0o700); err != nil {
+		return fmt.Errorf("audit dir: %w", err)
+	}
 	f, err := os.OpenFile(cc.auditPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
-		return
+		return fmt.Errorf("audit open: %w", err)
 	}
 	defer f.Close()
 	line, _ := json.Marshal(map[string]any{
@@ -101,11 +116,15 @@ func (cc *controlCenterServer) audit(action, target, outcome string) {
 		"target":  target,
 		"outcome": outcome,
 	})
-	_, _ = f.Write(append(line, '\n'))
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		return fmt.Errorf("audit write: %w", err)
+	}
+	return nil
 }
 
 func (cc *controlCenterServer) setSecurityHeaders(w http.ResponseWriter) {
-	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+	// Strict CSP: zero 'unsafe-inline' in script-src (OCL-014.8).
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Referrer-Policy", "no-referrer")
@@ -138,7 +157,21 @@ func (cc *controlCenterServer) hasValidSession(r *http.Request) bool {
 	if err != nil || c.Value == "" {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(c.Value), []byte(cc.sessionToken)) == 1
+	if subtle.ConstantTimeCompare([]byte(c.Value), []byte(cc.sessionToken)) != 1 {
+		return false
+	}
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	if cc.sessionRevoked || cc.sessionCreatedAt.IsZero() {
+		return false
+	}
+	now := time.Now()
+	if now.Sub(cc.sessionCreatedAt) > controlCenterMaxSessionLife || now.Sub(cc.sessionLastSeen) > controlCenterIdleTimeout {
+		cc.sessionRevoked = true
+		return false
+	}
+	cc.sessionLastSeen = now
+	return true
 }
 
 func (cc *controlCenterServer) hasValidCSRF(r *http.Request) bool {
@@ -166,6 +199,10 @@ func (cc *controlCenterServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		ok := !cc.bootstrapUsed && tok != "" && subtle.ConstantTimeCompare([]byte(tok), []byte(cc.bootstrapToken)) == 1
 		if ok {
 			cc.bootstrapUsed = true
+			now := time.Now()
+			cc.sessionCreatedAt = now
+			cc.sessionLastSeen = now
+			cc.sessionRevoked = false
 		}
 		cc.mu.Unlock()
 		if !ok {
@@ -179,8 +216,19 @@ func (cc *controlCenterServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			HttpOnly: true,
 			SameSite: http.SameSiteStrictMode,
 		})
-		cc.audit("session_bootstrap", "operator", "ok")
+		_ = cc.audit("session_bootstrap", "operator", "ok")
 		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+
+	// Authenticated embedded JS bundle (strict script-src 'self').
+	if r.URL.Path == "/app.js" && r.Method == http.MethodGet {
+		if !cc.hasValidSession(r) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+		_, _ = w.Write([]byte(controlCenterJS))
 		return
 	}
 
@@ -229,6 +277,28 @@ func (cc *controlCenterServer) handleAPI(w http.ResponseWriter, r *http.Request)
 	}
 
 	switch {
+	case path == "/api/auth/logout" && r.Method == http.MethodPost:
+		cc.mu.Lock()
+		cc.sessionRevoked = true
+		cc.mu.Unlock()
+		http.SetCookie(w, &http.Cookie{
+			Name:     controlCenterSessionCookie,
+			Value:    "",
+			Path:     "/",
+			MaxAge:   -1,
+			HttpOnly: true,
+			SameSite: http.SameSiteStrictMode,
+		})
+		_ = cc.audit("session_logout", "operator", "ok")
+		writeCCJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+
+	case path == "/api/setup/update-check" && r.Method == http.MethodGet:
+		bi := GetBuildInfo()
+		msg := fmt.Sprintf("Installed: v%s (%s, schema V%d). Run `ocliv update --check` to verify signed releases from your relay.", bi.Version, bi.BuildCommit, bi.StoreSchemaVersion)
+		writeCCJSON(w, http.StatusOK, map[string]any{"ok": true, "installed": bi, "message": msg})
+		return
+
 	case path == "/api/status" && r.Method == http.MethodGet:
 		relayReachable := false
 		if cc.key != nil {
@@ -285,6 +355,10 @@ func (cc *controlCenterServer) handleAPI(w http.ResponseWriter, r *http.Request)
 			writeCCJSON(w, http.StatusBadRequest, map[string]string{"error": "port must be 1..65535"})
 			return
 		}
+		if cc.port > 0 && body.Port == cc.port {
+			writeCCJSON(w, http.StatusBadRequest, map[string]string{"error": "refusing to publish the local Ocliv Control Center port"})
+			return
+		}
 		if body.Type == "" {
 			body.Type = "mcp"
 		}
@@ -329,17 +403,43 @@ func (cc *controlCenterServer) handleAPI(w http.ResponseWriter, r *http.Request)
 		return
 
 	case path == "/api/agents/permissions" && r.Method == http.MethodPut:
-		var pol AgentPermissionsPolicy
-		if err := json.NewDecoder(r.Body).Decode(&pol); err != nil {
+		var env struct {
+			ExpectedRevision *int64                  `json:"expected_revision"`
+			Policy           *AgentPermissionsPolicy `json:"policy"`
+		}
+		rawBytes := make([]byte, 0, 1024)
+		var direct AgentPermissionsPolicy
+		dec := json.NewDecoder(r.Body)
+		var rawDoc json.RawMessage
+		if err := dec.Decode(&rawDoc); err != nil {
 			writeCCJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid permissions payload"})
 			return
 		}
-		if err := saveAgentPermissionsPolicy(pol); err != nil {
-			writeCCJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		_ = rawBytes
+		expRev := int64(-1)
+		if json.Unmarshal(rawDoc, &env) == nil && env.Policy != nil {
+			direct = *env.Policy
+			if env.ExpectedRevision != nil {
+				expRev = *env.ExpectedRevision
+			}
+		} else if err := json.Unmarshal(rawDoc, &direct); err != nil {
+			writeCCJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid permissions payload"})
 			return
 		}
-		cc.audit("permissions_save", "agent-permissions.json", "ok")
-		writeCCJSON(w, http.StatusOK, map[string]any{"ok": true})
+		if aerr := cc.audit("permissions_save", "agent-permissions.json", "attempt"); aerr != nil {
+			writeCCJSON(w, http.StatusInternalServerError, map[string]string{"error": "audit log write failed: " + aerr.Error()})
+			return
+		}
+		saved, serr := saveAgentPermissionsPolicyCAS(direct, expRev)
+		if errors.Is(serr, ErrPolicyConflict) {
+			writeCCJSON(w, http.StatusConflict, map[string]string{"error": serr.Error()})
+			return
+		}
+		if serr != nil {
+			writeCCJSON(w, http.StatusInternalServerError, map[string]string{"error": serr.Error()})
+			return
+		}
+		writeCCJSON(w, http.StatusOK, map[string]any{"ok": true, "policy": saved})
 		return
 
 	case path == "/api/agents/requests" && r.Method == http.MethodGet:
@@ -544,6 +644,40 @@ func (cc *controlCenterServer) handleAPI(w http.ResponseWriter, r *http.Request)
 			writeCCJSON(w, http.StatusOK, map[string]any{"ok": true, "status": status, "policy": polRes})
 			return
 
+		case action == "connect-google" && r.Method == http.MethodPost:
+			// Operator-only confidential client provisioning for Gemini/Google.
+			// Never exposed through agent-visible MCP tools (OCL-014.5).
+			pubID, pubURL, found, rerr := resolveRelayPublication(rURL, cc.key, cc.keyID, rec, cc.ops)
+			if rerr != nil || !found {
+				writeCCJSON(w, http.StatusNotFound, map[string]string{"error": "no active publication found"})
+				return
+			}
+			reqPayload, _ := json.Marshal(map[string]any{
+				"name":          "Google (gemini)",
+				"redirect_uris": []string{"https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp"},
+				"confidential":  true,
+				"approve":       true,
+			})
+			st, respBody, cerr := cc.ops.callMgmtBody(rURL, cc.key, cc.keyID, http.MethodPost, "/v1/agent/mcp-routes/"+pubID+"/authz/register", reqPayload)
+			if cerr != nil || (st != http.StatusOK && st != http.StatusCreated) {
+				writeCCJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("relay registration failed (HTTP %d)", st)})
+				return
+			}
+			var regResp struct {
+				ClientID     string `json:"client_id"`
+				ClientSecret string `json:"client_secret"`
+			}
+			_ = json.Unmarshal(respBody, &regResp)
+			_ = cc.audit("connect_google", rec.Name, "ok")
+			writeCCJSON(w, http.StatusOK, map[string]any{
+				"ok":            true,
+				"url":           pubURL,
+				"client_id":     regResp.ClientID,
+				"client_secret": regResp.ClientSecret,
+				"detail":        "Save this one-time secret in Gemini now; it is never shown to MCP agents.",
+			})
+			return
+
 		case action == "verify" && r.Method == http.MethodPost:
 			rep := inspectServiceStatus(rec, cc.key, cc.keyID, cc.ops)
 			entry, _ := resolveCatalogEntry(rec.Name, rec.Profile, cc.ops)
@@ -552,16 +686,24 @@ func (cc *controlCenterServer) handleAPI(w http.ResponseWriter, r *http.Request)
 				d := runReadOnlyDiscoveryCheck(&http.Client{Timeout: 8 * time.Second}, entry.URL)
 				endpointStage, oauthStage = d.Transport, d.Discovery
 			}
-			authMCP := "UNKNOWN"
+			authMCP, extAcc := "UNKNOWN", "UNKNOWN"
 			if rep.PublicVerified {
 				authMCP = "PASS"
 			}
+			if rep.VerificationEvidence != nil && rep.VerificationEvidence.Stage == "EXTERNAL_CLIENT_VERIFIED" {
+				extAcc = "PASS"
+			}
 			writeCCJSON(w, http.StatusOK, map[string]any{
-				"ok": endpointStage == "PASS" && oauthStage == "PASS",
+				"ok":         endpointStage == "PASS" && oauthStage == "PASS",
+				"checked_at": time.Now().UTC().Format(time.RFC3339),
 				"stages": map[string]string{
-					"public_endpoint_reachable":   endpointStage,
-					"oauth_discovery_compatible":  oauthStage,
-					"authenticated_mcp_handshake": authMCP,
+					"public_endpoint_reachable":    endpointStage,
+					"oauth_discovery_compatible":   oauthStage,
+					"authenticated_mcp_handshake":  authMCP,
+					"events_advertised":            "UNKNOWN",
+					"events_subscription_verified": "UNKNOWN",
+					"callback_delivery_verified":   "UNKNOWN",
+					"external_client_acceptance":   extAcc,
 				},
 			})
 			return
@@ -656,6 +798,9 @@ func cmdUI(argv []string) int {
 	srv := &http.Server{
 		Handler:           cc,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 	launchURL := fmt.Sprintf("http://%s/auth?token=%s", ln.Addr().String(), cc.bootstrapToken)
 	fmt.Printf("Ocliv Control Center listening on http://%s (loopback-only)\n", ln.Addr().String())

@@ -109,7 +109,8 @@ func AttachVerifiedIngressHeaders(req *http.Request, secret []byte, route, subje
 		return
 	}
 	if scopes == "" {
-		scopes = "ocliv:read ocliv:write"
+		// Fail-closed least privilege (OCL-014.4): missing scopes NEVER default to write authority.
+		scopes = "ocliv:read"
 	}
 	reqPath := req.URL.RequestURI()
 	if reqPath == "" {

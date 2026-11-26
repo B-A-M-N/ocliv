@@ -121,6 +121,10 @@ func buildVersionInfo() map[string]any {
 			"optional_federated_oidc",
 			"mcp_events_qualification",
 			"host_observations",
+			"mcp_control_plane_v1",
+			"control_center_ui",
+			"exact_intent_approvals",
+			"ingress_auth_v2",
 		},
 	}
 }

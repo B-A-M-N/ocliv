@@ -67,24 +67,18 @@ func TestOCL013ManageControlPlanePermissionsLifecycleAndHonestVerification(t *te
 	pol := AgentPermissionsPolicy{
 		Agents: map[string]AgentPermissionRule{
 			"agent-ops": {
-				AgentPermissions: AgentPermissionsFlags{
-					Inspect:           true,
-					GetURL:            true,
-					Verify:            true,
-					Lifecycle:         true,
-					Deployment:        true,
-					AuthorizeVisitor:  true,
-					ManageAuthPolicy:  false, // strictly separate!
-					RevokeClient:      false,
-					RemovePublication: true,
+				Grants: []ServiceGrant{
+					{
+						ServiceID:        "svc_agw_immutable",
+						ServiceName:      "agentgateway",
+						Actions:          []string{"inspect", "get_url", "verify", "lifecycle", "deployment", "authorize_visitor", "remove_publication"},
+						AllowedPorts:     []int{8765, 8085},
+						AllowedAuthModes: []string{"ocliv-managed"},
+					},
 				},
-				AllowedServices:  []string{"agentgateway"},
-				AllowedPorts:     []int{8765, 8085},
-				AllowedAuthModes: []string{"ocliv-managed"},
 			},
 			"agent-empty": {
-				AgentPermissions: AgentPermissionsFlags{Inspect: true, Deployment: true},
-				// Empty AllowedServices and AllowedPorts MUST deny all!
+				// Empty grants MUST deny all!
 			},
 		},
 	}
@@ -143,8 +137,8 @@ func TestOCL013ManageControlPlanePermissionsLifecycleAndHonestVerification(t *te
 		t.Fatalf("list_services leaked restricted service: %+v", svcs)
 	}
 	emptyRaw, _ := handleMCPManageTool("agent-empty", "list_services", nil, "https://bamnlabs.duckdns.org", k, keyID, ops)
-	if len(emptyRaw.(map[string]any)["services"].([]map[string]any)) != 0 {
-		t.Fatal("empty allowed_services must not act as wildcard")
+	if emptyRaw.(map[string]any)["status"] != "OPERATOR_AUTHORIZATION_REQUIRED" {
+		t.Fatalf("empty grants must fail closed with OPERATOR_AUTHORIZATION_REQUIRED, got %+v", emptyRaw)
 	}
 
 	// 2. Single-call get_url returns canonical URL + reachability.

@@ -50,6 +50,7 @@
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
   th { color: var(--muted); font-weight: 600; }
 </style>
+<script src="/app.js" defer></script>
 </head>
 <body>
 <header>
@@ -57,7 +58,10 @@
     <h1>Ocliv Control Center</h1>
     <span id="relayBadge" class="pill">Checking relay…</span>
   </div>
-  <div class="muted" id="deviceInfo">Local operator session</div>
+  <div style="display:flex;align-items:center;gap:12px">
+    <div class="muted" id="deviceInfo">Local operator session</div>
+    <button class="btn" id="btnLogout">Sign out</button>
+  </div>
 </header>
 
 <nav>
@@ -68,7 +72,6 @@
 </nav>
 
 <main>
-  <!-- SERVICES TAB -->
   <section id="tab-services" class="panel active">
     <div class="row">
       <div>
@@ -83,12 +86,11 @@
     <div id="servicesGrid" class="grid"></div>
   </section>
 
-  <!-- ACCESS & CONNECTIONS TAB -->
   <section id="tab-access" class="panel">
     <div class="row">
       <div>
         <h2 style="margin:0">Connections &amp; Access</h2>
-        <div class="muted">Approve ChatGPT/MCP login requests natively and manage authorized clients.</div>
+        <div class="muted">Connect ChatGPT or Gemini, approve live login requests, and manage authorized clients.</div>
       </div>
       <div style="min-width:220px">
         <select id="accessServiceSelect"></select>
@@ -97,20 +99,22 @@
 
     <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));">
       <div class="card">
-        <h3>Guided Connection</h3>
-        <div class="muted">Copy your persistent MCP URL into ChatGPT or Gemini, then approve the live connection request below — no pairing secrets to copy.</div>
+        <h3>Guided Connection (ChatGPT &amp; Gemini)</h3>
+        <div class="muted">Paste your persistent MCP URL into ChatGPT or provision a confidential Gemini client below.</div>
         <div id="connectUrlBox" class="url">Select a service</div>
         <div class="actions">
           <button class="btn primary" id="btnCopyAccessUrl">Copy MCP URL</button>
           <button class="btn" id="btnTrustChatGPT">Trust ChatGPT Redirect</button>
-          <button class="btn" id="btnVerifyAccess">Verify Endpoint</button>
+          <button class="btn" id="btnConnectGemini">Provision Gemini Client</button>
+          <button class="btn" id="btnVerifyAccess">Verify All Stages</button>
         </div>
+        <div id="geminiResultBox" class="url" style="display:none"></div>
         <div id="verifyResult" class="muted" style="margin-top:10px"></div>
       </div>
 
       <div class="card">
         <h3>Pending Visitor Approvals</h3>
-        <div class="muted">When ChatGPT or another MCP client signs in, its exact request appears here for one-click approval.</div>
+        <div class="muted">Verify the service, claimed application name, and correlation code before approving.</div>
         <div id="pendingList" style="margin-top:10px"></div>
       </div>
     </div>
@@ -122,10 +126,9 @@
     </div>
   </section>
 
-  <!-- AGENTS & PERMISSIONS TAB -->
   <section id="tab-agents" class="panel">
     <h2 style="margin:0">Agents &amp; Permissions</h2>
-    <div class="muted">Control what AI agents can do through Ocliv MCP. Saved atomically with owner-only permissions — no JSON editing needed.</div>
+    <div class="muted">Permissions are explicitly bound per principal and per service — granting inspect on one service never expands authority on another.</div>
 
     <div class="card" style="margin-top:16px">
       <h3>Pending Agent Permission Requests</h3>
@@ -134,43 +137,34 @@
 
     <div class="card" style="margin-top:16px">
       <div class="row">
-        <h3 style="margin:0">Agent Permission Policy</h3>
-        <div style="display:flex;gap:8px;align-items:center">
-          <select id="principalSelect" style="width:200px"></select>
-          <input id="newPrincipalInput" placeholder="Add principal (e.g. agent-ops)" style="width:210px">
-          <button class="btn" id="btnAddPrincipal">Add</button>
+        <h3 style="margin:0">Per-Service Agent Permissions</h3>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <select id="principalSelect" style="width:190px"></select>
+          <select id="permServiceSelect" style="width:210px"></select>
         </div>
       </div>
-
+      <div id="permRevInfo" class="muted" style="margin-top:6px"></div>
       <div class="checkgrid" id="permCheckboxes"></div>
-
-      <div class="grid" style="margin-top:10px">
-        <label class="field"><span>Allowed services (comma-separated, empty = deny all)</span>
-          <input id="permServicesInput" placeholder="agentgateway, mytools">
-        </label>
-        <label class="field"><span>Allowed deployment ports (comma-separated, empty = deny deploy)</span>
-          <input id="permPortsInput" placeholder="8765, 8085">
-        </label>
-      </div>
       <div class="actions">
-        <button class="btn primary" id="btnSavePerms">Save Agent Permissions</button>
+        <button class="btn primary" id="btnSavePerms">Save Permissions for Selected Service</button>
       </div>
     </div>
   </section>
 
-  <!-- SETUP & DIAGNOSTICS TAB -->
   <section id="tab-setup" class="panel">
-    <h2 style="margin:0">Setup &amp; Diagnostics</h2>
-    <div class="muted">Relay health, build provenance, and desktop shortcut installation.</div>
+    <h2 style="margin:0">Setup, Updates &amp; Diagnostics</h2>
+    <div class="muted">Relay health, build provenance, signed updates, and desktop launcher setup.</div>
     <div class="grid" style="margin-top:16px">
       <div class="card">
         <h3>Relay &amp; Enrollment</h3>
         <div id="setupStatusBox" class="muted" style="margin-top:8px">Loading…</div>
       </div>
       <div class="card">
-        <h3>Desktop Launcher</h3>
-        <div class="muted">Install an application menu shortcut so you can open Ocliv Control Center without a terminal.</div>
+        <h3>Signed Updates &amp; Desktop Launcher</h3>
+        <div class="muted">Check signed release availability or install the desktop application shortcut.</div>
+        <div id="updateStatusBox" class="muted" style="margin-top:8px"></div>
         <div class="actions">
+          <button class="btn" id="btnCheckUpdates">Check Signed Updates</button>
           <button class="btn primary" id="btnInstallShortcut">Install Desktop Shortcut</button>
         </div>
       </div>
@@ -178,7 +172,6 @@
   </section>
 </main>
 
-<!-- ADD SERVICE DIALOG -->
 <dialog id="addDialog">
   <h3 style="margin-top:0">Add a local service</h3>
   <form id="addServiceForm">
@@ -199,363 +192,5 @@
 </dialog>
 
 <div id="toast"></div>
-
-<script>
-const CSRF = document.querySelector('meta[name="ocliv-csrf"]')?.content || '';
-let state = { status: null, services: [], policy: null, requests: [] };
-
-function toast(msg) {
-  const el = document.getElementById('toast');
-  el.textContent = msg;
-  el.style.display = 'block';
-  clearTimeout(window.__toastT);
-  window.__toastT = setTimeout(() => el.style.display = 'none', 4500);
-}
-
-async function api(path, opts = {}) {
-  const headers = { 'Accept': 'application/json', ...(opts.headers || {}) };
-  if (opts.method && opts.method !== 'GET') {
-    headers['Content-Type'] = 'application/json';
-    headers['X-Ocliv-CSRF'] = CSRF;
-  }
-  const res = await fetch(path, { credentials: 'same-origin', ...opts, headers });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-  return data;
-}
-
-document.querySelectorAll('nav button').forEach(btn => {
-  btn.onclick = () => {
-    document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
-    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-    btn.classList.add('active');
-    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
-    if (btn.dataset.tab === 'access') loadAccessForSelected();
-    if (btn.dataset.tab === 'agents') loadAgentsTab();
-  };
-});
-
-async function refreshAll() {
-  try {
-    const [st, svcs] = await Promise.all([api('/api/status'), api('/api/services')]);
-    state.status = st;
-    state.services = svcs.services || [];
-    renderHeader();
-    renderServices();
-    renderSetup();
-    populateAccessSelect();
-  } catch (e) { toast('Error: ' + e.message); }
-}
-
-function renderHeader() {
-  const b = document.getElementById('relayBadge');
-  if (state.status?.relay_reachable) {
-    b.className = 'pill ok'; b.textContent = 'Relay connected';
-  } else {
-    b.className = 'pill warn'; b.textContent = 'Relay unreachable';
-  }
-  document.getElementById('deviceInfo').textContent = `${state.status?.relay_url || ''} · ${state.status?.key_id || 'not enrolled'}`;
-}
-
-function renderServices() {
-  const grid = document.getElementById('servicesGrid');
-  grid.innerHTML = '';
-  if (!state.services.length) {
-    grid.innerHTML = '<div class="card"><div class="muted">No services configured yet. Click "+ Add service" to share a local MCP server.</div></div>';
-    return;
-  }
-  for (const s of state.services) {
-    const card = document.createElement('div');
-    card.className = 'card';
-    const online = s.observed_state === 'SERVING' && s.health === 'READY';
-    const badgeClass = online ? 'ok' : (s.desired_state === 'disabled' ? '' : 'warn');
-    const badgeText = online ? 'Online' : (s.desired_state === 'disabled' ? 'Disabled' : (s.observed_state || 'Checking'));
-    card.innerHTML = `
-      <div class="row">
-        <h3>${esc(s.name)}</h3>
-        <span class="pill ${badgeClass}">${esc(badgeText)}</span>
-      </div>
-      <div class="muted">${esc(s.type?.toUpperCase() || 'MCP')} · ${esc(s.authentication || 'ocliv-managed')}</div>
-      <div class="url">${esc(s.public_url || 'URL not yet bound')}</div>
-      <div class="actions">
-        ${s.public_url ? `<button class="btn" data-act="copy">Copy URL</button>` : ''}
-        <button class="btn" data-act="access">Connect / Access</button>
-        ${s.desired_state === 'enabled'
-          ? `<button class="btn" data-act="disable">Disable</button>`
-          : `<button class="btn primary" data-act="enable">Enable</button>`}
-        <button class="btn" data-act="reconcile">Repair</button>
-        <button class="btn danger" data-act="remove">Remove</button>
-      </div>
-    `;
-    card.querySelector('[data-act="copy"]')?.addEventListener('click', () => {
-      navigator.clipboard?.writeText(s.public_url).then(() => toast('Copied URL for ' + s.name));
-    });
-    card.querySelector('[data-act="access"]').onclick = () => {
-      document.getElementById('accessServiceSelect').value = s.name;
-      document.querySelector('nav button[data-tab="access"]').click();
-    };
-    card.querySelector('[data-act="enable"]')?.addEventListener('click', () => runSvcAction(s.name, 'enable'));
-    card.querySelector('[data-act="disable"]')?.addEventListener('click', () => runSvcAction(s.name, 'disable'));
-    card.querySelector('[data-act="reconcile"]').onclick = () => runSvcAction(s.name, 'reconcile');
-    card.querySelector('[data-act="remove"]').onclick = () => {
-      const typed = prompt(`Type "${s.name}" to permanently remove this service and revoke its public route:`);
-      if (typed === s.name) runSvcAction(s.name, 'remove');
-    };
-    grid.appendChild(card);
-  }
-}
-
-async function runSvcAction(name, action) {
-  try {
-    toast(`${action} ${name}…`);
-    const res = await api(`/api/services/${encodeURIComponent(name)}/${action}`, { method: 'POST', body: '{}' });
-    toast(res.confirmed ? `✓ ${action} ${name} confirmed` : `⚠ ${action} ${name}: ${res.status || res.detail || 'unconfirmed'}`);
-    await refreshAll();
-  } catch (e) { toast('Error: ' + e.message); }
-}
-
-function populateAccessSelect() {
-  const sel = document.getElementById('accessServiceSelect');
-  const prev = sel.value;
-  sel.innerHTML = '';
-  for (const s of state.services) {
-    const o = document.createElement('option');
-    o.value = s.name; o.textContent = s.name;
-    sel.appendChild(o);
-  }
-  if (prev && state.services.some(s => s.name === prev)) sel.value = prev;
-}
-
-document.getElementById('accessServiceSelect').onchange = loadAccessForSelected;
-
-async function loadAccessForSelected() {
-  const name = document.getElementById('accessServiceSelect').value;
-  if (!name) return;
-  const svc = state.services.find(s => s.name === name);
-  document.getElementById('connectUrlBox').textContent = svc?.public_url || 'No public URL bound';
-  try {
-    const [pend, clis] = await Promise.all([
-      api(`/api/services/${encodeURIComponent(name)}/pending`),
-      api(`/api/services/${encodeURIComponent(name)}/clients`),
-    ]);
-    const pWrap = document.getElementById('pendingList');
-    const txs = pend.pending_transactions || [];
-    if (!txs.length) {
-      pWrap.innerHTML = '<div class="muted">No pending login requests. Start OAuth from ChatGPT or your MCP client to see requests here.</div>';
-    } else {
-      pWrap.innerHTML = '';
-      for (const tx of txs) {
-        const d = document.createElement('div');
-        d.className = 'url';
-        d.innerHTML = `<strong>${esc(tx.client_name || tx.client_id)}</strong><br><span class="muted">${esc(tx.redirect_uri)}</span>
-          <div class="actions">
-            <button class="btn primary" data-d="approve">Approve</button>
-            <button class="btn danger" data-d="deny">Deny</button>
-          </div>`;
-        d.querySelector('[data-d="approve"]').onclick = () => decideTx(name, tx.challenge, 'approve');
-        d.querySelector('[data-d="deny"]').onclick = () => decideTx(name, tx.challenge, 'deny');
-        pWrap.appendChild(d);
-      }
-    }
-    const cWrap = document.getElementById('clientsTableWrap');
-    const list = clis.clients || [];
-    if (!list.length) {
-      cWrap.innerHTML = `<div class="muted" style="margin-top:8px">${esc(clis.detail || 'No authorized clients yet.')}</div>`;
-    } else {
-      cWrap.innerHTML = `<table><thead><tr><th>Client</th><th>Method</th><th>Status</th><th>Authorized</th><th></th></tr></thead><tbody></tbody></table>`;
-      const tbody = cWrap.querySelector('tbody');
-      for (const c of list) {
-        const tr = document.createElement('tr');
-        tr.innerHTML = `<td><strong>${esc(c.client_name || 'Unnamed')}</strong><div class="muted">${esc(c.client_id)}</div></td>
-          <td>${esc(c.auth_method)}</td><td>${esc(c.status)}</td><td class="muted">${esc(c.authorized_at || '')}</td>
-          <td>${c.status !== 'revoked' ? `<button class="btn danger">Revoke</button>` : ''}</td>`;
-        tr.querySelector('button')?.addEventListener('click', async () => {
-          await api(`/api/services/${encodeURIComponent(name)}/revoke-client`, { method: 'POST', body: JSON.stringify({ client_id: c.client_id }) });
-          toast('Revoked client ' + c.client_id);
-          loadAccessForSelected();
-        });
-        tbody.appendChild(tr);
-      }
-    }
-  } catch (e) { toast('Access load error: ' + e.message); }
-}
-
-async function decideTx(name, challenge, decision) {
-  try {
-    await api(`/api/services/${encodeURIComponent(name)}/decide-tx`, { method: 'POST', body: JSON.stringify({ challenge, decision }) });
-    toast(`Transaction ${decision}d`);
-    loadAccessForSelected();
-  } catch (e) { toast('Error: ' + e.message); }
-}
-
-document.getElementById('btnCopyAccessUrl').onclick = () => {
-  const u = document.getElementById('connectUrlBox').textContent;
-  if (u.startsWith('https://')) navigator.clipboard?.writeText(u).then(() => toast('Copied MCP URL'));
-};
-document.getElementById('btnTrustChatGPT').onclick = async () => {
-  const name = document.getElementById('accessServiceSelect').value;
-  if (!name) return;
-  try {
-    await api(`/api/services/${encodeURIComponent(name)}/trust`, { method: 'POST', body: JSON.stringify({ preset: 'chatgpt' }) });
-    toast('ChatGPT redirect trusted on ' + name);
-  } catch (e) { toast('Error: ' + e.message); }
-};
-document.getElementById('btnVerifyAccess').onclick = async () => {
-  const name = document.getElementById('accessServiceSelect').value;
-  if (!name) return;
-  try {
-    const r = await api(`/api/services/${encodeURIComponent(name)}/verify`, { method: 'POST', body: '{}' });
-    document.getElementById('verifyResult').textContent = `Endpoint: ${r.stages?.public_endpoint_reachable} · OAuth: ${r.stages?.oauth_discovery_compatible} · Auth MCP: ${r.stages?.authenticated_mcp_handshake}`;
-  } catch (e) { toast('Verify error: ' + e.message); }
-};
-
-const PERM_DEFS = [
-  ['inspect', 'Inspect service status'],
-  ['get_url', 'Retrieve service URLs'],
-  ['verify', 'Verify endpoints'],
-  ['lifecycle', 'Enable, disable & restart services'],
-  ['deployment', 'Deploy new services'],
-  ['authorize_visitor', 'Approve visitor connections'],
-  ['manage_auth_policy', 'Change authentication policies'],
-  ['revoke_client', 'Revoke client access'],
-  ['remove_publication', 'Permanently remove services'],
-];
-
-async function loadAgentsTab() {
-  try {
-    const [pol, reqs] = await Promise.all([api('/api/agents/permissions'), api('/api/agents/requests')]);
-    state.policy = pol;
-    state.requests = reqs.requests || [];
-    renderApprovalRequests();
-    renderPrincipalEditor();
-  } catch (e) { toast('Agents load error: ' + e.message); }
-}
-
-function renderApprovalRequests() {
-  const wrap = document.getElementById('approvalRequestsWrap');
-  const pending = state.requests.filter(r => r.status === 'PENDING');
-  if (!pending.length) { wrap.innerHTML = '<div class="muted">No pending agent permission requests.</div>'; return; }
-  wrap.innerHTML = '';
-  for (const r of pending) {
-    const d = document.createElement('div');
-    d.className = 'url';
-    d.innerHTML = `<strong>${esc(r.principal)}</strong> requested <strong>${esc(r.permission)}</strong> on <strong>${esc(r.service || '(global)')}</strong> (${esc(r.action)})
-      <div class="actions">
-        <button class="btn" data-d="allow_once">Allow Once</button>
-        <button class="btn primary" data-d="allow_persistent">Allow Persistently</button>
-        <button class="btn danger" data-d="deny">Deny</button>
-      </div>`;
-    for (const btn of d.querySelectorAll('button')) {
-      btn.onclick = async () => {
-        await api(`/api/agents/requests/${encodeURIComponent(r.request_id)}/decide`, { method: 'POST', body: JSON.stringify({ decision: btn.dataset.d }) });
-        toast(`Request ${btn.dataset.d}`);
-        loadAgentsTab();
-      };
-    }
-    wrap.appendChild(d);
-  }
-}
-
-function renderPrincipalEditor() {
-  const sel = document.getElementById('principalSelect');
-  const agents = state.policy?.agents || {};
-  const keys = Object.keys(agents);
-  if (!keys.length) keys.push('local-stdio');
-  const prev = sel.value || keys[0];
-  sel.innerHTML = '';
-  for (const k of keys) {
-    const o = document.createElement('option');
-    o.value = k; o.textContent = k;
-    sel.appendChild(o);
-  }
-  sel.value = keys.includes(prev) ? prev : keys[0];
-  renderRuleFor(sel.value);
-}
-
-function renderRuleFor(principal) {
-  const rule = (state.policy?.agents || {})[principal] || { agent_permissions: {}, allowed_services: [], allowed_ports: [] };
-  const perms = rule.agent_permissions || {};
-  const box = document.getElementById('permCheckboxes');
-  box.innerHTML = '';
-  for (const [key, label] of PERM_DEFS) {
-    const lbl = document.createElement('label');
-    lbl.className = 'checkitem';
-    lbl.innerHTML = `<input type="checkbox" data-k="${key}" ${perms[key] ? 'checked' : ''}><span>${esc(label)}</span>`;
-    box.appendChild(lbl);
-  }
-  document.getElementById('permServicesInput').value = (rule.allowed_services || []).join(', ');
-  document.getElementById('permPortsInput').value = (rule.allowed_ports || []).join(', ');
-}
-
-document.getElementById('principalSelect').onchange = e => renderRuleFor(e.target.value);
-document.getElementById('btnAddPrincipal').onclick = () => {
-  const name = document.getElementById('newPrincipalInput').value.trim();
-  if (!name) return;
-  if (!state.policy.agents) state.policy.agents = {};
-  if (!state.policy.agents[name]) state.policy.agents[name] = { agent_permissions: { inspect: true }, allowed_services: [], allowed_ports: [] };
-  document.getElementById('newPrincipalInput').value = '';
-  renderPrincipalEditor();
-  document.getElementById('principalSelect').value = name;
-  renderRuleFor(name);
-};
-
-document.getElementById('btnSavePerms').onclick = async () => {
-  const principal = document.getElementById('principalSelect').value;
-  const perms = {};
-  document.querySelectorAll('#permCheckboxes input').forEach(i => perms[i.dataset.k] = i.checked);
-  const allowed_services = document.getElementById('permServicesInput').value.split(',').map(s => s.trim()).filter(Boolean);
-  const allowed_ports = document.getElementById('permPortsInput').value.split(',').map(s => parseInt(s.trim(), 10)).filter(n => n > 0 && n <= 65535);
-  if (!state.policy.agents) state.policy.agents = {};
-  state.policy.agents[principal] = { agent_permissions: perms, allowed_services, allowed_ports, allowed_auth_modes: ['ocliv-managed'] };
-  try {
-    await api('/api/agents/permissions', { method: 'PUT', body: JSON.stringify(state.policy) });
-    toast('✓ Saved permissions for ' + principal);
-  } catch (e) { toast('Save error: ' + e.message); }
-};
-
-function renderSetup() {
-  const v = state.status?.version || {};
-  document.getElementById('setupStatusBox').innerHTML = `
-    <div><strong>Relay:</strong> ${esc(state.status?.relay_url || 'not configured')}</div>
-    <div><strong>Publisher Key:</strong> ${esc(state.status?.key_id || 'not enrolled')}</div>
-    <div><strong>Version:</strong> ${esc(v.version || '')} (${esc((v.build_commit || '').slice(0, 12))}, dirty=${v.dirty})</div>
-    <div><strong>Schema:</strong> V${esc(v.schema_version || '')}</div>
-  `;
-}
-
-document.getElementById('btnInstallShortcut').onclick = async () => {
-  try {
-    const r = await api('/api/setup/install-shortcut', { method: 'POST', body: '{}' });
-    toast('✓ Installed shortcut at ' + r.path);
-  } catch (e) { toast('Shortcut error: ' + e.message); }
-};
-
-const dlg = document.getElementById('addDialog');
-document.getElementById('btnAddService').onclick = () => dlg.showModal();
-document.getElementById('btnCancelAdd').onclick = () => dlg.close();
-document.getElementById('btnRefresh').onclick = refreshAll;
-document.getElementById('addServiceForm').onsubmit = async e => {
-  e.preventDefault();
-  const fd = new FormData(e.target);
-  try {
-    const res = await api('/api/services', {
-      method: 'POST',
-      body: JSON.stringify({
-        name: fd.get('name'),
-        port: Number(fd.get('port')),
-        path: fd.get('path'),
-        type: fd.get('type'),
-        authentication: fd.get('authentication'),
-      }),
-    });
-    dlg.close();
-    toast(res.confirmed ? '✓ Service added & published' : 'Service configured: ' + (res.detail || res.status));
-    refreshAll();
-  } catch (err) { toast('Add failed: ' + err.message); }
-};
-
-function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-refreshAll();
-</script>
 </body>
 </html>

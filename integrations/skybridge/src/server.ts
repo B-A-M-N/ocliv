@@ -89,8 +89,12 @@ export const app = new Skybridge({
       throw new Error('OCLIV_ALLOWED_SUBJECTS required: at least one authorized agent/operator subject');
     }
     const ingressSecret = authMode === 'ocliv-managed' ? loadIngressSecret() : '';
+    const expectedRoute = (process.env.OCLIV_EXPECTED_ROUTE ?? '').trim();
     if (authMode === 'ocliv-managed' && ingressSecret.length < 16) {
       throw new Error('OCLIV_INGRESS_SECRET or OCLIV_INGRESS_SECRET_FILE (>=16 chars, 0600) required in ocliv-managed mode');
+    }
+    if (authMode === 'ocliv-managed' && !expectedRoute) {
+      throw new Error('OCLIV_EXPECTED_ROUTE required in ocliv-managed mode to bind verified ingress assertions to this route');
     }
     const permissionsFile = (process.env.OCLIV_PERMISSIONS_FILE ?? '').trim();
     if (!permissionsFile) {
@@ -112,10 +116,10 @@ export const app = new Skybridge({
       permissions,
       nativeClient,
     });
-    return { subjects, ingressSecret, controlPlane };
+    return { subjects, ingressSecret, expectedRoute, controlPlane };
   },
   ...(oauthConfig ? { oauth: oauthConfig } : {}),
-  handler: (server, { subjects, ingressSecret, controlPlane }) => {
+  handler: (server, { subjects, ingressSecret, expectedRoute, controlPlane }) => {
     const resolveSubject = (extra: any, requiredScope = 'ocliv:read'): string => {
       if (authMode === 'external-oidc') {
         return authorize(extra?.http?.authInfo, subjects, requiredScope);
@@ -131,6 +135,7 @@ export const app = new Skybridge({
         remoteAddress,
         ingressSecret,
         allowedSubjects: subjects,
+        expectedRoute,
       });
       if (requiredScope && !verified.scopes.includes(requiredScope) && !verified.scopes.includes('ocliv:write')) {
         throw new Error(`Required scope: ${requiredScope}`);

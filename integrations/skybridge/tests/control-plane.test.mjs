@@ -114,6 +114,28 @@ test('OCL-013 verified ocliv-ingress-v2 rejects spoofing, replay, method/path ta
       }),
     /loopback/
   );
+
+  // Cross-route assertion MUST fail closed when expectedRoute mismatches (OCL-014.4).
+  assert.throws(
+    () =>
+      verifyIngressIdentity({
+        headers: validHeaders,
+        method: 'POST',
+        path: '/mcp',
+        remoteAddress: '127.0.0.1',
+        ingressSecret: secret,
+        allowedSubjects: allowed,
+        expectedRoute: 'different-route-id',
+        nowSec: now,
+        replayCache: new IngressReplayCache(),
+      }),
+    /expected publication route/
+  );
+
+  // Saturated replay cache MUST reject fail-closed rather than evicting unexpired entries (OCL-014.4).
+  const tinyCache = new IngressReplayCache(1);
+  assert.equal(tinyCache.consume('r:n1', now, 120).ok, true);
+  assert.equal(tinyCache.consume('r:n2', now, 120).code, 'INGRESS_REPLAY_CAPACITY');
 });
 
 test('OCL-013 durable permissions separate authorize_visitor from manage_auth_policy and deny empty allowlists', () => {
@@ -151,7 +173,7 @@ test('OCL-013 durable permissions separate authorize_visitor from manage_auth_po
   // Empty allowed_services and empty allowed_ports NEVER act as wildcards.
   assert.equal(enforcer.canAccessService('agent-empty-allowlist', 'agentgateway'), false);
   assert.throws(() => enforcer.assertAllowed({ subject: 'agent-empty-allowlist', action: 'inspect', service: 'agentgateway' }), /not authorized to operate on service/);
-  assert.throws(() => enforcer.assertAllowed({ subject: 'agent-empty-allowlist', action: 'deployment', port: 8085, authMode: 'ocliv-managed' }), /port allowlist/);
+  assert.throws(() => enforcer.assertAllowed({ subject: 'agent-empty-allowlist', action: 'deployment', port: 8085, authMode: 'ocliv-managed' }), /not permitted|port allowlist/);
 });
 
 test('OCL-013 NativeControlPlane filters list_services, enforces config conflict on deploy, and redacts secrets', async () => {
