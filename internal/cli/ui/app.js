@@ -231,19 +231,38 @@ document.getElementById('btnTrustChatGPT').addEventListener('click', async () =>
   } catch (e) { toast('Error: ' + e.message); }
 });
 
-document.getElementById('btnConnectGemini')?.addEventListener('click', async () => {
+async function connectGemini(opts = {}) {
+  const name = document.getElementById('accessServiceSelect').value;
+  if (!name) return;
+  const redirectUri = (document.getElementById('geminiRedirectInput')?.value || '').trim();
+  try {
+    const r = await api(`/api/services/${encodeURIComponent(name)}/connect-google`, {
+      method: 'POST',
+      body: JSON.stringify({ type: 'gemini', redirect_uri: redirectUri, ...opts }),
+    });
+    const box = document.getElementById('geminiResultBox');
+    box.style.display = 'block';
+    box.innerHTML = `<strong>Gemini / Google OAuth Client (${r.idempotent ? 'Already Configured — Idempotent' : 'Provisioned'} · policy=${esc(r.refresh_policy || 'google_confidential')}):</strong><br>
+      MCP URL: <code>${esc(r.url)}</code><br>
+      Client ID: <code>${esc(r.client_id)}</code><br>
+      ${r.client_secret ? `One-time Client Secret: <code>${esc(r.client_secret)}</code><br>` : ''}
+      <span class="muted">${esc(r.detail || '')}</span>`;
+    loadAccessForSelected();
+  } catch (e) { toast('Gemini connect error: ' + e.message); }
+}
+
+document.getElementById('btnConnectGemini')?.addEventListener('click', () => connectGemini({ update: false }));
+document.getElementById('btnRotateGemini')?.addEventListener('click', () => connectGemini({ update: true, reconnect: true }));
+document.getElementById('btnRevokeGemini')?.addEventListener('click', async () => {
   const name = document.getElementById('accessServiceSelect').value;
   if (!name) return;
   try {
-    const r = await api(`/api/services/${encodeURIComponent(name)}/connect-google`, { method: 'POST', body: JSON.stringify({ type: 'gemini' }) });
+    await api(`/api/services/${encodeURIComponent(name)}/connect-google`, { method: 'DELETE' });
     const box = document.getElementById('geminiResultBox');
     box.style.display = 'block';
-    box.innerHTML = `<strong>Gemini / Google OAuth Client Provisioned (operator-only view):</strong><br>
-      MCP URL: <code>${esc(r.url)}</code><br>
-      Client ID: <code>${esc(r.client_id)}</code><br>
-      ${r.client_secret ? `One-time Client Secret: <code>${esc(r.client_secret)}</code>` : `<span class="muted">${esc(r.detail || '')}</span>`}`;
+    box.innerHTML = '<strong>Gemini / Google client revoked.</strong> Click Rotate Gemini to reconnect with a fresh client.';
     loadAccessForSelected();
-  } catch (e) { toast('Gemini connect error: ' + e.message); }
+  } catch (e) { toast('Gemini revoke error: ' + e.message); }
 });
 
 document.getElementById('btnVerifyAccess').addEventListener('click', async () => {
@@ -253,9 +272,9 @@ document.getElementById('btnVerifyAccess').addEventListener('click', async () =>
     const r = await api(`/api/services/${encodeURIComponent(name)}/verify`, { method: 'POST', body: '{}' });
     const st = r.stages || {};
     document.getElementById('verifyResult').innerHTML = `
-      <div>Checked at: ${esc(r.checked_at || '')}</div>
+      <div>Checked at: ${esc(r.checked_at || '')} · Source: <strong>${esc(r.verification_source || 'read_only_discovery')}</strong></div>
       <div>Endpoint: <strong>${esc(st.public_endpoint_reachable)}</strong> · OAuth: <strong>${esc(st.oauth_discovery_compatible)}</strong> · Auth MCP: <strong>${esc(st.authenticated_mcp_handshake)}</strong></div>
-      <div>Events Discovered: <strong>${esc(st.events_advertised)}</strong> · Events Sub: <strong>${esc(st.events_subscription_verified)}</strong> · Callback: <strong>${esc(st.callback_delivery_verified)}</strong> · External Client: <strong>${esc(st.external_client_acceptance)}</strong></div>`;
+      <div>Events Discovered: <strong>${esc(st.events_advertised)}</strong> · Events List: <strong>${esc(st.events_list_verified || 'UNKNOWN')}</strong> · Events Sub: <strong>${esc(st.events_subscription_verified)}</strong> · Callback: <strong>${esc(st.callback_delivery_verified)}</strong> · External Client: <strong>${esc(st.external_client_acceptance)}</strong></div>`;
   } catch (e) { toast('Verify error: ' + e.message); }
 });
 

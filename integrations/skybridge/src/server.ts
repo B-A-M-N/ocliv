@@ -100,7 +100,7 @@ export const app = new Skybridge({
     if (!permissionsFile) {
       throw new Error('OCLIV_PERMISSIONS_FILE required: operator-controlled 0600 agent permissions policy');
     }
-    const permissions = new PermissionsEnforcer(loadPermissionsPolicyFile(permissionsFile));
+    const permissions = new PermissionsEnforcer(loadPermissionsPolicyFile(permissionsFile), permissionsFile);
 
     let nativeClient: NativeOclivClient | null = null;
     if (process.env.OCLIV_RELAY_URL && process.env.OCLIV_AGENT_KEY_FILE) {

@@ -235,7 +235,23 @@ func atomicWriteOwnerOnly0600(path string, data []byte) error {
 		_ = os.Remove(tmpName)
 		return err
 	}
-	return os.Rename(tmpName, path)
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return fmt.Errorf("sync parent directory %s: %w", filepath.Dir(path), err)
+	}
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	if syncErr != nil {
+		return fmt.Errorf("sync parent directory %s: %w", filepath.Dir(path), syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close parent directory %s: %w", filepath.Dir(path), closeErr)
+	}
+	return nil
 }
 
 func flagsToActions(f *AgentPermissionsFlags) []string {
@@ -423,18 +439,15 @@ func (g ServiceGrant) matchesService(serviceName, serviceID string) bool {
 	if g.ServiceName == "*" {
 		return true
 	}
-	if serviceID != "" && g.ServiceID != "" && g.ServiceID == serviceID {
-		return true
+	// An ID-bound grant is authoritative and fails closed whenever the caller's
+	// immutable service_id is absent or mismatched (prevents deletion/recreation
+	// identity substitution).
+	if g.ServiceID != "" {
+		return serviceID != "" && g.ServiceID == serviceID
 	}
-	if serviceName != "" && g.ServiceName != "" && g.ServiceName == serviceName {
-		// If the grant is pinned to a specific immutable service_id and the
-		// caller provided a different non-empty service_id, refuse mismatch.
-		if g.ServiceID != "" && serviceID != "" && g.ServiceID != serviceID {
-			return false
-		}
-		return true
-	}
-	return false
+	// Name-only grants match only when no immutable service_id is pinned
+	// (e.g. pre-creation authorization before deployment assigns a ServiceID).
+	return serviceName != "" && g.ServiceName != "" && g.ServiceName == serviceName
 }
 
 func (g ServiceGrant) hasAction(action string) bool {
@@ -730,8 +743,14 @@ func grantPersistentServicePermission(req OperatorApprovalRequest) error {
 	rule := pol.Agents[req.Principal]
 	idx := -1
 	for i, g := range rule.Grants {
-		if (req.ServiceID != "" && g.ServiceID == req.ServiceID) ||
-			(req.Service != "" && g.ServiceName == req.Service && (g.ServiceID == "" || g.ServiceID == req.ServiceID)) {
+		if g.ServiceID != "" {
+			if req.ServiceID != "" && g.ServiceID == req.ServiceID {
+				idx = i
+				break
+			}
+			continue
+		}
+		if req.Service != "" && g.ServiceName == req.Service {
 			idx = i
 			break
 		}
@@ -767,6 +786,39 @@ func grantPersistentServicePermission(req OperatorApprovalRequest) error {
 		rule.Grants[idx] = g
 	}
 	pol.Agents[req.Principal] = rule
+	_, err = saveAgentPermissionsPolicyCAS(pol, pol.Revision)
+	return err
+}
+
+// bindNameOnlyGrantsToServiceID promotes any name-only creation grant for
+// (principal, serviceName) to the resulting immutable serviceID once deployment
+// succeeds, preventing later deletion/recreation identity substitution.
+func bindNameOnlyGrantsToServiceID(principal, serviceName, serviceID string) error {
+	principal = strings.TrimSpace(principal)
+	serviceName = strings.TrimSpace(serviceName)
+	serviceID = strings.TrimSpace(serviceID)
+	if principal == "" || serviceName == "" || serviceID == "" {
+		return nil
+	}
+	pol, err := loadAgentPermissionsPolicy()
+	if err != nil {
+		return err
+	}
+	rule, ok := pol.Agents[principal]
+	if !ok {
+		return nil
+	}
+	changed := false
+	for i := range rule.Grants {
+		if rule.Grants[i].ServiceID == "" && rule.Grants[i].ServiceName == serviceName {
+			rule.Grants[i].ServiceID = serviceID
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	pol.Agents[principal] = rule
 	_, err = saveAgentPermissionsPolicyCAS(pol, pol.Revision)
 	return err
 }

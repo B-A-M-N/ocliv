@@ -102,10 +102,16 @@
         <h3>Guided Connection (ChatGPT &amp; Gemini)</h3>
         <div class="muted">Paste your persistent MCP URL into ChatGPT or provision a confidential Gemini client below.</div>
         <div id="connectUrlBox" class="url">Select a service</div>
+        <div style="margin-top:8px">
+          <label class="muted" style="font-size:12px" for="geminiRedirectInput">Exact Google / Gemini callback URI</label>
+          <input id="geminiRedirectInput" type="text" value="https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp" />
+        </div>
         <div class="actions">
           <button class="btn primary" id="btnCopyAccessUrl">Copy MCP URL</button>
           <button class="btn" id="btnTrustChatGPT">Trust ChatGPT Redirect</button>
-          <button class="btn" id="btnConnectGemini">Provision Gemini Client</button>
+          <button class="btn" id="btnConnectGemini">Connect Gemini</button>
+          <button class="btn" id="btnRotateGemini">Rotate Gemini</button>
+          <button class="btn danger" id="btnRevokeGemini">Revoke Gemini</button>
           <button class="btn" id="btnVerifyAccess">Verify All Stages</button>
         </div>
         <div id="geminiResultBox" class="url" style="display:none"></div>

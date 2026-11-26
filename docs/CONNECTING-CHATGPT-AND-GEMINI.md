@@ -172,3 +172,11 @@ If your Google integration requires domain verification via `/.well-known/google
 | ChatGPT stalls on the authorization page | Run `ocliv service pending mytools` and approve the exact challenge with `ocliv service approve mytools --challenge <ID>`. |
 | `ocliv connect google` fails with `not authoritatively published` | Ensure the service is started (`ocliv start mytools`) and `ocliv mcp check mytools` passes before running `connect google`. |
 | Need to inspect all historical/disabled routes on the relay | Run `ocliv mcp list` for full administrative inventory (historical `HOST_MISMATCH` and revoked routes are kept there for audit while excluded from ordinary service-name discovery). |
+
+---
+
+## Agent-Facing Management Boundary & Canonical Local Integration
+
+- **Canonical local MCP management integration:** **AgentGateway** (`ocliv mcp manage` stdio target, exposing the 20-tool control plane) is the canonical local agent integration. Any legacy standalone registered Ocliv MCP entry outside AgentGateway is retired — remove stale standalone entries rather than running parallel management servers.
+- **Shared-principal boundary (AgentGateway stdio):** All callers sharing a local AgentGateway stdio connection share the same management principal (`transport_isolation: "shared-local-stdio"`, `caller_isolation: "shared_local_stdio_no_per_remote_caller_isolation"`). This is safe only when every caller using that transport is intentionally authorized to share the same management authority. For independently isolated per-remote-agent authorization, deploy the Skybridge integration (`integrations/skybridge/`) behind verified `ocliv-ingress-v2` assertions.
+- **Canonical human operator interface:** Use **Ocliv Control Center (`ocliv ui`)** for adding services, connecting ChatGPT/Gemini, approving visitor logins, and managing per-service agent permissions.

@@ -4,7 +4,14 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 )
+
+// DiagnosticProbeSubject is the reserved subject for short-lived, single-route
+// internally managed diagnostic verification tokens minted only by the relay's
+// Ed25519-signed publisher management API. Diagnostic tokens never create
+// persistent visitor grants and are always tagged synthetic in host observations.
+const DiagnosticProbeSubject = "ocliv-diagnostic-probe"
 
 // Authorizer validates a presented bearer token against one route.
 type Authorizer struct {
@@ -46,7 +53,15 @@ func (a *Authorizer) AuthorizeClaims(r *http.Request, routeURL, issuerURL, tenan
 	// path would trade a long-lived renewal credential for route access,
 	// so it is refused here. An access token (unset typ, including
 	// legacy tokens minted before the field existed) is unaffected.
-	if claims.TokenType != "" && claims.TokenType != "access" {
+	// Short-lived "diagnostic" tokens are permitted ONLY for the reserved
+	// DiagnosticProbeSubject with a bounded lifetime (<= 2m).
+	isDiagnostic := false
+	if claims.TokenType == "diagnostic" {
+		if claims.Subject != DiagnosticProbeSubject || claims.IssuedAt == nil || claims.ExpiresAt == nil || claims.ExpiresAt.Sub(claims.IssuedAt.Time) > 2*time.Minute {
+			return nil, fmt.Errorf("authz: invalid diagnostic token bounds")
+		}
+		isDiagnostic = true
+	} else if claims.TokenType != "" && claims.TokenType != "access" {
 		return nil, fmt.Errorf("authz: %s tokens are not valid for route access", claims.TokenType)
 	}
 	if !claims.ValidateAudience(routeURL) {
@@ -58,32 +73,34 @@ func (a *Authorizer) AuthorizeClaims(r *http.Request, routeURL, issuerURL, tenan
 	if routeID != "" && claims.Route != routeID {
 		return nil, fmt.Errorf("authz: route mismatch: got %q want %q", claims.Route, routeID)
 	}
-	// Publication-level boundary: the client must hold an ACTIVE grant for
-	// this tenant + route, and any bound trust policy or federated visitor
-	// auth policy/subject must remain active. Revocation is checked here on
-	// every request (OCL-005, OCL-006).
-	grant, err := a.store.GetGrant(claims.Subject, tenant, routeID)
-	if err != nil {
-		return nil, fmt.Errorf("authz: no grant for client %q: %w", claims.Subject, err)
-	}
-	if err := validateGrantPolicyLive(a.store, grant, tenant, routeID); err != nil {
-		return nil, fmt.Errorf("authz: client %q denied: %w", claims.Subject, err)
-	}
-	// Client-level revocation: a revoked client's existing tokens stop at
-	// admission, not just at the next token exchange. The registration
-	// must also belong to this route: a client_id minted through another
-	// authorization server is not an identity here. Legacy rows with no
-	// stored identity are unbound and fail closed.
-	client, cerr := a.store.GetClient(claims.Subject)
-	if cerr != nil || client.RevokedAt != nil {
-		return nil, fmt.Errorf("authz: client %q is revoked", claims.Subject)
-	}
-	if client.Tenant == "" || client.Route == "" {
-		return nil, fmt.Errorf("authz: client %q has no route registration scope", claims.Subject)
-	}
-	if client.Tenant != tenant {
-		return nil, fmt.Errorf("authz: client %q is registered for tenant %q, not tenant %q",
-			claims.Subject, client.Tenant, tenant)
+	if !isDiagnostic {
+		// Publication-level boundary: the client must hold an ACTIVE grant for
+		// this tenant + route, and any bound trust policy or federated visitor
+		// auth policy/subject must remain active. Revocation is checked here on
+		// every request (OCL-005, OCL-006).
+		grant, err := a.store.GetGrant(claims.Subject, tenant, routeID)
+		if err != nil {
+			return nil, fmt.Errorf("authz: no grant for client %q: %w", claims.Subject, err)
+		}
+		if err := validateGrantPolicyLive(a.store, grant, tenant, routeID); err != nil {
+			return nil, fmt.Errorf("authz: client %q denied: %w", claims.Subject, err)
+		}
+		// Client-level revocation: a revoked client's existing tokens stop at
+		// admission, not just at the next token exchange. The registration
+		// must also belong to this route: a client_id minted through another
+		// authorization server is not an identity here. Legacy rows with no
+		// stored identity are unbound and fail closed.
+		client, cerr := a.store.GetClient(claims.Subject)
+		if cerr != nil || client.RevokedAt != nil {
+			return nil, fmt.Errorf("authz: client %q is revoked", claims.Subject)
+		}
+		if client.Tenant == "" || client.Route == "" {
+			return nil, fmt.Errorf("authz: client %q has no route registration scope", claims.Subject)
+		}
+		if client.Tenant != tenant {
+			return nil, fmt.Errorf("authz: client %q is registered for tenant %q, not tenant %q",
+				claims.Subject, client.Tenant, tenant)
+		}
 	}
 	// Every managed token must carry a jti. A token without one cannot be
 	// individually revoked, so it is refused rather than admitted.

@@ -934,3 +934,348 @@ func cmdConnectGoogleRevoke(argv []string, ops serviceOps) int {
 	fmt.Printf("✓ revoked Google connection binding for %q (client_id=%s)\n", serviceName, b.ClientID)
 	return apperr.ExitOK
 }
+
+// googleConnectRequest holds canonical parameters for provisioning a Google
+// confidential OAuth client (shared by CLI and Control Center so both paths
+// enforce identical callback validation, google_confidential refresh policy,
+// idempotency, binding persistence, and cutover rotation).
+type googleConnectRequest struct {
+	ServiceName      string
+	Profile          string
+	Tenant           string
+	ConnectionType   string
+	RedirectURIs     []string
+	Approve          bool
+	Update           bool
+	Reconnect        bool
+	SkipDomainVerify bool // true when Control Center provisions a "gemini" client
+}
+
+type googleConnectResult struct {
+	Service               string                 `json:"service"`
+	RouteID               string                 `json:"route_id"`
+	URL                   string                 `json:"url"`
+	ClientID              string                 `json:"client_id"`
+	ClientSecret          string                 `json:"client_secret,omitempty"`
+	AuthorizationEndpoint string                 `json:"authorization_endpoint,omitempty"`
+	TokenEndpoint         string                 `json:"token_endpoint,omitempty"`
+	RefreshPolicy         string                 `json:"refresh_policy"`
+	Status                string                 `json:"status"`
+	Stage                 string                 `json:"stage"`
+	Idempotent            bool                   `json:"idempotent"`
+	Binding               config.ProviderBinding `json:"binding"`
+	Detail                string                 `json:"detail"`
+}
+
+// provisionGoogleConnectionCanonical executes the canonical remote Google/Gemini
+// OAuth provisioning workflow via the publisher's Ed25519 management channel.
+// Repeated calls with matching parameters return the existing active binding
+// idempotently without creating duplicate clients.
+func provisionGoogleConnectionCanonical(req googleConnectRequest, ops serviceOps, hc *http.Client) (googleConnectResult, int, error) {
+	if hc == nil {
+		hc = safeEgressHTTPClient()
+	}
+	connType := strings.ToLower(strings.TrimSpace(req.ConnectionType))
+	if connType == "" {
+		connType = "gemini"
+	}
+	if connType != "connected-app" && connType != "gemini" {
+		return googleConnectResult{}, http.StatusBadRequest, fmt.Errorf("invalid connection type %q (want connected-app|gemini)", connType)
+	}
+	tenant := strings.TrimSpace(req.Tenant)
+	if tenant == "" {
+		tenant = "default"
+	}
+	profile := strings.TrimSpace(req.Profile)
+	if profile == "" {
+		profile = config.ActiveProfile()
+	}
+	var redirects []string
+	for _, uri := range req.RedirectURIs {
+		uri = strings.TrimSpace(uri)
+		if uri != "" {
+			redirects = append(redirects, uri)
+		}
+	}
+	if len(redirects) == 0 {
+		return googleConnectResult{}, http.StatusBadRequest, fmt.Errorf("redirect_uris is required (supply the exact Google callback URI)")
+	}
+	for _, uri := range redirects {
+		if err := authz.ValidateRedirectURI(uri, redirects); err != nil {
+			return googleConnectResult{}, http.StatusBadRequest, fmt.Errorf("invalid redirect URI %q: %w", uri, err)
+		}
+	}
+
+	svcStore, err := openServicesForProfile(profile)
+	if err != nil {
+		return googleConnectResult{}, http.StatusInternalServerError, err
+	}
+	rec, hasRec, err := svcStore.Get(req.ServiceName)
+	if err != nil || !hasRec {
+		return googleConnectResult{}, http.StatusNotFound, fmt.Errorf("unknown service %q", req.ServiceName)
+	}
+	k, keyID, kerr := loadKeyForProfile(profile)
+	if kerr != nil {
+		return googleConnectResult{}, http.StatusUnauthorized, fmt.Errorf("not enrolled in profile %q: %w", profile, kerr)
+	}
+	rURL := rec.RelayURL
+	if rURL == "" {
+		rURL = agentRelayURLForProfile(profile)
+	}
+	pubID, pubURL, found, rerr := resolveRelayPublication(rURL, k, keyID, rec, ops)
+	if rerr != nil || !found || pubID == "" {
+		return googleConnectResult{}, http.StatusNotFound, fmt.Errorf("no active publication found for %q", req.ServiceName)
+	}
+	if pubURL == "" {
+		pubURL = rec.PublicURL
+	}
+	if pubURL == "" {
+		if entry, _ := resolveCatalogEntry(rec.Name, profile, ops); entry.URL != "" {
+			pubURL = entry.URL
+		}
+	}
+
+	issuer := pubURL
+	authEP, tokenEP := "", ""
+	if pubURL != "" {
+		disc := runReadOnlyDiscoveryCheck(hc, pubURL)
+		if disc.Issuer != "" {
+			issuer = disc.Issuer
+		}
+		authEP = disc.AuthorizationEP
+		tokenEP = disc.TokenEP
+	}
+
+	fp := googleBindingFingerprint(rec.Name, tenant, issuer, pubID, connType, redirects)
+	var existing *config.ProviderBinding
+	if rec.ProviderBindings != nil {
+		if b, bok := rec.ProviderBindings["google"]; bok {
+			existing = &b
+		}
+	}
+
+	if existing != nil {
+		if existing.Status == "revoked" && !req.Reconnect {
+			return googleConnectResult{}, http.StatusConflict, fmt.Errorf("Google binding for %q was explicitly revoked; pass reconnect=true to create a new client", rec.Name)
+		}
+		if existing.Status != "revoked" && existing.Fingerprint == fp && existing.Status != "CUTOVER_INCOMPLETE" && existing.Status != "PREPARED" && !req.Update {
+			return googleConnectResult{
+				Service:               rec.Name,
+				RouteID:               pubID,
+				URL:                   pubURL,
+				ClientID:              existing.ClientID,
+				AuthorizationEndpoint: authEP,
+				TokenEndpoint:         tokenEP,
+				RefreshPolicy:         "google_confidential",
+				Status:                existing.Status,
+				Stage:                 existing.Stage,
+				Idempotent:            true,
+				Binding:               *existing,
+				Detail:                "Google/Gemini client already provisioned (idempotent; click Rotate to replace credentials or Revoke to disconnect).",
+			}, http.StatusOK, nil
+		}
+		if existing.Status != "revoked" && !req.Update {
+			return googleConnectResult{}, http.StatusConflict, fmt.Errorf("%q already has a Google binding with different callbacks or type; pass update=true to replace intentionally", rec.Name)
+		}
+	}
+
+	reqPayload, _ := json.Marshal(map[string]any{
+		"name":           "Google (" + connType + ")",
+		"redirect_uris":  redirects,
+		"refresh_policy": "google_confidential",
+		"approve":        req.Approve,
+	})
+	stCode, body, callErr := ops.callMgmtBody(rURL, k, keyID, http.MethodPost, "/v1/agent/mcp-routes/"+pubID+"/authz/register", reqPayload)
+	if callErr != nil {
+		return googleConnectResult{}, http.StatusBadGateway, fmt.Errorf("remote registration failed: %w", callErr)
+	}
+	if stCode != http.StatusCreated && stCode != http.StatusOK {
+		return googleConnectResult{}, http.StatusBadGateway, fmt.Errorf("relay registration returned HTTP %d: %s", stCode, strings.TrimSpace(string(body)))
+	}
+	var regResp struct {
+		ClientID     string `json:"client_id"`
+		ClientSecret string `json:"client_secret"`
+		Status       string `json:"status"`
+	}
+	if err := json.Unmarshal(body, &regResp); err != nil || regResp.ClientID == "" || regResp.ClientSecret == "" {
+		return googleConnectResult{}, http.StatusBadGateway, fmt.Errorf("invalid registration response from relay")
+	}
+
+	now := time.Now().UTC()
+	timestamps := map[string]string{"CONFIGURED": now.Format(time.RFC3339)}
+	status := "pending"
+	stage := "CONFIGURED"
+	nextAction := fmt.Sprintf("approve client explicitly on relay for route %s client %s", pubID, regResp.ClientID)
+	if regResp.Status == "approved" || req.Approve {
+		status = "active"
+		stage = "CLIENT_APPROVED"
+		timestamps["CLIENT_APPROVED"] = now.Format(time.RFC3339)
+		nextAction = "paste client_id, client_secret, authorization_endpoint, and token_endpoint into Google console"
+	}
+
+	var revokedIDs []string
+	var oldID string
+	if existing != nil {
+		revokedIDs = append(revokedIDs, existing.RevokedClientIDs...)
+		if existing.Status == "revoked" && existing.ClientID != "" {
+			revokedIDs = append(revokedIDs, existing.ClientID)
+		} else if existing.ClientID != "" && existing.ClientID != regResp.ClientID {
+			oldID = existing.ClientID
+			opID := fmt.Sprintf("cutover-%d", now.UnixNano())
+			updatedPrep, prepErr := svcStore.UpdateCAS(rec.Name, rec.Revision, func(r *config.ServiceRecord) error {
+				if r.ProviderBindings == nil {
+					r.ProviderBindings = map[string]config.ProviderBinding{}
+				}
+				b := r.ProviderBindings["google"]
+				b.CandidateClientID = regResp.ClientID
+				b.Status = "PREPARED"
+				b.Cutover = &config.GoogleCutoverRecord{
+					OperationID:     opID,
+					OldClientID:     oldID,
+					NewClientID:     regResp.ClientID,
+					OldTenant:       tenant,
+					NewTenant:       tenant,
+					RouteID:         pubID,
+					CandidateStatus: status,
+					RecoveryState:   "PREPARED",
+				}
+				b.NextAction = fmt.Sprintf("cutover prepared for candidate %s; completing replacement of %s", regResp.ClientID, oldID)
+				r.ProviderBindings["google"] = b
+				return nil
+			})
+			if prepErr != nil {
+				return googleConnectResult{}, http.StatusInternalServerError, fmt.Errorf("persist PREPARED cutover: %w", prepErr)
+			}
+			rec = updatedPrep
+		}
+	}
+
+	binding := config.ProviderBinding{
+		Provider:         "google",
+		ConnectionType:   connType,
+		ClientID:         regResp.ClientID,
+		RevokedClientIDs: revokedIDs,
+		RedirectURIs:     redirects,
+		AuthMode:         "confidential+google_confidential",
+		Fingerprint:      fp,
+		Status:           status,
+		Stage:            stage,
+		StageTimestamps:  timestamps,
+		LastVerifiedAt:   now.Format(time.RFC3339),
+		NextAction:       nextAction,
+		UpdatedAt:        now.Format(time.RFC3339),
+	}
+	updatedCommit, uerr := svcStore.UpdateCAS(rec.Name, rec.Revision, func(r *config.ServiceRecord) error {
+		if r.PublicationID == "" {
+			r.PublicationID = pubID
+		}
+		if r.PublicURL == "" && pubURL != "" {
+			r.PublicURL = pubURL
+		}
+		if r.ProviderBindings == nil {
+			r.ProviderBindings = map[string]config.ProviderBinding{}
+		}
+		r.ProviderBindings["google"] = binding
+		return nil
+	})
+	if uerr != nil {
+		return googleConnectResult{}, http.StatusInternalServerError, fmt.Errorf("save service binding: %w", uerr)
+	}
+	rec = updatedCommit
+
+	if oldID != "" {
+		revSt, _, revErr := ops.callMgmtBody(rURL, k, keyID, http.MethodPost, "/v1/agent/mcp-routes/"+pubID+"/authz/revoke/"+oldID, nil)
+		if revErr != nil || (revSt != http.StatusOK && revSt != http.StatusNotFound) {
+			_, _ = svcStore.UpdateCAS(rec.Name, rec.Revision, func(r *config.ServiceRecord) error {
+				b := r.ProviderBindings["google"]
+				b.Status = "CUTOVER_INCOMPLETE"
+				b.NextAction = fmt.Sprintf("old client %s revocation incomplete", oldID)
+				r.ProviderBindings["google"] = b
+				return nil
+			})
+			return googleConnectResult{}, http.StatusBadGateway, fmt.Errorf("cutover incomplete: failed to revoke previous client %s", oldID)
+		}
+		if finalRec, ferr := svcStore.UpdateCAS(rec.Name, rec.Revision, func(r *config.ServiceRecord) error {
+			b := r.ProviderBindings["google"]
+			b.RevokedClientIDs = append(b.RevokedClientIDs, oldID)
+			r.ProviderBindings["google"] = b
+			return nil
+		}); ferr == nil {
+			binding = finalRec.ProviderBindings["google"]
+		}
+	}
+
+	return googleConnectResult{
+		Service:               rec.Name,
+		RouteID:               pubID,
+		URL:                   pubURL,
+		ClientID:              regResp.ClientID,
+		ClientSecret:          regResp.ClientSecret,
+		AuthorizationEndpoint: authEP,
+		TokenEndpoint:         tokenEP,
+		RefreshPolicy:         "google_confidential",
+		Status:                status,
+		Stage:                 stage,
+		Idempotent:            false,
+		Binding:               binding,
+		Detail:                "Save this one-time secret in Gemini now; it is never shown to MCP agents.",
+	}, http.StatusOK, nil
+}
+
+// revokeGoogleConnectionCanonical revokes the recorded Google/Gemini OAuth client
+// on the relay and persists the revoked lifecycle state on the local service record.
+func revokeGoogleConnectionCanonical(serviceName, profile string, ops serviceOps) (config.ProviderBinding, int, error) {
+	if strings.TrimSpace(profile) == "" {
+		profile = config.ActiveProfile()
+	}
+	svcStore, err := openServicesForProfile(profile)
+	if err != nil {
+		return config.ProviderBinding{}, http.StatusInternalServerError, err
+	}
+	rec, ok, err := svcStore.Get(serviceName)
+	if err != nil || !ok || rec.ProviderBindings == nil {
+		return config.ProviderBinding{}, http.StatusNotFound, fmt.Errorf("no Google connection binding recorded for %q", serviceName)
+	}
+	b, bok := rec.ProviderBindings["google"]
+	if !bok || b.ClientID == "" {
+		return config.ProviderBinding{}, http.StatusNotFound, fmt.Errorf("no Google connection binding recorded for %q", serviceName)
+	}
+	k, keyID, kerr := loadKeyForProfile(profile)
+	if kerr != nil {
+		return config.ProviderBinding{}, http.StatusUnauthorized, fmt.Errorf("not enrolled in profile %q: %w", profile, kerr)
+	}
+	rURL := rec.RelayURL
+	if rURL == "" {
+		rURL = agentRelayURLForProfile(profile)
+	}
+	pubID, _, found, rerr := resolveRelayPublication(rURL, k, keyID, rec, ops)
+	if rerr != nil || !found || pubID == "" {
+		pubID = rec.PublicationID
+	}
+	if pubID == "" {
+		return config.ProviderBinding{}, http.StatusNotFound, fmt.Errorf("missing publication_id on service %q", serviceName)
+	}
+	stCode, body, callErr := ops.callMgmtBody(rURL, k, keyID, http.MethodPost, "/v1/agent/mcp-routes/"+pubID+"/authz/revoke/"+b.ClientID, nil)
+	if callErr != nil || (stCode != http.StatusOK && stCode != http.StatusNotFound) {
+		return config.ProviderBinding{}, http.StatusBadGateway, fmt.Errorf("remote revoke failed (HTTP %d): %s", stCode, strings.TrimSpace(string(body)))
+	}
+	var updatedBinding config.ProviderBinding
+	_, uerr := svcStore.UpdateCAS(serviceName, rec.Revision, func(r *config.ServiceRecord) error {
+		cur := r.ProviderBindings["google"]
+		cur.Status = "revoked"
+		cur.Stage = "REVOKED"
+		if cur.StageTimestamps == nil {
+			cur.StageTimestamps = map[string]string{}
+		}
+		cur.StageTimestamps["REVOKED"] = time.Now().UTC().Format(time.RFC3339)
+		cur.NextAction = "binding revoked; register a new client if reconnecting"
+		cur.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+		r.ProviderBindings["google"] = cur
+		updatedBinding = cur
+		return nil
+	})
+	if uerr != nil {
+		return config.ProviderBinding{}, http.StatusInternalServerError, fmt.Errorf("remote client revoked, but failed to persist local binding state: %w", uerr)
+	}
+	return updatedBinding, http.StatusOK, nil
+}

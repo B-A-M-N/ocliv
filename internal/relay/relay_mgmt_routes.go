@@ -236,6 +236,10 @@ func (s *Server) handleAgentPublications(w http.ResponseWriter, r *http.Request)
 			s.serveKeyPublicationAuthzRegister(w, r, tenant, keyID, routeID)
 			return
 		}
+		if routeID, ok := strings.CutSuffix(rest, "/authz/diagnostic-token"); ok && validRouteID(routeID) {
+			s.serveKeyPublicationAuthzDiagnosticToken(w, tenant, keyID, routeID)
+			return
+		}
 		if idx := strings.Index(rest, "/authz/revoke/"); idx > 0 {
 			routeID := rest[:idx]
 			clientID := rest[idx+len("/authz/revoke/"):]
@@ -1014,6 +1018,56 @@ func (s *Server) serveKeyPublicationAuthzRegister(w http.ResponseWriter, r *http
 		"client_secret":  secret,
 		"refresh_policy": req.RefreshPolicy,
 		"status":         status,
+	})
+}
+
+// serveKeyPublicationAuthzDiagnosticToken mints a short-lived (60s), single-route,
+// synthetic-tagged diagnostic bearer token exclusively for the route's Ed25519-signed
+// publisher key so native MCP/Events verification can exercise the real public OAuth
+// path without requiring operator token files or creating persistent visitor grants.
+func (s *Server) serveKeyPublicationAuthzDiagnosticToken(w http.ResponseWriter, tenant, keyID, routeID string) {
+	if s.authz == nil || s.authz.issuer == nil {
+		http.Error(w, "managed authz unavailable", http.StatusConflict)
+		return
+	}
+	var exists int
+	if err := s.db.SQL().QueryRow(
+		`SELECT 1 FROM mcp_publications WHERE route_id=? AND tenant_id=? AND owner_key_id=? AND revoked_at IS NULL`,
+		routeID, tenant, keyID,
+	).Scan(&exists); err != nil {
+		http.Error(w, "unknown route", http.StatusNotFound)
+		return
+	}
+	jti, err := authz.MintClientID()
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	routeURL := routeURLFor(s.mcpHost, s.mcpPort, routeID)
+	issuerURL := issuerURLFor(s.mcpHost, s.mcpPort, routeID)
+	exp := time.Now().UTC().Add(60 * time.Second)
+	tok, err := s.authz.issuer.Mint(authz.TokenClaims{
+		Issuer:    issuerURL,
+		Subject:   authz.DiagnosticProbeSubject,
+		Audience:  routeURL,
+		Tenant:    tenant,
+		Route:     routeID,
+		Scope:     "mcp:tools",
+		ID:        "diag_" + jti,
+		Expiry:    exp.Unix(),
+		TokenType: "diagnostic",
+	})
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	s.db.AuditKey("agent", tenant, keyID, "", "authz-diagnostic-token", "ok", "route "+routeID+" ttl=60s")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"route_id":     routeID,
+		"access_token": tok,
+		"token_type":   "Bearer",
+		"expires_at":   exp.Format(time.RFC3339),
+		"synthetic":    true,
 	})
 }
 

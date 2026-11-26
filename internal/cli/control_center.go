@@ -407,30 +407,24 @@ func (cc *controlCenterServer) handleAPI(w http.ResponseWriter, r *http.Request)
 			ExpectedRevision *int64                  `json:"expected_revision"`
 			Policy           *AgentPermissionsPolicy `json:"policy"`
 		}
-		rawBytes := make([]byte, 0, 1024)
-		var direct AgentPermissionsPolicy
-		dec := json.NewDecoder(r.Body)
 		var rawDoc json.RawMessage
-		if err := dec.Decode(&rawDoc); err != nil {
+		if err := json.NewDecoder(r.Body).Decode(&rawDoc); err != nil {
 			writeCCJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid permissions payload"})
 			return
 		}
-		_ = rawBytes
-		expRev := int64(-1)
-		if json.Unmarshal(rawDoc, &env) == nil && env.Policy != nil {
-			direct = *env.Policy
-			if env.ExpectedRevision != nil {
-				expRev = *env.ExpectedRevision
-			}
-		} else if err := json.Unmarshal(rawDoc, &direct); err != nil {
-			writeCCJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid permissions payload"})
+		if err := json.Unmarshal(rawDoc, &env); err != nil || env.Policy == nil {
+			writeCCJSON(w, http.StatusBadRequest, map[string]string{"error": "permissions payload must wrap {expected_revision, policy}"})
 			return
 		}
-		if aerr := cc.audit("permissions_save", "agent-permissions.json", "attempt"); aerr != nil {
+		if env.ExpectedRevision == nil || *env.ExpectedRevision < 0 {
+			writeCCJSON(w, http.StatusBadRequest, map[string]string{"error": "expected_revision is required for policy updates"})
+			return
+		}
+		if aerr := cc.audit("permissions_save", "agent-permissions.json", fmt.Sprintf("expected_rev=%d", *env.ExpectedRevision)); aerr != nil {
 			writeCCJSON(w, http.StatusInternalServerError, map[string]string{"error": "audit log write failed: " + aerr.Error()})
 			return
 		}
-		saved, serr := saveAgentPermissionsPolicyCAS(direct, expRev)
+		saved, serr := saveAgentPermissionsPolicyCAS(*env.Policy, *env.ExpectedRevision)
 		if errors.Is(serr, ErrPolicyConflict) {
 			writeCCJSON(w, http.StatusConflict, map[string]string{"error": serr.Error()})
 			return
@@ -460,12 +454,15 @@ func (cc *controlCenterServer) handleAPI(w http.ResponseWriter, r *http.Request)
 			writeCCJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
 			return
 		}
+		if aerr := cc.audit("approval_request_"+body.Decision, reqID, "attempt"); aerr != nil {
+			writeCCJSON(w, http.StatusInternalServerError, map[string]string{"error": "audit log write failed: " + aerr.Error()})
+			return
+		}
 		updated, err := decideOperatorApprovalRequest(reqID, body.Decision)
 		if err != nil {
 			writeCCJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		cc.audit("approval_request_"+body.Decision, reqID, updated.Status)
 		writeCCJSON(w, http.StatusOK, map[string]any{"ok": true, "request": updated})
 		return
 
@@ -585,12 +582,15 @@ func (cc *controlCenterServer) handleAPI(w http.ResponseWriter, r *http.Request)
 				writeCCJSON(w, http.StatusNotFound, map[string]string{"error": "no publication found"})
 				return
 			}
+			if aerr := cc.audit("visitor_tx_"+body.Decision, rec.Name+"/"+pubID, "attempt"); aerr != nil {
+				writeCCJSON(w, http.StatusInternalServerError, map[string]string{"error": "audit log write failed: " + aerr.Error()})
+				return
+			}
 			st, respBody, cerr := cc.ops.mgmtCall(rURL, cc.key, cc.keyID, http.MethodPost, "/v1/agent/mcp-routes/"+pubID+"/authz/consents/"+body.Challenge+"/"+body.Decision)
 			if cerr != nil || (st != http.StatusOK && st != http.StatusCreated) {
 				writeCCJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("relay returned HTTP %d", st)})
 				return
 			}
-			cc.audit("visitor_tx_"+body.Decision, rec.Name, "ok")
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			_, _ = w.Write(respBody)
 			return
@@ -608,12 +608,15 @@ func (cc *controlCenterServer) handleAPI(w http.ResponseWriter, r *http.Request)
 				writeCCJSON(w, http.StatusNotFound, map[string]string{"error": "no publication found"})
 				return
 			}
+			if aerr := cc.audit("revoke_client", rec.Name+"/"+body.ClientID, "attempt"); aerr != nil {
+				writeCCJSON(w, http.StatusInternalServerError, map[string]string{"error": "audit log write failed: " + aerr.Error()})
+				return
+			}
 			st, _, cerr := cc.ops.mgmtCall(rURL, cc.key, cc.keyID, http.MethodPost, "/v1/agent/mcp-routes/"+pubID+"/authz/revoke/"+body.ClientID)
 			if cerr != nil || st != http.StatusOK {
 				writeCCJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("revoke failed (HTTP %d)", st)})
 				return
 			}
-			cc.audit("revoke_client", rec.Name+"/"+body.ClientID, "ok")
 			writeCCJSON(w, http.StatusOK, map[string]any{"ok": true, "confirmed": true})
 			return
 
@@ -631,6 +634,10 @@ func (cc *controlCenterServer) handleAPI(w http.ResponseWriter, r *http.Request)
 				writeCCJSON(w, http.StatusNotFound, map[string]string{"error": "no publication found"})
 				return
 			}
+			if aerr := cc.audit("trust_policy_add", rec.Name, "attempt"); aerr != nil {
+				writeCCJSON(w, http.StatusInternalServerError, map[string]string{"error": "audit log write failed: " + aerr.Error()})
+				return
+			}
 			var redirects []string
 			if body.RedirectURI != "" {
 				redirects = []string{body.RedirectURI}
@@ -640,71 +647,101 @@ func (cc *controlCenterServer) handleAPI(w http.ResponseWriter, r *http.Request)
 				writeCCJSON(w, http.StatusBadRequest, map[string]string{"error": perr.Error()})
 				return
 			}
-			cc.audit("trust_policy_add", rec.Name, status)
 			writeCCJSON(w, http.StatusOK, map[string]any{"ok": true, "status": status, "policy": polRes})
 			return
 
+		case action == "connect-google" && r.Method == http.MethodGet:
+			var binding *config.ProviderBinding
+			if rec.ProviderBindings != nil {
+				if b, ok := rec.ProviderBindings["google"]; ok {
+					binding = &b
+				}
+			}
+			writeCCJSON(w, http.StatusOK, map[string]any{"ok": true, "binding": binding})
+			return
+
 		case action == "connect-google" && r.Method == http.MethodPost:
-			// Operator-only confidential client provisioning for Gemini/Google.
-			// Never exposed through agent-visible MCP tools (OCL-014.5).
-			pubID, pubURL, found, rerr := resolveRelayPublication(rURL, cc.key, cc.keyID, rec, cc.ops)
-			if rerr != nil || !found {
-				writeCCJSON(w, http.StatusNotFound, map[string]string{"error": "no active publication found"})
+			// Operator-only confidential client provisioning reusing canonical cli_connect.go.
+			// Never exposed through agent-visible MCP tools.
+			var body struct {
+				Type         string   `json:"type"`
+				RedirectURI  string   `json:"redirect_uri"`
+				RedirectURIs []string `json:"redirect_uris"`
+				Update       bool     `json:"update"`
+				Reconnect    bool     `json:"reconnect"`
+				Approve      *bool    `json:"approve"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			redirects := append([]string(nil), body.RedirectURIs...)
+			if strings.TrimSpace(body.RedirectURI) != "" {
+				redirects = append(redirects, strings.TrimSpace(body.RedirectURI))
+			}
+			connType := strings.ToLower(strings.TrimSpace(body.Type))
+			if connType == "" {
+				connType = "gemini"
+			}
+			if len(redirects) == 0 && connType == "gemini" {
+				redirects = []string{"https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp"}
+			}
+			approve := true
+			if body.Approve != nil {
+				approve = *body.Approve
+			}
+			if aerr := cc.audit("connect_google", rec.Name, fmt.Sprintf("type=%s update=%v reconnect=%v", connType, body.Update, body.Reconnect)); aerr != nil {
+				writeCCJSON(w, http.StatusInternalServerError, map[string]string{"error": "audit log write failed: " + aerr.Error()})
 				return
 			}
-			reqPayload, _ := json.Marshal(map[string]any{
-				"name":          "Google (gemini)",
-				"redirect_uris": []string{"https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp"},
-				"confidential":  true,
-				"approve":       true,
-			})
-			st, respBody, cerr := cc.ops.callMgmtBody(rURL, cc.key, cc.keyID, http.MethodPost, "/v1/agent/mcp-routes/"+pubID+"/authz/register", reqPayload)
-			if cerr != nil || (st != http.StatusOK && st != http.StatusCreated) {
-				writeCCJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("relay registration failed (HTTP %d)", st)})
+			res, httpCode, perr := provisionGoogleConnectionCanonical(googleConnectRequest{
+				ServiceName:    rec.Name,
+				Profile:        rec.Profile,
+				ConnectionType: connType,
+				RedirectURIs:   redirects,
+				Approve:        approve,
+				Update:         body.Update,
+				Reconnect:      body.Reconnect,
+			}, cc.ops, &http.Client{Timeout: 8 * time.Second})
+			if perr != nil {
+				writeCCJSON(w, httpCode, map[string]string{"error": perr.Error()})
 				return
 			}
-			var regResp struct {
-				ClientID     string `json:"client_id"`
-				ClientSecret string `json:"client_secret"`
-			}
-			_ = json.Unmarshal(respBody, &regResp)
-			_ = cc.audit("connect_google", rec.Name, "ok")
 			writeCCJSON(w, http.StatusOK, map[string]any{
-				"ok":            true,
-				"url":           pubURL,
-				"client_id":     regResp.ClientID,
-				"client_secret": regResp.ClientSecret,
-				"detail":        "Save this one-time secret in Gemini now; it is never shown to MCP agents.",
+				"ok":                     true,
+				"idempotent":             res.Idempotent,
+				"url":                    res.URL,
+				"client_id":              res.ClientID,
+				"client_secret":          res.ClientSecret,
+				"authorization_endpoint": res.AuthorizationEndpoint,
+				"token_endpoint":         res.TokenEndpoint,
+				"refresh_policy":         res.RefreshPolicy,
+				"status":                 res.Status,
+				"stage":                  res.Stage,
+				"binding":                res.Binding,
+				"detail":                 res.Detail,
 			})
 			return
 
+		case action == "connect-google" && r.Method == http.MethodDelete:
+			if aerr := cc.audit("revoke_google", rec.Name, "attempt"); aerr != nil {
+				writeCCJSON(w, http.StatusInternalServerError, map[string]string{"error": "audit log write failed: " + aerr.Error()})
+				return
+			}
+			binding, httpCode, rerr := revokeGoogleConnectionCanonical(rec.Name, rec.Profile, cc.ops)
+			if rerr != nil {
+				writeCCJSON(w, httpCode, map[string]string{"error": rerr.Error()})
+				return
+			}
+			writeCCJSON(w, http.StatusOK, map[string]any{"ok": true, "binding": binding})
+			return
+
 		case action == "verify" && r.Method == http.MethodPost:
-			rep := inspectServiceStatus(rec, cc.key, cc.keyID, cc.ops)
-			entry, _ := resolveCatalogEntry(rec.Name, rec.Profile, cc.ops)
-			endpointStage, oauthStage := "FAIL", "UNKNOWN"
-			if entry.URL != "" {
-				d := runReadOnlyDiscoveryCheck(&http.Client{Timeout: 8 * time.Second}, entry.URL)
-				endpointStage, oauthStage = d.Transport, d.Discovery
-			}
-			authMCP, extAcc := "UNKNOWN", "UNKNOWN"
-			if rep.PublicVerified {
-				authMCP = "PASS"
-			}
-			if rep.VerificationEvidence != nil && rep.VerificationEvidence.Stage == "EXTERNAL_CLIENT_VERIFIED" {
-				extAcc = "PASS"
-			}
+			v := runAuthenticatedServiceVerification(rec, rURL, cc.key, cc.keyID, cc.ops, &http.Client{Timeout: 8 * time.Second}, false)
 			writeCCJSON(w, http.StatusOK, map[string]any{
-				"ok":         endpointStage == "PASS" && oauthStage == "PASS",
-				"checked_at": time.Now().UTC().Format(time.RFC3339),
-				"stages": map[string]string{
-					"public_endpoint_reachable":    endpointStage,
-					"oauth_discovery_compatible":   oauthStage,
-					"authenticated_mcp_handshake":  authMCP,
-					"events_advertised":            "UNKNOWN",
-					"events_subscription_verified": "UNKNOWN",
-					"callback_delivery_verified":   "UNKNOWN",
-					"external_client_acceptance":   extAcc,
-				},
+				"ok":                  v.OK,
+				"checked_at":          time.Now().UTC().Format(time.RFC3339),
+				"verification_source": v.VerificationSource,
+				"qualification_level": v.QualificationLevel,
+				"detail":              v.Detail,
+				"stages":              v.Stages,
 			})
 			return
 		}

@@ -44,6 +44,10 @@ across schema migrations or security-boundary changes.
 - **Live Promotion Status:**
   - `pop-os` publisher (`/home/bamn/.local/bin/ocliv`): **DEPLOYED** (`8fdb319f…`, `commit=9b66c37…`, `dirty=false`, `agentgateway` `SERVING`/`READY`/`OAUTH_COMPATIBLE` at `https://bamnlabs.duckdns.org/r/jr8x2Txyoa1jPs22CROuBQ/mcp`).
   - Pi relay (`10.9.66.170`, `/usr/local/bin/ocliv`): **DEPLOYED** (`65452a77…`, `commit=9b66c37…`, `dirty=false`, `schema_version=24`, `/health/live=ok`, `/health/ready=ok`, `PI_PROMOTION_9b66c37=PASS`).
+- **Remaining Operational Limitations & Stabilization Patch Note:**
+  - Production stays cleanly on `9b66c37` (`release_sequence=1007`) while the 24-hour soak (`PID 989673`) completes.
+  - A subsequent source-only stabilization patch on `master` (not yet built into a new signed release or promoted; does NOT inherit `9b66c37`'s 88/0/0 Pi receipt) hardens: (1) fail-closed immutable service-ID grants in Go and Skybridge, (2) authoritative publication binding & `INTENT_STALE` revalidation before mutation, (3) parent-directory `fsync` on permission writes, mandatory `expected_revision` CAS and pre-mutation audit failure handling in Control Center, and live file-backed policy reload in Skybridge, (4) canonical `cli_connect.go` reuse for Control Center Google/Gemini provisioning (idempotency, `google_confidential`, rotation, revocation), (5) internal short-lived synthetic diagnostic token verification (`POST /v1/agent/mcp-routes/{route_id}/authz/diagnostic-token`) keeping `external_client_acceptance` strictly separate, (6) explicit shared-principal boundary reporting for AgentGateway stdio, and (7) explicit retirement of legacy standalone Ocliv MCP registrations in favor of AgentGateway + Control Center.
+  - Official external ChatGPT host OAuth E2E and authenticated public Events host consumption remain `EXTERNAL_ACCEPTANCE_UNVERIFIED` until exercised by a real external host.
 
 ## Prior Isolated Pi Staging Receipt (`88a11fe` — preserved)
 

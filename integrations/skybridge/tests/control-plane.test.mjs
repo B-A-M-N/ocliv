@@ -256,3 +256,67 @@ test('OCL-013 NativeControlPlane filters list_services, enforces config conflict
     nested: { safe: 1 },
   });
 });
+
+test('Stabilization: ID-bound grants fail closed on missing/mismatched serviceId and live policy reload honors revocation without restart', async () => {
+  const { mkdtempSync, writeFileSync, chmodSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { loadPermissionsPolicyFile } = await import('../src/core/permissions.mjs');
+
+  const dir = mkdtempSync(join(tmpdir(), 'ocliv-sb-perm-'));
+  const polPath = join(dir, 'agent-permissions.json');
+  try {
+    const initial = {
+      schema_version: 2,
+      revision: 1,
+      agents: {
+        'agent-live': {
+          grants: [
+            {
+              service_id: 'svc-immutable-42',
+              service_name: 'demo',
+              actions: ['inspect', 'lifecycle'],
+              allowed_ports: [8765],
+              allowed_auth_modes: ['ocliv-managed'],
+            },
+          ],
+        },
+      },
+    };
+    writeFileSync(polPath, JSON.stringify(initial), { mode: 0o600 });
+    chmodSync(polPath, 0o600);
+
+    const enforcer = new PermissionsEnforcer(loadPermissionsPolicyFile(polPath), polPath);
+
+    // Exact immutable serviceId passes; missing or mismatched serviceId fails closed.
+    assert.equal(enforcer.assertAllowed({ subject: 'agent-live', action: 'inspect', service: 'demo', serviceId: 'svc-immutable-42' }), true);
+    assert.throws(() => enforcer.assertAllowed({ subject: 'agent-live', action: 'inspect', service: 'demo', serviceId: '' }), /not authorized/);
+    assert.throws(() => enforcer.assertAllowed({ subject: 'agent-live', action: 'inspect', service: 'demo', serviceId: 'svc-recreated-99' }), /not authorized/);
+
+    // Operator revokes lifecycle permission on disk — running enforcer MUST honor immediately without restart.
+    const revoked = {
+      schema_version: 2,
+      revision: 2,
+      agents: {
+        'agent-live': {
+          grants: [
+            {
+              service_id: 'svc-immutable-42',
+              service_name: 'demo',
+              actions: ['inspect'],
+              allowed_ports: [8765],
+              allowed_auth_modes: ['ocliv-managed'],
+            },
+          ],
+        },
+      },
+    };
+    writeFileSync(polPath, JSON.stringify(revoked), { mode: 0o600 });
+    chmodSync(polPath, 0o600);
+
+    assert.equal(enforcer.assertAllowed({ subject: 'agent-live', action: 'inspect', service: 'demo', serviceId: 'svc-immutable-42' }), true);
+    assert.throws(() => enforcer.assertAllowed({ subject: 'agent-live', action: 'lifecycle', service: 'demo', serviceId: 'svc-immutable-42' }), /not permitted/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

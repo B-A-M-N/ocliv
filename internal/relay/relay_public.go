@@ -861,7 +861,8 @@ func (s *Server) recordManagedMCPObservation(t *routeTarget, clientID, method, p
 		}
 	}
 	clientKind := "generic"
-	if isSynth {
+	if isSynth || clientID == authz.DiagnosticProbeSubject {
+		isSynth = true
 		clientKind = "synthetic-probe"
 	} else if c, err := s.authz.Store().GetClient(clientID); err == nil && c != nil {
 		clientKind = authz.ClassifyClientKind(c.RedirectURIs, false)

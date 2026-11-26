@@ -170,11 +170,46 @@ export function loadPermissionsPolicyFile(filePath) {
 }
 
 export class PermissionsEnforcer {
-  constructor(policy) {
+  /**
+   * @param {any} policy
+   * @param {string | null} [policyFilePath]
+   */
+  constructor(policy, policyFilePath = null) {
     this.policy = policy ?? { defaultRule: null, agents: new Map() };
+    this.policyFilePath = typeof policyFilePath === 'string' && policyFilePath.trim() ? policyFilePath.trim() : null;
+    this._lastSig = null;
+    if (this.policyFilePath) {
+      try {
+        const st = lstatSync(this.policyFilePath);
+        this._lastSig = `${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}`;
+      } catch {
+        this._lastSig = null;
+      }
+    }
+  }
+
+  /**
+   * Reload the authoritative 0600 permissions policy if the backing file changed
+   * on disk so operator revocations take effect immediately without restart.
+   * Fails closed if the policy file was removed, tampered with, or corrupted.
+   */
+  reloadIfNeeded() {
+    if (!this.policyFilePath) return;
+    let st;
+    try {
+      st = lstatSync(this.policyFilePath);
+    } catch {
+      throw new PermissionError('POLICY_MISSING', `Permissions policy unreadable: ${this.policyFilePath}`);
+    }
+    const sig = `${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}`;
+    if (sig !== this._lastSig) {
+      this.policy = loadPermissionsPolicyFile(this.policyFilePath);
+      this._lastSig = sig;
+    }
   }
 
   ruleFor(subject) {
+    this.reloadIfNeeded();
     if (typeof subject !== 'string' || !subject.trim()) return null;
     const key = subject.trim();
     if (this.policy.agents.has(key)) return this.policy.agents.get(key);
@@ -183,12 +218,12 @@ export class PermissionsEnforcer {
 
   grantMatchesService(grant, service, serviceId = '') {
     if (grant.serviceName === '*') return true;
-    if (serviceId && grant.serviceId && grant.serviceId === serviceId) return true;
-    if (service && grant.serviceName && grant.serviceName === service) {
-      if (grant.serviceId && serviceId && grant.serviceId !== serviceId) return false;
-      return true;
+    // An ID-bound grant is authoritative and fails closed whenever the caller's
+    // immutable serviceId is absent or mismatched.
+    if (grant.serviceId) {
+      return Boolean(serviceId) && grant.serviceId === serviceId;
     }
-    return false;
+    return Boolean(service && grant.serviceName && grant.serviceName === service);
   }
 
   canAccessService(subject, service, serviceId = '') {

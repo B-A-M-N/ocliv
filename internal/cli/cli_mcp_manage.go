@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -392,16 +393,18 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		}
 		pubs, _, pubErr := fetchRelayPublications(relayURL, k, keyID, ops)
 		return map[string]any{
-			"ok":                  true,
-			"principal":           principal,
-			"transport_isolation": "shared-local-stdio",
-			"relay_url":           relayURL,
-			"key_id":              keyID,
-			"relay_reachable":     pubErr == nil,
-			"publications":        len(pubs),
-			"services_count":      visibleCount,
-			"version":             buildVersionInfo(),
-			"permissions_mode":    "operator-controlled",
+			"ok":                       true,
+			"principal":                principal,
+			"transport_isolation":      "shared-local-stdio",
+			"caller_isolation":         "shared_local_stdio_no_per_remote_caller_isolation",
+			"shared_principal_warning": "All callers sharing this AgentGateway stdio transport share the same management principal; use Skybridge with verified ocliv-ingress-v2 for per-remote-agent isolation.",
+			"relay_url":                relayURL,
+			"key_id":                   keyID,
+			"relay_reachable":          pubErr == nil,
+			"publications":             len(pubs),
+			"services_count":           visibleCount,
+			"version":                  buildVersionInfo(),
+			"permissions_mode":         "operator-controlled",
 		}, nil
 
 	case "list_services":
@@ -601,6 +604,11 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 				"status":    "UNCONFIRMED",
 				"detail":    sanitizeMCPError(regErr),
 			}, nil
+		}
+		// Promote any name-only creation grant to the resulting immutable service ID
+		// so deletion/recreation cannot substitute a different service identity.
+		if rec.Identity != nil && rec.Identity.ServiceID != "" {
+			_ = bindNameOnlyGrantsToServiceID(principal, rec.Name, rec.Identity.ServiceID)
 		}
 		if !persistent {
 			rep := inspectServiceStatus(rec, k, keyID, ops)
@@ -893,14 +901,21 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		if err != nil {
 			return nil, err
 		}
-		if denied, ok, aerr := authorizeAction("authorize_visitor", rec.Name, svcID, rec.PublicationID, rec.Revision, map[string]any{"service": rec.Name, "challenge": challenge, "decision": decision}, 0, ""); aerr != nil {
+		// Resolve authoritative publication identity BEFORE constructing the exact
+		// authorization intent, then revalidate immediately before mutation so an
+		// approval is never silently transferred to a different publication.
+		pubID, _, found, rerr := resolveRelayPublication(rURL, rk, rKeyID, rec, ops)
+		if rerr != nil || !found {
+			return nil, fmt.Errorf("no publication found for service %q", svcName)
+		}
+		if denied, ok, aerr := authorizeAction("authorize_visitor", rec.Name, svcID, pubID, rec.Revision, map[string]any{"service": rec.Name, "challenge": challenge, "decision": decision}, 0, ""); aerr != nil {
 			return nil, aerr
 		} else if !ok {
 			return denied, nil
 		}
-		pubID, _, found, rerr := resolveRelayPublication(rURL, rk, rKeyID, rec, ops)
-		if rerr != nil || !found {
-			return nil, fmt.Errorf("no publication found for service %q", svcName)
+		curPubID, _, curFound, curErr := resolveRelayPublication(rURL, rk, rKeyID, rec, ops)
+		if curErr != nil || !curFound || curPubID != pubID {
+			return staleIntentResponse("decide_authorization", rec.Name, pubID, curPubID), nil
 		}
 		path := "/v1/agent/mcp-routes/" + pubID + "/authz/consents/" + challenge + "/" + decision
 		st, body, cerr := ops.mgmtCall(rURL, rk, rKeyID, http.MethodPost, path)
@@ -983,14 +998,18 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		if err != nil {
 			return nil, err
 		}
-		if denied, ok, aerr := authorizeAction("revoke_client", rec.Name, svcID, rec.PublicationID, rec.Revision, map[string]any{"service": rec.Name, "client_id": clientID}, 0, ""); aerr != nil {
+		pubID, _, found, rerr := resolveRelayPublication(rURL, rk, rKeyID, rec, ops)
+		if rerr != nil || !found {
+			return nil, fmt.Errorf("no publication found for service %q", svcName)
+		}
+		if denied, ok, aerr := authorizeAction("revoke_client", rec.Name, svcID, pubID, rec.Revision, map[string]any{"service": rec.Name, "client_id": clientID}, 0, ""); aerr != nil {
 			return nil, aerr
 		} else if !ok {
 			return denied, nil
 		}
-		pubID, _, found, rerr := resolveRelayPublication(rURL, rk, rKeyID, rec, ops)
-		if rerr != nil || !found {
-			return nil, fmt.Errorf("no publication found for service %q", svcName)
+		curPubID, _, curFound, curErr := resolveRelayPublication(rURL, rk, rKeyID, rec, ops)
+		if curErr != nil || !curFound || curPubID != pubID {
+			return staleIntentResponse("revoke_client", rec.Name, pubID, curPubID), nil
 		}
 		st, _, cerr := ops.mgmtCall(rURL, rk, rKeyID, http.MethodPost, "/v1/agent/mcp-routes/"+pubID+"/authz/revoke/"+clientID)
 		if cerr != nil || st != http.StatusOK {
@@ -1076,15 +1095,20 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		if err != nil {
 			return nil, err
 		}
-		// Strictly independent permission from authorize_visitor, bound to exact policy arguments.
-		if denied, ok, aerr := authorizeAction("manage_auth_policy", rec.Name, svcID, rec.PublicationID, rec.Revision, map[string]any{"service": rec.Name, "preset": preset, "redirect_uri": redirectURI}, 0, ""); aerr != nil {
+		pubID, _, found, rerr := resolveRelayPublication(rURL, rk, rKeyID, rec, ops)
+		if rerr != nil || !found {
+			return nil, fmt.Errorf("no publication found for service %q", svcName)
+		}
+		// Strictly independent permission from authorize_visitor, bound to exact
+		// authoritative publication ID and policy arguments.
+		if denied, ok, aerr := authorizeAction("manage_auth_policy", rec.Name, svcID, pubID, rec.Revision, map[string]any{"service": rec.Name, "preset": preset, "redirect_uri": redirectURI}, 0, ""); aerr != nil {
 			return nil, aerr
 		} else if !ok {
 			return denied, nil
 		}
-		pubID, _, found, rerr := resolveRelayPublication(rURL, rk, rKeyID, rec, ops)
-		if rerr != nil || !found {
-			return nil, fmt.Errorf("no publication found for service %q", svcName)
+		curPubID, _, curFound, curErr := resolveRelayPublication(rURL, rk, rKeyID, rec, ops)
+		if curErr != nil || !curFound || curPubID != pubID {
+			return staleIntentResponse("set_auth_policy", rec.Name, pubID, curPubID), nil
 		}
 		var redirects []string
 		if preset != "" && preset != "chatgpt" {
@@ -1115,7 +1139,7 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 
 	case "verify_service":
 		svcName := mcpToolStringArg(args, "service")
-		rec, svcID, _, rk, rKeyID, err := resolveSvc(svcName)
+		rec, svcID, rURL, rk, rKeyID, err := resolveSvc(svcName)
 		if err != nil {
 			return nil, err
 		}
@@ -1124,38 +1148,16 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		} else if !ok {
 			return denied, nil
 		}
-		rep := inspectServiceStatus(rec, rk, rKeyID, ops)
-		entry, _ := resolveCatalogEntry(svcName, rec.Profile, ops)
-		endpointStage := "FAIL"
-		oauthStage := "UNKNOWN"
-		if entry.URL != "" {
-			d := runReadOnlyDiscoveryCheck(&http.Client{Timeout: 8 * time.Second}, entry.URL)
-			endpointStage = d.Transport
-			oauthStage = d.Discovery
-		}
-		authMCPStage := "UNKNOWN"
-		externalStage := "UNKNOWN"
-		if rep.PublicVerified {
-			authMCPStage = "PASS"
-		}
-		if rep.VerificationEvidence != nil && rep.VerificationEvidence.Stage == "EXTERNAL_CLIENT_VERIFIED" {
-			externalStage = "PASS"
-		}
+		v := runAuthenticatedServiceVerification(rec, rURL, rk, rKeyID, ops, &http.Client{Timeout: 8 * time.Second}, false)
 		return map[string]any{
-			"ok":             endpointStage == "PASS" && oauthStage == "PASS" && rep.Health == HealthReady,
-			"service":        svcName,
-			"publication_id": rep.PublicationID,
-			"url":            entry.URL,
-			"stages": map[string]string{
-				"public_endpoint_reachable":    endpointStage,
-				"oauth_discovery_compatible":   oauthStage,
-				"authenticated_mcp_handshake":  authMCPStage,
-				"events_advertised":            "UNKNOWN",
-				"events_subscription_verified": "UNKNOWN",
-				"callback_delivery_verified":   "UNKNOWN",
-				"external_client_acceptance":   externalStage,
-			},
-			"status": safeStatusReport(rep),
+			"ok":                  v.OK,
+			"service":             svcName,
+			"publication_id":      v.PublicationID,
+			"url":                 v.URL,
+			"verification_source": v.VerificationSource,
+			"stages":              v.Stages,
+			"detail":              v.Detail,
+			"status":              safeStatusReport(v.Status),
 		}, nil
 
 	case "diagnose_service":
@@ -1182,7 +1184,7 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 
 	case "verify_events":
 		svcName := mcpToolStringArg(args, "service")
-		rec, svcID, _, rk, rKeyID, err := resolveSvc(svcName)
+		rec, svcID, rURL, rk, rKeyID, err := resolveSvc(svcName)
 		if err != nil {
 			return nil, err
 		}
@@ -1191,30 +1193,173 @@ func handleMCPManageTool(principal, name string, args map[string]any, relayURL s
 		} else if !ok {
 			return denied, nil
 		}
-		rep := inspectServiceStatus(rec, rk, rKeyID, ops)
-		entry, _ := resolveCatalogEntry(svcName, rec.Profile, ops)
-		if entry.URL == "" {
+		v := runAuthenticatedServiceVerification(rec, rURL, rk, rKeyID, ops, &http.Client{Timeout: 8 * time.Second}, false)
+		if v.URL == "" {
 			return nil, fmt.Errorf("no canonical URL available for service %q", svcName)
 		}
-		d := runReadOnlyDiscoveryCheck(&http.Client{Timeout: 8 * time.Second}, entry.URL)
-		// Never misrepresent OAuth metadata discovery as authenticated Events verification.
+		evOK := v.EventsResult != nil && v.EventsResult.OK()
 		return map[string]any{
-			"ok":             false,
-			"verified":       false,
-			"service":        svcName,
-			"publication_id": rep.PublicationID,
-			"url":            entry.URL,
-			"stages": map[string]string{
-				"public_endpoint_reachable":    d.Transport,
-				"oauth_discovery_compatible":   d.Discovery,
-				"authenticated_mcp_handshake":  "UNKNOWN",
-				"events_advertised":            "UNKNOWN",
-				"events_subscription_verified": "UNKNOWN",
-				"callback_delivery_verified":   "UNKNOWN",
-				"external_client_acceptance":   "UNKNOWN",
-			},
-			"detail": "Authenticated Events qualification requires an operator-supplied visitor token via `ocliv mcp check NAME --capability events --token-file PATH` or Ocliv Control Center.",
+			"ok":                  evOK,
+			"verified":            evOK,
+			"service":             svcName,
+			"publication_id":      v.PublicationID,
+			"url":                 v.URL,
+			"verification_source": v.VerificationSource,
+			"stages":              v.Stages,
+			"qualification_level": v.QualificationLevel,
+			"detail":              v.Detail,
 		}, nil
 	}
 	return nil, fmt.Errorf("unknown tool %q", name)
+}
+
+func staleIntentResponse(operation, serviceName, approvedPubID, currentPubID string) map[string]any {
+	return map[string]any{
+		"ok":                      false,
+		"status":                  "INTENT_STALE",
+		"operation":               operation,
+		"service":                 serviceName,
+		"approved_publication_id": approvedPubID,
+		"current_publication_id":  currentPubID,
+		"message":                 "Target publication changed after approval; refusing to transfer approval. Re-request authorization for the current publication.",
+	}
+}
+
+type authenticatedVerificationSummary struct {
+	OK                 bool
+	PublicationID      string
+	URL                string
+	VerificationSource string
+	QualificationLevel string
+	Stages             map[string]string
+	Detail             string
+	Status             ServiceStatusReport
+	EventsResult       *MCPEventsQualificationResult
+}
+
+// runAuthenticatedServiceVerification runs the existing native MCP & Events
+// verifier using an internally managed, short-lived diagnostic bearer token
+// minted by the relay's Ed25519-signed owner endpoint. The token is kept
+// strictly in memory, never written to disk, never exposed to MCP agents, and
+// always tagged synthetic so external_client_acceptance remains strictly
+// separate from synthetic verification.
+func runAuthenticatedServiceVerification(rec config.ServiceRecord, rURL string, rk *identity.KeyPair, rKeyID string, ops serviceOps, hc *http.Client, qualifySubscription bool) authenticatedVerificationSummary {
+	if hc == nil {
+		hc = &http.Client{Timeout: 8 * time.Second}
+	}
+	rep := inspectServiceStatus(rec, rk, rKeyID, ops)
+	entry, _ := resolveCatalogEntry(rec.Name, rec.Profile, ops)
+	pubURL := entry.URL
+	if pubURL == "" {
+		pubURL = rep.PublicURL
+	}
+	pubID := rep.PublicationID
+	if pubID == "" {
+		pubID = entry.RouteID
+	}
+	if pubID == "" {
+		if resolvedID, resolvedURL, found, _ := resolveRelayPublication(rURL, rk, rKeyID, rec, ops); found {
+			pubID = resolvedID
+			if pubURL == "" {
+				pubURL = resolvedURL
+			}
+		}
+	}
+
+	stages := map[string]string{
+		"public_endpoint_reachable":    "FAIL",
+		"oauth_discovery_compatible":   "UNKNOWN",
+		"authenticated_mcp_handshake":  "UNKNOWN",
+		"events_advertised":            "UNKNOWN",
+		"events_list_verified":         "UNKNOWN",
+		"events_subscription_verified": "UNKNOWN",
+		"callback_delivery_verified":   "UNKNOWN",
+		"external_client_acceptance":   "UNVERIFIED",
+	}
+	if rep.VerificationEvidence != nil && rep.VerificationEvidence.Stage == "EXTERNAL_CLIENT_VERIFIED" {
+		stages["external_client_acceptance"] = "PASS"
+	}
+
+	out := authenticatedVerificationSummary{
+		PublicationID:      pubID,
+		URL:                pubURL,
+		VerificationSource: "read_only_discovery",
+		QualificationLevel: "NONE",
+		Stages:             stages,
+		Status:             rep,
+	}
+	if pubURL == "" {
+		out.Detail = "no canonical public URL available"
+		return out
+	}
+
+	// Obtain a short-lived, single-route diagnostic token internally over the
+	// publisher's Ed25519 management channel (never exposed to callers/agents).
+	diagToken := ""
+	if rURL != "" && pubID != "" && rk != nil && rKeyID != "" {
+		st, body, cerr := ops.mgmtCall(rURL, rk, rKeyID, http.MethodPost, "/v1/agent/mcp-routes/"+pubID+"/authz/diagnostic-token")
+		if cerr == nil && st == http.StatusOK {
+			var tokResp struct {
+				AccessToken string `json:"access_token"`
+			}
+			if json.Unmarshal(body, &tokResp) == nil && strings.TrimSpace(tokResp.AccessToken) != "" {
+				diagToken = strings.TrimSpace(tokResp.AccessToken)
+			}
+		}
+	}
+
+	if diagToken == "" {
+		d := runReadOnlyDiscoveryCheck(hc, pubURL)
+		stages["public_endpoint_reachable"] = d.Transport
+		stages["oauth_discovery_compatible"] = d.Discovery
+		if rep.PublicVerified {
+			stages["authenticated_mcp_handshake"] = "PASS"
+		}
+		out.OK = d.Transport == "PASS" && d.Discovery == "PASS" && rep.Health == HealthReady
+		out.Detail = d.Detail
+		if out.Detail == "" {
+			out.Detail = "relay did not issue an internal diagnostic token; authenticated MCP/Events stages remain UNKNOWN"
+		}
+		return out
+	}
+
+	parsedPub, perr := url.Parse(pubURL)
+	if perr != nil {
+		out.Detail = "invalid public URL"
+		return out
+	}
+	var parsedLocal *url.URL
+	if rec.LocalURL != "" {
+		if lu, lerr := url.Parse(rec.LocalURL); lerr == nil {
+			parsedLocal = lu
+		}
+	}
+	authMode := "mcp_managed_oauth"
+	if rec.Auth == "upstream-oauth" {
+		authMode = "mcp_upstream_oauth"
+	} else if rec.Auth != "" && rec.Auth != "ocliv-managed" {
+		authMode = rec.Auth
+	}
+	evRes := QualifyMCPEvents(MCPEventsQualificationConfig{
+		PublicEndpoint:      parsedPub,
+		LocalEndpoint:       parsedLocal,
+		AuthMode:            authMode,
+		BearerToken:         diagToken,
+		Client:              hc,
+		LocalClient:         hc,
+		QualifySubscription: qualifySubscription,
+	})
+	out.VerificationSource = "synthetic_diagnostic_probe"
+	out.QualificationLevel = evRes.QualificationLevel
+	out.EventsResult = &evRes
+	stages["public_endpoint_reachable"] = evRes.PublicTransport
+	stages["oauth_discovery_compatible"] = evRes.ResourceDiscovery
+	stages["authenticated_mcp_handshake"] = evRes.MCPNegotiation
+	stages["events_advertised"] = evRes.EventsAdvertised
+	stages["events_list_verified"] = evRes.EventsList
+	stages["events_subscription_verified"] = evRes.Subscription
+	stages["callback_delivery_verified"] = evRes.CallbackDelivery
+	out.Detail = evRes.Detail
+	out.OK = evRes.PublicTransport == "PASS" && evRes.ResourceDiscovery == "PASS" && evRes.MCPNegotiation == "PASS"
+	return out
 }
