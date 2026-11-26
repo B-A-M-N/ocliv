@@ -314,8 +314,10 @@ Organizations that do not wish to comply with `AGPL-3.0-only` obligations may ob
 
 ---
 
-## Disclaimer
+## Acknowledgments & Independence
 
-This is an independent project by the repository author. FreeInference.org ("FI") did not sponsor, commission, direct, review, approve, or endorse it, and has no involvement in its design, development, or publication. Every decision to create, modify, and publish this work was made by me at my own discretion.
+Ocliv is an independently developed project. Access to AI inference through [FreeInference.org](https://freeinference.org/) played an important role in its development, and I am grateful for that support.
 
-The inference access FI supplied was vital in bringing this project to its current state. If you find this project useful or helpful, I encourage you to support FreeInference.org through the donation options on their website. FI provides a vital service for independent developers and researchers who would otherwise lack access to this kind of infrastructure, and sustained community support is what keeps that access available.
+Ocliv's design, implementation, and publication remain the responsibility of its author. FreeInference.org did not sponsor, commission, direct, review, or endorse the project.
+
+FreeInference.org makes AI infrastructure more accessible to independent developers and researchers. If Ocliv has been useful to you, please consider supporting their work through the donation options on their website.
