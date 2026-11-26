@@ -311,3 +311,11 @@ Ocliv was originally developed as a Meta hackathon project exploring secure infr
 Ocliv is licensed under the **GNU Affero General Public License v3.0 only (`AGPL-3.0-only`)** — see [LICENSE](LICENSE).
 
 Organizations that do not wish to comply with `AGPL-3.0-only` obligations may obtain a separate commercial license; see [LICENSING.md](LICENSING.md). The Ocliv name and logo are reserved trademarks; see [TRADEMARKS.md](TRADEMARKS.md). For contributor guidelines and CLA terms, see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+---
+
+## Disclaimer
+
+This is an independent project by the repository author. FreeInference.org ("FI") did not sponsor, commission, direct, review, approve, or endorse it, and has no involvement in its design, development, or publication. Every decision to create, modify, and publish this work was made by me at my own discretion.
+
+The inference access FI supplied was vital in bringing this project to its current state. If you find this project useful or helpful, I encourage you to support FreeInference.org through the donation options on their website. FI provides a vital service for independent developers and researchers who would otherwise lack access to this kind of infrastructure, and sustained community support is what keeps that access available.
